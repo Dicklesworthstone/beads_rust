@@ -344,8 +344,9 @@ fn e2e_routing_routes_jsonl_external_route() {
 }
 
 #[test]
-fn e2e_routing_external_target_lock_blocks_routed_access() {
-    let _log = common::test_log("e2e_routing_external_target_lock_blocks_routed_access");
+fn e2e_routing_external_target_lock_blocks_writes_but_allows_observation() {
+    let _log =
+        common::test_log("e2e_routing_external_target_lock_blocks_writes_but_allows_observation");
 
     let main_workspace = BrWorkspace::new();
     let external_workspace = BrWorkspace::new();
@@ -374,16 +375,34 @@ fn e2e_routing_external_target_lock_blocks_routed_access() {
         "show_routed_external_while_target_locked",
     );
     assert!(
-        !routed_show.status.success(),
-        "routed access should fail while target .write.lock is held"
+        routed_show.status.success(),
+        "routed observation should not acquire the target writer lock: {}",
+        routed_show.stderr
+    );
+    let routed_update = run_br(
+        &main_workspace,
+        [
+            "--lock-timeout",
+            "1",
+            "update",
+            &external_id,
+            "--title",
+            "Blocked change",
+            "--json",
+        ],
+        "update_routed_external_while_target_locked",
     );
     assert!(
-        routed_show
+        !routed_update.status.success(),
+        "routed mutation should fail while target .write.lock is held"
+    );
+    assert!(
+        routed_update
             .stdout
             .contains("Routed external workspace is busy")
-            || routed_show.stdout.contains("target write lock"),
+            || routed_update.stdout.contains("target write lock"),
         "expected target lock diagnostic, got stdout: {}",
-        routed_show.stdout
+        routed_update.stdout
     );
 
     drop(lock_file);
@@ -397,6 +416,95 @@ fn e2e_routing_external_target_lock_blocks_routed_access() {
         "routed access should succeed after target lock release: {}",
         unlocked_show.stderr
     );
+}
+
+#[test]
+fn e2e_routing_explicit_read_only_commands_preserve_external_family() {
+    let _log = common::test_log("e2e_routing_explicit_read_only_commands_preserve_external_family");
+    let main_workspace = BrWorkspace::new();
+    let seed_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+    init_workspace(&main_workspace, "init_read_only_main");
+    init_workspace(&seed_workspace, "init_read_only_seed");
+    fs::write(
+        seed_workspace.root.join(".beads/config.yaml"),
+        "issue_prefix: ext\n",
+    )
+    .expect("seed prefix");
+    let external_id = create_issue_and_get_id(
+        &seed_workspace,
+        "External issue observed without touching its database",
+        "create_read_only_seed",
+    );
+
+    // Copy only the checkpointed tracker into a workspace never opened by
+    // br. Any source lock acquisition or engine sidecar becomes visible.
+    let external_beads = external_workspace.root.join(".beads");
+    fs::create_dir_all(&external_beads).expect("external beads dir");
+    for filename in ["beads.db", "issues.jsonl", "metadata.json"] {
+        fs::copy(
+            seed_workspace.root.join(".beads").join(filename),
+            external_beads.join(filename),
+        )
+        .expect("copy durable tracker");
+    }
+    configure_external_route(&main_workspace, &external_workspace);
+    let snapshot = || -> std::collections::BTreeMap<_, _> {
+        fs::read_dir(&external_beads)
+            .expect("list external tracker")
+            .map(|entry| {
+                let entry = entry.expect("external tracker entry");
+                (
+                    entry.file_name(),
+                    fs::read(entry.path()).expect("read external tracker file"),
+                )
+            })
+            .collect()
+    };
+    let before = snapshot();
+
+    for (label, command) in [
+        ("show_json", vec!["show", external_id.as_str(), "--json"]),
+        ("show_text", vec!["show", external_id.as_str()]),
+        (
+            "comments",
+            vec!["comments", "list", external_id.as_str(), "--json"],
+        ),
+        (
+            "dependencies",
+            vec!["dep", "list", external_id.as_str(), "--json"],
+        ),
+        (
+            "labels",
+            vec!["label", "list", external_id.as_str(), "--json"],
+        ),
+        ("graph", vec!["graph", external_id.as_str(), "--json"]),
+        ("lint", vec!["lint", external_id.as_str(), "--json"]),
+        (
+            "audit",
+            vec!["audit", "log", external_id.as_str(), "--json"],
+        ),
+    ] {
+        let result = run_br_with_env(
+            &main_workspace,
+            ["--no-auto-import", "--no-auto-flush"]
+                .into_iter()
+                .chain(command),
+            [("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")],
+            &format!("explicit_read_only_routed_{label}"),
+        );
+        assert!(
+            result.status.success(),
+            "{label}: stdout={} stderr={}",
+            result.stdout,
+            result.stderr
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "{label} must not change external files or add locks"
+        );
+    }
 }
 
 #[test]

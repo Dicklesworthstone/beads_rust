@@ -1121,8 +1121,8 @@ fn has_non_ok(checks: &[CheckResult]) -> bool {
         .any(|check| !matches!(check.status, CheckStatus::Ok))
 }
 
-/// Inspect pending sync-merge metadata through a current-schema read-only
-/// connection and one coherent read transaction.
+/// Inspect pending sync-merge metadata through a verified private copy,
+/// a current-schema read-only connection, and one coherent read transaction.
 ///
 /// This is an advisory inspection for doctor reporting and startup warnings.
 /// Mutation gates must use [`inspect_pending_sync_merge_under_authority`].
@@ -1171,7 +1171,7 @@ pub fn inspect_pending_sync_merge_at_path(db_path: &Path) -> Result<Option<Pendi
         }
     }
 
-    let Some(storage) = SqliteStorage::open_current_read_only(db_path)? else {
+    let Some(storage) = SqliteStorage::open_current_read_only_snapshot(db_path)? else {
         // The lock-free lane also declines when an fsqlite namespace sidecar
         // needs the authority-gated owner-only mode repair; that is not a
         // schema problem and must not be reported as one (GitHub #491).
@@ -12927,20 +12927,21 @@ fn execute_repair_indexes(
     args: &DoctorArgs,
     cli: &config::CliOverrides,
 ) -> Result<()> {
-    // Acquire the workspace write lock the same way --repair does.
-    // A REINDEX inside a transaction is a write, and concurrency with
-    // another writer is operator error.
-    let write_authority = if let Some(authority) =
+    // Applying REINDEX requires writer authority; describing it must not
+    // create lock sidecars or bind/create the original database inode.
+    let write_authority = if args.dry_run {
+        None
+    } else if let Some(authority) =
         cli.database_family_write_authority_for(beads_dir, &paths.db_path)
     {
         if let Err(err) = authority.verify_database_authority() {
             emit_concurrency_lost(beads_dir, &err, ctx, "--repair-indexes");
             crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
         }
-        Arc::clone(authority)
+        Some(Arc::clone(authority))
     } else {
         match acquire_doctor_database_write_authority(beads_dir, &paths.db_path, Some(0)) {
-            Ok(authority) => authority,
+            Ok(authority) => Some(authority),
             Err(err) => {
                 emit_concurrency_lost(beads_dir, &err, ctx, "--repair-indexes");
                 crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
@@ -12960,15 +12961,6 @@ fn execute_repair_indexes(
         }
     }
 
-    if !args.dry_run {
-        refuse_doctor_mutation_if_merge_pending(
-            "--repair-indexes",
-            &paths.db_path,
-            &write_authority,
-            ctx,
-        );
-    }
-
     // Pre-snapshot backup. Same shape `--repair` uses: copy the live
     // DB to a sidecar before mutating, restore on any failure inside
     // the REINDEX transaction. The snapshot path lives next to the
@@ -12978,13 +12970,31 @@ fn execute_repair_indexes(
     let shm_path = PathBuf::from(format!("{}-shm", paths.db_path.to_string_lossy()));
 
     if args.dry_run {
-        ctx.info(&format!(
+        let message = format!(
             "[dry-run] Would snapshot {} -> {} and REINDEX every user index on the issues family",
             paths.db_path.display(),
             snapshot_path.display(),
-        ));
+        );
+        if ctx.is_json() {
+            ctx.json(&serde_json::json!({
+                "dry_run": true,
+                "repaired": false,
+                "message": message,
+                "snapshot_path": snapshot_path,
+            }));
+        } else {
+            ctx.info(&message);
+        }
         return Ok(());
     }
+    let write_authority =
+        write_authority.expect("applying index repair acquires authority before refusal gates");
+    refuse_doctor_mutation_if_merge_pending(
+        "--repair-indexes",
+        &paths.db_path,
+        &write_authority,
+        ctx,
+    );
 
     // The write authority excludes writers, not readers. Keep sole-opener
     // admission through checkpoint, repair, connection teardown and restore.
@@ -14583,55 +14593,55 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // early-return below. Releasing the lock implicitly on panic is
     // load-bearing: a panicking fixer must not strand the `.write.lock`
     // file held against subsequent runs.
-    let repair_write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>> = if args.repair
-        && !args.robot_triage
-    {
-        if let Some(authority) = cli.database_family_write_authority_for(&beads_dir, &paths.db_path)
-        {
-            // main.rs already serialized us against concurrent writers.
-            // Reuse that exact inode-bound capability; a fresh flock
-            // handle in the same process would deadlock on Linux.
-            if let Err(err) = authority.verify_database_authority() {
-                emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
-                crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
-            }
-            Some(Arc::clone(authority))
-        } else {
-            // Phase 10 cold-prober finding (`beads_rust-mbpq` P0):
-            // the documented contract is "try-lock or refuse with
-            // exit 5 (concurrency_lost)" — NOT "block up to
-            // --lock-timeout then refuse". Concurrency between two
-            // `br doctor --repair` invocations is an unrecoverable
-            // operator-level condition: blocking for 30s and then
-            // erroring serves nobody. Operators who genuinely want
-            // to wait can pass `--lock-timeout 30000` explicitly;
-            // the default doctor path tries once and refuses fast.
-            let timeout_ms = cli.lock_timeout.unwrap_or(0);
-            match crate::sync::blocking_database_family_write_lock_with_timeout(
-                &beads_dir,
-                &paths.db_path,
-                Some(timeout_ms),
-            ) {
-                Ok(authority) => {
-                    let authority = Arc::new(authority);
-                    if let Err(err) = authority
-                        .bind_database_inode_for_mutation()
-                        .and_then(|_| authority.verify_database_authority())
-                    {
-                        emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
-                        crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
-                    }
-                    Some(authority)
-                }
-                Err(err) => {
+    let repair_write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>> =
+        if args.repair && !args.dry_run && !args.robot_triage {
+            if let Some(authority) =
+                cli.database_family_write_authority_for(&beads_dir, &paths.db_path)
+            {
+                // main.rs already serialized us against concurrent writers.
+                // Reuse that exact inode-bound capability; a fresh flock
+                // handle in the same process would deadlock on Linux.
+                if let Err(err) = authority.verify_database_authority() {
                     emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
                     crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
                 }
+                Some(Arc::clone(authority))
+            } else {
+                // Phase 10 cold-prober finding (`beads_rust-mbpq` P0):
+                // the documented contract is "try-lock or refuse with
+                // exit 5 (concurrency_lost)" — NOT "block up to
+                // --lock-timeout then refuse". Concurrency between two
+                // `br doctor --repair` invocations is an unrecoverable
+                // operator-level condition: blocking for 30s and then
+                // erroring serves nobody. Operators who genuinely want
+                // to wait can pass `--lock-timeout 30000` explicitly;
+                // the default doctor path tries once and refuses fast.
+                let timeout_ms = cli.lock_timeout.unwrap_or(0);
+                match crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &beads_dir,
+                    &paths.db_path,
+                    Some(timeout_ms),
+                ) {
+                    Ok(authority) => {
+                        let authority = Arc::new(authority);
+                        if let Err(err) = authority
+                            .bind_database_inode_for_mutation()
+                            .and_then(|_| authority.verify_database_authority())
+                        {
+                            emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
+                            crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
+                        }
+                        Some(authority)
+                    }
+                    Err(err) => {
+                        emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
+                        crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
+                    }
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Round-5 fresh-eyes follow-through (`beads_rust-73ux`): the WP1
     // refuse-unsafe gates (schema-version-downgrade,
@@ -14743,6 +14753,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 ctx,
             );
         }
+    }
+
+    // Planning must stop before creating a repair session or invoking any
+    // fixer. Even chokepointed dry-runs previously acquired database/JSONL
+    // writer locks, created a missing database, or reached a write probe while
+    // preparing their operations. Apply rechecks these findings under its
+    // original write-authority and refusal gates.
+    if args.repair && args.dry_run {
+        return emit_repair_dry_run(&beads_dir, &initial.report, args, ctx);
     }
 
     // Local sidecar repair can quarantine an orphan WAL before the JSONL
@@ -15917,6 +15936,112 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         crate::shutdown::exit_process(exit_code.as_i32());
     }
 
+    Ok(())
+}
+
+/// Select possible repair paths from the observational report. Registry
+/// filter IDs are the same IDs consulted by apply; specialized predicates
+/// distinguish cache, index and page findings that share a check name.
+/// These are candidates, because an actual repair rechecks its prerequisites
+/// and may make a later fallback unnecessary.
+fn repair_dry_run_candidates(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    args: &DoctorArgs,
+) -> Vec<crate::cli::commands::doctor_subsystems::capabilities_doctor::FixerEntry> {
+    use crate::cli::commands::doctor_subsystems::capabilities_doctor::DoctorCapabilities;
+
+    let filter = FixerFilter::from_args(&args.only, &args.skip);
+    let finding_kind = |name: &str, kind: &str| {
+        report.checks.iter().any(|check| {
+            check.name == name
+                && check.status == CheckStatus::Warn
+                && check
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(kind)
+        })
+    };
+    let inner_gitignore = fs::symlink_metadata(beads_dir.join(".gitignore"));
+    DoctorCapabilities::build()
+        .fixers
+        .into_iter()
+        .filter(|fixer| fixer.filter_ids.iter().any(|id| filter.allows(id)))
+        .filter(|fixer| {
+            let has_warning = report.checks.iter().any(|check| {
+                check.status == CheckStatus::Warn && fixer.addressed_findings.contains(&check.name)
+            });
+            match fixer.id.as_str() {
+                "doctor.repair_recoverable_db_state" => filter_allows_recoverable_db_state_repair(
+                    &filter,
+                    report_has_blocked_cache_rebuild_finding(report),
+                    report_has_sidecar_anomaly(report),
+                ),
+                "doctor.repair_database_sidecars" => report_has_sidecar_anomaly(report),
+                "doctor.repair_partial_indexes" => report_has_partial_index_warnings(report),
+                "doctor.repair_via_vacuum" => {
+                    report_has_page_corruption(report) || report_has_warn_level_page_anomaly(report)
+                }
+                "doctor.repair_database_from_jsonl" => {
+                    !report.ok
+                        || report_has_partial_index_warnings(report)
+                        || report_has_warn_level_page_anomaly(report)
+                        || report_has_blocked_cache_rebuild_finding(report)
+                }
+                "doctor.db_bloat_vacuum" => args.unsafe_auto_fix && has_warning,
+                "doctor.base_jsonl_symlink_quarantine" => finding_kind("base_jsonl", "symlink"),
+                "doctor.base_jsonl_regen" => finding_kind("base_jsonl", "stale"),
+                "doctor.inner_gitignore_create" => {
+                    has_warning
+                        && inner_gitignore
+                            .as_ref()
+                            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                }
+                "doctor.inner_gitignore_append" => {
+                    has_warning && inner_gitignore.as_ref().is_ok_and(fs::Metadata::is_file)
+                }
+                "doctor.dirty_bitmap_orphan_prune"
+                | "doctor.comments_orphan_prune"
+                | "doctor.labels_orphan_prune"
+                | "doctor.dependencies_orphan_prune" => {
+                    has_warning && !report_has_structural_integrity_error(report)
+                }
+                _ => has_warning && fixer.auto_fixable,
+            }
+        })
+        .collect()
+}
+
+fn emit_repair_dry_run(
+    beads_dir: &Path,
+    report: &DoctorReport,
+    args: &DoctorArgs,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let candidates = repair_dry_run_candidates(beads_dir, report, args);
+    let message = "Dry run: no repair writes were applied. Candidate repairs are rechecked under write authority when applying; later fallbacks may be unnecessary.";
+    if ctx.is_json() {
+        ctx.json(&serde_json::json!({
+            "schema": "br.doctor.repair-plan.v1",
+            "dry_run": true,
+            "repaired": false,
+            "report": report,
+            "candidate_repairs": candidates,
+            "message": message,
+        }));
+    } else {
+        print_report(report, ctx)?;
+        ctx.info(message);
+        for candidate in candidates {
+            ctx.info(&format!(
+                "[dry-run] Candidate repair: {} (findings: {})",
+                candidate.id,
+                candidate.addressed_findings.join(", ")
+            ));
+        }
+    }
     Ok(())
 }
 

@@ -6,7 +6,6 @@ use crate::config;
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
 use crate::franken_sync::Connection;
-use crate::franken_sync::compat::{OpenFlags, open_with_flags};
 use crate::output::{OutputContext, OutputMode, rich_text_panel};
 use crate::storage::SqliteStorage;
 use crate::util::parse_id;
@@ -198,19 +197,6 @@ fn load_info_snapshot_without_recovery(
         return InfoSnapshot::default();
     }
 
-    if !db_path_is_symlink(&paths.db_path) {
-        match load_info_snapshot_direct_read_only(args, &paths.db_path) {
-            Ok(snapshot) => return snapshot,
-            Err(err) => {
-                debug!(
-                    path = %paths.db_path.display(),
-                    error = %err,
-                    "Direct read-only info query failed; falling back to database-family snapshot"
-                );
-            }
-        }
-    }
-
     match config::with_database_family_snapshot(&paths.db_path, |snapshot_db_path| {
         let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
         let snapshot = collect_info_snapshot(args, &conn);
@@ -227,26 +213,6 @@ fn load_info_snapshot_without_recovery(
             InfoSnapshot::default()
         }
     }
-}
-
-fn db_path_is_symlink(db_path: &Path) -> bool {
-    std::fs::symlink_metadata(db_path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-fn load_info_snapshot_direct_read_only(args: &InfoArgs, db_path: &Path) -> Result<InfoSnapshot> {
-    // Info reads historical schemas directly. Participate in the opener
-    // protocol so a concurrent migration cannot replace/checkpoint the family
-    // while this connection is observing it (GH #585).
-    let _opener_lease = crate::sync::DatabaseOpenerLease::register(db_path)?;
-    let conn = open_with_flags(
-        db_path.to_string_lossy().as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-    let snapshot = collect_info_snapshot(args, &conn);
-    conn.close()?;
-    Ok(snapshot)
 }
 
 fn collect_info_snapshot(args: &InfoArgs, conn: &Connection) -> InfoSnapshot {

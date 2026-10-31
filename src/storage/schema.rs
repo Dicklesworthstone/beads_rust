@@ -757,9 +757,7 @@ pub(crate) fn canonical_index_creation_statements() -> Vec<&'static str> {
         .collect()
 }
 
-/// Identify only indexes whose definitions the migration and runtime schema
-/// attestations own. Operator indexes must retain their exact schema witness.
-pub(crate) fn is_reviewed_migration_managed_index(table: &str, name: &str) -> bool {
+fn reviewed_migration_index_definition(table: &str, name: &str) -> Option<ExpectedRuntimeIndex> {
     let indexes = match table {
         "issues" => ISSUES_RUNTIME_INDEXES,
         "dependencies" => DEPENDENCIES_RUNTIME_INDEXES,
@@ -778,11 +776,33 @@ pub(crate) fn is_reviewed_migration_managed_index(table: &str, name: &str) -> bo
         "gate_result_history" => {
             return GATE_RESULT_HISTORY_INDEXES
                 .iter()
-                .any(|(expected, _)| *expected == name);
+                .find(|(expected, _)| *expected == name)
+                .map(|&(name, columns)| runtime_index(name, columns, false, false));
         }
-        _ => return false,
+        _ => return None,
     };
-    indexes.iter().any(|index| index.name == name)
+    indexes.iter().find(|index| index.name == name).copied()
+}
+
+/// Exempt only an observed canonical index definition from schema preservation.
+/// A familiar name cannot authorize removal of operator UNIQUE constraints,
+/// expressions, key ordering, collations, or partial predicates.
+pub(crate) fn is_reviewed_migration_managed_index(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+) -> bool {
+    let Some(expected) = reviewed_migration_index_definition(table, name) else {
+        return false;
+    };
+    let escaped = table.replace('\'', "''");
+    conn.query(&format!("PRAGMA main.index_list('{escaped}')"))
+        .is_ok_and(|rows| {
+            rows.iter().any(|row| {
+                row.get(1).and_then(SqliteValue::as_text) == Some(name)
+                    && runtime_index_row_canonical(conn, row, &expected)
+            })
+        })
 }
 
 pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
@@ -1507,6 +1527,24 @@ const DEPENDENCIES_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
         true,
     ),
 ];
+// Released pair-key schemas also carried these redundant accelerators. They
+// contain no independent records, but may be retired only after attesting
+// their complete definitions; an operator's same-name UNIQUE/expression/
+// partial index must not be silently discarded during the v19 table copy.
+const REVIEWED_DEPENDENCY_RETIRED_INDEXES: &[ExpectedRuntimeIndex] = &[
+    runtime_index(
+        "idx_dependencies_depends_on_type_issue",
+        &["depends_on_id", "type", "issue_id"],
+        false,
+        false,
+    ),
+    runtime_index(
+        "idx_dependencies_issue_type",
+        &["issue_id", "type"],
+        false,
+        false,
+    ),
+];
 const LABELS_RUNTIME_INDEXES: &[ExpectedRuntimeIndex] = &[
     runtime_index("idx_labels_label", &["label"], false, false),
     runtime_index("idx_labels_issue", &["issue_id"], false, false),
@@ -2009,26 +2047,44 @@ fn auxiliary_runtime_indexes_canonical(
         else {
             return false;
         };
-        let uniqueness_matches =
-            index_row.get(2).and_then(SqliteValue::as_integer) == Some(i64::from(expected.unique));
-        let explicitly_created = index_row
-            .get(3)
-            .and_then(SqliteValue::as_text)
-            .is_some_and(|value| value.eq_ignore_ascii_case("c"));
-        let partial = index_row
-            .get(4)
-            .and_then(SqliteValue::as_integer)
-            .is_some_and(|value| value != 0);
-        if !uniqueness_matches || !explicitly_created || partial != expected.partial {
-            return false;
-        }
-
-        runtime_index_key_shape_canonical(conn, expected.name, expected.columns)
-            && (!expected.partial
-                || semantic_partial_index_predicate_canonical(conn, expected.name))
+        runtime_index_row_canonical(conn, index_row, expected)
     });
 
     expected_indexes_match && runtime_index_names_canonical(&index_rows, indexes)
+}
+
+fn runtime_index_row_canonical(
+    conn: &Connection,
+    row: &Row,
+    expected: &ExpectedRuntimeIndex,
+) -> bool {
+    row.get(2).and_then(SqliteValue::as_integer) == Some(i64::from(expected.unique))
+        && row
+            .get(3)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("c"))
+        && row.get(4).and_then(SqliteValue::as_integer) == Some(i64::from(expected.partial))
+        && runtime_index_key_shape_canonical(conn, expected.name, expected.columns)
+        && (!expected.partial || semantic_partial_index_predicate_canonical(conn, expected.name))
+}
+
+/// Missing owned indexes can be recreated, but every present definition must
+/// have the reviewed semantics before a migration plan can retire or replace it.
+fn reviewed_source_indexes_canonical(
+    conn: &Connection,
+    table: &str,
+    indexes: &[ExpectedRuntimeIndex],
+) -> bool {
+    let escaped = table.replace('\'', "''");
+    let Ok(rows) = conn.query(&format!("PRAGMA main.index_list('{escaped}')")) else {
+        return false;
+    };
+    runtime_index_names_canonical(&rows, indexes)
+        && indexes.iter().all(|index| {
+            rows.iter()
+                .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some(index.name))
+                .is_none_or(|row| runtime_index_row_canonical(conn, row, index))
+        })
 }
 
 fn runtime_index_names_canonical(rows: &[Row], indexes: &[ExpectedRuntimeIndex]) -> bool {
@@ -2050,6 +2106,44 @@ fn runtime_index_names_canonical(rows: &[Row], indexes: &[ExpectedRuntimeIndex])
             _ => false,
         }
     })
+}
+
+/// Recognize a redundant released dependency accelerator by its full shape.
+/// Its deliberate retirement may be excluded from the migration schema proof;
+/// the same name on another table or with operator-defined semantics may not.
+pub(crate) fn is_reviewed_dependency_retired_index(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+) -> bool {
+    if table != "dependencies" {
+        return false;
+    }
+    let Some(index) = REVIEWED_DEPENDENCY_RETIRED_INDEXES
+        .iter()
+        .find(|index| index.name == name)
+    else {
+        return false;
+    };
+    let Ok(rows) = conn.query("PRAGMA main.index_list('dependencies')") else {
+        return false;
+    };
+    rows.iter().any(|row| {
+        row.get(1).and_then(SqliteValue::as_text) == Some(name)
+            && row.get(2).and_then(SqliteValue::as_integer) == Some(0)
+            && row.get(3).and_then(SqliteValue::as_text) == Some("c")
+            && row.get(4).and_then(SqliteValue::as_integer) == Some(0)
+            && runtime_index_key_shape_canonical(conn, name, index.columns)
+    })
+}
+
+/// Admit optional, precisely identified accelerators from released pair-key
+/// schemas without admitting arbitrary operator indexes. Current canonical
+/// indexes may be missing because candidate maintenance recreates them.
+fn reviewed_dependency_source_indexes_canonical(conn: &Connection) -> bool {
+    let mut admitted = DEPENDENCIES_RUNTIME_INDEXES.to_vec();
+    admitted.extend_from_slice(REVIEWED_DEPENDENCY_RETIRED_INDEXES);
+    reviewed_source_indexes_canonical(conn, "dependencies", &admitted)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2831,9 +2925,10 @@ fn attest_reviewed_source_core_tables(conn: &Connection, legacy_v15: bool) -> Re
             && (!legacy_v15 || legacy_v15_table_declaration_exact(conn, table, columns));
         let indexes_ok = if legacy_v15 {
             legacy_v15_indexes_canonical(conn, table, indexes)
+        } else if table == "dependencies" {
+            reviewed_dependency_source_indexes_canonical(conn)
         } else {
-            conn.query(&format!("PRAGMA index_list('{table}')"))
-                .is_ok_and(|rows| runtime_index_names_canonical(&rows, indexes))
+            reviewed_source_indexes_canonical(conn, table, indexes)
         };
         if !declaration_ok || !indexes_ok {
             return Err(BeadsError::Config(format!(
@@ -5211,15 +5306,7 @@ fn apply_dependency_type_key_migration_in_transaction(
     conn: &Connection,
     source_version: u32,
 ) -> Result<bool> {
-    let indexes_admitted = conn
-        .query("PRAGMA index_list('dependencies')")
-        .is_ok_and(|rows| runtime_index_names_canonical(&rows, DEPENDENCIES_RUNTIME_INDEXES));
-    if !indexes_admitted {
-        return Err(BeadsError::Config(
-            "schema migrate v19 refused: dependencies has unreviewed indexes".into(),
-        ));
-    }
-    if core_runtime_table_declaration_canonical(
+    let already_typed = core_runtime_table_declaration_canonical(
         conn,
         "dependencies",
         DEPENDENCIES_RUNTIME_COLUMNS,
@@ -5227,7 +5314,18 @@ fn apply_dependency_type_key_migration_in_transaction(
         false,
         None,
         false,
-    ) {
+    );
+    let indexes_admitted = if already_typed {
+        reviewed_source_indexes_canonical(conn, "dependencies", DEPENDENCIES_RUNTIME_INDEXES)
+    } else {
+        reviewed_dependency_source_indexes_canonical(conn)
+    };
+    if !indexes_admitted {
+        return Err(BeadsError::Config(
+            "schema migrate v19 refused: dependencies has unreviewed indexes".into(),
+        ));
+    }
+    if already_typed {
         return Ok(false);
     }
     attest_pair_key_dependency_source(conn, source_version)?;
@@ -6817,6 +6915,8 @@ mod tests {
 
     #[test]
     fn reviewed_migration_managed_indexes_require_exact_table_and_name() {
+        let conn = Connection::open(":memory:").unwrap();
+        execute_batch(&conn, SCHEMA_SQL).unwrap();
         for (table, name) in [
             ("blocked_issues_cache", "idx_blocked_cache_blocked_at"),
             ("labels", "idx_labels_issue"),
@@ -6827,23 +6927,30 @@ mod tests {
             ("gate_result_history", "idx_gate_result_history_scope"),
             ("dependencies", "idx_dependencies_blocking"),
         ] {
-            assert!(is_reviewed_migration_managed_index(table, name));
-            assert!(!is_reviewed_migration_managed_index("operator_table", name));
+            assert!(is_reviewed_migration_managed_index(&conn, table, name));
             assert!(!is_reviewed_migration_managed_index(
+                &conn,
+                "operator_table",
+                name
+            ));
+            assert!(!is_reviewed_migration_managed_index(
+                &conn,
                 table,
                 &format!("{name}_operator")
             ));
         }
         for name in REVIEWED_LEGACY_V15_RETIRED_INDEXES {
             for table in ["dependencies", "labels", "comments", "events"] {
-                assert!(!is_reviewed_migration_managed_index(table, name));
+                assert!(!is_reviewed_migration_managed_index(&conn, table, name));
             }
         }
         assert!(!is_reviewed_migration_managed_index(
+            &conn,
             "labels",
             "idx_config_key"
         ));
         assert!(!is_reviewed_migration_managed_index(
+            &conn,
             "labels",
             "sqlite_autoindex_labels_1"
         ));
@@ -7015,6 +7122,140 @@ mod tests {
                 .and_then(SqliteValue::as_integer),
             Some(9)
         );
+    }
+
+    fn pair_key_source_with_retired_indexes() -> (TempDir, Connection) {
+        let temp = TempDir::new().unwrap();
+        let conn =
+            Connection::open(temp.path().join("source.db").to_string_lossy().into_owned()).unwrap();
+        let source_schema = SCHEMA_SQL
+            .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
+            .replace(
+                "PRIMARY KEY (issue_id, depends_on_id, type)",
+                "PRIMARY KEY (issue_id, depends_on_id)",
+            );
+        execute_batch(&conn, &source_schema).unwrap();
+        execute_batch(
+            &conn,
+            "CREATE INDEX idx_dependencies_depends_on_type_issue
+                ON dependencies(depends_on_id, type, issue_id);
+             CREATE INDEX idx_dependencies_issue_type ON dependencies(issue_id, type);
+             INSERT INTO issues (id, title) VALUES ('bd-source', 'Source'), ('bd-target', 'Target');
+             INSERT INTO dependencies (rowid, issue_id, depends_on_id, created_by)
+                VALUES (41, 'bd-source', 'bd-target', 'historical actor');
+             INSERT INTO events (id, issue_id, event_type, actor, comment)
+                VALUES (91, 'bd-source', 'created', 'historical actor', 'keep this history');
+             INSERT INTO config (key, value) VALUES ('compact_model', 'operator choice');
+             INSERT INTO metadata (key, value) VALUES ('operator_metadata', 'keep this value');
+             PRAGMA user_version = 16;",
+        )
+        .unwrap();
+        (temp, conn)
+    }
+
+    #[test]
+    fn reviewed_v16_migration_accepts_exact_historical_dependency_indexes() {
+        let (_temp, conn) = pair_key_source_with_retired_indexes();
+        assert!(!attest_reviewed_migration_source_core_tables(&conn).unwrap());
+        for retired in REVIEWED_DEPENDENCY_RETIRED_INDEXES {
+            assert!(is_reviewed_dependency_retired_index(
+                &conn,
+                "dependencies",
+                retired.name
+            ));
+            assert!(!is_reviewed_dependency_retired_index(
+                &conn,
+                "operator_notes",
+                retired.name
+            ));
+        }
+        let queries = [
+            "SELECT rowid, * FROM dependencies ORDER BY rowid",
+            "SELECT rowid, * FROM events ORDER BY rowid",
+            "SELECT rowid, * FROM config ORDER BY rowid",
+            "SELECT rowid, * FROM metadata ORDER BY rowid",
+            "SELECT name, seq FROM sqlite_sequence ORDER BY name",
+        ];
+        let before = queries.map(|query| format!("{:?}", conn.query(query).unwrap()));
+        run_migrations_atomic(&conn, 16, current_schema_version_u32().unwrap()).unwrap();
+        assert!(runtime_schema_compatible(&conn));
+        for (query, expected) in queries.iter().zip(before) {
+            assert_eq!(
+                format!("{:?}", conn.query(query).unwrap()),
+                expected,
+                "{query}"
+            );
+        }
+        for retired in REVIEWED_DEPENDENCY_RETIRED_INDEXES {
+            assert!(!index_exists(&conn, retired.name));
+        }
+        conn.execute("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('bd-source', 'bd-target', 'related')").unwrap();
+        assert_eq!(
+            conn.query("SELECT type FROM dependencies").unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn reviewed_source_refuses_canonical_names_with_operator_index_semantics() {
+        for replacement in [
+            "CREATE UNIQUE INDEX idx_issues_status ON issues(status)",
+            "CREATE INDEX idx_issues_status ON issues(title)",
+            "CREATE INDEX idx_issues_status ON issues(status COLLATE NOCASE)",
+            "CREATE INDEX idx_issues_status ON issues(status DESC)",
+            "CREATE INDEX idx_issues_status ON issues(status) WHERE status = 'open'",
+            "CREATE INDEX idx_issues_status ON issues(lower(status))",
+        ] {
+            let (_temp, conn) = pair_key_source_with_retired_indexes();
+            conn.execute("UPDATE issues SET status='in_progress' WHERE id='bd-target'")
+                .unwrap();
+            conn.execute("DROP INDEX idx_issues_status").unwrap();
+            conn.execute(replacement).unwrap();
+            assert!(!is_reviewed_migration_managed_index(
+                &conn,
+                "issues",
+                "idx_issues_status"
+            ));
+            let before = legacy_v15_test_state(&conn);
+            let error = attest_reviewed_migration_source_core_tables(&conn)
+                .expect_err("a canonical name must not authorize changing index semantics");
+            assert!(error.to_string().contains("core table issues"), "{error}");
+            assert_eq!(legacy_v15_test_state(&conn), before, "{replacement}");
+        }
+    }
+
+    #[test]
+    fn reviewed_v16_migration_refuses_changed_historical_indexes_without_writes() {
+        for replacement in [
+            "CREATE UNIQUE INDEX idx_dependencies_issue_type ON dependencies(issue_id, type)",
+            "CREATE INDEX idx_dependencies_issue_type ON dependencies(type, issue_id)",
+            "CREATE INDEX idx_dependencies_issue_type ON dependencies(issue_id COLLATE NOCASE, type)",
+            "CREATE INDEX idx_dependencies_issue_type ON dependencies(issue_id DESC, type)",
+            "CREATE INDEX idx_dependencies_issue_type ON dependencies(issue_id, type) WHERE type = 'blocks'",
+            "CREATE INDEX idx_dependencies_issue_type ON dependencies(lower(issue_id), type)",
+            "CREATE INDEX operator_dependency_index ON dependencies(issue_id, type)",
+        ] {
+            let (_temp, conn) = pair_key_source_with_retired_indexes();
+            conn.execute("DROP INDEX idx_dependencies_issue_type")
+                .unwrap();
+            conn.execute(replacement).unwrap();
+            assert!(!is_reviewed_dependency_retired_index(
+                &conn,
+                "dependencies",
+                "idx_dependencies_issue_type"
+            ));
+            let before = legacy_v15_test_state(&conn);
+            let error = attest_reviewed_migration_source_core_tables(&conn)
+                .expect_err("changed or unknown index must not receive a migration plan");
+            assert!(
+                error.to_string().contains("core table dependencies"),
+                "{error}"
+            );
+            assert_eq!(legacy_v15_test_state(&conn), before, "{replacement}");
+            run_migrations_atomic(&conn, 16, current_schema_version_u32().unwrap())
+                .expect_err("transactional migration must also refuse unknown index semantics");
+            assert_eq!(legacy_v15_test_state(&conn), before, "{replacement}");
+        }
     }
 
     #[test]

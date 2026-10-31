@@ -177,24 +177,31 @@ fn execute_inner(
         &mut config_layer,
     )?;
 
-    // Output based on mode
+    render_statistics(&output, &ctx, output_format, args.stats);
+    Ok(())
+}
+
+fn render_statistics(
+    output: &Statistics,
+    ctx: &OutputContext,
+    output_format: OutputFormat,
+    show_stats: bool,
+) {
     match output_format {
         OutputFormat::Json => {
-            ctx.json_pretty(&output);
+            ctx.json_pretty(output);
         }
         OutputFormat::Toon => {
-            ctx.toon_with_stats(&output, args.stats);
+            ctx.toon_with_stats(output, show_stats);
         }
         OutputFormat::Text | OutputFormat::Csv => {
             if matches!(ctx.mode(), OutputMode::Rich) {
-                render_stats_rich(&output, &ctx);
+                render_stats_rich(output, ctx);
             } else {
-                print_text_output(&output);
+                print_text_output(output);
             }
         }
     }
-
-    Ok(())
 }
 
 fn resolve_stats_external_blockers(

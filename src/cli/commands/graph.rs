@@ -120,7 +120,7 @@ fn open_storage_for_graph(
         let mut route_cli = cli_for_routed_workspace(cli, route.is_external);
         let routed_write_lock = acquire_routed_workspace_write_lock(
             &route.beads_dir,
-            route.is_external,
+            route.is_external && !route_cli.read_only_storage,
             route_cli.lock_timeout,
         )?;
         routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
@@ -155,7 +155,7 @@ pub fn execute_with_storage_ctx(
             let mut route_cli = cli_for_routed_workspace(cli, true);
             let routed_write_lock = acquire_routed_workspace_write_lock(
                 &route.beads_dir,
-                true,
+                !route_cli.read_only_storage,
                 route_cli.lock_timeout,
             )?;
             routed_write_lock.mark_cli_write_lock_held(&mut route_cli);

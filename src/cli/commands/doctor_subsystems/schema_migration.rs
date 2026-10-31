@@ -43,8 +43,9 @@ use crate::storage::schema::{
     CURRENT_SCHEMA_VERSION, REVIEWED_LEGACY_V15_RETIRED_INDEXES,
     REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedSchemaMigrationEffects,
     apply_reviewed_legacy_v15_core_conversion_in_transaction,
-    attest_reviewed_migration_source_core_tables, is_reviewed_migration_managed_index,
-    run_reviewed_schema_migration_steps_in_transaction, runtime_schema_compatible,
+    attest_reviewed_migration_source_core_tables, is_reviewed_dependency_retired_index,
+    is_reviewed_migration_managed_index, run_reviewed_schema_migration_steps_in_transaction,
+    runtime_schema_compatible,
 };
 use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
 
@@ -314,19 +315,40 @@ pub fn execute(
     cli: &config::CliOverrides,
     _ctx: &OutputContext,
 ) -> Result<()> {
-    let migration = resolve_context(cli)?;
     match &args.command {
-        DoctorMigrateSchemaCommand::Recover(recover) => execute_recover(recover, &migration),
-        DoctorMigrateSchemaCommand::Plan(plan) => execute_plan(plan, &migration),
-        DoctorMigrateSchemaCommand::Apply(apply) => execute_apply(apply, &migration),
-        DoctorMigrateSchemaCommand::Undo(undo) => execute_undo(undo, &migration),
-        DoctorMigrateSchemaCommand::Heal(heal) => super::schema_heal::execute_heal(
-            heal,
-            cli,
-            &migration.beads_dir,
-            &migration.write_authority,
-        ),
+        DoctorMigrateSchemaCommand::Plan(plan) => {
+            let paths = resolve_preview_paths(cli)?;
+            execute_plan(plan, &paths.db_path)
+        }
+        DoctorMigrateSchemaCommand::Undo(undo) if undo.dry_run => {
+            let paths = resolve_preview_paths(cli)?;
+            execute_undo_preview(undo, &paths.beads_dir, &paths.db_path)
+        }
+        DoctorMigrateSchemaCommand::Heal(heal) if heal.dry_run => {
+            let paths = resolve_preview_paths(cli)?;
+            super::schema_heal::execute_heal_preview(heal, &paths)
+        }
+        DoctorMigrateSchemaCommand::Recover(recover) => {
+            execute_recover(recover, &resolve_context(cli)?)
+        }
+        DoctorMigrateSchemaCommand::Apply(apply) => execute_apply(apply, &resolve_context(cli)?),
+        DoctorMigrateSchemaCommand::Undo(undo) => execute_undo(undo, &resolve_context(cli)?),
+        DoctorMigrateSchemaCommand::Heal(heal) => {
+            let migration = resolve_context(cli)?;
+            super::schema_heal::execute_heal(
+                heal,
+                cli,
+                &migration.beads_dir,
+                &migration.write_authority,
+            )
+        }
     }
+}
+
+fn resolve_preview_paths(cli: &config::CliOverrides) -> Result<config::ConfigPaths> {
+    let beads_dir =
+        config::discover_optional_beads_dir_with_cli(cli)?.ok_or(BeadsError::NotInitialized)?;
+    config::resolve_paths(&beads_dir, cli.db.as_ref())
 }
 
 fn resolve_context(cli: &config::CliOverrides) -> Result<MigrationContext> {
@@ -355,10 +377,45 @@ fn resolve_context(cli: &config::CliOverrides) -> Result<MigrationContext> {
     })
 }
 
-fn execute_plan(args: &DoctorMigrateSchemaPlanArgs, migration: &MigrationContext) -> Result<()> {
-    let plan = build_plan(&migration.db_path)?;
+fn execute_plan(args: &DoctorMigrateSchemaPlanArgs, db_path: &Path) -> Result<()> {
+    let plan = build_observational_plan(db_path)?;
     emit_plan(&plan, args.json)?;
     Ok(())
+}
+
+/// Keep engine opens, reader marks, and namespace registration away from the
+/// original family. The snapshot helper retains source identities and proves
+/// a coherent copy; the additional comparison binds its bytes to the raw
+/// original witness reported by the preview, including original permissions.
+fn with_migration_read_snapshot<T>(
+    db_path: &Path,
+    read: impl FnOnce(&Path, &RawFamilyWitness) -> Result<T>,
+) -> Result<T> {
+    refuse_non_regular_component(db_path)?;
+    let raw = raw_family_witness(db_path)?;
+    config::with_database_family_snapshot(db_path, |snapshot| {
+        let directory = snapshot
+            .parent()
+            .ok_or_else(|| BeadsError::internal("migration snapshot has no parent"))?;
+        verify_backup_family(db_path, directory, &raw)?;
+        read(snapshot, &raw)
+    })
+}
+
+fn build_observational_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
+    with_migration_read_snapshot(db_path, |snapshot, raw| {
+        let mut plan = build_plan(snapshot)?;
+        plan.database_path = db_path.display().to_string();
+        plan.raw_witness = raw.clone();
+        if let Some(forecast) = plan.forecast.as_ref() {
+            let token = compute_plan_token(&plan.database_path, &plan.logical_witness, forecast)?;
+            plan.apply_command = Some(format!(
+                "br doctor migrate-schema apply --plan-token {token}"
+            ));
+            plan.plan_token = Some(token);
+        }
+        Ok(plan)
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -4863,11 +4920,96 @@ fn rollback_compacted_install(
     sync_directory(failed_dir)
 }
 
+fn execute_undo_preview(
+    args: &DoctorMigrateSchemaUndoArgs,
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
+    let receipt = build_undo_preview(args, beads_dir, db_path)?;
+    emit_undo(&receipt, args.json)
+}
+
+/// Validate the same receipt chain, retained backup and live preservation
+/// proof as undo, while keeping every engine open and temporary proof outside
+/// the tracker. Actual undo repeats all checks under its exclusive authority.
+fn build_undo_preview(
+    args: &DoctorMigrateSchemaUndoArgs,
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<UndoReceipt> {
+    validate_run_id(&args.run_id)?;
+    let run_dir = migration_runs_root(beads_dir).join(&args.run_id);
+    if run_dir.join("undone.json").exists() {
+        let receipt: UndoReceipt = read_json(&run_dir.join("undone.json"))?;
+        validate_completed_undo_receipt_structure(&receipt, args, beads_dir, db_path)?;
+        with_migration_read_snapshot(db_path, |snapshot, raw| {
+            validate_completed_undo_live_state(&receipt, &logical_witness(snapshot)?, raw)
+        })?;
+        return Ok(receipt);
+    }
+    let applied_path = run_dir.join("applied.json");
+    let applied_receipt_sha256 = file_sha256(&applied_path)?;
+    let applied: AppliedMigrationReceipt = read_json(&applied_path)?;
+    validate_applied_receipt_for_path(&applied, args, db_path, &run_dir)?;
+    verify_backup_family(db_path, &run_dir.join("before"), &applied.raw_before)?;
+    if run_dir.join("undo-prepared.json").exists() {
+        return Err(BeadsError::internal(format!(
+            "schema migration undo for run {} is already prepared; rerun without \
+             --dry-run to resume it",
+            args.run_id
+        )));
+    }
+    with_migration_read_snapshot(db_path, |snapshot, raw| {
+        let logical_live = logical_witness(snapshot).ok();
+        let projection_unchanged = verify_retained_migration_preservation_at(
+            snapshot,
+            &run_dir,
+            &applied.raw_before,
+            &applied.forecast,
+            None,
+        )
+        .is_ok();
+        require_unchanged_applied_state(
+            &applied,
+            raw,
+            logical_live.as_ref(),
+            &args.run_id,
+            projection_unchanged,
+        )?;
+        let quarantine_id = format!(
+            "undo-{}-{}",
+            Utc::now().format("%Y%m%dT%H%M%S%.6fZ"),
+            std::process::id()
+        );
+        Ok(UndoReceipt {
+            schema_version: UNDO_SCHEMA.to_string(),
+            run_id: args.run_id.clone(),
+            dry_run: true,
+            database_path: db_path.display().to_string(),
+            quarantine_path: run_dir
+                .join("undo-quarantine")
+                .join(quarantine_id)
+                .display()
+                .to_string(),
+            applied_receipt_sha256,
+            raw_expected_before: applied.raw_before.clone(),
+            logical_expected_before: applied.logical_before.clone(),
+            raw_live_before_undo: raw.clone(),
+            logical_live_before_undo: logical_live,
+            raw_restored: None,
+            logical_restored: None,
+        })
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "undo is a linear crash-recovery protocol whose operation ordering is safety-critical"
 )]
 fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext) -> Result<()> {
+    if args.dry_run {
+        return execute_undo_preview(args, &migration.beads_dir, &migration.db_path);
+    }
     validate_run_id(&args.run_id)?;
     let run_dir = migration_runs_root(&migration.beads_dir).join(&args.run_id);
     if run_dir.join("undone.json").exists() {
@@ -4884,19 +5026,10 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
     verify_backup_family(&migration.db_path, &before_dir, &applied.raw_before)?;
 
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-    if !args.dry_run {
-        verify_migration_exchange_support(&migration.db_path, exchange_database_paths)?;
-    }
+    verify_migration_exchange_support(&migration.db_path, exchange_database_paths)?;
 
     let undo_prepared_path = run_dir.join("undo-prepared.json");
     let mut receipt = if undo_prepared_path.exists() {
-        if args.dry_run {
-            return Err(BeadsError::internal(format!(
-                "schema migration undo for run {} is already prepared; rerun without \
-                 --dry-run to resume it",
-                args.run_id
-            )));
-        }
         let receipt: UndoReceipt = read_json(&undo_prepared_path)?;
         validate_prepared_undo_receipt(
             &receipt,
@@ -4937,7 +5070,7 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
         let receipt = UndoReceipt {
             schema_version: UNDO_SCHEMA.to_string(),
             run_id: args.run_id.clone(),
-            dry_run: args.dry_run,
+            dry_run: false,
             database_path: migration.db_path.display().to_string(),
             quarantine_path: quarantine_dir.display().to_string(),
             applied_receipt_sha256: applied_receipt_sha256.clone(),
@@ -4948,11 +5081,6 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
             raw_restored: None,
             logical_restored: None,
         };
-        if args.dry_run {
-            emit_undo(&receipt, args.json)?;
-            return Ok(());
-        }
-
         let quarantine_parent = quarantine_dir.parent().ok_or_else(|| {
             BeadsError::internal("schema migration undo quarantine path has no parent")
         })?;
@@ -5204,6 +5332,15 @@ fn validate_applied_receipt(
     migration: &MigrationContext,
     run_dir: &Path,
 ) -> Result<()> {
+    validate_applied_receipt_for_path(applied, args, &migration.db_path, run_dir)
+}
+
+fn validate_applied_receipt_for_path(
+    applied: &AppliedMigrationReceipt,
+    args: &DoctorMigrateSchemaUndoArgs,
+    db_path: &Path,
+    run_dir: &Path,
+) -> Result<()> {
     validate_raw_family_witness(&applied.raw_before)?;
     if let Some(raw_after) = applied.raw_after.as_ref() {
         validate_raw_family_witness(raw_after)?;
@@ -5220,12 +5357,12 @@ fn validate_applied_receipt(
             args.run_id, applied.run_id
         )));
     }
-    if applied.database_path != migration.db_path.display().to_string() {
+    if applied.database_path != db_path.display().to_string() {
         return Err(BeadsError::internal(format!(
             "schema migration run {} belongs to {}, not {}",
             args.run_id,
             applied.database_path,
-            migration.db_path.display()
+            db_path.display()
         )));
     }
     if applied.attested != applied.attestation_errors.is_empty() {
@@ -5286,12 +5423,29 @@ fn validate_completed_undo_receipt(
     args: &DoctorMigrateSchemaUndoArgs,
     migration: &MigrationContext,
 ) -> Result<()> {
+    validate_completed_undo_receipt_structure(
+        receipt,
+        args,
+        &migration.beads_dir,
+        &migration.db_path,
+    )?;
+    let logical = logical_witness(&migration.db_path)?;
+    let raw = raw_family_witness(&migration.db_path)?;
+    validate_completed_undo_live_state(receipt, &logical, &raw)
+}
+
+fn validate_completed_undo_receipt_structure(
+    receipt: &UndoReceipt,
+    args: &DoctorMigrateSchemaUndoArgs,
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
     validate_raw_family_witness(&receipt.raw_expected_before)?;
     validate_raw_family_witness(&receipt.raw_live_before_undo)?;
-    let run_dir = migration_runs_root(&migration.beads_dir).join(&args.run_id);
+    let run_dir = migration_runs_root(beads_dir).join(&args.run_id);
     if receipt.schema_version != UNDO_SCHEMA
         || receipt.run_id != args.run_id
-        || receipt.database_path != migration.db_path.display().to_string()
+        || receipt.database_path != db_path.display().to_string()
         || receipt.dry_run
     {
         return Err(BeadsError::internal(format!(
@@ -5308,7 +5462,7 @@ fn validate_completed_undo_receipt(
         )));
     }
     let applied: AppliedMigrationReceipt = read_json(&applied_path)?;
-    validate_applied_receipt(&applied, args, migration, &run_dir)?;
+    validate_applied_receipt_for_path(&applied, args, db_path, &run_dir)?;
     let quarantine_dir = validate_quarantine_path(receipt, &run_dir)?;
     let logical_restored = receipt.logical_restored.as_ref().ok_or_else(|| {
         BeadsError::internal(format!(
@@ -5334,17 +5488,23 @@ fn validate_completed_undo_receipt(
             args.run_id
         )));
     }
-    verify_backup_family(
-        &migration.db_path,
-        &quarantine_dir,
-        &receipt.raw_live_before_undo,
-    )?;
-    if logical_witness(&migration.db_path)? != *logical_restored
-        || !stable_raw_eq(&raw_family_witness(&migration.db_path)?, raw_restored)
+    verify_backup_family(db_path, &quarantine_dir, &receipt.raw_live_before_undo)
+}
+
+fn validate_completed_undo_live_state(
+    receipt: &UndoReceipt,
+    logical: &LogicalDatabaseWitness,
+    raw: &RawFamilyWitness,
+) -> Result<()> {
+    if receipt.logical_restored.as_ref() != Some(logical)
+        || receipt
+            .raw_restored
+            .as_ref()
+            .is_none_or(|expected| !stable_raw_eq(raw, expected))
     {
         return Err(BeadsError::internal(format!(
             "schema migration run {} was previously undone, but the live database family has since changed",
-            args.run_id
+            receipt.run_id
         )));
     }
     Ok(())
@@ -5698,13 +5858,17 @@ fn reviewed_schema_objects(
         let name = preservation_text(row.get(1), "schema object name")?;
         let table = preservation_text(row.get(2), "schema object table")?;
         let sql = preservation_text(row.get(3), "schema object definition")?;
-        if (object_type == "index" && is_reviewed_migration_managed_index(&table, &name))
+        if (object_type == "index"
+            && (is_reviewed_migration_managed_index(conn, &table, &name)
+                || is_reviewed_dependency_retired_index(conn, &table, &name)))
             || (matches!(table.as_str(), "issues" | "dependencies")
                 && (object_type == "table" || (object_type == "index" && sql.is_empty())))
         {
             // Both source and candidate attest these exact runtime-owned
             // shapes. Only their reviewed column/key changes and canonical
-            // index maintenance may differ; operator DDL is never exempted.
+            // index maintenance may differ. Exact released dependency
+            // accelerators are deliberately retired by the pair-key copy;
+            // same-name operator DDL is never exempted.
             continue;
         }
         let fingerprint = if project_close_metadata_addition
@@ -5777,6 +5941,16 @@ fn verify_retained_migration_preservation(
     raw_before: &RawFamilyWitness,
     forecast: &MigrationForecast,
 ) -> Result<()> {
+    verify_retained_migration_preservation_at(db_path, run_dir, raw_before, forecast, Some(run_dir))
+}
+
+fn verify_retained_migration_preservation_at(
+    db_path: &Path,
+    run_dir: &Path,
+    raw_before: &RawFamilyWitness,
+    forecast: &MigrationForecast,
+    scratch_parent: Option<&Path>,
+) -> Result<()> {
     if forecast.legacy_v15_conversion.is_some() {
         return verify_legacy_v15_projection(
             db_path,
@@ -5786,9 +5960,12 @@ fn verify_retained_migration_preservation(
     }
     let before_dir = run_dir.join("before");
     verify_backup_family(db_path, &before_dir, raw_before)?;
-    let private = tempfile::Builder::new()
-        .prefix("preservation-proof-")
-        .tempdir_in(run_dir)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("preservation-proof-");
+    let private = match scratch_parent {
+        Some(parent) => builder.tempdir_in(parent)?,
+        None => builder.tempdir()?,
+    };
     let retained_source = backup_component_path(&before_dir, db_path, "")?;
     copy_family_to_backup(&retained_source, private.path(), raw_before)?;
     verify_backup_family(&retained_source, private.path(), raw_before)?;
@@ -5991,7 +6168,7 @@ fn legacy_preserved_schema_witness(
                 | "child_counters"
         ) || LEGACY_V15_NEW_TABLES.contains(&table)
             || REVIEWED_LEGACY_V15_RETIRED_INDEXES.contains(&name)
-            || (object_type == "index" && is_reviewed_migration_managed_index(table, name))
+            || (object_type == "index" && is_reviewed_migration_managed_index(conn, table, name))
         {
             // Managed index definitions are independently checked by source
             // admission and candidate runtime attestation. Their recreation
@@ -9048,6 +9225,43 @@ mod tests {
         reviewed_v14_migration_context_with_database_name("beads.db")
     }
 
+    #[test]
+    fn observational_plan_preserves_original_family_and_original_path_token() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let before = crate::storage::sqlite::database_family_snapshot(&migration.db_path).unwrap();
+        let raw_before = raw_family_witness(&migration.db_path).unwrap();
+        let plan = build_observational_plan(&migration.db_path).unwrap();
+        assert_eq!(
+            crate::storage::sqlite::database_family_snapshot(&migration.db_path).unwrap(),
+            before,
+            "planning must not touch original WAL/SHM or engine namespace files"
+        );
+        assert_eq!(plan.database_path, migration.db_path.display().to_string());
+        assert_eq!(plan.raw_witness, raw_before);
+        let expected = build_plan(&migration.db_path).unwrap();
+        assert_eq!(plan.plan_token, expected.plan_token);
+        assert_eq!(plan.forecast, expected.forecast);
+        assert_eq!(plan.logical_witness, expected.logical_witness);
+        assert!(!migration_runs_root(&migration.beads_dir).exists());
+    }
+
+    #[test]
+    fn observational_plan_refusal_preserves_original_family() {
+        let (_temp, migration) = reviewed_v14_migration_context();
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("CREATE INDEX operator_dependency ON dependencies(created_by)")
+            .unwrap();
+        close_connection(conn).unwrap();
+        let before = crate::storage::sqlite::database_family_snapshot(&migration.db_path).unwrap();
+        let error = build_observational_plan(&migration.db_path).unwrap_err();
+        assert!(error.to_string().contains("core table dependencies"));
+        assert_eq!(
+            crate::storage::sqlite::database_family_snapshot(&migration.db_path).unwrap(),
+            before
+        );
+        assert!(!migration_runs_root(&migration.beads_dir).exists());
+    }
+
     fn preservation_fixture() -> (TempDir, PathBuf, MigrationForecast) {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("preservation.db");
@@ -9207,6 +9421,111 @@ mod tests {
                 .contains("opaque_rowids shadows every hidden rowid alias"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn reviewed_preservation_keeps_noncanonical_managed_index_definitions() {
+        for (table, name, source, canonical) in [
+            (
+                "issues",
+                "idx_issues_content_hash",
+                "CREATE UNIQUE INDEX idx_issues_content_hash ON issues(content_hash)",
+                "CREATE INDEX idx_issues_content_hash ON issues(content_hash)",
+            ),
+            (
+                "issues",
+                "idx_issues_content_hash",
+                "CREATE INDEX idx_issues_content_hash ON issues(content_hash COLLATE NOCASE)",
+                "CREATE INDEX idx_issues_content_hash ON issues(content_hash)",
+            ),
+            (
+                "issues",
+                "idx_issues_content_hash",
+                "CREATE INDEX idx_issues_content_hash ON issues(content_hash) WHERE content_hash IS NOT NULL",
+                "CREATE INDEX idx_issues_content_hash ON issues(content_hash)",
+            ),
+            (
+                "issues",
+                "idx_issues_content_hash",
+                "CREATE INDEX idx_issues_content_hash ON issues(title)",
+                "CREATE INDEX idx_issues_content_hash ON issues(content_hash)",
+            ),
+            (
+                "close_metadata",
+                "idx_close_metadata_recorded_at",
+                "CREATE UNIQUE INDEX idx_close_metadata_recorded_at ON close_metadata(recorded_at)",
+                "CREATE INDEX idx_close_metadata_recorded_at ON close_metadata(recorded_at)",
+            ),
+            (
+                "capacity_occupancy",
+                "idx_capacity_occupancy_actor",
+                "CREATE INDEX idx_capacity_occupancy_actor ON capacity_occupancy(actor) WHERE actor != ''",
+                "CREATE INDEX idx_capacity_occupancy_actor ON capacity_occupancy(actor) WHERE actor IS NOT NULL",
+            ),
+        ] {
+            let (_temp, db_path, forecast) = preservation_fixture();
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute("CREATE TABLE close_metadata (recorded_at TEXT, closed_by TEXT)")
+                .unwrap();
+            conn.execute("CREATE TABLE capacity_occupancy (actor TEXT)")
+                .unwrap();
+            conn.execute(source).unwrap();
+            assert!(!is_reviewed_migration_managed_index(&conn, table, name));
+            close_connection(conn).unwrap();
+            let proof = capture_reviewed_state_preservation(&db_path, &forecast).unwrap();
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute(&format!("DROP INDEX {}", quote_identifier(name)))
+                .unwrap();
+            conn.execute(canonical).unwrap();
+            assert!(is_reviewed_migration_managed_index(&conn, table, name));
+            close_connection(conn).unwrap();
+            let error =
+                verify_reviewed_state_preservation(&db_path, proof.as_ref(), true).unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("index {name} changed")),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reviewed_preservation_retires_only_exact_historical_dependency_indexes() {
+        for (sql, may_retire) in [
+            (
+                "CREATE INDEX idx_dependencies_issue_type ON dependencies(issue_id, type)",
+                true,
+            ),
+            (
+                "CREATE UNIQUE INDEX idx_dependencies_issue_type ON dependencies(issue_id, type)",
+                false,
+            ),
+            (
+                "CREATE INDEX idx_dependencies_issue_type ON operator_notes(key)",
+                false,
+            ),
+        ] {
+            let (_temp, db_path, forecast) = preservation_fixture();
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute(sql).unwrap();
+            close_connection(conn).unwrap();
+            let proof = capture_reviewed_state_preservation(&db_path, &forecast).unwrap();
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute("DROP INDEX idx_dependencies_issue_type")
+                .unwrap();
+            close_connection(conn).unwrap();
+            let result = verify_reviewed_state_preservation(&db_path, proof.as_ref(), true);
+            if may_retire {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("index idx_dependencies_issue_type changed"),
+                    "{sql}: {error}"
+                );
+            }
+        }
     }
 
     #[test]

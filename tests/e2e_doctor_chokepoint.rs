@@ -190,6 +190,43 @@ fn hash_workspace(root: &Path) -> BTreeMap<PathBuf, String> {
     out
 }
 
+/// Read-only invocations must preserve all paths, bytes and permissions,
+/// including coordination files that a mutating repair may legitimately add.
+type WorkspaceInventory = BTreeMap<PathBuf, (Option<Vec<u8>>, fs::Permissions)>;
+
+fn complete_workspace_inventory(root: &Path) -> WorkspaceInventory {
+    fn visit(dir: &Path, root: &Path, out: &mut WorkspaceInventory) {
+        for entry in fs::read_dir(dir).expect("read workspace") {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).expect("inspect workspace path");
+            let bytes = metadata.is_file().then(|| fs::read(&path).unwrap());
+            out.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                (bytes, metadata.permissions()),
+            );
+            if metadata.is_dir() {
+                visit(&path, root, out);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
+fn assert_complete_workspace_unchanged(root: &Path, before: &WorkspaceInventory) {
+    let after = complete_workspace_inventory(root);
+    let changed: Vec<_> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "read-only invocation changed {changed:?}"
+    );
+}
+
 fn walk_workspace_hashes(dir: &Path, root: &Path, out: &mut BTreeMap<PathBuf, String>) {
     for entry in fs::read_dir(dir).expect("read_dir") {
         let entry = entry.expect("dir entry");
@@ -661,7 +698,7 @@ fn chokepoint_dry_run_writes_no_files() {
     br_init(&root);
     corrupt_root_gitignore(&root);
 
-    let pre = hash_workspace(&root);
+    let pre = complete_workspace_inventory(&root);
     let out = br_cmd(&root)
         .args(["doctor", "--repair", "--dry-run", "--json"])
         .output()
@@ -679,8 +716,18 @@ fn chokepoint_dry_run_writes_no_files() {
         root.join(".doctor").display()
     );
 
-    let post = hash_workspace(&root);
-    assert_eq!(pre, post, "dry-run mutated the workspace");
+    let preview: Value = serde_json::from_slice(&out.stdout).expect("repair plan JSON");
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(preview["repaired"], false);
+    assert!(
+        preview["candidate_repairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["id"] == "doctor.gitignore_repair"),
+        "the nonmutating preview must still explain the selected repair: {preview}"
+    );
+    assert_complete_workspace_unchanged(&root, &pre);
 }
 
 /// #583: on a healthy workspace with no root `.gitignore`, the dry run used
@@ -695,7 +742,7 @@ fn chokepoint_dry_run_on_healthy_workspace_creates_no_gitignore() {
         "fixture starts without one"
     );
 
-    let pre = hash_workspace(&root);
+    let pre = complete_workspace_inventory(&root);
     let out = br_cmd(&root)
         .args(["doctor", "--repair", "--dry-run"])
         .output()
@@ -713,7 +760,132 @@ fn chokepoint_dry_run_on_healthy_workspace_creates_no_gitignore() {
         "dry-run created .gitignore"
     );
     assert!(!root.join(".doctor").exists(), "dry-run created .doctor/");
-    assert_eq!(pre, hash_workspace(&root), "dry-run mutated the workspace");
+    assert_complete_workspace_unchanged(&root, &pre);
+}
+
+#[test]
+fn doctor_repair_previews_do_not_create_a_missing_database_or_lock_files() {
+    let tmp = isolated_tempdir();
+    let root = tmp.path();
+    let beads_dir = root.join(".beads");
+    fs::create_dir_all(&beads_dir).unwrap();
+    fs::write(beads_dir.join("config.yaml"), "issue_prefix: preview\n").unwrap();
+    fs::write(beads_dir.join("issues.jsonl"), "").unwrap();
+    let nested = root.join("project/nested");
+    fs::create_dir_all(&nested).unwrap();
+    let before = complete_workspace_inventory(root);
+    for repair_flag in ["--repair", "--repair-indexes"] {
+        let output = br_cmd(&nested)
+            .args([
+                "doctor",
+                repair_flag,
+                "--dry-run",
+                "--json",
+                "--no-auto-import",
+                "--no-auto-flush",
+            ])
+            .env("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{repair_flag}: {output:?}");
+        let plan: Value = serde_json::from_slice(&output.stdout).expect("preview JSON");
+        assert_eq!(plan["dry_run"], true, "{plan}");
+        assert_eq!(plan["repaired"], false, "{plan}");
+        assert_complete_workspace_unchanged(root, &before);
+        assert!(!beads_dir.join("beads.db").exists());
+        assert!(!root.join(".doctor").exists());
+    }
+}
+
+#[test]
+fn doctor_reads_and_repair_previews_preserve_the_complete_legacy_workspace() {
+    let tmp = isolated_tempdir();
+    let root = tmp.path();
+    let beads_dir = root.join(".beads");
+    fs::create_dir_all(&beads_dir).unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/schema_migration");
+    let mut db = Vec::new();
+    GzDecoder::new(fs::File::open(fixtures.join("schema4_v0127_clean.db.gz")).unwrap())
+        .read_to_end(&mut db)
+        .unwrap();
+    fs::write(beads_dir.join("beads.db"), db).unwrap();
+    fs::copy(
+        fixtures.join("schema4_v0127.issues.jsonl"),
+        beads_dir.join("issues.jsonl"),
+    )
+    .unwrap();
+    fs::write(beads_dir.join("config.yaml"), "issue_prefix: leg\n").unwrap();
+    let nested = root.join("project/nested");
+    fs::create_dir_all(&nested).unwrap();
+    let before = complete_workspace_inventory(root);
+    for mut args in [
+        vec!["doctor", "--json"],
+        vec!["doctor", "--quick", "--json"],
+        vec!["doctor", "--robot-triage", "--json"],
+        vec!["doctor", "health", "--json"],
+        vec!["doctor", "--repair", "--dry-run", "--json"],
+        vec!["doctor", "--repair-indexes", "--dry-run", "--json"],
+    ] {
+        args.extend(["--no-auto-import", "--no-auto-flush"]);
+        let output = br_cmd(&nested)
+            .args(&args)
+            .env("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{args:?}: invalid JSON ({error}): {output:?}"));
+        if args.contains(&"--dry-run") {
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            assert_eq!(report["dry_run"], true, "{report}");
+            assert_eq!(report["repaired"], false, "{report}");
+        }
+        assert_complete_workspace_unchanged(root, &before);
+        assert!(!beads_dir.join(".br_recovery").exists());
+        assert!(!root.join(".doctor").exists());
+    }
+}
+
+#[test]
+fn doctor_repair_preview_preserves_only_and_skip_selection() {
+    let tmp = isolated_tempdir();
+    let root = tmp.path();
+    br_init(root);
+    corrupt_root_gitignore(root);
+    let before = complete_workspace_inventory(root);
+    for (filter, should_plan) in [("--only", true), ("--skip", false)] {
+        let output = br_cmd(root)
+            .args([
+                "doctor",
+                "--repair",
+                "--dry-run",
+                filter,
+                "fm-configs-gitignore-leaking-beads",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{filter}: {output:?}");
+        let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let candidates = plan["candidate_repairs"].as_array().unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .any(|candidate| candidate["id"] == "doctor.gitignore_repair"),
+            should_plan,
+            "{filter}: {plan}"
+        );
+        if should_plan {
+            assert!(
+                candidates.iter().all(|candidate| candidate["filter_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|id| id == "fm-configs-gitignore-leaking-beads")),
+                "{plan}"
+            );
+        }
+        assert_complete_workspace_unchanged(root, &before);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,22 +1418,13 @@ fn chokepoint_repair_acquires_workspace_lock() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 9b (Phase-10 cold-prober follow-through, bead `beads_rust-mbpq`):
-// `br doctor --repair --dry-run` (and `--repair` in general) must refuse
-// IMMEDIATELY with exit 5 when another process holds the workspace lock,
-// NOT block up to --lock-timeout. The agent contract is "try-lock or
-// refuse"; the timing of the refusal is part of the contract.
-//
-// The pre-fix behavior was a silent 30s wait that contradicted both
-// capabilities --format json and robot-docs. This test enforces the
-// timing bound: the refusal must arrive within 2 seconds of the child
-// being spawned, regardless of --lock-timeout default.
+// A preview observes a stable source through private snapshots without
+// acquiring writer authority. Applying the same repair still must refuse
+// promptly when another process holds that authority.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn chokepoint_repair_dry_run_refuses_on_lock_contention() {
-    use std::time::{Duration, Instant};
-
+fn chokepoint_repair_preview_keeps_reads_separate_from_writer_authority() {
     let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
@@ -1280,50 +1443,31 @@ fn chokepoint_repair_dry_run_refuses_on_lock_contention() {
         .try_lock()
         .expect("test should be uncontended at this point");
 
-    let bin_path = env!("CARGO_BIN_EXE_br");
-    // Note: no `--lock-timeout` flag — relying on the doctor's default
-    // try-once behavior introduced by the mbpq fix. If the fix
-    // regresses, the child will wait for the 30s default and this
-    // test will trip the 2s timing assertion below.
-    let start = Instant::now();
-    let output = std::process::Command::new(bin_path)
-        .args(["doctor", "--repair", "--dry-run", "--json"])
-        .current_dir(&root)
-        .env("RUST_LOG", "error")
-        .env("BR_NO_AUTOFLUSH", "1")
-        .env("PATH", common::cli::deduplicated_br_path())
-        .env_remove("BD_DB")
-        .env_remove("BEADS_DB")
-        .output()
-        .expect("invoke br doctor --repair --dry-run");
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "doctor --repair --dry-run took {elapsed:?} to refuse on lock contention; \
-         expected immediate refusal (mbpq regression)"
-    );
-
-    assert_eq!(
-        output.status.code(),
-        Some(5),
-        "expected exit 5 ConcurrencyLost; got {:?}\nstdout={}\nstderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("concurrency_lost")
-            || combined.contains("ConcurrencyLost")
-            || combined.contains("Refusing --repair"),
-        "refusal output should be recognizable: {combined}"
-    );
+    let before = complete_workspace_inventory(&root);
+    for repair_flag in ["--repair", "--repair-indexes"] {
+        let preview = br_cmd(&root)
+            .args([
+                "doctor",
+                repair_flag,
+                "--dry-run",
+                "--json",
+                "--lock-timeout",
+                "50",
+            ])
+            .output()
+            .unwrap();
+        assert!(preview.status.success(), "{repair_flag}: {preview:?}");
+        let plan: Value = serde_json::from_slice(&preview.stdout).unwrap();
+        assert_eq!(plan["dry_run"], true, "{plan}");
+        assert_complete_workspace_unchanged(&root, &before);
+    }
+    for repair_flag in ["--repair", "--repair-indexes"] {
+        let apply = br_cmd(&root)
+            .args(["doctor", repair_flag, "--json", "--lock-timeout", "50"])
+            .output()
+            .unwrap();
+        assert_eq!(apply.status.code(), Some(5), "{repair_flag}: {apply:?}");
+    }
 
     drop(lock_file);
 }

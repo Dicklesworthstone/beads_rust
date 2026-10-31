@@ -2949,6 +2949,31 @@ impl SqliteStorage {
         Self::open_current_read_only_inner(path, true)
     }
 
+    /// Read from a coherent private copy without creating opener locks or
+    /// changing WAL reader marks in the caller's database family. A read
+    /// must not repair the original on a fast-open miss, even when its
+    /// current version stamp hides an incomplete schema.
+    pub(crate) fn open_current_read_only_snapshot(path: &Path) -> Result<Option<Self>> {
+        if checked_database_header_user_version(path)?.is_none()
+            || namespace_sidecar_mode_repair_required(path)?
+        {
+            return Ok(None);
+        }
+        let directory = tempfile::tempdir()?;
+        let copy_path = directory.path().join("snapshot.db");
+        copy_database_family_read_snapshot(path, &copy_path)?;
+        let mut storage = Self::open_current_read_only(&copy_path)?;
+        if let Some(storage) = storage.as_mut()
+            && storage.read_snapshot_dir.is_none()
+        {
+            // Missing/stale WAL indexes can already have moved the reader
+            // into another private snapshot. Keep that directory when set;
+            // otherwise this copy owns the connection's entire lifetime.
+            storage.read_snapshot_dir = Some(directory);
+        }
+        Ok(storage)
+    }
+
     fn open_current_read_only_inner(path: &Path, allow_snapshot: bool) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
         // Cheap header pre-filter: only reject when the file is definitively not
@@ -18610,6 +18635,28 @@ fn verify_read_snapshot_family(family: &mut [ReadSnapshotMember]) -> Result<()> 
     Ok(())
 }
 
+/// Copy a database family through identity-bound source descriptors, then
+/// verify both the copy and every original component. No engine or lock is
+/// opened on the source. A concurrent writer or family replacement causes a
+/// refusal instead of allowing a mixed-generation diagnostic snapshot.
+pub(crate) fn copy_database_family_read_snapshot(path: &Path, destination: &Path) -> Result<()> {
+    let mut family = capture_read_snapshot_family(path)?;
+    if family.first().is_none_or(|member| member.source.is_none()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "Database snapshot source '{}' does not exist",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    for member in &mut family {
+        member.copy_to(destination)?;
+    }
+    verify_read_snapshot_family(&mut family)
+}
+
 /// Whether a read-only open that the engine just refused with `BusyRecovery`
 /// (after its own transient retries) is facing a settled WAL index the engine
 /// can never admit read-only: one left by br 0.6.0's engine, which never
@@ -20320,8 +20367,16 @@ fn query_external_project_capabilities(
         return Ok(HashSet::new());
     }
 
-    let _opener_lease = DatabaseOpenerLease::register(db_path)?;
-    let conn = open_existing_read_only_connection(db_path)?;
+    if !db_path.is_file() {
+        return Err(BeadsError::Config(format!(
+            "external project database not found: {}",
+            db_path.display()
+        )));
+    }
+    let snapshot_dir = tempfile::tempdir()?;
+    let snapshot_path = snapshot_dir.path().join("external.db");
+    copy_database_family_read_snapshot(db_path, &snapshot_path)?;
+    let conn = open_existing_read_only_connection(&snapshot_path)?;
     let labels: Vec<String> = capabilities
         .iter()
         .map(|cap| format!("provides:{cap}"))
@@ -24999,15 +25054,22 @@ required_fields:
         for (name, open) in lanes {
             let error = open(&db_path).expect_err(name);
             let text = error.to_string();
-            assert!(
-                text.contains("fsqlite refused its namespace sidecar"),
-                "{name}: {text}"
-            );
-            assert!(text.contains("has 2 hard links"), "{name}: {text}");
-            assert!(
-                text.contains("Database integrity remains unverified"),
-                "{name}: a sidecar inspection cannot establish database integrity: {text}"
-            );
+            if name == "external_capabilities" {
+                assert!(
+                    text.contains("Refusing unsafe fsqlite namespace sidecar"),
+                    "{name}: the private reader must reject before copying: {text}"
+                );
+            } else {
+                assert!(
+                    text.contains("fsqlite refused its namespace sidecar"),
+                    "{name}: {text}"
+                );
+                assert!(
+                    text.contains("Database integrity remains unverified"),
+                    "{name}: a sidecar inspection cannot establish database integrity: {text}"
+                );
+            }
+            assert!(text.contains("2 hard links"), "{name}: {text}");
             assert!(
                 !text.contains("unable to open database file"),
                 "{name}: {text}"
@@ -34011,11 +34073,24 @@ required_fields:
             .unwrap();
         drop(storage);
 
+        // Observe a fresh source family so any opener registration or engine
+        // sidecar creation would be visible in its complete inventory.
+        let observed_dir = temp_dir.path().join("observed");
+        fs::create_dir_all(&observed_dir).unwrap();
+        let observed_db = observed_dir.join("external.db");
+        fs::copy(&db_path, &observed_db).unwrap();
+        let before = fs::read(&observed_db).unwrap();
         let capabilities = HashSet::from(["closed-cap".to_string(), "deleted-cap".to_string()]);
-        let satisfied = query_external_project_capabilities(&db_path, &capabilities).unwrap();
+        let satisfied = query_external_project_capabilities(&observed_db, &capabilities).unwrap();
 
         assert!(satisfied.contains("closed-cap"));
         assert!(!satisfied.contains("deleted-cap"));
+        assert_eq!(fs::read(&observed_db).unwrap(), before);
+        let names: Vec<_> = fs::read_dir(&observed_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("external.db")]);
     }
 
     #[test]

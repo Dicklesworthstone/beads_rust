@@ -4096,54 +4096,18 @@ fn copy_database_family_to_directory(db_path: &Path, destination_dir: &Path) -> 
         .unwrap_or_else(|| std::ffi::OsStr::new(DEFAULT_DB_FILENAME));
     let snapshot_db_path = destination_dir.join(snapshot_db_name);
 
-    for original in database_family_paths(db_path) {
-        match fs::symlink_metadata(&original) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(BeadsError::Config(format!(
-                    "Database snapshot source '{}' must not be a symlink",
-                    original.display()
-                )));
-            }
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(BeadsError::Config(format!(
-                    "Database snapshot source '{}' must be a regular file",
-                    original.display()
-                )));
-            }
-            Ok(_) => {
-                let snapshot_path = destination_dir.join(
-                    original
-                        .file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new(DEFAULT_DB_FILENAME)),
-                );
-                fs::copy(&original, &snapshot_path).with_context(|| {
-                    format!(
-                        "Failed to copy database snapshot artifact '{}' to '{}'",
-                        original.display(),
-                        snapshot_path.display()
-                    )
-                })?;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if original == db_path {
-                    return Err(err.into());
-                }
-            }
-            Err(err) => {
-                return Err(BeadsError::WithContext {
-                    context: format!(
-                        "Failed to inspect database snapshot source '{}'",
-                        original.display()
-                    ),
-                    source: Box::new(err),
-                });
-            }
-        }
-    }
+    crate::storage::sqlite::copy_database_family_read_snapshot(db_path, &snapshot_db_path)?;
 
     Ok(snapshot_db_path)
 }
 
+/// Inspect a verified private database family without opening or locking the
+/// source. The callback's snapshot is retained until the callback returns.
+///
+/// # Errors
+///
+/// Returns an error if the source changes during capture, cannot be copied
+/// safely, or the callback fails.
 pub(crate) fn with_database_family_snapshot<T, F>(db_path: &Path, read: F) -> Result<T>
 where
     F: FnOnce(&Path) -> Result<T>,
@@ -4156,6 +4120,29 @@ where
     })?;
     let snapshot_db_path = copy_database_family_to_directory(db_path, snapshot_dir.path())?;
     read(&snapshot_db_path)
+}
+
+/// Probe an outdated schema without opening the original database with the
+/// engine. The WAL-aware check runs on a verified private copy, so read-only
+/// startup cannot create sidecars or change WAL reader marks.
+///
+/// # Errors
+///
+/// Returns an error if the database family changes during capture or its
+/// effective version cannot be inspected safely.
+pub fn stale_schema_version_without_mutation(db_path: &Path) -> Result<Option<u32>> {
+    let Some(header) = crate::storage::sqlite::database_header_user_version(db_path) else {
+        return Ok(None);
+    };
+    let current = u32::try_from(crate::storage::schema::CURRENT_SCHEMA_VERSION).unwrap_or(u32::MAX);
+    if header >= current {
+        return Ok(None);
+    }
+    with_database_family_snapshot(db_path, |snapshot| {
+        let effective =
+            crate::storage::sqlite::effective_database_user_version(snapshot)?.unwrap_or(header);
+        Ok((effective < current).then_some(effective))
+    })
 }
 
 fn recovery_backup_filename(path: &Path, stamp: &str, suffix: &str) -> String {
@@ -5396,7 +5383,7 @@ pub(crate) fn open_sqlite_storage_read_only(db_path: &Path) -> Result<SqliteStor
             db_path.display(),
         )
     };
-    let storage = SqliteStorage::open_current_read_only(db_path).map_err(|error| {
+    let storage = SqliteStorage::open_current_read_only_snapshot(db_path).map_err(|error| {
         BeadsError::WithContext {
             context: refusal_context(),
             source: Box::new(error),
@@ -5414,10 +5401,75 @@ pub(crate) fn open_sqlite_storage_read_only(db_path: &Path) -> Result<SqliteStor
     Ok(storage)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "startup routing keeps observational refusal ahead of every writable fallback"
-)]
+fn open_strict_sqlite_storage_for_startup(
+    db_path: &Path,
+) -> Result<(
+    SqliteRecoveryOpenResult,
+    Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
+)> {
+    Ok((
+        SqliteRecoveryOpenResult {
+            storage: open_sqlite_storage_read_only(db_path)?,
+            auto_rebuilt: false,
+            pending_recovery_backup: None,
+            recovered_jsonl: None,
+        },
+        None,
+    ))
+}
+
+// This lane is an optimization, not an observation contract. Strict readers
+// return through the separate helper above before writable fallback is possible.
+fn open_sqlite_storage_with_preferred_read_only(
+    beads_dir: &Path,
+    paths: &ConfigPaths,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    options: SqliteStartupOpenOptions<'_>,
+) -> Result<(
+    SqliteRecoveryOpenResult,
+    Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
+)> {
+    match SqliteStorage::open_current_read_only(&paths.db_path) {
+        Ok(Some(storage)) if storage.fast_open_runtime_schema_is_compatible() => Ok((
+            SqliteRecoveryOpenResult {
+                storage,
+                auto_rebuilt: false,
+                pending_recovery_backup: None,
+                recovered_jsonl: None,
+            },
+            None,
+        )),
+        Ok(storage) => {
+            // Release the registered read opener before recovery may replace
+            // the database or require a sole-opener checkpoint.
+            drop(storage);
+            open_sqlite_storage_with_recovery_after_fast_open_miss(
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                options.write_authority,
+                options.allow_external_jsonl,
+            )
+        }
+        Err(err) => {
+            tracing::trace!(
+                error = %err,
+                "read-only fast open failed; falling back to normal storage open"
+            );
+            open_sqlite_storage_with_recovery_after_fast_open_miss(
+                beads_dir,
+                paths,
+                lock_timeout,
+                bootstrap_layer,
+                options.write_authority,
+                options.allow_external_jsonl,
+            )
+        }
+    }
+}
+
 fn open_sqlite_storage_for_startup(
     beads_dir: &Path,
     paths: &ConfigPaths,
@@ -5429,15 +5481,7 @@ fn open_sqlite_storage_for_startup(
     Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
 )> {
     if options.read_only_storage {
-        return Ok((
-            SqliteRecoveryOpenResult {
-                storage: open_sqlite_storage_read_only(&paths.db_path)?,
-                auto_rebuilt: false,
-                pending_recovery_backup: None,
-                recovered_jsonl: None,
-            },
-            None,
-        ));
+        return open_strict_sqlite_storage_for_startup(&paths.db_path);
     }
     if options.defer_jsonl_recovery {
         let database_was_missing = options
@@ -5467,45 +5511,13 @@ fn open_sqlite_storage_for_startup(
         };
         Ok((result, None))
     } else if options.read_only_fast_open {
-        match SqliteStorage::open_current_read_only(&paths.db_path) {
-            Ok(Some(storage)) if storage.fast_open_runtime_schema_is_compatible() => Ok((
-                SqliteRecoveryOpenResult {
-                    storage,
-                    auto_rebuilt: false,
-                    pending_recovery_backup: None,
-                    recovered_jsonl: None,
-                },
-                None,
-            )),
-            Ok(storage) => {
-                // An ignored Some(_) keeps its registered read opener alive
-                // until the match finishes. Release it before recovery can
-                // replace the database and require a sole-opener checkpoint.
-                drop(storage);
-                open_sqlite_storage_with_recovery_after_fast_open_miss(
-                    beads_dir,
-                    paths,
-                    lock_timeout,
-                    bootstrap_layer,
-                    options.write_authority,
-                    options.allow_external_jsonl,
-                )
-            }
-            Err(err) => {
-                tracing::trace!(
-                    error = %err,
-                    "read-only fast open failed; falling back to normal storage open"
-                );
-                open_sqlite_storage_with_recovery_after_fast_open_miss(
-                    beads_dir,
-                    paths,
-                    lock_timeout,
-                    bootstrap_layer,
-                    options.write_authority,
-                    options.allow_external_jsonl,
-                )
-            }
-        }
+        open_sqlite_storage_with_preferred_read_only(
+            beads_dir,
+            paths,
+            lock_timeout,
+            bootstrap_layer,
+            options,
+        )
     } else {
         let database_was_missing = options
             .write_authority
@@ -12402,6 +12414,47 @@ routing:
     }
 
     #[test]
+    fn strict_read_only_storage_preserves_source_inventory_without_opener_locks() {
+        let temp = TempDir::new().expect("tempdir");
+        let seed_path = temp.path().join("seed.db");
+        let mut seed = SqliteStorage::open(&seed_path).expect("seed storage");
+        seed.set_config("issue_prefix", "bd").unwrap();
+        seed.set_config("saved_query:preserved", "status=open")
+            .unwrap();
+        seed.checkpoint_full().expect("checkpoint seed");
+        drop(seed);
+
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        fs::copy(&seed_path, &db_path).unwrap();
+        let before = database_family_snapshot(&db_path).unwrap();
+        let cli = CliOverrides {
+            read_only_storage: true,
+            ..CliOverrides::default()
+        };
+        let opened = open_storage_with_cli(&beads_dir, &cli).expect("private read-only open");
+        assert_eq!(
+            opened
+                .storage
+                .get_config("saved_query:preserved")
+                .unwrap()
+                .as_deref(),
+            Some("status=open")
+        );
+        assert!(!opened.auto_rebuilt);
+        assert!(opened.retained_database_write_authority().is_none());
+        drop(opened);
+
+        assert_eq!(database_family_snapshot(&db_path).unwrap(), before);
+        let names: Vec<_> = fs::read_dir(&beads_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("beads.db")]);
+    }
+
+    #[test]
     fn strict_read_only_storage_allows_private_jsonl_view_without_creating_database() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -13158,7 +13211,7 @@ routing:
         })
         .expect_err("symlinked migration marker must be refused");
 
-        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(error.to_string().contains("not a regular file"));
         assert_eq!(fs::read(&db_path).unwrap(), b"database sentinel");
         assert_eq!(fs::read(&external_path).unwrap(), b"external marker");
         assert_eq!(fs::read_link(marker_path).unwrap(), external_path);

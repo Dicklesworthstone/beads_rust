@@ -60,8 +60,8 @@ fn json_stdout(stdout: &str) -> Value {
     serde_json::from_str(&extract_json_payload(stdout)).expect("stdout must be clean JSON")
 }
 
-/// Source payloads and retained recovery evidence. A read may acquire an
-/// opener lease or update SHM reader marks, but none of these bytes may change.
+/// Source payloads and retained recovery evidence. A refused mutation may
+/// acquire coordination locks, but none of these bytes may change.
 fn protected_files(workspace: &BrWorkspace) -> BTreeMap<PathBuf, Vec<u8>> {
     protected_files_at(&workspace.root.join(".beads"))
 }
@@ -93,6 +93,47 @@ fn protected_files_at(beads_dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         );
     }
     files
+}
+
+/// An observational command must leave even reader coordination files alone.
+/// Include every tracker file, including SHM, lock files and recovery evidence.
+fn tracker_files(beads_dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    walk(beads_dir)
+        .into_iter()
+        .map(|path| {
+            (
+                path.strip_prefix(beads_dir).unwrap().to_path_buf(),
+                fs::read(&path).expect("read tracker file"),
+            )
+        })
+        .collect()
+}
+
+fn assert_tracker_unchanged(beads_dir: &Path, before: &BTreeMap<PathBuf, Vec<u8>>) {
+    let after = tracker_files(beads_dir);
+    let changed: Vec<_> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "observational command changed tracker files: {changed:?}"
+    );
+}
+
+fn edit_fixture(db: &Path, statements: &[&str]) {
+    let connection = Connection::open(db.to_string_lossy().into_owned()).expect("open fixture");
+    for sql in statements {
+        connection.execute(sql).expect("edit fixture");
+    }
+    connection.close().expect("close fixture");
+}
+
+fn move_to_nested_directory(workspace: &mut BrWorkspace) {
+    workspace.root = workspace.root.join("project/nested");
+    fs::create_dir_all(&workspace.root).unwrap();
+    assert!(!workspace.root.join(".beads").exists());
 }
 
 fn show(workspace: &BrWorkspace, id: &str) -> Value {
@@ -163,15 +204,12 @@ fn synthetic_tracker(version: u32, events: usize, refused_index: bool) -> (BrWor
         }
     }
     if refused_index {
-        // These accelerators appeared in the #585 report and are outside the
-        // reviewed schema-16 dependency index set. The source is not corrupt.
-        for sql in [
-            "CREATE INDEX idx_dependencies_depends_on_type_issue \
-             ON dependencies (depends_on_id, type, issue_id)",
-            "CREATE INDEX idx_dependencies_issue_type ON dependencies (issue_id, type)",
-        ] {
-            connection.execute(sql).unwrap();
-        }
+        // An operator's index remains outside the reviewed dependency-table
+        // migration. The two historical accelerators from #585 are covered
+        // separately by a successful lossless-upgrade regression below.
+        connection
+            .execute("CREATE INDEX operator_dependency_index ON dependencies (created_by)")
+            .unwrap();
     }
     connection
         .execute(&format!("PRAGMA user_version = {version}"))
@@ -209,6 +247,63 @@ fn event_count(db: &Path) -> usize {
     match rows[0][0] {
         SqliteValue::Integer(count) => usize::try_from(count).expect("nonnegative event count"),
         ref other => panic!("invalid event count: {other:?}"),
+    }
+}
+
+fn seed_migration_only_records(db: &Path) {
+    edit_fixture(
+        db,
+        &[
+            "INSERT INTO metadata (key, value) VALUES ('operator_receipt', 'preserve this receipt')",
+            "INSERT INTO child_counters (parent_id, last_child) VALUES ('v15ws-4kf', 47)",
+            "CREATE TABLE operator_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL, payload BLOB NOT NULL)",
+            "INSERT INTO operator_notes VALUES (12, 'custom durable state', X'0001FF00')",
+            "UPDATE sqlite_sequence SET seq = 91 WHERE name = 'operator_notes'",
+        ],
+    );
+}
+
+fn migration_only_records(db: &Path) -> BTreeMap<&'static str, Vec<Vec<SqliteValue>>> {
+    [
+        ("events", "SELECT * FROM events ORDER BY id"),
+        ("config", "SELECT * FROM config ORDER BY key, value"),
+        (
+            "metadata",
+            "SELECT key, value FROM metadata WHERE key = 'operator_receipt'",
+        ),
+        (
+            "child_counters",
+            "SELECT * FROM child_counters ORDER BY parent_id",
+        ),
+        ("operator_notes", "SELECT * FROM operator_notes ORDER BY id"),
+        (
+            "sqlite_sequence",
+            "SELECT name, seq FROM sqlite_sequence WHERE name = 'operator_notes'",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, query)| (name, query_copy(db, query)))
+    .collect()
+}
+
+fn assert_migration_kept_records(
+    db: &Path,
+    before: &BTreeMap<&'static str, Vec<Vec<SqliteValue>>>,
+) {
+    let after = migration_only_records(db);
+    for (table, rows) in before {
+        if *table == "events" {
+            assert!(
+                rows.iter().all(|row| after[*table].contains(row)),
+                "migration removed or altered original event records"
+            );
+            assert!(
+                after[*table].len() > rows.len(),
+                "the successful mutation must record its own new event"
+            );
+        } else {
+            assert_eq!(after[*table], *rows, "migration changed durable {table}");
+        }
     }
 }
 
@@ -749,7 +844,7 @@ fn gh585_nested_read_matrix_never_upgrades_or_rebuilds_old_databases() {
     for (version, refused_index) in [(0, false), (4, false), (7, false), (16, true), (17, false)] {
         let (mut workspace, db) = synthetic_tracker(version, 5, refused_index);
         let beads_dir = workspace.root.join(".beads");
-        let before = protected_files(&workspace);
+        let before = tracker_files(&beads_dir);
         let config = query_copy(&db, "SELECT key, value FROM config ORDER BY key");
         assert_eq!(config.len(), 4);
         assert_eq!(event_count(&db), 5);
@@ -791,11 +886,7 @@ fn gh585_nested_read_matrix_never_upgrades_or_rebuilds_old_databases() {
                         run.stderr
                     );
                 }
-                assert_eq!(
-                    protected_files_at(&beads_dir),
-                    before,
-                    "{label}: a read changed source or recovery bytes"
-                );
+                assert_tracker_unchanged(&beads_dir, &before);
                 assert_eq!(header_user_version(&db), version);
                 assert!(!beads_dir.join(".br_recovery").exists());
             }
@@ -1014,6 +1105,7 @@ fn gh585_old_schema_readers_do_not_take_writer_or_replacement_authority() {
     lock.lock().expect("hold writer lock");
     let _peer = beads_rust::sync::DatabaseOpenerLease::register(&db).unwrap();
     let before = protected_files(&workspace);
+    let before_reads = tracker_files(&workspace.root.join(".beads"));
     std::thread::scope(|scope| {
         for (index, command) in ["list", "ready", "stats"].into_iter().enumerate() {
             let workspace = &workspace;
@@ -1033,21 +1125,44 @@ fn gh585_old_schema_readers_do_not_take_writer_or_replacement_authority() {
             });
         }
     });
-    // Info's generic historical-schema snapshot remains serialized with the
-    // writer so it never reads a half-copied database family.
+    // A stable source can be inspected through a verified private snapshot
+    // even while a writer holds its advisory lock. The read must not acquire
+    // writer or replacement authority merely to inspect historical tables.
     let info = run_br(
         &workspace,
         ["info", "--json", "--lock-timeout", "50"],
         "gh585_info_under_writer",
     );
-    assert!(!info.status.success(), "{}", info.stdout);
+    assert!(info.status.success(), "{} {}", info.stdout, info.stderr);
+    assert_eq!(
+        json_stdout(&info.stdout)["config"]["compact_model"],
+        "local-model"
+    );
+    assert_tracker_unchanged(&workspace.root.join(".beads"), &before_reads);
+    let mutation = run_br(
+        &workspace,
+        [
+            "create",
+            "Writer lock is still authoritative",
+            "--json",
+            "--lock-timeout",
+            "50",
+        ],
+        "gh585_mutation_under_writer",
+    );
     assert!(
-        format!("{} {}", info.stdout, info.stderr)
+        !mutation.status.success(),
+        "mutation must still honor the writer lock: {} {}",
+        mutation.stdout,
+        mutation.stderr
+    );
+    assert!(
+        format!("{} {}", mutation.stdout, mutation.stderr)
             .to_lowercase()
             .contains("lock"),
         "{} {}",
-        info.stdout,
-        info.stderr
+        mutation.stdout,
+        mutation.stderr
     );
     assert_eq!(protected_files(&workspace), before);
     assert!(!workspace.root.join(".beads/.br_recovery").exists());
@@ -1144,8 +1259,253 @@ fn gh585_reviewed_migration_waits_for_live_opener_without_reconstructing() {
 }
 
 #[test]
+fn historical_dependency_indexes_migrate_without_losing_database_only_records() {
+    let (mut workspace, db) = synthetic_tracker(16, 9, false);
+    seed_migration_only_records(&db);
+    edit_fixture(
+        &db,
+        &[
+            "CREATE INDEX idx_dependencies_depends_on_type_issue ON dependencies(depends_on_id, type, issue_id)",
+            "CREATE INDEX idx_dependencies_issue_type ON dependencies(issue_id, type)",
+        ],
+    );
+    let original_db = fs::read(&db).unwrap();
+    let records = migration_only_records(&db);
+    assert_eq!(records["events"].len(), 9);
+    assert_eq!(records["config"].len(), 4);
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl = fs::read(beads_dir.join("issues.jsonl")).unwrap();
+    move_to_nested_directory(&mut workspace);
+
+    // A real mutation triggers the reviewed upgrade. Disable synchronization
+    // so these checks distinguish migration preservation from JSONL import.
+    let result = run_br(
+        &workspace,
+        [
+            "create",
+            "Created after the historical-index upgrade",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "historical_indexes_create",
+    );
+    assert!(
+        result.status.success(),
+        "{} {}",
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("migrated it in place"),
+        "{}",
+        result.stderr
+    );
+    assert!(!result.stderr.contains("rebuilt it from the JSONL"));
+    assert_eq!(header_user_version(&db), current_version());
+    assert_migration_kept_records(&db, &records);
+    assert_eq!(fs::read(beads_dir.join("issues.jsonl")).unwrap(), jsonl);
+    assert!(
+        query_copy(
+            &db,
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN \
+             ('idx_dependencies_depends_on_type_issue', 'idx_dependencies_issue_type')"
+        )
+        .is_empty(),
+        "the reviewed pair-key accelerators are retired during typed-key migration"
+    );
+
+    let backup = walk(&beads_dir.join(".br_recovery/schema-migrations"))
+        .into_iter()
+        .find(|path| fs::read(path).is_ok_and(|bytes| bytes == original_db))
+        .expect("successful migration retains a byte-identical source backup");
+    assert_eq!(header_user_version(&backup), 16);
+    assert_eq!(migration_only_records(&backup), records);
+}
+
+#[test]
+fn schema17_migration_preserves_capacity_occupancy_and_history() {
+    // synthetic_tracker adds schema 17's real occupancy table and indexes to
+    // the released v16 fixture, not only a different user_version stamp.
+    let (workspace, db) = synthetic_tracker(17, 9, false);
+    seed_migration_only_records(&db);
+    edit_fixture(
+        &db,
+        &[
+            "INSERT INTO capacity_occupancy (issue_id, actor, agent_name, harness, session) \
+             VALUES ('v15ws-9nx', 'operator', 'migration-agent', 'cli', 'retained-session')",
+        ],
+    );
+    let records = migration_only_records(&db);
+    let occupancy = query_copy(&db, "SELECT * FROM capacity_occupancy ORDER BY issue_id");
+    assert_eq!(occupancy.len(), 1);
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl = fs::read(beads_dir.join("issues.jsonl")).unwrap();
+    let result = run_br(
+        &workspace,
+        [
+            "create",
+            "Created after the schema-17 upgrade",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "schema17_create",
+    );
+    assert!(
+        result.status.success(),
+        "{} {}",
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("migrated it in place"),
+        "{}",
+        result.stderr
+    );
+    assert_eq!(header_user_version(&db), current_version());
+    assert_migration_kept_records(&db, &records);
+    assert_eq!(
+        query_copy(&db, "SELECT * FROM capacity_occupancy ORDER BY issue_id"),
+        occupancy
+    );
+    assert_eq!(fs::read(beads_dir.join("issues.jsonl")).unwrap(), jsonl);
+    assert!(beads_dir.join(".br_recovery/schema-migrations").is_dir());
+}
+
+#[test]
+fn schema_migration_previews_preserve_nested_tracker_and_keep_plan_token_applicable() {
+    let (mut workspace, db) = synthetic_tracker(16, 5, false);
+    seed_migration_only_records(&db);
+    let beads_dir = workspace.root.join(".beads");
+    let records = migration_only_records(&db);
+    move_to_nested_directory(&mut workspace);
+    let before = tracker_files(&beads_dir);
+    let plan = run_br_with_env(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "plan",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        [("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")],
+        "observational_migration_plan",
+    );
+    assert!(plan.status.success(), "{} {}", plan.stdout, plan.stderr);
+    let plan = json_stdout(&plan.stdout);
+    assert_eq!(plan["eligible"], true, "{plan}");
+    assert_eq!(Path::new(plan["database_path"].as_str().unwrap()), db);
+    let token = plan["plan_token"].as_str().expect("applicable plan token");
+    assert_tracker_unchanged(&beads_dir, &before);
+
+    let heal = run_br_with_env(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "heal",
+            "--dry-run",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        [("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")],
+        "observational_heal_plan",
+    );
+    assert!(heal.status.success(), "{} {}", heal.stdout, heal.stderr);
+    let _ = json_stdout(&heal.stdout);
+    assert_tracker_unchanged(&beads_dir, &before);
+    assert_eq!(header_user_version(&db), 16);
+    assert!(!beads_dir.join(".br_recovery").exists());
+
+    let applied = run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            token,
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "apply_observational_plan",
+    );
+    assert!(
+        applied.status.success(),
+        "{} {}",
+        applied.stdout,
+        applied.stderr
+    );
+    let applied = json_stdout(&applied.stdout);
+    let run_id = applied["run_id"].as_str().unwrap();
+    assert_eq!(header_user_version(&db), current_version());
+    assert_eq!(migration_only_records(&db), records);
+    let after_apply = tracker_files(&beads_dir);
+    let undo = run_br_with_env(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "undo",
+            run_id,
+            "--dry-run",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        [("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")],
+        "observational_undo_plan",
+    );
+    assert!(undo.status.success(), "{} {}", undo.stdout, undo.stderr);
+    assert_eq!(json_stdout(&undo.stdout)["dry_run"], true);
+    assert_tracker_unchanged(&beads_dir, &after_apply);
+    assert_eq!(header_user_version(&db), current_version());
+}
+
+#[test]
+fn refused_schema_migration_previews_keep_the_complete_legacy_tracker() {
+    let mut workspace = BrWorkspace::new();
+    let db = install(
+        &workspace,
+        "schema4_v0127_clean.db.gz",
+        "schema4_v0127.issues.jsonl",
+        "leg",
+    );
+    let beads_dir = workspace.root.join(".beads");
+    let before = tracker_files(&beads_dir);
+    move_to_nested_directory(&mut workspace);
+    for mut command in [
+        vec!["doctor", "migrate-schema", "plan", "--json"],
+        vec!["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+    ] {
+        command.extend(["--no-auto-import", "--no-auto-flush"]);
+        let preview = run_br_with_env(
+            &workspace,
+            command,
+            [("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")],
+            "refused_observational_migration_plan",
+        );
+        let report = json_stdout(&preview.stdout);
+        assert!(
+            report["eligible"] == false
+                || report["automatic_heal_allowed"] == false
+                || report["error"].is_object(),
+            "an unsupported schema must remain refused: {report}"
+        );
+        assert_tracker_unchanged(&beads_dir, &before);
+        assert_eq!(header_user_version(&db), 4);
+        assert!(!beads_dir.join(".br_recovery").exists());
+    }
+}
+
+#[test]
 fn gh585_unreadable_schema_probe_cannot_fall_through_to_startup_reconstruction() {
-    let (workspace, db) = synthetic_tracker(16, 5, false);
+    let (mut workspace, db) = synthetic_tracker(16, 5, false);
     let beads_dir = workspace.root.join(".beads");
     let mut damaged = fs::read(&db).unwrap();
     // Keep the valid SQLite header and stale user_version but make the first
@@ -1161,7 +1521,8 @@ fn gh585_unreadable_schema_probe_cannot_fall_through_to_startup_reconstruction()
     }
     damaged[100] = 0xff;
     fs::write(&db, damaged).unwrap();
-    let before = protected_files(&workspace);
+    let before = tracker_files(&beads_dir);
+    move_to_nested_directory(&mut workspace);
 
     for (index, args) in [
         vec!["list", "--json"],
@@ -1171,9 +1532,10 @@ fn gh585_unreadable_schema_probe_cannot_fall_through_to_startup_reconstruction()
     .into_iter()
     .enumerate()
     {
-        let run = run_br(
+        let run = run_br_with_env(
             &workspace,
             args,
+            [("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")],
             &format!("gh585_unreadable_source_{index}"),
         );
         if index < 2 {
@@ -1184,10 +1546,158 @@ fn gh585_unreadable_schema_probe_cannot_fall_through_to_startup_reconstruction()
             );
             assert!(json_stdout(&run.stdout)["error"].is_object());
         }
-        assert_eq!(protected_files(&workspace), before);
+        assert_tracker_unchanged(&beads_dir, &before);
         assert_eq!(header_user_version(&db), 16);
     }
     assert_eq!(event_count(&evidence.join("beads.db")), 5);
+}
+
+#[test]
+fn released_legacy_info_keeps_the_complete_tracker_unchanged_with_fast_open_disabled() {
+    for (version, db_gz, issues, prefix, issue_count) in [
+        (
+            4,
+            "schema4_v0127_clean.db.gz",
+            "schema4_v0127.issues.jsonl",
+            "leg",
+            2,
+        ),
+        (
+            16,
+            "schema16_v0219_release.db.gz",
+            "schema16_issues.jsonl",
+            "v15ws",
+            3,
+        ),
+    ] {
+        let mut workspace = BrWorkspace::new();
+        let db = install(&workspace, db_gz, issues, prefix);
+        let beads_dir = workspace.root.join(".beads");
+        let before = tracker_files(&beads_dir);
+        for nested in [false, true] {
+            if nested {
+                move_to_nested_directory(&mut workspace);
+            }
+            let result = run_br_with_env(
+                &workspace,
+                [
+                    "info",
+                    "--schema",
+                    "--json",
+                    "--no-auto-import",
+                    "--no-auto-flush",
+                ],
+                [("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")],
+                &format!("released_info_{version}_{nested}"),
+            );
+            assert!(
+                result.status.success(),
+                "{} {}",
+                result.stdout,
+                result.stderr
+            );
+            let info = json_stdout(&result.stdout);
+            assert_eq!(info["issue_count"], issue_count);
+            assert_eq!(info["schema"]["schema_version"], version.to_string());
+            assert_eq!(header_user_version(&db), version);
+            assert_tracker_unchanged(&beads_dir, &before);
+            assert!(!beads_dir.join(".br_recovery").exists());
+        }
+    }
+}
+
+#[test]
+fn explicit_reads_do_not_repair_a_current_database_with_missing_runtime_state() {
+    for disable_fast_open in [false, true] {
+        let mut workspace = BrWorkspace::new();
+        let init = run_br(&workspace, ["init", "--prefix", "current"], "current_init");
+        assert!(init.status.success(), "{} {}", init.stdout, init.stderr);
+        let create = run_br(
+            &workspace,
+            ["create", "Current fixture", "--json"],
+            "current_create",
+        );
+        assert!(
+            create.status.success(),
+            "{} {}",
+            create.stdout,
+            create.stderr
+        );
+        let db = workspace.root.join(".beads/beads.db");
+        edit_fixture(&db, &["DROP TABLE blocked_issues_cache"]);
+        let beads_dir = workspace.root.join(".beads");
+        let before = tracker_files(&beads_dir);
+        move_to_nested_directory(&mut workspace);
+        for command in ["info", "list", "ready"] {
+            let result = run_br_with_env(
+                &workspace,
+                [command, "--json", "--no-auto-import", "--no-auto-flush"],
+                [(
+                    "BR_DISABLE_READ_ONLY_FAST_OPEN",
+                    if disable_fast_open { "1" } else { "0" },
+                )],
+                &format!("current_observational_{command}"),
+            );
+            // Generic diagnostics can inspect this source. A query requiring
+            // the absent runtime table can refuse, but cannot repair it.
+            if command == "info" {
+                assert!(
+                    result.status.success(),
+                    "{} {}",
+                    result.stdout,
+                    result.stderr
+                );
+            }
+            let _ = json_stdout(&result.stdout);
+            assert_tracker_unchanged(&beads_dir, &before);
+            assert_eq!(header_user_version(&db), current_version());
+            assert!(!beads_dir.join(".br_recovery").exists());
+        }
+    }
+}
+
+#[test]
+fn explicit_reads_never_reconstruct_a_missing_or_unreadable_database() {
+    for corrupt in [false, true] {
+        let mut workspace = BrWorkspace::new();
+        let db = install(
+            &workspace,
+            "schema4_v0127_clean.db.gz",
+            "schema4_v0127.issues.jsonl",
+            "leg",
+        );
+        let retained = workspace.root.join("retained-original.db");
+        fs::rename(&db, &retained).expect("retain original fixture");
+        if corrupt {
+            fs::write(&db, b"unreadable database must remain untouched").unwrap();
+        }
+        let beads_dir = workspace.root.join(".beads");
+        let before = tracker_files(&beads_dir);
+        move_to_nested_directory(&mut workspace);
+        for disable_fast_open in [false, true] {
+            for command in ["info", "list"] {
+                let result = run_br_with_env(
+                    &workspace,
+                    [command, "--json", "--no-auto-import", "--no-auto-flush"],
+                    [(
+                        "BR_DISABLE_READ_ONLY_FAST_OPEN",
+                        if disable_fast_open { "1" } else { "0" },
+                    )],
+                    &format!("unavailable_db_{command}_{disable_fast_open}"),
+                );
+                assert!(
+                    !result.stderr.contains("rebuilt it from the JSONL"),
+                    "{} {}",
+                    result.stdout,
+                    result.stderr
+                );
+                let _ = json_stdout(&result.stdout);
+                assert_tracker_unchanged(&beads_dir, &before);
+                assert!(!beads_dir.join(".br_recovery").exists());
+            }
+        }
+        assert_eq!(header_user_version(&retained), 4);
+    }
 }
 
 /// Reproduce the investigation's scale and documented version distribution

@@ -455,11 +455,18 @@ fn query_rows(
 }
 
 /// The `metadata` table, `sqlite_master`, and the newest `events` rows via a
-/// read-only engine connection. Every failure is recorded in the value.
+/// private read-only engine connection. Every failure is recorded in the value.
 fn read_only_dump(db_path: &Path, events: usize) -> Value {
     if !db_path.is_file() {
         return json!({ "opened": false, "error": "database file absent" });
     }
+    config::with_database_family_snapshot(db_path, |snapshot_path| {
+        Ok(read_only_dump_snapshot(snapshot_path, events))
+    })
+    .unwrap_or_else(|err| json!({ "opened": false, "error": err.to_string() }))
+}
+
+fn read_only_dump_snapshot(db_path: &Path, events: usize) -> Value {
     let conn = match open_with_flags(&db_path.to_string_lossy(), OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(conn) => conn,
         Err(err) => return json!({ "opened": false, "error": err.to_string() }),
@@ -606,7 +613,12 @@ mod tests {
         assert_eq!(missing["opened"], false);
         let db_path = temp.path().join("beads.db");
         drop(crate::storage::SqliteStorage::open(&db_path).expect("create schema"));
-        let dump = read_only_dump(&db_path, 5);
+        let observed = temp.path().join("observed");
+        fs::create_dir_all(&observed).unwrap();
+        let observed_db = observed.join("beads.db");
+        fs::copy(&db_path, &observed_db).unwrap();
+        let before = fs::read(&observed_db).unwrap();
+        let dump = read_only_dump(&observed_db, 5);
         assert_eq!(dump["opened"], true, "{dump}");
         assert!(
             dump["sqlite_master"]["rows"]
@@ -614,5 +626,11 @@ mod tests {
                 .is_some_and(|rows| rows.iter().any(|row| row["name"] == "issues")),
             "{dump}"
         );
+        assert_eq!(fs::read(&observed_db).unwrap(), before);
+        let names: Vec<_> = fs::read_dir(&observed)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("beads.db")]);
     }
 }

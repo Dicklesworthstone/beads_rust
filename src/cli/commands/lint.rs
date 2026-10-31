@@ -384,7 +384,7 @@ fn resolve_issues(
         let mut batch_cli = routed_cli_for_batch(cli, batch.is_external);
         let routed_write_lock = acquire_routed_workspace_write_lock(
             &batch.beads_dir,
-            batch.is_external,
+            batch.is_external && !batch_cli.read_only_storage,
             batch_cli.lock_timeout,
         )?;
         routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);

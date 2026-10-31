@@ -176,7 +176,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             || supports_read_only_fast_open(&cli.command))
         && let Some((beads_dir, paths)) = ctx.beads_dir.clone().zip(ctx.paths.clone())
         && let Ok(Some(found)) =
-            commands::doctor_subsystems::schema_heal::stale_schema_version(&paths.db_path)
+            stale_schema_version_for_startup(&paths.db_path, observational_startup)
     {
         let refusal = if observational_startup {
             // Read intent, not fast-open eligibility, protects this boundary.
@@ -290,9 +290,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     let ordinary_database_authority_required = should_acquire_startup_write_lock(
         command_needs_write_lock,
         should_preopen_storage,
-        ctx.overrides.read_only_fast_open
-            || (ctx.overrides.read_only_storage
-                && !inspects_legacy_database_without_recovery(&cli.command)),
+        ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage,
     );
     let pending_merge_mutation_gate_required =
         pending_merge_disposition == PendingMergeStartupDisposition::Refuse;
@@ -1233,19 +1231,29 @@ const fn doctor_subcommand_needs_write_lock(args: &beads_rust::cli::DoctorArgs) 
     if args.selftest || args.bundle.is_some() {
         return false;
     }
+    !doctor_requires_read_only_storage(args)
+}
+
+const fn doctor_requires_read_only_storage(args: &beads_rust::cli::DoctorArgs) -> bool {
     match &args.subcommand {
-        None
-        | Some(
-            beads_rust::cli::DoctorSubcommand::Undo(_)
-            | beads_rust::cli::DoctorSubcommand::MigrateSchema(_),
-        ) => true,
+        None => args.robot_triage || args.dry_run || !(args.repair || args.repair_indexes),
+        Some(beads_rust::cli::DoctorSubcommand::Undo(undo)) => undo.dry_run,
+        Some(beads_rust::cli::DoctorSubcommand::MigrateSchema(migration)) => {
+            match &migration.command {
+                beads_rust::cli::DoctorMigrateSchemaCommand::Plan(_) => true,
+                beads_rust::cli::DoctorMigrateSchemaCommand::Heal(heal) => heal.dry_run,
+                beads_rust::cli::DoctorMigrateSchemaCommand::Undo(undo) => undo.dry_run,
+                beads_rust::cli::DoctorMigrateSchemaCommand::Apply(_)
+                | beads_rust::cli::DoctorMigrateSchemaCommand::Recover(_) => false,
+            }
+        }
         Some(
             beads_rust::cli::DoctorSubcommand::Capabilities(_)
             | beads_rust::cli::DoctorSubcommand::RobotDocs(_)
             | beads_rust::cli::DoctorSubcommand::Health(_)
             | beads_rust::cli::DoctorSubcommand::Ls(_)
             | beads_rust::cli::DoctorSubcommand::Explain(_),
-        ) => false,
+        ) => true,
     }
 }
 
@@ -1375,6 +1383,8 @@ const fn requires_read_only_storage(cmd: &Commands) -> bool {
     match cmd {
         Commands::Create(args) => args.dry_run,
         Commands::Delete(args) => args.dry_run,
+        Commands::Sync(args) => commands::sync::requires_read_only_storage(args),
+        Commands::Doctor(args) => doctor_requires_read_only_storage(args),
         Commands::Info(_) | Commands::Where => true,
         Commands::Config { command } => matches!(
             command,
@@ -1399,9 +1409,9 @@ const fn requires_read_only_storage(cmd: &Commands) -> bool {
 }
 
 /// These diagnostics already read generic tables through observational
-/// connections/snapshots and do not require the current application schema.
-/// Keep their writer serialization for coherent snapshots, but never heal or
-/// substitute JSONL for the original database's configuration and row counts.
+/// snapshots and do not require the current application schema. Their
+/// snapshots verify source identity and contents without writer locks. Never
+/// heal or substitute JSONL for the original configuration and row counts.
 const fn inspects_legacy_database_without_recovery(cmd: &Commands) -> bool {
     matches!(
         cmd,
@@ -1436,17 +1446,10 @@ const fn command_must_refuse_during_pending_merge(cmd: &Commands) -> bool {
                 || args.import_only
                 || (args.reconcile && !args.dry_run)
                 || (args.reconcile_additive && args.apply)
+                || (args.migrate_source_repo_path && args.apply)
         }
         Commands::Doctor(args) => {
-            ((!args.robot_triage && (args.repair || args.repair_indexes)) && !args.dry_run)
-                || matches!(
-                    args.subcommand.as_ref(),
-                    Some(beads_rust::cli::DoctorSubcommand::Undo(undo)) if !undo.dry_run
-                )
-                || matches!(
-                    args.subcommand.as_ref(),
-                    Some(beads_rust::cli::DoctorSubcommand::MigrateSchema(_))
-                )
+            !doctor_requires_read_only_storage(args) && !args.selftest && args.bundle.is_none()
         }
         Commands::Gate { command } => {
             matches!(command, beads_rust::cli::GateCommands::Report(_))
@@ -1557,6 +1560,14 @@ fn stale_schema_observational_refusal(found: u32) -> BeadsError {
             expected: beads_rust::storage::schema::CURRENT_SCHEMA_VERSION,
             found: i32::try_from(found).unwrap_or(i32::MAX),
         }),
+    }
+}
+
+fn stale_schema_version_for_startup(db_path: &Path, observational: bool) -> Result<Option<u32>> {
+    if observational {
+        config::stale_schema_version_without_mutation(db_path)
+    } else {
+        commands::doctor_subsystems::schema_heal::stale_schema_version(db_path)
     }
 }
 
@@ -2980,6 +2991,8 @@ mod tests {
             &["br", "epic", "close-eligible", "--dry-run"],
             &["br", "create", "preview", "--dry-run"],
             &["br", "delete", "demo-1", "--dry-run"],
+            &["br", "sync", "--migrate-source-repo-path"],
+            &["br", "sync", "--reconcile-additive"],
         ];
         for args in reads {
             let cli = Cli::parse_from(*args);
@@ -2994,6 +3007,14 @@ mod tests {
             &["br", "query", "delete", "saved"],
             &["br", "sync", "--import-only"],
             &["br", "sync", "--flush-only"],
+            &[
+                "br",
+                "sync",
+                "--migrate-source-repo-path",
+                "--apply",
+                "--expect-plan-sha256",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ],
             &["br", "doctor", "migrate-schema", "heal"],
         ];
         for args in writes {
@@ -3051,6 +3072,12 @@ mod tests {
             assert!(inspects_legacy_database_without_recovery(&cli.command));
             assert!(requires_read_only_storage(&cli.command));
             assert!(!should_auto_import(&cli.command));
+            let overrides = build_cli_overrides(&cli);
+            assert!(!should_acquire_startup_write_lock(
+                needs_write_lock(&cli.command),
+                false,
+                overrides.read_only_fast_open || overrides.read_only_storage,
+            ));
         }
         let list = Cli::parse_from(["br", "list"]);
         assert!(!inspects_legacy_database_without_recovery(&list.command));
@@ -4147,7 +4174,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_requires_write_lock_before_live_inspection() {
+    fn doctor_requires_write_lock_only_for_explicit_mutations() {
         let inspect = Cli::parse_from(["br", "doctor"]).command;
         let repair = Cli::parse_from(["br", "doctor", "--repair"]).command;
         let repair_indexes = Cli::parse_from(["br", "doctor", "--repair-indexes"]).command;
@@ -4162,8 +4189,8 @@ mod tests {
         let undo = Cli::parse_from(["br", "doctor", "undo", "latest"]).command;
 
         assert!(
-            needs_write_lock(&inspect),
-            "`br doctor` copies/probes the live DB family and must serialize via .write.lock"
+            !needs_write_lock(&inspect),
+            "`br doctor` inspects verified private copies without creating source locks"
         );
         assert!(needs_write_lock(&repair));
         assert!(needs_write_lock(&repair_indexes));
@@ -4188,6 +4215,29 @@ mod tests {
             !needs_write_lock(&explain),
             "explain is a read-only diagnostic surface and must not acquire the DB write lock"
         );
+        for args in [
+            vec!["br", "doctor", "--robot-triage"],
+            vec!["br", "doctor", "--repair", "--dry-run"],
+            vec!["br", "doctor", "--repair-indexes", "--dry-run"],
+            vec!["br", "doctor", "undo", "latest", "--dry-run"],
+            vec!["br", "doctor", "migrate-schema", "plan"],
+            vec!["br", "doctor", "migrate-schema", "heal", "--dry-run"],
+            vec!["br", "doctor", "migrate-schema", "undo", "run", "--dry-run"],
+        ] {
+            let cli = Cli::parse_from(args);
+            assert!(!needs_write_lock(&cli.command), "{:?}", cli.command);
+            assert!(
+                requires_read_only_storage(&cli.command),
+                "{:?}",
+                cli.command
+            );
+            assert_eq!(
+                pending_merge_startup_disposition(&cli.command),
+                PendingMergeStartupDisposition::ReadOnlyNoAutoSync,
+                "a preview must not join the pending-merge mutation gate: {:?}",
+                cli.command,
+            );
+        }
     }
 
     #[test]

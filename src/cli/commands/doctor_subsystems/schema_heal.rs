@@ -1059,7 +1059,7 @@ fn table_names(conn: &Connection) -> Result<HashSet<String>> {
 }
 
 fn column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    conn.query(&format!("PRAGMA table_info({})", quote_identifier(table)))?
+    conn.query(&format!("PRAGMA table_xinfo({})", quote_identifier(table)))?
         .iter()
         .map(|row| required_legacy_text(row.get(1), table, "column name"))
         .collect()
@@ -1390,38 +1390,7 @@ pub fn execute_heal(
 ) -> Result<()> {
     if args.dry_run {
         let paths = config::resolve_paths(beads_dir, cli.db.as_ref())?;
-        let Some(from_version) = stale_schema_version(&paths.db_path)? else {
-            return emit_not_needed(args.json);
-        };
-        let audited = (|| {
-            let (_jsonl_authority, source) = capture_jsonl(&paths.jsonl_path, cli.lock_timeout)?;
-            audit_stale_database(&paths.db_path, source.as_ref())
-        })();
-        let mut audit = match audited {
-            Ok(audit) => audit,
-            Err(error) if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from_version) => {
-                return emit_migration_dry_run_without_audit(from_version, &error, args.json);
-            }
-            Err(error) => return Err(error),
-        };
-        audit.from_version = from_version;
-        let action = planned_action(&audit, args.discard_db_only);
-        if args.json {
-            let payload = serde_json::json!({
-                "dry_run": true,
-                "audit": audit,
-                "automatic_heal_allowed": audit.automatic_heal_allowed(),
-                "automatic_rebuild_allowed": false,
-                "planned_action": action,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).map_err(BeadsError::Json)?
-            );
-        } else {
-            print_dry_run_audit(&audit, &action);
-        }
-        return Ok(());
+        return execute_heal_preview(args, &paths);
     }
 
     let ctx = HealContext {
@@ -1449,6 +1418,62 @@ pub fn execute_heal(
             Ok(())
         }
     }
+}
+
+/// Observe a private SQLite snapshot and immutable JSONL bytes without taking
+/// either source write authority. Only an actual heal may touch live opener
+/// registration, WAL reader marks, or migration/recovery artifacts.
+pub(super) fn execute_heal_preview(
+    args: &crate::cli::DoctorMigrateSchemaHealArgs,
+    paths: &config::ConfigPaths,
+) -> Result<()> {
+    match std::fs::symlink_metadata(&paths.db_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return emit_not_needed(args.json);
+        }
+        Err(error) => return Err(BeadsError::Io(error)),
+        Ok(_) => {}
+    }
+    config::with_database_family_snapshot(&paths.db_path, |snapshot| {
+        let Some(from_version) = stale_schema_version(snapshot)? else {
+            return emit_not_needed(args.json);
+        };
+        let audited = (|| {
+            let source = match std::fs::symlink_metadata(&paths.jsonl_path) {
+                Ok(_) => Some(crate::sync::capture_jsonl_source_snapshot(
+                    &paths.jsonl_path,
+                )?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(BeadsError::Io(error)),
+            };
+            audit_stale_database(snapshot, source.as_ref())
+        })();
+        let mut audit = match audited {
+            Ok(audit) => audit,
+            Err(error) if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from_version) => {
+                return emit_migration_dry_run_without_audit(from_version, &error, args.json);
+            }
+            Err(error) => return Err(error),
+        };
+        audit.from_version = from_version;
+        let action = planned_action(&audit, args.discard_db_only);
+        if args.json {
+            let payload = serde_json::json!({
+                "dry_run": true,
+                "audit": audit,
+                "automatic_heal_allowed": audit.automatic_heal_allowed(),
+                "automatic_rebuild_allowed": false,
+                "planned_action": action,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).map_err(BeadsError::Json)?
+            );
+        } else {
+            print_dry_run_audit(&audit, &action);
+        }
+        Ok(())
+    })
 }
 
 fn emit_not_needed(json: bool) -> Result<()> {
@@ -1718,6 +1743,31 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("sqlite_sequence")
+        );
+    }
+
+    #[test]
+    fn preservation_audit_includes_generated_columns_hidden_from_table_info() {
+        let (conn, jsonl) = legacy_audit_fixture();
+        conn.execute(
+            "ALTER TABLE issues ADD COLUMN operator_note TEXT \
+             GENERATED ALWAYS AS (lower(title)) VIRTUAL",
+        )
+        .unwrap();
+        assert!(
+            conn.query("PRAGMA table_info(issues)")
+                .unwrap()
+                .iter()
+                .all(|row| row.get(1).and_then(SqliteValue::as_text) != Some("operator_note"))
+        );
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(jsonl))).unwrap();
+        assert!(!audit.is_clean());
+        assert!(
+            audit
+                .rebuild_blockers
+                .iter()
+                .any(|blocker| blocker.contains("issues.operator_note")),
+            "generated fields must remain visible in preservation diagnostics"
         );
     }
 

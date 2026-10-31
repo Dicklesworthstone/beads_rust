@@ -115,7 +115,7 @@ fn execute_routed(
             let mut batch_cli = cli_for_routed_workspace(cli, !use_preloaded);
             let routed_write_lock = acquire_routed_workspace_write_lock(
                 &batch_beads_dir,
-                !use_preloaded,
+                !use_preloaded && !batch_cli.read_only_storage,
                 batch_cli.lock_timeout,
             )?;
             routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);
@@ -181,7 +181,7 @@ fn execute_routed(
         let mut batch_cli = cli_for_routed_workspace(cli, !use_preloaded);
         let routed_write_lock = acquire_routed_workspace_write_lock(
             &batch.beads_dir,
-            !use_preloaded,
+            !use_preloaded && !batch_cli.read_only_storage,
             batch_cli.lock_timeout,
         )?;
         routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);

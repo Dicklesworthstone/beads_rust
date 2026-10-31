@@ -751,10 +751,14 @@ fn prepare_sync_startup(
 ) -> Result<SyncStartupState> {
     let (beads_dir, startup, path_policy) = resolve_sync_startup_paths(args, cli)?;
     let allow_external_jsonl = path_policy.allow_external_jsonl;
+    let mut open_overrides = cli.clone();
+    if requires_read_only_storage(args) {
+        open_overrides.read_only_storage = true;
+    }
 
     let open_result = config::open_storage_with_startup_config_and_jsonl_policy(
         startup,
-        cli,
+        &open_overrides,
         should_defer_jsonl_recovery(args),
         allow_external_jsonl,
     )?;
@@ -764,6 +768,16 @@ fn prepare_sync_startup(
         path_policy,
         open_result,
     })
+}
+
+/// Sync modes whose observation contract also forbids initialization or
+/// recovery while opening storage, regardless of automatic-sync flags.
+#[must_use]
+pub const fn requires_read_only_storage(args: &SyncArgs) -> bool {
+    args.status
+        || (args.reconcile && args.dry_run)
+        || (args.reconcile_additive && !args.apply)
+        || (args.migrate_source_repo_path && !args.apply)
 }
 
 fn resolve_sync_startup_paths(
@@ -5294,6 +5308,18 @@ fn execute_source_repo_path_migration(
     ctx: &OutputContext,
 ) -> Result<SyncDispatchCompletion> {
     let jsonl_path = &path_policy.jsonl_path;
+    if !args.apply {
+        // Planning has no publication authority: capture immutable input
+        // without creating lock files or resuming a pending merge saga.
+        let source = crate::sync::capture_optional_jsonl_source(jsonl_path)?;
+        let plan = build_source_repo_path_migration_plan(
+            storage,
+            &path_policy.beads_dir,
+            source.as_ref(),
+        )?;
+        render_source_repo_path_migration_receipt(&plan.receipt, ctx, use_json);
+        return Ok(SyncDispatchCompletion::default());
+    }
     let owned_jsonl_authority = retained_authority
         .is_none()
         .then(|| {
@@ -5353,10 +5379,6 @@ fn execute_source_repo_path_migration(
     }
 
     let mut plan = build_source_repo_path_migration_plan(storage, &path_policy.beads_dir, source)?;
-    if !args.apply {
-        render_source_repo_path_migration_receipt(&plan.receipt, ctx, use_json);
-        return Ok(SyncDispatchCompletion::default());
-    }
     let expected_plan_sha256 =
         args.expect_plan_sha256
             .as_deref()
@@ -6005,7 +6027,7 @@ mod tests {
         GitExportStatus, PostImportCompactionReason, PostImportDatabaseProbe, SyncOperation,
         additive_conflict_human_lines, auto_rebuild_semantic_conflict_field,
         auto_rebuild_semantic_flag_conflict_reason, classify_sync_status_workspace,
-        detect_prefix_from_jsonl, freelist_warrants_compaction,
+        detect_prefix_from_jsonl, execute, freelist_warrants_compaction,
         jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
         merge_conflict_resolution, post_import_compaction_reason, prepare_sync_startup,
         should_defer_jsonl_recovery, should_render_human_sync_output, sync_operation,
@@ -6025,7 +6047,7 @@ mod tests {
         tombstones_missing_from_jsonl_tombstones,
     };
     use chrono::Utc;
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -6808,21 +6830,23 @@ mod tests {
     }
 
     #[test]
-    fn sync_status_fast_open_miss_reuses_caller_write_lock_for_rebuild() {
+    fn observational_sync_open_refuses_rebuild_even_under_caller_write_lock() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         let db_path = beads_dir.join("beads.db");
         let jsonl_path = beads_dir.join("issues.jsonl");
-        let issue = make_test_issue("bd-sync-selflock", "Recovered while caller holds lock");
+        let issue = make_test_issue(
+            "bd-sync-selflock",
+            "Read-only status cannot recreate the DB",
+        );
         fs::write(
             &jsonl_path,
             format!("{}\n", serde_json::to_string(&issue).unwrap()),
         )
         .unwrap();
-        // main.rs takes the database-family authority before dispatch and
-        // hands it to the command through the override marker; the startup
-        // path must reuse that authority instead of contending for it.
+        // Even a direct caller that already owns write authority cannot
+        // authorize recovery as a side effect of an observational command.
         let held = std::sync::Arc::new(
             crate::sync::blocking_database_family_write_lock_with_timeout(
                 &beads_dir,
@@ -6831,10 +6855,6 @@ mod tests {
             )
             .unwrap(),
         );
-        let args = SyncArgs {
-            status: true,
-            ..SyncArgs::default()
-        };
         let mut cli = CliOverrides {
             db: Some(db_path.clone()),
             lock_timeout: Some(1),
@@ -6843,17 +6863,102 @@ mod tests {
         };
         cli.mark_database_family_lock_held(&beads_dir, &held);
 
-        let startup = prepare_sync_startup(&args, &cli, true)
-            .expect("caller-held write lock should not be reacquired on fast-open miss");
-
-        assert!(db_path.is_file(), "missing DB should rebuild from JSONL");
-        assert!(
-            startup
-                .open_result
-                .storage
-                .id_exists("bd-sync-selflock")
+        let snapshot = || -> BTreeMap<_, _> {
+            fs::read_dir(&beads_dir)
                 .unwrap()
-        );
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect()
+        };
+        let before = snapshot();
+        for args in [
+            SyncArgs {
+                status: true,
+                ..SyncArgs::default()
+            },
+            SyncArgs {
+                reconcile: true,
+                dry_run: true,
+                ..SyncArgs::default()
+            },
+            SyncArgs {
+                migrate_source_repo_path: true,
+                ..SyncArgs::default()
+            },
+        ] {
+            let error = prepare_sync_startup(&args, &cli, true)
+                .err()
+                .expect("observational modes must refuse recovery even with write authority");
+            assert!(
+                error.to_string().contains("Read-only storage open refused"),
+                "{error}"
+            );
+            assert!(
+                !db_path.exists(),
+                "an observational mode must not create the database"
+            );
+            assert_eq!(
+                snapshot(),
+                before,
+                "all original files and bytes must survive refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn source_repo_path_migration_plan_preserves_files_without_creating_locks() {
+        let temp = TempDir::new().unwrap();
+        let seed_path = temp.path().join("seed.db");
+        {
+            let mut storage = SqliteStorage::open(&seed_path).unwrap();
+            storage.checkpoint_full().unwrap();
+        }
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        fs::copy(&seed_path, &db_path).unwrap();
+        let issue = make_test_issue("bd-observed", "Plan without source writes");
+        fs::write(
+            beads_dir.join("issues.jsonl"),
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+        let snapshot = || -> BTreeMap<_, _> {
+            fs::read_dir(&beads_dir)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect()
+        };
+        let before = snapshot();
+        let cli = CliOverrides {
+            db: Some(db_path),
+            ..CliOverrides::default()
+        };
+        let ctx = OutputContext::from_flags(true, false, true);
+        for dry_run in [false, true] {
+            execute(
+                &SyncArgs {
+                    migrate_source_repo_path: true,
+                    dry_run,
+                    ..SyncArgs::default()
+                },
+                true,
+                &cli,
+                &ctx,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                snapshot(),
+                before,
+                "planning must not modify source files or create any locks"
+            );
+        }
     }
 
     #[test]

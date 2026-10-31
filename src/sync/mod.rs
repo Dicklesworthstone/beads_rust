@@ -5210,7 +5210,7 @@ pub fn plan_reviewed_additive_reconcile(
     let (canonical_beads, canonical_database, configured_source, database_identity) =
         resolve_reviewed_additive_workspace(&request.beads_dir, request.db_override.as_ref())?;
     let storage = redact_reviewed_path_result(
-        SqliteStorage::open_current_read_only(&canonical_database),
+        SqliteStorage::open_current_read_only_snapshot(&canonical_database),
         &canonical_database,
         "database",
         "open",
@@ -21593,6 +21593,48 @@ mod tests {
         assert!(
             receipt.postcommit_failures.is_empty(),
             "healthy committed free pages must not become a false postcommit failure"
+        );
+    }
+
+    #[test]
+    fn reviewed_additive_planner_preserves_source_files_without_creating_locks() {
+        let temp = TempDir::new().unwrap();
+        let seed_path = temp.path().join("seed.db");
+        {
+            let mut storage = SqliteStorage::open(&seed_path).unwrap();
+            storage.checkpoint_full().unwrap();
+        }
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let database_path = beads_dir.join("beads.db");
+        fs::copy(&seed_path, &database_path).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let incoming = make_issue_at("bd-observed", "Plan without source writes", fixed_time(100));
+        write_additive_issues(&jsonl_path, &[incoming]);
+        let snapshot = || -> BTreeMap<_, _> {
+            fs::read_dir(&beads_dir)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect()
+        };
+        let before = snapshot();
+        let plan = plan_reviewed_additive_reconcile(&ReviewedAdditiveReconcilePlanRequest {
+            beads_dir: beads_dir.clone(),
+            db_override: None,
+            source_path_override: None,
+            allow_external_jsonl: false,
+            source_authoritative_ids: BTreeSet::new(),
+        })
+        .unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+        assert_eq!(plan.receipt().created, 1);
+        assert_eq!(
+            snapshot(),
+            before,
+            "a plan must not create source opener locks or modify files"
         );
     }
 

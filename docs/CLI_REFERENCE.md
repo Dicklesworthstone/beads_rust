@@ -2342,6 +2342,13 @@ beside `beads.db`, the shared opener lease and whether it is held, and any
 one finding with its registry entry, a live observation, fixers, and next
 commands; `br doctor explain --list` enumerates the finding ids.
 
+Doctor observations and previews use private database snapshots. `doctor`,
+`doctor --quick`, `doctor --repair --dry-run`, and
+`doctor --repair-indexes --dry-run` do not acquire source writer locks or run
+writable probes. A repair preview reports findings and filtered candidate
+repairs; actual execution still performs each repair's authority and safety
+checks. A missing database remains missing during a preview.
+
 #### JSONL rebuild verification
 
 `br doctor --repair --json` distinguishes completing a database rebuild from
@@ -2447,6 +2454,13 @@ that database-only records are retained in SQLite and may be absent from that
 view. Commands without a safe reader refuse with migration guidance.
 `--no-auto-import --no-auto-flush` also prevents automatic synchronization;
 disabling the fast-open optimization does not disable read-only protection.
+Explicitly read-only paths inspect coherent private copies of the database
+family, so even opener registration and shared-memory reader marks cannot
+change the tracker. This includes `info --json`, routed issue reads, and
+discovery from nested directories. Sync status and reconciliation or
+source-path migration planning use the same protection without requiring the
+flag pair. If a safe snapshot cannot be read, the command refuses instead of
+opening the original database for recovery.
 
 A mutating command may upgrade schemas 13-18 through the reviewed migration
 below, which witnesses the complete database and retains a recovery bundle
@@ -2460,6 +2474,12 @@ Inspect the available migration or explicit reconstruction plan with:
 br doctor migrate-schema plan --json       # reviewed lossless migration
 br doctor migrate-schema heal --dry-run    # inspect explicit heal safety
 ```
+
+`plan`, `heal --dry-run`, and `undo --dry-run` use verified private snapshots
+without creating source lock files or changing the tracker. Plans remain
+bound to the original database path and state. Previewing undo still validates
+the receipt, backup, and preservation proofs; actual apply or undo repeats its
+checks under exclusive write authority.
 
 `heal` attempts the same reviewed migration and refuses if that migration is
 unavailable or fails. Its dry-run audit identifies state that JSONL cannot
@@ -2526,14 +2546,21 @@ The installation's database-identity witnesses remain mandatory after this
 preflight. `plan` and dry-run `undo` do not create probe files.
 
 The version stamp alone does not establish eligibility. Planning also checks
-the core table declarations and index names. Historical layouts with extra
-columns, incompatible keys or constraints, or operator indexes on core tables
+the core table declarations and complete definitions of present core indexes.
+Historical layouts with extra columns, incompatible keys or constraints, or operator indexes on core tables
 are refused before a token is issued. Schema 19 can represent parallel typed
 edges, but this does not admit arbitrary historical table layouts. Migration
 will not silently choose one edge. Keep
 the source database and resolve the named table before planning again. Known
 index definitions can be recreated during maintenance; operator tables outside
 the core schema remain preserved by the existing migration and undo workflow.
+The released dependency accelerators `idx_dependencies_depends_on_type_issue`
+and `idx_dependencies_issue_type` are recognized during the schema-19 key
+upgrade only with their exact original column order, non-unique keys,
+ascending BINARY comparisons, and absence of a partial predicate. A changed
+definition under either name still refuses migration. Retiring these derived
+indexes does not exempt any source table, record, or sequence reservation from
+the complete preservation checks.
 An operator foreign key referencing the old dependency pair key is refused:
 it needs a typed relationship definition before that key can be widened.
 
