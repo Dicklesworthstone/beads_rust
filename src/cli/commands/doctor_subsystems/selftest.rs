@@ -159,13 +159,18 @@ impl Runner {
         self.step(name, args, exit_success)
     }
 
-    /// A step that must exit successfully and print JSON.
-    fn json(&mut self, name: &str, args: &[&str]) -> Option<Value> {
+    /// A creation step must also return the ID needed by later steps.
+    fn create_id(&mut self, name: &str, args: &[&str]) -> Option<String> {
+        let mut id = None;
         self.step(name, args, |output| {
             exit_success(output)?;
-            parse_json(&output.stdout).map(|_| ())
-        })
-        .and_then(|output| parse_json(&output.stdout).ok())
+            id = created_id(&parse_json(&output.stdout)?).filter(|id| !id.is_empty());
+            if id.is_none() {
+                return Err("create JSON did not contain a non-empty issue id".to_string());
+            }
+            Ok(())
+        })?;
+        id
     }
 
     fn all_ok(&self) -> bool {
@@ -342,34 +347,25 @@ fn run_lifecycle(runner: &mut Runner) {
         }
     });
 
-    let Some(a) = runner
-        .json(
-            "create A",
-            &[
-                "create",
-                "Alpha selftest issue",
-                "--priority",
-                "1",
-                "--json",
-            ],
-        )
-        .and_then(|value| created_id(&value))
-    else {
+    let Some(a) = runner.create_id(
+        "create A",
+        &[
+            "create",
+            "Alpha selftest issue",
+            "--priority",
+            "1",
+            "--json",
+        ],
+    ) else {
         return;
     };
-    let Some(b) = runner
-        .json("create B", &["create", "Beta selftest issue", "--json"])
-        .and_then(|value| created_id(&value))
-    else {
+    let Some(b) = runner.create_id("create B", &["create", "Beta selftest issue", "--json"]) else {
         return;
     };
-    let Some(epic) = runner
-        .json(
-            "create epic",
-            &["create", "Selftest epic", "--type", "epic", "--json"],
-        )
-        .and_then(|value| created_id(&value))
-    else {
+    let Some(epic) = runner.create_id(
+        "create epic",
+        &["create", "Selftest epic", "--type", "epic", "--json"],
+    ) else {
         return;
     };
     runner.step("ids carry the prefix", &["show", &a, "--json"], |output| {
@@ -681,6 +677,150 @@ pub fn execute(args: &DoctorArgs, ctx: &OutputContext) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn lifecycle_fixture(changed_create: Option<&str>, reply: &str) -> (tempfile::TempDir, Runner) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().expect("create lifecycle fixture");
+        let root = fixture.path().join("workspace with spaces");
+        std::fs::create_dir(&root).expect("create fixture workspace");
+        let a = if changed_create == Some("create A") {
+            reply
+        } else {
+            r#"{"id":"self-a"}"#
+        };
+        let b = if changed_create == Some("create B") {
+            reply
+        } else {
+            r#"{"issue":{"id":"self-b"}}"#
+        };
+        let epic = if changed_create == Some("create epic") {
+            reply
+        } else {
+            r#"[{"id":"self-epic"}]"#
+        };
+        let exe = fixture.path().join("fixture-br");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+case "$1" in
+    --version) printf '%s\n' 'br selftest fixture' ;;
+    init) mkdir -p "$BEADS_DIR"; : > "$BEADS_DIR/beads.db" ;;
+    where) printf '%s\n' "$BEADS_DIR" ;;
+    create)
+        case "$2" in
+            'Alpha selftest issue') printf '%s\n' '{a}' ;;
+            'Beta selftest issue') printf '%s\n' '{b}' ;;
+            'Selftest epic') printf '%s\n' '{epic}' ;;
+            *) exit 98 ;;
+        esac
+        ;;
+    *) exit 99 ;;
+esac
+"#
+        );
+        std::fs::write(&exe, script).expect("write lifecycle fixture executable");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+            .expect("make lifecycle fixture executable");
+        (
+            fixture,
+            Runner {
+                exe,
+                root,
+                steps: Vec::new(),
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    fn assert_create_reply_fails(stage: &str, reply: &str) {
+        let (_fixture, mut runner) = lifecycle_fixture(Some(stage), reply);
+        run_lifecycle(&mut runner);
+        assert!(
+            !runner.all_ok(),
+            "{stage} accepted {reply} and reported an incomplete lifecycle as successful"
+        );
+        let step = runner.steps.last().expect("creation step receipt");
+        assert_eq!(
+            step.name, stage,
+            "lifecycle should stop at invalid creation"
+        );
+        assert!(!step.ok, "invalid creation must be recorded as a failure");
+        assert!(
+            step.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("non-empty issue id")),
+            "missing creation diagnostic: {:?}",
+            step.detail
+        );
+        assert_eq!(runner.steps.iter().filter(|step| !step.ok).count(), 1);
+    }
+
+    #[cfg(unix)]
+    fn assert_missing_create_id_fails(stage: &str) {
+        for reply in ["{}", "[]", "null", r#"{"id":null}"#] {
+            assert_create_reply_fails(stage, reply);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_a_requires_an_id() {
+        assert_missing_create_id_fails("create A");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_b_requires_an_id() {
+        assert_missing_create_id_fails("create B");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_epic_requires_an_id() {
+        assert_missing_create_id_fails("create epic");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_created_ids_are_failed_steps() {
+        for stage in ["create A", "create B", "create epic"] {
+            for reply in [r#"{"id":""}"#, r#"{"issue":{"id":""}}"#] {
+                assert_create_reply_fails(stage, reply);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_create_ids_reach_later_lifecycle_steps() {
+        let (_fixture, mut runner) = lifecycle_fixture(None, "{}");
+        run_lifecycle(&mut runner);
+        for name in ["create A", "create B", "create epic"] {
+            let step = runner
+                .steps
+                .iter()
+                .find(|step| step.name == name)
+                .expect("creation step");
+            assert!(step.ok, "{name}: {:?}", step.detail);
+        }
+        assert!(
+            runner
+                .steps
+                .iter()
+                .any(|step| step.command == "br dep add self-b self-a")
+        );
+        assert!(
+            runner
+                .steps
+                .iter()
+                .any(|step| { step.command == "br dep add self-b self-epic --type parent-child" })
+        );
+        // The fixture intentionally refuses commands beyond creation. It
+        // proves ID propagation, not a successful complete application run.
+        assert!(!runner.all_ok());
+    }
 
     #[test]
     fn collect_ids_walks_every_envelope_shape() {
