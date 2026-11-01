@@ -281,6 +281,14 @@ pub fn blocking_write_lock_with_timeout(
     beads_dir: &Path,
     lock_timeout_ms: Option<u64>,
 ) -> Result<File> {
+    blocking_write_lock_with_cancellation(beads_dir, lock_timeout_ms, None)
+}
+
+fn blocking_write_lock_with_cancellation(
+    beads_dir: &Path,
+    lock_timeout_ms: Option<u64>,
+    cancellation_requested: Option<&dyn Fn() -> bool>,
+) -> Result<File> {
     let lock_path = beads_dir.join(".write.lock");
     open_and_lock_regular_file(
         &lock_path,
@@ -289,7 +297,7 @@ pub fn blocking_write_lock_with_timeout(
         "workspace write lock",
         false,
         ExclusiveLockMechanism::LockSidecar,
-        LockRetrySafety::BeforeMutation,
+        LockWaitPolicy::new(LockRetrySafety::BeforeMutation, cancellation_requested),
     )
 }
 
@@ -320,6 +328,36 @@ enum LockRetrySafety {
     InspectOperationState,
 }
 
+/// Cancellation is opt-in and only safe before the requested mutation begins.
+/// Recovery and cleanup acquisitions keep their existing completion contract.
+#[derive(Clone, Copy)]
+struct LockWaitPolicy<'a> {
+    retry_safety: LockRetrySafety,
+    cancellation_requested: Option<&'a dyn Fn() -> bool>,
+}
+
+impl<'a> LockWaitPolicy<'a> {
+    const fn new(
+        retry_safety: LockRetrySafety,
+        cancellation_requested: Option<&'a dyn Fn() -> bool>,
+    ) -> Self {
+        Self {
+            retry_safety,
+            cancellation_requested,
+        }
+    }
+
+    fn check_cancelled(self) -> Result<()> {
+        if self
+            .cancellation_requested
+            .is_some_and(|requested| requested())
+        {
+            return Err(BeadsError::ShuttingDown);
+        }
+        Ok(())
+    }
+}
+
 /// Non-blocking exclusive lock attempt through the selected mechanism.
 #[allow(clippy::incompatible_msrv)]
 fn try_lock_exclusive(
@@ -346,6 +384,7 @@ fn blocking_database_file_lock_with_timeout(
     database_path: &Path,
     lock_timeout_ms: Option<u64>,
     create_if_missing: bool,
+    cancellation_requested: Option<&dyn Fn() -> bool>,
 ) -> Result<File> {
     open_and_lock_regular_file(
         database_path,
@@ -354,7 +393,10 @@ fn blocking_database_file_lock_with_timeout(
         "database write authority",
         true,
         ExclusiveLockMechanism::DatabaseInode,
-        LockRetrySafety::InspectOperationState,
+        LockWaitPolicy::new(
+            LockRetrySafety::InspectOperationState,
+            cancellation_requested,
+        ),
     )
 }
 
@@ -767,6 +809,7 @@ impl DatabaseFamilyWriteLock {
             &self.canonical_database_path,
             Some(self.remaining_lock_timeout_ms()),
             false,
+            None,
         )?;
         let replacement_identity = verify_locked_file_identity(
             &replacement_lock,
@@ -1163,6 +1206,7 @@ impl DatabaseFamilyWriteLock {
             candidate_path,
             Some(self.remaining_lock_timeout_ms()),
             false,
+            None,
         )
     }
 
@@ -1696,7 +1740,7 @@ pub fn blocking_jsonl_family_write_lock_with_timeout(
         "JSONL-family write lock",
         true,
         ExclusiveLockMechanism::LockSidecar,
-        LockRetrySafety::InspectOperationState,
+        LockWaitPolicy::new(LockRetrySafety::InspectOperationState, None),
     )?;
     let canonical_after = canonical_database_authority_key(jsonl_path)?;
     if canonical_after != canonical_jsonl_path {
@@ -1737,12 +1781,51 @@ pub fn database_write_authority_sha256(database_path: &Path) -> Result<String> {
 
 /// Acquire the common database-family authority honored by CLI, MCP, recovery,
 /// and reviewed reconciliation mutation paths.
-#[allow(clippy::too_many_lines)]
 pub fn blocking_database_family_write_lock_with_timeout(
     beads_dir: &Path,
     database_path: &Path,
     lock_timeout_ms: Option<u64>,
 ) -> Result<DatabaseFamilyWriteLock> {
+    blocking_database_family_write_lock_with_cancellation(
+        beads_dir,
+        database_path,
+        lock_timeout_ms,
+        None,
+    )
+}
+
+/// Acquire import authority for a read that has not started writable startup.
+///
+/// Cooperative shutdown abandons every acquisition stage, drops partial
+/// authority, and removes the owned queue registration. This must not be used
+/// for recovery, cleanup, or a mutation that has already begun. The caller must
+/// also recheck shutdown before opening writable storage or starting import;
+/// acquiring authority is not permission to ignore a later interrupt.
+pub fn blocking_database_family_write_lock_for_read_startup_with_timeout(
+    beads_dir: &Path,
+    database_path: &Path,
+    lock_timeout_ms: Option<u64>,
+) -> Result<DatabaseFamilyWriteLock> {
+    blocking_database_family_write_lock_with_cancellation(
+        beads_dir,
+        database_path,
+        lock_timeout_ms,
+        Some(&crate::shutdown::is_requested),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn blocking_database_family_write_lock_with_cancellation(
+    beads_dir: &Path,
+    database_path: &Path,
+    lock_timeout_ms: Option<u64>,
+    cancellation_requested: Option<&dyn Fn() -> bool>,
+) -> Result<DatabaseFamilyWriteLock> {
+    let wait_policy = LockWaitPolicy::new(
+        LockRetrySafety::InspectOperationState,
+        cancellation_requested,
+    );
+    wait_policy.check_cancelled()?;
     let acquisition_started = Instant::now();
     let total_timeout_ms = lock_timeout_ms.unwrap_or(DEFAULT_WRITE_LOCK_TIMEOUT_MS);
     let remaining_timeout_ms = || {
@@ -1752,7 +1835,11 @@ pub fn blocking_database_family_write_lock_with_timeout(
     };
     let routed_database_path = reject_unsafe_database_routing_leaf(database_path)?;
     let workspace_lock_path = beads_dir.join(".write.lock");
-    let workspace_lock = blocking_write_lock_with_timeout(beads_dir, Some(remaining_timeout_ms()))?;
+    let workspace_lock = blocking_write_lock_with_cancellation(
+        beads_dir,
+        Some(remaining_timeout_ms()),
+        cancellation_requested,
+    )?;
     let canonical_database_path = canonical_database_authority_key(database_path)?;
     let authority_path = database_write_authority_path(database_path)?;
     let authority_path_sha256 = database_write_authority_sha256(database_path)?;
@@ -1763,7 +1850,7 @@ pub fn blocking_database_family_write_lock_with_timeout(
         "database-family write lock",
         true,
         ExclusiveLockMechanism::LockSidecar,
-        LockRetrySafety::InspectOperationState,
+        wait_policy,
     )?;
     let (database_lock, database_identity) = match fs::symlink_metadata(&canonical_database_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -1777,6 +1864,7 @@ pub fn blocking_database_family_write_lock_with_timeout(
                 &canonical_database_path,
                 Some(remaining_timeout_ms()),
                 false,
+                cancellation_requested,
             )?;
             let identity = authority_file_identity(
                 &database_lock,
@@ -1818,6 +1906,7 @@ pub fn blocking_database_family_write_lock_with_timeout(
         (None, None) => verify_database_authority_path_still_missing(&canonical_after)?,
         _ => unreachable!("database inode authority lock and identity must be paired"),
     }
+    wait_policy.check_cancelled()?;
     Ok(DatabaseFamilyWriteLock {
         workspace_lock,
         workspace_lock_path,
@@ -1851,7 +1940,7 @@ impl WorkspaceWriteWaiter {
             queue,
             Instant::now(),
             DEFAULT_WRITE_LOCK_TIMEOUT_MS,
-            LockRetrySafety::BeforeMutation,
+            LockWaitPolicy::new(LockRetrySafety::BeforeMutation, None),
         )
     }
 
@@ -1859,10 +1948,11 @@ impl WorkspaceWriteWaiter {
         queue: &Path,
         start: Instant,
         timeout_ms: u64,
-        retry_safety: LockRetrySafety,
+        wait_policy: LockWaitPolicy<'_>,
     ) -> Result<Self> {
         use std::hash::BuildHasher;
 
+        wait_policy.check_cancelled()?;
         let parent_anchor = pin_jsonl_target(&queue.with_file_name(".waiter-parent-anchor"))?;
         parent_anchor
             .with_sibling_path(queue)?
@@ -1876,6 +1966,7 @@ impl WorkspaceWriteWaiter {
             .checked_add(1)
             .ok_or_else(|| workspace_waiter_error(queue, "waiter sequence exhausted"))?;
         for attempt in 0..MAX_JSONL_TEMP_PATH_ATTEMPTS {
+            wait_policy.check_cancelled()?;
             let nonce = RandomState::new().hash_one((sequence, attempt));
             let leaf = format!("{sequence:020}-{nonce:016x}.waiter");
             let name = anchor.with_leaf(leaf.as_ref())?;
@@ -1890,12 +1981,13 @@ impl WorkspaceWriteWaiter {
                 order: (sequence, leaf),
             };
             loop {
+                wait_policy.check_cancelled()?;
                 if start.elapsed() >= Duration::from_millis(timeout_ms) {
                     return Err(write_lock_timeout_error(
                         &queue.with_file_name(".write.lock").display().to_string(),
                         "workspace write lock",
                         timeout_ms,
-                        retry_safety,
+                        wait_policy.retry_safety,
                     ));
                 }
                 match try_lock_exclusive(
@@ -1917,6 +2009,7 @@ impl WorkspaceWriteWaiter {
                 }
             }
             waiter.verify_identity()?;
+            wait_policy.check_cancelled()?;
             return Ok(waiter);
         }
         Err(workspace_waiter_error(
@@ -2029,8 +2122,9 @@ fn open_and_lock_regular_file(
     role: &str,
     redact_path: bool,
     mechanism: ExclusiveLockMechanism,
-    retry_safety: LockRetrySafety,
+    wait_policy: LockWaitPolicy<'_>,
 ) -> Result<File> {
+    wait_policy.check_cancelled()?;
     let lock_path_display = if redact_path {
         if role.starts_with("JSONL-") {
             additive_path_descriptor(lock_path, "jsonl-authority")
@@ -2119,10 +2213,12 @@ fn open_and_lock_regular_file(
     // the OS write lock, which remains the sole write authority.
     // Guard the call directly: constructing TryLockError::WouldBlock requires
     // Rust 1.89, newer than the declared MSRV.
+    wait_policy.check_cancelled()?;
     if !has_waiters {
         match try_lock_exclusive(&file, mechanism) {
             Ok(()) => {
                 verify_locked_file_identity(&file, lock_path, role, redact_path)?;
+                wait_policy.check_cancelled()?;
                 return Ok(file);
             }
             Err(TryLockError::WouldBlock) => {}
@@ -2135,17 +2231,18 @@ fn open_and_lock_regular_file(
         }
     }
 
+    wait_policy.check_cancelled()?;
     if start.elapsed() >= timeout {
         return Err(write_lock_timeout_error(
             &lock_path_display,
             role,
             timeout_ms,
-            retry_safety,
+            wait_policy.retry_safety,
         ));
     }
     let waiter = queue
         .as_deref()
-        .map(|queue| WorkspaceWriteWaiter::join_until(queue, start, timeout_ms, retry_safety))
+        .map(|queue| WorkspaceWriteWaiter::join_until(queue, start, timeout_ms, wait_policy))
         .transpose()?;
     tracing::debug!(
         timeout_ms,
@@ -2155,17 +2252,19 @@ fn open_and_lock_regular_file(
     );
 
     loop {
+        wait_policy.check_cancelled()?;
         if start.elapsed() >= timeout {
             return Err(write_lock_timeout_error(
                 &lock_path_display,
                 role,
                 timeout_ms,
-                retry_safety,
+                wait_policy.retry_safety,
             ));
         }
 
         let remaining = timeout.saturating_sub(start.elapsed());
         thread::sleep(remaining.min(WRITE_LOCK_POLL_INTERVAL));
+        wait_policy.check_cancelled()?;
 
         if let Some(waiter) = &waiter
             && !waiter.is_first()?
@@ -2176,12 +2275,14 @@ fn open_and_lock_regular_file(
         // Sleeping, queue inspection, or process suspension can consume the
         // remaining budget. Return through the timeout branch before retrying
         // the OS lock, even if its previous owner has released it meanwhile.
+        wait_policy.check_cancelled()?;
         if start.elapsed() >= timeout {
             continue;
         }
 
         match try_lock_exclusive(&file, mechanism) {
             Ok(()) => {
+                wait_policy.check_cancelled()?;
                 // A deschedule between the preceding check and acquisition
                 // must not turn an expired wait into authority to mutate.
                 if start.elapsed() >= timeout {
@@ -2189,13 +2290,14 @@ fn open_and_lock_regular_file(
                         &lock_path_display,
                         role,
                         timeout_ms,
-                        retry_safety,
+                        wait_policy.retry_safety,
                     ));
                 }
                 verify_locked_file_identity(&file, lock_path, role, redact_path)?;
                 if let Some(waiter) = &waiter {
                     waiter.verify_identity()?;
                 }
+                wait_policy.check_cancelled()?;
                 return Ok(file);
             }
             Err(TryLockError::WouldBlock) => {}
@@ -20909,6 +21011,210 @@ mod tests {
         let acquired =
             blocking_write_lock_with_timeout(&beads_dir, Some(25)).expect("lock after release");
         drop(acquired);
+    }
+
+    /// Publish cancellation only after the selected OS lock has actually
+    /// refused acquisition. The existing wait event is a deterministic barrier;
+    /// no timing guess or process-global shutdown flag is needed.
+    fn cancel_read_authority_at_wait(
+        beads_dir: &Path,
+        database_path: &Path,
+        expected_role: &'static str,
+    ) -> BeadsError {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct CancelOnWait {
+            expected_role: &'static str,
+            requested: Arc<AtomicBool>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CancelOnWait {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct WaitFields {
+                    expected_role: &'static str,
+                    role_matches: bool,
+                    is_wait: bool,
+                }
+
+                impl tracing::field::Visit for WaitFields {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "role" {
+                            self.role_matches = value == self.expected_role;
+                        }
+                    }
+
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.is_wait = format!("{value:?}").contains(
+                                "write authority is held by another process; waiting with timeout",
+                            );
+                        }
+                    }
+                }
+
+                let mut fields = WaitFields {
+                    expected_role: self.expected_role,
+                    role_matches: false,
+                    is_wait: false,
+                };
+                event.record(&mut fields);
+                if fields.role_matches && fields.is_wait {
+                    self.requested.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        let requested = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::registry().with(CancelOnWait {
+            expected_role,
+            requested: Arc::clone(&requested),
+        });
+        let result = tracing::subscriber::with_default(subscriber, || {
+            blocking_database_family_write_lock_with_cancellation(
+                beads_dir,
+                database_path,
+                Some(5_000),
+                Some(&|| requested.load(Ordering::Acquire)),
+            )
+        });
+        assert!(
+            requested.load(Ordering::Acquire),
+            "must reach the contended {expected_role} before cancellation"
+        );
+        result.expect_err("canceled read must not acquire authority")
+    }
+
+    #[test]
+    fn read_authority_already_cancelled_does_not_publish_locks() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let error = blocking_database_family_write_lock_with_cancellation(
+            &beads_dir,
+            &beads_dir.join("beads.db"),
+            Some(0),
+            Some(&|| true),
+        )
+        .unwrap_err();
+        assert!(matches!(error, BeadsError::ShuttingDown));
+        assert_eq!(
+            fs::read_dir(&beads_dir).unwrap().count(),
+            0,
+            "already canceled startup must create neither locks nor a database"
+        );
+    }
+
+    #[test]
+    fn read_authority_cancelled_at_workspace_wait_removes_registration() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let database = beads_dir.join("beads.db");
+        fs::write(&database, b"unchanged database authority fixture").unwrap();
+        let owner = blocking_write_lock(&beads_dir).unwrap();
+        let error = cancel_read_authority_at_wait(&beads_dir, &database, "workspace write lock");
+        assert!(matches!(error, BeadsError::ShuttingDown));
+        assert_eq!(
+            fs::read_dir(beads_dir.join(WRITE_WAITER_DIRECTORY))
+                .unwrap()
+                .count(),
+            0,
+            "cancellation must remove its owned registration"
+        );
+        assert!(matches!(
+            blocking_write_lock_with_timeout(&beads_dir, Some(0)),
+            Err(BeadsError::WriteLockTimeout {
+                retryable: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            fs::read(&database).unwrap(),
+            b"unchanged database authority fixture"
+        );
+        drop(owner);
+        blocking_database_family_write_lock_with_timeout(&beads_dir, &database, Some(100))
+            .expect("a later writer must not inherit the canceled queue entry");
+    }
+
+    #[test]
+    fn read_authority_cancelled_at_canonical_wait_releases_workspace_lock() {
+        let temp = TempDir::new().unwrap();
+        let first_beads = temp.path().join("first/.beads");
+        let second_beads = temp.path().join("second/.beads");
+        fs::create_dir_all(&first_beads).unwrap();
+        fs::create_dir_all(&second_beads).unwrap();
+        let database = first_beads.join("beads.db");
+        fs::write(&database, b"unchanged shared database").unwrap();
+        let owner =
+            blocking_database_family_write_lock_with_timeout(&first_beads, &database, Some(100))
+                .unwrap();
+        let error =
+            cancel_read_authority_at_wait(&second_beads, &database, "database-family write lock");
+        assert!(matches!(error, BeadsError::ShuttingDown));
+        let still_held =
+            blocking_database_family_write_lock_with_timeout(&second_beads, &database, Some(0))
+                .unwrap_err();
+        assert!(
+            matches!(
+                still_held,
+                BeadsError::WriteLockTimeout { ref role, retryable: false, .. }
+                    if role == "database-family write lock"
+            ),
+            "the local workspace lock must be free while the other family owner remains: {still_held}"
+        );
+        assert_eq!(fs::read(&database).unwrap(), b"unchanged shared database");
+        drop(owner);
+        blocking_database_family_write_lock_with_timeout(&second_beads, &database, Some(100))
+            .expect("a later writer must acquire the released workspace and family authority");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_authority_cancelled_at_inode_wait_releases_partial_authority() {
+        let temp = TempDir::new().unwrap();
+        let first_beads = temp.path().join("first/.beads");
+        let second_beads = temp.path().join("second/.beads");
+        fs::create_dir_all(&first_beads).unwrap();
+        fs::create_dir_all(&second_beads).unwrap();
+        let database = first_beads.join("beads.db");
+        let alias = second_beads.join("alias.db");
+        fs::write(&database, b"unchanged hard-linked database").unwrap();
+        fs::hard_link(&database, &alias).unwrap();
+        let owner =
+            blocking_database_family_write_lock_with_timeout(&first_beads, &database, Some(100))
+                .unwrap();
+        let error =
+            cancel_read_authority_at_wait(&second_beads, &alias, "database write authority");
+        assert!(matches!(error, BeadsError::ShuttingDown));
+        let still_held =
+            blocking_database_family_write_lock_with_timeout(&second_beads, &alias, Some(0))
+                .unwrap_err();
+        assert!(
+            matches!(
+                still_held,
+                BeadsError::WriteLockTimeout { ref role, retryable: false, .. }
+                    if role == "database write authority"
+            ),
+            "workspace and canonical locks must be free while inode authority remains: {still_held}"
+        );
+        assert_eq!(
+            fs::read(&database).unwrap(),
+            b"unchanged hard-linked database"
+        );
+        assert_eq!(fs::read(&alias).unwrap(), b"unchanged hard-linked database");
+        drop(owner);
+        blocking_database_family_write_lock_with_timeout(&second_beads, &alias, Some(100))
+            .expect("a later alias writer must acquire all released authority");
     }
 
     #[test]

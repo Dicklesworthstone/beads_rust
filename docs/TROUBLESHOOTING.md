@@ -694,6 +694,19 @@ other writers. If `.sync.lock` is already held, startup skips automatic import
 without opening the original database writable; it keeps the verified private
 snapshot already obtained by the recheck.
 
+A shutdown signal received while a read is waiting to start automatic import
+cancels that admission and releases any authority it has already acquired. The
+command exits with the signal's status without starting the import or producing
+query output, even if another process still holds the contested lock. Once an
+import has started, its safe completion and writable teardown remain protected;
+cancellation does not roll back an already committed import.
+
+Automatic import refuses a torn WAL or a WAL index that needs live recovery.
+A readable private snapshot is not permission to repair the original family.
+Inspect the reported condition with `br doctor --json` and use the applicable
+reviewed recovery procedure. Healthy WAL-backed databases remain eligible for
+automatic import.
+
 This handoff keeps normal writers serialized, preserves sole-opener checkpoint
 admission, and does not let database replacement change an in-flight query.
 Incomplete recovery, changed database routing or identity, and an unavailable

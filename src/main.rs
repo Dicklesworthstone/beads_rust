@@ -594,15 +594,28 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                     database = %paths.db_path.display(),
                     "Read startup is acquiring write authority for automatic import"
                 );
+                let acquire_authority = if requires_read_only_storage(&cli.command) {
+                    beads_rust::sync::blocking_database_family_write_lock_for_read_startup_with_timeout
+                } else {
+                    beads_rust::sync::blocking_database_family_write_lock_with_timeout
+                };
                 auto_import_write_lock = match ctx.beads_dir.as_deref().map(|beads_dir| {
-                    beads_rust::sync::blocking_database_family_write_lock_with_timeout(
-                        beads_dir,
-                        &paths.db_path,
-                        lock_timeout,
-                    )
-                    .map(Arc::new)
+                    acquire_authority(beads_dir, &paths.db_path, lock_timeout).map(Arc::new)
                 }) {
                     Some(Ok(lock)) => Some(lock),
+                    Some(Err(BeadsError::ShuttingDown)) => {
+                        let Some(exit_code) = beads_rust::shutdown::exit_code() else {
+                            return Err(BeadsError::ShuttingDown);
+                        };
+                        // The canceled acquisition has already released every
+                        // partial lock and its queue registration before logging.
+                        tracing::debug!(
+                            target: "br::startup",
+                            exit_code,
+                            "Read interrupted before automatic import; skipping query execution"
+                        );
+                        return Ok(exit_code);
+                    }
                     Some(Err(e)) => return Err(e),
                     None => None,
                 };
@@ -616,6 +629,11 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             // classified pending receipt keeps the command read-only; probe
             // uncertainty is an error because serving the database anyway
             // could return stale state.
+            if requires_read_only_storage(&cli.command)
+                && let Some(exit_code) = beads_rust::shutdown::exit_code()
+            {
+                return Ok(exit_code);
+            }
             if (ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage)
                 && let Some(authority) = auto_import_write_lock.as_ref().or(write_lock.as_ref())
             {
@@ -676,10 +694,24 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                     // import must retain its already verified private snapshot.
                     // This exact-current reopen still forbids schema migration,
                     // database creation, or reconstruction from JSONL (GH #585).
+                    if requires_read_only_storage(&cli.command)
+                        && let Some(exit_code) = beads_rust::shutdown::exit_code()
+                    {
+                        return Ok(exit_code);
+                    }
                     res.reopen_current_for_auto_import(authority)?;
                 }
                 let expected_prefix =
                     Some(resolve_auto_import_expected_prefix(res, &ctx.overrides)?);
+                // Opening the current database may take time. Recheck after
+                // it and prefix resolution, before starting a new import.
+                // Storage retains authority through protected close on return;
+                // an import already entered still completes before cancellation.
+                if requires_read_only_storage(&cli.command)
+                    && let Some(exit_code) = beads_rust::shutdown::exit_code()
+                {
+                    return Ok(exit_code);
+                }
                 auto_import_if_stale(
                     &mut res.storage,
                     &paths.beads_dir,

@@ -4319,13 +4319,18 @@ impl OpenStorageResult {
     ///
     /// # Errors
     ///
-    /// Refuses mismatched authority, a missing or incompatible database, or
-    /// any engine-open failure. No recovery fallback is attempted.
+    /// Refuses mismatched authority, a missing or incompatible database,
+    /// required live WAL recovery, or any engine-open failure. No recovery
+    /// fallback is attempted.
     #[doc(hidden)]
     pub fn reopen_current_for_auto_import(
         &mut self,
         authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
     ) -> Result<()> {
+        use crate::cli::commands::doctor_subsystems::schema_migration::{
+            torn_wal_present, wal_index_needs_recovery,
+        };
+
         if self.no_db
             || self.database_transition_failed_closed
             || self.pending_recovery_backup.is_some()
@@ -4355,6 +4360,23 @@ impl OpenStorageResult {
                 self.paths.db_path.display(),
             )
         };
+        // READ_WRITE is recovery-capable even when schema migration and
+        // metadata repair are disabled. An observational startup may have read
+        // a private, recovered snapshot while the live WAL/index still needs
+        // recovery. Do not bypass the startup recovery contract (sole opener,
+        // retained evidence, and refusal of frame-bearing WAL recovery) merely
+        // because JSONL freshness now requires an import.
+        if torn_wal_present(&self.paths.db_path)? || wal_index_needs_recovery(&self.paths.db_path)?
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "{}; the live WAL or its index requires recovery before a writable open. \
+                     Preserve the complete database family and follow the diagnosed recovery \
+                     procedure before retrying; automatic import does not recover the database",
+                    refusal_context(),
+                ),
+            });
+        }
         let mut storage = SqliteStorage::open_current_for_reconcile(
             &self.paths.db_path,
             self.resolved_lock_timeout,
@@ -13075,6 +13097,176 @@ routing:
             "mismatched authority changed source: {diffs:?}"
         );
         assert!(context.retained_database_write_authority().is_none());
+        assert!(!beads_dir.join(".br_recovery").exists());
+    }
+
+    fn leave_auto_import_metadata_in_wal(db_path: &Path) {
+        let mut fixture = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        fixture.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        fixture.execute("BEGIN IMMEDIATE").unwrap();
+        fixture
+            .execute(
+                "INSERT INTO metadata (key, value) \
+                 VALUES ('auto_import_wal_sentinel', 'committed database-only state')",
+            )
+            .unwrap();
+        fixture.execute("COMMIT").unwrap();
+        fixture.close_without_checkpoint_in_place().unwrap();
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        assert!(fs::metadata(wal_path).unwrap().len() > 32);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn current_auto_import_reopen_refuses_live_wal_recovery_without_touching_source() {
+        for condition in ["missing-index", "stale-index", "torn-wal"] {
+            // Match the platform capability of the existing startup probe:
+            // native Unix index recovery is supported on Linux/Android/macOS/iOS.
+            // Torn WAL refusal is independent of that capability.
+            if condition != "torn-wal"
+                && !crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
+            {
+                continue;
+            }
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            let db_path = beads_dir.join("beads.db");
+            let wal_path = beads_dir.join("beads.db-wal");
+            let shm_path = beads_dir.join("beads.db-shm");
+            let jsonl_path = beads_dir.join("issues.jsonl");
+            fs::create_dir_all(&beads_dir).unwrap();
+            let fixture = SqliteStorage::open(&db_path).unwrap();
+            fixture
+                .execute_test_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            drop(fixture);
+            write_single_issue_jsonl(&jsonl_path, "bd-source", "Import must not recover live WAL");
+            let mut context = open_storage_with_cli(
+                &beads_dir,
+                &CliOverrides {
+                    read_only_storage: true,
+                    ..CliOverrides::default()
+                },
+            )
+            .unwrap();
+
+            if condition == "torn-wal" {
+                if wal_path.exists() {
+                    fs::rename(&wal_path, temp.path().join("retained-frameless-wal")).unwrap();
+                }
+                fs::write(&wal_path, b"torn WAL header").unwrap();
+            } else {
+                leave_auto_import_metadata_in_wal(&db_path);
+                fs::rename(&shm_path, temp.path().join("retained-matching-shm")).unwrap();
+                if condition == "stale-index" {
+                    fs::write(&shm_path, vec![0_u8; 32_768]).unwrap();
+                }
+            }
+            let before = database_family_snapshot(&db_path).unwrap();
+            let jsonl_before = fs::read(&jsonl_path).unwrap();
+            let authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &beads_dir,
+                    &db_path,
+                    Some(100),
+                )
+                .unwrap(),
+            );
+
+            let error = context
+                .reopen_current_for_auto_import(&authority)
+                .expect_err("automatic import must refuse live WAL recovery before engine open");
+
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains("Automatic import refused"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("live WAL or its index requires recovery"));
+            assert!(diagnostic.contains("br doctor --json"));
+            assert!(context.storage.attached_write_authority().is_none());
+            assert!(context.retained_database_write_authority().is_none());
+            assert_eq!(
+                context
+                    .storage
+                    .get_metadata("auto_import_wal_sentinel")
+                    .unwrap(),
+                None,
+                "refusal must retain the original observational handle"
+            );
+            assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+            assert!(!beads_dir.join(".br_recovery").exists());
+            assert_eq!(
+                database_family_snapshot(&db_path).unwrap(),
+                before,
+                "{condition} refusal must not change any database-family bytes"
+            );
+
+            if condition != "torn-wal" {
+                let preserved = SqliteStorage::open_current_read_only(&db_path)
+                    .unwrap()
+                    .expect("a private snapshot may still recover the preserved committed WAL");
+                assert_eq!(
+                    preserved.get_metadata("auto_import_wal_sentinel").unwrap(),
+                    Some("committed database-only state".to_string())
+                );
+                drop(preserved);
+                let diffs = database_family_read_only_diffs(
+                    &before,
+                    &database_family_snapshot(&db_path).unwrap(),
+                );
+                assert!(
+                    diffs.is_empty(),
+                    "private read changed {condition}: {diffs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_auto_import_reopen_accepts_healthy_committed_wal() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = beads_dir.join("beads.db-wal");
+        fs::create_dir_all(&beads_dir).unwrap();
+        drop(SqliteStorage::open(&db_path).unwrap());
+        let mut context = open_storage_with_cli(
+            &beads_dir,
+            &CliOverrides {
+                read_only_storage: true,
+                ..CliOverrides::default()
+            },
+        )
+        .unwrap();
+        leave_auto_import_metadata_in_wal(&db_path);
+        let main_before = fs::read(&db_path).unwrap();
+        let wal_before = fs::read(&wal_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(100),
+            )
+            .unwrap(),
+        );
+
+        context
+            .reopen_current_for_auto_import(&authority)
+            .expect("a healthy framed WAL remains available for authorized automatic import");
+
+        assert_eq!(
+            context
+                .storage
+                .get_metadata("auto_import_wal_sentinel")
+                .unwrap(),
+            Some("committed database-only state".to_string()),
+            "the writable handle must observe the current committed WAL"
+        );
+        assert!(context.storage.attached_write_authority().is_some());
+        assert!(context.retained_database_write_authority().is_some());
+        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
         assert!(!beads_dir.join(".br_recovery").exists());
     }
 

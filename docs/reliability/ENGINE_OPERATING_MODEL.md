@@ -69,6 +69,10 @@ Implemented in `src/sync/mod.rs` (`DatabaseOpenerLease`) and
   the exit-time TRUNCATE (`SqliteStorage::drop`, only when the handle made
   mutations, #270) first **upgrade to the exclusive hold** and are **skipped
   when another process has the database open** (`CheckpointAdmission::PeersPresent`).
+  Teardown also revalidates any attached database-family write authority before
+  checkpointing. If a lock or database identity has changed, it skips the
+  checkpoint and closes without checkpointing while retaining the opener hold;
+  committed WAL contents remain available for a later safe open.
 - New openers wait out an in-flight exclusive hold and refuse admission after
   five seconds; they never proceed without registration.
 - A sibling `.br-db-openers-<hash>.transition.lock` serializes upgrades before
@@ -99,6 +103,15 @@ freshness probe may require an automatic import. That escalation must retain
 the same workspace, canonical-path and database-inode authority through the
 protected freshness/pending-merge reprobe, the import, and writable teardown.
 
+Before an automatic import begins, read-startup admission cooperatively honors
+shutdown requests at each authority component, including fair-queue registration.
+Cancellation releases partial acquisitions and the caller's own waiter entry;
+it does not wait for the lock holder to finish or start the pending import.
+The CLI preserves the signal's exit status without rendering query output.
+Mutating commands, recovery and cleanup retain their existing acquisition
+semantics, and an already-started import retains protected completion and close.
+These checkpoints do not impose a hard wall-clock bound on filesystem calls.
+
 Before command dispatch, `OpenStorageResult::finish_read_only_startup` verifies
 the routing and authority, captures and verifies a private database family,
 and closes the writable connection while its authority is still live. The
@@ -119,6 +132,12 @@ after the no-import decision is final. Likewise, the automatic-import path
 must acquire its nonblocking sync lock before reopening writable storage. A
 busy sync lock leaves the protected private snapshot intact and avoids an
 unnecessary live open, teardown, and second capture.
+
+The non-repairing reopen for automatic import also refuses a torn WAL or a WAL
+index that requires recovery before entering the writable engine open. A private
+read snapshot's successful recovery does not authorize repair of the live family.
+This keeps the sole-opener, preserved-evidence and reviewed-recovery requirements
+in force; a healthy WAL remains eligible for an ordinary import.
 
 The snapshot retains the committed startup state independently of later writes
 or database-family replacement. An unfinished recovery or an unverifiable

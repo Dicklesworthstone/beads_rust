@@ -1432,13 +1432,13 @@ fn e2e_586_interrupted_read_does_not_strand_writer_authority() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn e2e_586_interrupted_import_finishes_startup_without_running_search() {
+fn e2e_586_cancelled_auto_import_wait_exits_without_writer_release() {
     let workspace = snapshot_search_workspace();
     let root = &workspace.root;
     let jsonl_path = root.join(".beads/issues.jsonl");
     let mut incoming: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&jsonl_path).unwrap()).unwrap();
-    incoming["notes"] = "import completed before interruption was honored".into();
+    incoming["notes"] = "pending import must not start after interruption".into();
     incoming["updated_at"] = "2999-01-01T00:00:00Z".into();
     fs::write(
         &jsonl_path,
@@ -1447,12 +1447,19 @@ fn e2e_586_interrupted_import_finishes_startup_without_running_search() {
     .unwrap();
     let jsonl_before = fs::read(&jsonl_path).unwrap();
     let owner = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+    let snapshot = || {
+        ["beads.db", "beads.db-wal", "beads.db-journal"].map(|name| {
+            let path = root.join(".beads").join(name);
+            path.exists().then(|| fs::read(path).unwrap())
+        })
+    };
+    let database_before = snapshot();
     let diagnostics = root.join("logs/interrupted-import-stderr.log");
     let mut command = br_child_command_in_dir_with_env(
         root,
         [
             "--lock-timeout",
-            "10000",
+            "30000",
             "--no-auto-flush",
             "search",
             "snapshot",
@@ -1466,8 +1473,9 @@ fn e2e_586_interrupted_import_finishes_startup_without_running_search() {
     wait_for_workspace_waiters(root, 1);
     wait_for_child_owned_workspace_registration(root, &mut reader.0[0]);
     request_and_observe_cooperative_shutdown(&mut reader.0[0]);
-    drop(owner);
-    let output = reader.finish(Duration::from_secs(20)).remove(0);
+    // Cancellation must finish while the competing owner still holds the
+    // lock, well before this reader's 30-second acquisition deadline.
+    let output = reader.finish(Duration::from_secs(5)).remove(0);
     let diagnostics = fs::read_to_string(diagnostics).unwrap();
     assert_eq!(output.status.code(), Some(143), "{diagnostics}");
     assert!(
@@ -1475,19 +1483,26 @@ fn e2e_586_interrupted_import_finishes_startup_without_running_search() {
         "cancelled read must not emit a result"
     );
     assert!(
-        diagnostics.contains("Read interrupted after startup; skipping query execution"),
+        diagnostics.contains("Read interrupted before automatic import; skipping query execution"),
         "{diagnostics}"
     );
     assert!(
         !diagnostics.contains("Search query execution started"),
         "{diagnostics}"
     );
-    let (_, acquired, latency) = workspace_lock_probe(root);
-    acquired.expect("cancelled startup releases the workspace lock");
-    eprintln!(
-        "GH586 cancelled-startup flock acquisition: {} ns",
-        latency.as_nanos()
+    let (_, acquired, _) = workspace_lock_probe(root);
+    assert!(
+        matches!(acquired, Err(std::fs::TryLockError::WouldBlock)),
+        "the competing writer must still own workspace authority"
     );
+    assert!(wait_for_workspace_waiters(root, 0).is_empty());
+    assert_eq!(
+        snapshot(),
+        database_before,
+        "cancelled waiter mutated the database"
+    );
+    assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+    drop(owner);
     let shown = run_br_in_dir(
         root,
         [
@@ -1504,8 +1519,96 @@ fn e2e_586_interrupted_import_finishes_startup_without_running_search() {
     );
     assert_eq!(
         extract_issues_array(&shown.stdout)[0]["notes"],
-        incoming["notes"]
+        "before concurrent writer"
     );
+    let writer = competing_snapshot_writer(root, "test-read");
+    assert!(
+        writer.status.success(),
+        "writer after cancelled wait failed: {writer:?}"
+    );
+    assert_eq!(fs::read(jsonl_path).unwrap(), jsonl_before);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_cancelled_search_preserves_completed_auto_import() {
+    let workspace = snapshot_search_workspace();
+    let root = &workspace.root;
+    let jsonl_path = root.join(".beads/issues.jsonl");
+    let mut incoming: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&jsonl_path).unwrap()).unwrap();
+    incoming["title"] = "Imported snapshot before search cancellation".into();
+    incoming["notes"] = "imported before search cancellation".into();
+    incoming["updated_at"] = "2999-01-01T00:00:00Z".into();
+    fs::write(
+        &jsonl_path,
+        format!("{}\n", serde_json::to_string(&incoming).unwrap()),
+    )
+    .unwrap();
+    let jsonl_before = fs::read(&jsonl_path).unwrap();
+    let mut reader = stalled_snapshot_search(root, false, true);
+    assert_read_has_no_workspace_authority(root, &mut reader.0[0]);
+
+    // The search is blocked on output after startup. A separate read, with
+    // import disabled, proves the incoming record is already committed to
+    // the live database before TERM is sent.
+    let shown = run_br_in_dir(
+        root,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            "test-read",
+            "--json",
+        ],
+    );
+    assert!(
+        shown.success,
+        "committed import verification failed: {shown:?}"
+    );
+    let issues = extract_issues_array(&shown.stdout);
+    assert_eq!(issues[0]["title"], incoming["title"]);
+    assert_eq!(issues[0]["notes"], incoming["notes"]);
+    let snapshot = || {
+        ["beads.db", "beads.db-wal", "beads.db-journal"].map(|name| {
+            let path = root.join(".beads").join(name);
+            path.exists().then(|| fs::read(path).unwrap())
+        })
+    };
+    let database_before = snapshot();
+    request_and_observe_cooperative_shutdown(&mut reader.0[0]);
+    let output = reader.finish(Duration::from_secs(10)).remove(0);
+    assert_eq!(output.status.code(), Some(143), "reader must honor TERM");
+    assert_eq!(
+        snapshot(),
+        database_before,
+        "cancellation changed the committed import"
+    );
+    assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+    assert!(wait_for_workspace_waiters(root, 0).is_empty());
+
+    let writer = competing_snapshot_writer(root, "test-read");
+    assert!(
+        writer.status.success(),
+        "writer after cancelled search failed: {writer:?}"
+    );
+    let shown = run_br_in_dir(
+        root,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            "test-read",
+            "--json",
+        ],
+    );
+    assert!(
+        shown.success,
+        "post-cancellation verification failed: {shown:?}"
+    );
+    let issues = extract_issues_array(&shown.stdout);
+    assert_eq!(issues[0]["title"], incoming["title"]);
+    assert_eq!(issues[0]["notes"], "after concurrent writer");
     assert_eq!(fs::read(jsonl_path).unwrap(), jsonl_before);
 }
 

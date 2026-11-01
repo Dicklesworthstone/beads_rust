@@ -23487,8 +23487,16 @@ impl Drop for SqliteStorage {
             match self.admit_checkpoint() {
                 CheckpointAdmission::Sole(hold) => {
                     exit_hold = hold;
-                    if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+                    // Sole-opener admission does not prove that the retained
+                    // writer authority still names the live database family.
+                    // A rejected startup handoff can reach Drop after that
+                    // authority changed; closing must not resume mutation.
+                    if let Err(e) = self.verify_attached_database_authority() {
+                        tracing::debug!(error = %e, "Skipping exit WAL checkpoint: database authority changed");
+                    } else if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
                         tracing::debug!(error = %e, "WAL checkpoint on drop failed (non-fatal)");
+                    } else if let Err(e) = self.verify_attached_database_authority() {
+                        tracing::warn!(error = %e, "Database authority changed during exit WAL checkpoint");
                     }
                 }
                 CheckpointAdmission::PeersPresent => {
@@ -42890,6 +42898,79 @@ required_fields:
         assert!(
             storage.get_issue("bd-drop-1").unwrap().is_some(),
             "row written before drop must be visible after re-open"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_preserves_committed_wal_after_workspace_lock_replacement() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(100),
+            )
+            .unwrap(),
+        );
+        storage.attach_write_authority(Arc::clone(&authority));
+        storage
+            .execute_test_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        storage
+            .execute_test_sql("PRAGMA wal_autocheckpoint=0")
+            .unwrap();
+        let main_before = fs::read(&db_path).unwrap();
+        let issue = make_issue(
+            "bd-drop-authority",
+            "Committed history survives rejected teardown authority",
+            Status::Open,
+            2,
+            None,
+            Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap(),
+            None,
+        );
+        storage.create_issue(&issue, "test").unwrap();
+        assert!(storage.mutation_count > 0);
+        assert_eq!(fs::read(&db_path).unwrap(), main_before);
+        let wal_before = fs::read(&wal_path).unwrap();
+        assert!(wal_before.len() > 32);
+
+        // Keep the DB inode and engine namespace unchanged so fsqlite cannot
+        // mask the missing Beads authority check with its own identity guard.
+        // Only the cooperative workspace-lock name changes.
+        fs::rename(
+            beads_dir.join(".write.lock"),
+            beads_dir.join("retained-write-lock"),
+        )
+        .unwrap();
+        fs::write(beads_dir.join(".write.lock"), b"replacement lock").unwrap();
+        assert!(authority.verify_database_authority().is_err());
+
+        drop(storage);
+
+        assert_eq!(
+            fs::read(&db_path).unwrap(),
+            main_before,
+            "teardown must not checkpoint after its writer authority changed"
+        );
+        assert_eq!(
+            fs::read(&wal_path).unwrap(),
+            wal_before,
+            "the committed WAL must remain intact for the next valid opener"
+        );
+        drop(authority);
+        let reopened = SqliteStorage::open_current_read_only(&db_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened.get_issue(&issue.id).unwrap().unwrap().title,
+            issue.title
         );
     }
 
