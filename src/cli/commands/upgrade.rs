@@ -359,20 +359,11 @@ fn release_binary_asset_for<'a>(
     target: &str,
     identifier: Option<&str>,
 ) -> Option<&'a ReleaseAsset> {
-    release
-        .assets()
-        .iter()
-        .find(|asset| {
-            is_archive_asset_name(asset.name())
-                && asset.name().contains(target)
-                && identifier.is_none_or(|id| asset.name().contains(id))
-        })
-        .or_else(|| {
-            release.assets().iter().find(|asset| {
-                is_archive_asset_name(asset.name())
-                    && identifier.is_none_or(|id| asset.name().contains(id))
-            })
-        })
+    release.assets().iter().find(|asset| {
+        is_archive_asset_name(asset.name())
+            && asset.name().contains(target)
+            && identifier.is_none_or(|id| asset.name().contains(id))
+    })
 }
 
 fn checksum_asset_for<'a>(release: &'a Release, archive_name: &str) -> Option<&'a ReleaseAsset> {
@@ -868,6 +859,62 @@ mod tests {
 
         let asset = release_binary_asset_for(&release, "linux_amd64", None).unwrap();
         assert_eq!(asset.name(), "br-1.2.3-linux_amd64.tar.gz");
+    }
+
+    #[test]
+    fn release_binary_asset_rejects_other_platforms_when_target_is_missing() {
+        let release = release_with_assets(&[
+            "br-1.2.3-linux_arm64.tar.gz",
+            "br-1.2.3-darwin_amd64.tar.gz",
+            "br-1.2.3-darwin_arm64.tar.gz.sha256",
+            "br-1.2.3-darwin_arm64.tar.gz.minisig",
+        ]);
+
+        assert!(release_binary_asset_for(&release, "darwin_arm64", None).is_none());
+    }
+
+    #[test]
+    fn release_binary_asset_rejects_archives_without_target() {
+        let release = release_with_assets(&["br-1.2.3.tar.gz", "br-1.2.3.zip"]);
+
+        assert!(release_binary_asset_for(&release, "darwin_arm64", None).is_none());
+    }
+
+    #[test]
+    fn release_binary_asset_preserves_supported_target_aliases() {
+        let assets = [
+            ("darwin_amd64", "br-1.2.3-darwin_amd64.tar.gz"),
+            ("darwin_arm64", "br-1.2.3-darwin_arm64.tar.gz"),
+            ("linux_amd64", "br-1.2.3-linux_amd64.tar.gz"),
+            ("linux_musl_amd64", "br-1.2.3-linux_musl_amd64.tar.gz"),
+            ("linux_arm64", "br-1.2.3-linux_arm64.tar.gz"),
+            ("linux_musl_arm64", "br-1.2.3-linux_musl_arm64.tar.gz"),
+            ("windows_amd64", "br-1.2.3-windows_amd64.zip"),
+        ];
+        let names: Vec<_> = assets.iter().map(|(_, name)| *name).collect();
+        let release = release_with_assets(&names);
+
+        for (target, expected_name) in assets {
+            let asset = release_binary_asset_for(&release, target, None).unwrap();
+            assert_eq!(asset.name(), expected_name);
+        }
+    }
+
+    #[test]
+    fn release_binary_asset_requires_matching_target_and_identifier() {
+        let release = release_with_assets(&[
+            "br-1.2.3-darwin_arm64.tar.gz",
+            "br-1.2.3-alternate-darwin_amd64.tar.gz",
+        ]);
+        assert!(release_binary_asset_for(&release, "darwin_arm64", Some("alternate")).is_none());
+
+        let release = release_with_assets(&[
+            "br-1.2.3-darwin_arm64.tar.gz",
+            "br-1.2.3-alternate-darwin_amd64.tar.gz",
+            "br-1.2.3-alternate-darwin_arm64.tar.gz",
+        ]);
+        let asset = release_binary_asset_for(&release, "darwin_arm64", Some("alternate")).unwrap();
+        assert_eq!(asset.name(), "br-1.2.3-alternate-darwin_arm64.tar.gz");
     }
 
     #[test]
