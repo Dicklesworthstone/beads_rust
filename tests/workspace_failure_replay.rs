@@ -68,6 +68,20 @@ impl PreservationRefusalEvidence {
     }
 
     fn assert_unchanged(&self, fixture: &FixtureWorkspace) {
+        for name in ["beads.db", "beads.db-wal", "beads.db-journal"] {
+            let path = fixture.beads_dir.join(name);
+            let observed = match fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("read current source {}: {error}", path.display()),
+            };
+            assert_eq!(
+                observed.as_ref(),
+                self.source_bytes.get(&path),
+                "refusal changed the data-bearing family inventory: {}",
+                path.display()
+            );
+        }
         for path in &self.family_paths {
             assert!(
                 path.is_file(),
@@ -645,6 +659,20 @@ fn surface_label(name: &str, surface: &str) -> String {
 fn run_surface(fixture: &FixtureWorkspace, surface: &str) -> BrRun {
     let label = surface_label(&fixture.metadata.name, surface);
     match surface {
+        // The malformed-primary manifests describe refusal at ordinary
+        // writable startup. Reads have a separate observational contract;
+        // disable sync here so this probe reaches the opener itself.
+        "startup/open" | "create" if fixture.preservation_evidence.is_some() => run_br(
+            &fixture.workspace,
+            [
+                "create",
+                "Replay preservation refusal probe",
+                "--no-auto-import",
+                "--no-auto-flush",
+                "--json",
+            ],
+            &label,
+        ),
         "startup/open" => run_br(&fixture.workspace, ["list", "--json"], &label),
         "create" => run_br(
             &fixture.workspace,
@@ -753,20 +781,79 @@ fn assert_unflushed_preservation_refusal(fixture: &FixtureWorkspace, run: &BrRun
     for detail in [
         "Automatic database recovery refused",
         "unflushed-state preservation",
+        "the original database could not be opened",
         "not replaced",
         ".br_recovery",
-        "br doctor --repair",
+        "br doctor --json",
     ] {
         assert!(
             message.contains(detail),
             "{context}: missing {detail:?} in {message}"
         );
     }
+    assert!(
+        message.contains(&current_database_path(fixture).display().to_string()),
+        "{context}: refusal must identify the retained primary: {message}"
+    );
     fixture
         .preservation_evidence
         .as_ref()
         .expect("preservation refusal fixture evidence")
         .assert_unchanged(fixture);
+}
+
+fn assert_read_only_source_unchanged(
+    fixture: &FixtureWorkspace,
+    before: &BTreeMap<PathBuf, Vec<u8>>,
+) {
+    assert_eq!(
+        retained_tree_bytes(&fixture.beads_dir),
+        *before,
+        "observation changed tracker files or created source sidecars"
+    );
+    fixture
+        .preservation_evidence
+        .as_ref()
+        .expect("malformed-primary preservation evidence")
+        .assert_unchanged(fixture);
+}
+
+fn assert_read_only_header_refusal(fixture: &FixtureWorkspace, command: &[&str], label: &str) {
+    for explicit_flags in [false, true] {
+        let before = retained_tree_bytes(&fixture.beads_dir);
+        let mut args = command.to_vec();
+        args.push("--json");
+        if explicit_flags {
+            args.extend(["--no-auto-import", "--no-auto-flush"]);
+        }
+        let run = run_br(
+            &fixture.workspace,
+            args,
+            &format!("{label}_explicit_{explicit_flags}"),
+        );
+        assert_eq!(run.status.code(), Some(7), "{label}: {run:?}");
+        let error: Value = serde_json::from_str(&run.stdout)
+            .unwrap_or_else(|error| panic!("{label}: expected one JSON error: {error}; {run:?}"));
+        assert_eq!(error["error"]["code"], "CONFIG_ERROR", "{label}: {error}");
+        let message = error["error"]["message"]
+            .as_str()
+            .expect("read-only refusal");
+        for detail in [
+            "Read-only storage open refused for",
+            "writable recovery and schema changes are disabled",
+            "br doctor --json",
+        ] {
+            assert!(
+                message.contains(detail),
+                "{label}: missing {detail:?}: {message}"
+            );
+        }
+        assert!(
+            message.contains(&current_database_path(fixture).display().to_string()),
+            "{label}: refusal must identify the untouched primary: {message}"
+        );
+        assert_read_only_source_unchanged(fixture, &before);
+    }
 }
 
 fn first_issue_id(list_json: &Value) -> String {
@@ -1295,6 +1382,23 @@ fn assert_core_read_failure(
     where_json: &Value,
     failure: WorkspaceFailureCommandOutcome,
 ) {
+    if failure == WorkspaceFailureCommandOutcome::FailsUnflushedPreservation {
+        let issue_id = first_issue_id_from_jsonl(&fixture.beads_dir.join("issues.jsonl"));
+        for (command, label) in [
+            (vec!["list"], "core_list_read_only"),
+            (vec!["ready"], "core_ready_read_only"),
+            (vec!["show", &issue_id], "core_show_read_only"),
+            (vec!["sync", "--status"], "core_status_read_only"),
+        ] {
+            let workspace = fixture_workspace(&fixture.metadata.name);
+            assert_read_only_header_refusal(
+                &workspace,
+                &command,
+                &surface_label(&fixture.metadata.name, label),
+            );
+        }
+        return;
+    }
     let list_workspace = fixture_workspace(&fixture.metadata.name);
     assert_surface_outcome(&list_workspace, "startup/open", failure);
 
@@ -1316,13 +1420,6 @@ fn assert_core_read_failure(
             assert_config_error(
                 &ready,
                 "conflict marker",
-                &format!("{} core ready", fixture.metadata.name),
-            );
-        }
-        WorkspaceFailureCommandOutcome::FailsUnflushedPreservation => {
-            assert_unflushed_preservation_refusal(
-                &ready_workspace,
-                &ready,
                 &format!("{} core ready", fixture.metadata.name),
             );
         }
@@ -1352,13 +1449,6 @@ fn assert_core_read_failure(
             assert_config_error(
                 &show,
                 "conflict marker",
-                &format!("{} core show", fixture.metadata.name),
-            );
-        }
-        WorkspaceFailureCommandOutcome::FailsUnflushedPreservation => {
-            assert_unflushed_preservation_refusal(
-                &show_workspace,
-                &show,
                 &format!("{} core show", fixture.metadata.name),
             );
         }
@@ -1513,7 +1603,19 @@ fn workspace_failure_replay_manifest_expectations_hold_on_fresh_copies() {
     for fixture in fixtures {
         for expectation in &fixture.metadata.expected_command_outcomes {
             let workspace = fixture_workspace(&fixture.metadata.name);
-            assert_surface_outcome(&workspace, &expectation.surface, expectation.outcome);
+            // Status is observational even when the historical manifest
+            // classifies this malformed workspace as unsafe for recovery.
+            if expectation.outcome == WorkspaceFailureCommandOutcome::FailsUnflushedPreservation
+                && expectation.surface == "sync --status"
+            {
+                assert_read_only_header_refusal(
+                    &workspace,
+                    &["sync", "--status"],
+                    &surface_label(&fixture.metadata.name, &expectation.surface),
+                );
+            } else {
+                assert_surface_outcome(&workspace, &expectation.surface, expectation.outcome);
+            }
         }
     }
 }
@@ -1548,6 +1650,10 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
 
     for fixture in fixtures {
         let where_workspace = fixture_workspace(&fixture.metadata.name);
+        let where_before = where_workspace
+            .preservation_evidence
+            .as_ref()
+            .map(|_| retained_tree_bytes(&where_workspace.beads_dir));
         let where_run = run_br(
             &where_workspace.workspace,
             ["where", "--json"],
@@ -1561,8 +1667,15 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
         );
         let where_json =
             parse_stdout_json(&where_run, &format!("{} core where", fixture.metadata.name));
+        if let Some(before) = &where_before {
+            assert_read_only_source_unchanged(&where_workspace, before);
+        }
 
         let info_workspace = fixture_workspace(&fixture.metadata.name);
+        let info_before = info_workspace
+            .preservation_evidence
+            .as_ref()
+            .map(|_| retained_tree_bytes(&info_workspace.beads_dir));
         let info = run_br(
             &info_workspace.workspace,
             ["info", "--json"],
@@ -1575,6 +1688,9 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
             info.stderr
         );
         let _info_json = parse_stdout_json(&info, &format!("{} core info", fixture.metadata.name));
+        if let Some(before) = &info_before {
+            assert_read_only_source_unchanged(&info_workspace, before);
+        }
 
         match fixture
             .metadata
@@ -1615,9 +1731,13 @@ fn workspace_failure_replay_core_write_surfaces_match_expected_posture() {
             .outcome_for("create")
             .expect("create expectation");
         let workspace = fixture_workspace(&fixture.metadata.name);
+        let mut args = vec!["create", "Replay write probe", "--json"];
+        if expected_create == WorkspaceFailureCommandOutcome::FailsUnflushedPreservation {
+            args.extend(["--no-auto-import", "--no-auto-flush"]);
+        }
         let create = run_br(
             &workspace.workspace,
-            ["create", "Replay write probe", "--json"],
+            args,
             &surface_label(&fixture.metadata.name, "core_create"),
         );
 

@@ -693,7 +693,14 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             prefix,
             force,
             backend: _,
-        } => commands::init::execute(prefix, force, None, &output_ctx),
+        } => commands::init::execute_with_authority(
+            prefix,
+            force,
+            None,
+            &output_ctx,
+            write_lock.as_ref(),
+            cli.lock_timeout,
+        ),
         Commands::Create(args) => {
             execute_create_command(&args, &overrides, &output_ctx, &mut storage_result)
         }

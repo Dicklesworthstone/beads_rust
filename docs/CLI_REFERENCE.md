@@ -149,7 +149,7 @@ br init [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--prefix <PREFIX>` | Issue ID prefix (e.g., "bd", "proj") |
-| `--force` | Overwrite existing database |
+| `--force` | Reinitialize an existing current-schema workspace, retaining its database records |
 | `--backend <BACKEND>` | Backend type placeholder; currently ignored and always uses SQLite |
 
 **Examples:**
@@ -160,9 +160,18 @@ br init
 # Initialize with custom prefix
 br init --prefix myproj
 
-# Force reinitialize
+# Reinitialize a current-schema workspace
 br init --force
 ```
+
+`init` validates the database it will actually use, including a cache-directory
+target and the schema version in committed WAL frames. It refuses an existing
+legacy, future, or unsupported database before changing tracker files; `--force`
+does not authorize an unreviewed schema upgrade. Inspect that source with
+`br doctor --json` and use `br doctor migrate-schema plan` to prepare a supported
+lossless migration. Malformed startup metadata or a different global `--db`
+route cannot bypass this check. A missing main file with retained WAL frames or
+rollback data also requires an explicit recovery decision before initialization.
 
 ---
 

@@ -3,12 +3,14 @@
 //! retain their bytes. An ordinary mutation must refuse an orphan WAL that
 //! holds frames because its unflushed state cannot be established without
 //! the main database; a header-only WAL holds none, so the rebuild from
-//! JSONL proceeds. Explicit `br init` still quarantines the orphans before
-//! creating a fresh database.
+//! JSONL proceeds. Explicit `br init` applies the same preservation refusal
+//! to data-bearing sidecars and quarantines only empty or derived orphans
+//! before creating a fresh database.
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
@@ -47,14 +49,14 @@ fn plant_orphans(beads_dir: &Path) {
     }
 }
 
-fn assert_orphans_quarantined(beads_dir: &Path) {
+fn assert_orphans_quarantined(beads_dir: &Path, orphans: &[(&str, &[u8])]) {
     let recovery = beads_dir.join(".br_recovery");
     let quarantined: Vec<String> = fs::read_dir(&recovery)
         .unwrap_or_else(|err| panic!("{} missing: {err}", recovery.display()))
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
         .collect();
-    for (name, bytes) in ORPHANS {
+    for &(name, bytes) in orphans {
         // The engine recreates its own sidecars (`-wal-cert`, namespace
         // files, `-wal`) for the fresh database, so the live name may exist
         // again; what must be gone is the stale content.
@@ -77,6 +79,24 @@ fn assert_orphans_quarantined(beads_dir: &Path) {
             recovery.display()
         );
     }
+}
+
+fn orphan_inventory(beads_dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    walkdir::WalkDir::new(beads_dir)
+        .into_iter()
+        .map(|entry| {
+            let entry = entry.expect("read orphan fixture inventory");
+            assert!(entry.file_type().is_file() || entry.file_type().is_dir());
+            let bytes = entry
+                .file_type()
+                .is_file()
+                .then(|| fs::read(entry.path()).expect("read retained orphan fixture"));
+            (
+                entry.path().strip_prefix(beads_dir).unwrap().to_path_buf(),
+                bytes,
+            )
+        })
+        .collect()
 }
 
 fn assert_preservation_refusal(refused: &Output) {
@@ -258,27 +278,85 @@ fn missing_database_with_header_only_wal_is_rebuilt_from_jsonl() {
 }
 
 #[test]
-fn init_quarantines_orphaned_sidecars_before_creating_the_database() {
-    let _log = common::test_log("init_quarantines_orphaned_sidecars_before_creating_the_database");
+fn init_refuses_orphaned_wal_frames_and_nonempty_journal_without_changes() {
+    let _log =
+        common::test_log("init_refuses_orphaned_wal_frames_and_nonempty_journal_without_changes");
+    for (name, bytes) in [
+        ORPHANS[2],
+        (
+            "beads.db-journal",
+            b"uncommitted rollback journal history".as_slice(),
+        ),
+    ] {
+        let retained_root = TempDir::new_in(common::cli::isolated_temp_root())
+            .expect("tempdir")
+            .keep();
+        let root = retained_root.as_path();
+        let beads_dir = root.join(".beads");
+        let recovery = beads_dir.join(".br_recovery/previous-operator-run");
+        fs::create_dir_all(&recovery).expect("create retained recovery directory");
+        fs::write(recovery.join("evidence.bin"), b"original recovery evidence")
+            .expect("write retained recovery evidence");
+        for (derived_name, derived_bytes) in &ORPHANS[..2] {
+            fs::write(beads_dir.join(derived_name), derived_bytes)
+                .expect("write derived orphan sidecar");
+        }
+        fs::write(beads_dir.join(name), bytes).expect("write data-bearing orphan sidecar");
+        let before = orphan_inventory(&beads_dir);
+        for args in [vec!["init", "--json"], vec!["init", "--force", "--json"]] {
+            let refused = br(root, &args);
+            assert_eq!(refused.status.code(), Some(6), "{}", rendered(&refused));
+            let error: serde_json::Value = serde_json::from_slice(&refused.stdout)
+                .unwrap_or_else(|error| panic!("{error}: {}", rendered(&refused)));
+            assert_eq!(error["error"]["code"], "SYNC_CONFLICT", "{error}");
+            let message = error["error"]["message"].as_str().unwrap();
+            for detail in [
+                "Refusing init for database",
+                name,
+                "unflushed",
+                "br doctor --json",
+                "br doctor migrate-schema plan",
+            ] {
+                assert!(message.contains(detail), "missing {detail:?}: {message}");
+            }
+            assert_eq!(
+                orphan_inventory(&beads_dir),
+                before,
+                "Init changed original sidecars or recovery evidence on refusal"
+            );
+            assert!(!beads_dir.join("beads.db").exists());
+        }
+    }
+}
+
+#[test]
+fn init_quarantines_derived_and_header_only_sidecars_before_creating_the_database() {
+    let _log = common::test_log(
+        "init_quarantines_derived_and_header_only_sidecars_before_creating_the_database",
+    );
     let retained_root = TempDir::new_in(common::cli::isolated_temp_root())
         .expect("tempdir")
         .keep();
     let root = retained_root.as_path();
     let beads_dir = root.join(".beads");
     fs::create_dir_all(&beads_dir).expect("create .beads");
-    plant_orphans(&beads_dir);
+    let wal = header_only_wal();
+    let orphans = [ORPHANS[0], ORPHANS[1], ("beads.db-wal", wal.as_slice())];
+    for (name, bytes) in orphans {
+        fs::write(beads_dir.join(name), bytes).expect("write frameless or derived sidecar");
+    }
 
     let init = br(root, &["init"]);
     assert!(
         init.status.success(),
-        "init should quarantine the orphans and create the database:\n{}",
+        "init should quarantine frameless or derived orphans and create the database:\n{}",
         rendered(&init)
     );
     assert!(
         beads_dir.join("beads.db").is_file(),
         "init created no database"
     );
-    assert_orphans_quarantined(&beads_dir);
+    assert_orphans_quarantined(&beads_dir, &orphans);
 
     let created = br(root, &["create", "usable after init", "--json"]);
     assert!(created.status.success(), "{}", rendered(&created));

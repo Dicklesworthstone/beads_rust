@@ -59,10 +59,23 @@ fn is_binary(path: &std::path::Path) -> bool {
 }
 
 fn is_transient_sqlite(name: &str) -> bool {
+    // Init now retains both workspace and canonical database write authority.
+    // Match only the minted authority filename, not arbitrary operator locks.
+    let database_write_authority = name
+        .strip_prefix(".br-db-write-")
+        .and_then(|suffix| suffix.strip_suffix(".lock"))
+        .is_some_and(|digest| {
+            digest.len() == 24
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
     // The sole-opener lease (`.br-db-openers-<hash>.lock`, #457) is a flock
     // target that persists beside the database by design; init's .gitignore
     // covers it (`*.lock`) and `br doctor`'s engine block accounts for it.
-    name.starts_with(".br-db-openers-")
+    name == ".write.lock"
+        || database_write_authority
+        || name.starts_with(".br-db-openers-")
         || name.ends_with("-wal")
         || name.ends_with("-wal-cert")
         || name.ends_with("-wal-cert-head")

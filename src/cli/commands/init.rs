@@ -1,6 +1,7 @@
+mod preservation;
+
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode, rich_text_panel};
-use crate::storage::SqliteStorage;
 use crate::util::db_path;
 use rich_rust::prelude::*;
 use schemars::JsonSchema;
@@ -8,6 +9,7 @@ use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Successful initialization receipt emitted by JSON and TOON output modes.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -203,45 +205,62 @@ fn write_init_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the directory or database cannot be created.
-#[allow(clippy::too_many_lines)]
 pub fn execute(
     prefix: Option<String>,
     force: bool,
     root_dir: Option<&Path>,
     ctx: &OutputContext,
 ) -> Result<()> {
+    execute_with_authority(prefix, force, root_dir, ctx, None, None)
+}
+
+/// Initialize under startup's authority when it protects the actual init target.
+///
+/// # Errors
+///
+/// Refuses an unsafe existing database or a mismatched authority before init
+/// changes workspace files. Other errors match [`execute`].
+#[allow(clippy::too_many_lines)]
+pub fn execute_with_authority(
+    prefix: Option<String>,
+    force: bool,
+    root_dir: Option<&Path>,
+    ctx: &OutputContext,
+    write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
+    lock_timeout_ms: Option<u64>,
+) -> Result<()> {
     let base_dir = root_dir.unwrap_or_else(|| Path::new("."));
     let beads_dir = resolve_init_beads_dir(base_dir);
+    let effective_db_path = db_path(&beads_dir);
+
+    if path_entry_exists(&effective_db_path)? && !force {
+        return Err(BeadsError::AlreadyInitialized {
+            path: effective_db_path,
+        });
+    }
+    // Init resolves its target independently of startup metadata and --db.
+    // Admit that exact database before creating directories or changing files.
+    let db_existed = preservation::preflight(&effective_db_path)?;
+    preservation::verify_authority_target(&effective_db_path, write_authority)?;
 
     let mut created_dir = false;
-    if beads_dir.exists() {
-        // Check if DB exists (in cache dir if BEADS_CACHE_DIR is set)
-        let effective_db_path = db_path(&beads_dir);
-        if effective_db_path.exists() && !force {
-            return Err(BeadsError::AlreadyInitialized {
-                path: effective_db_path,
-            });
-        }
-    } else {
+    if !beads_dir.exists() {
         fs::create_dir(&beads_dir)?;
         created_dir = true;
     }
-
-    let effective_db_path = db_path(&beads_dir);
-    let db_existed = effective_db_path.exists();
 
     // Ensure cache directory exists if using BEADS_CACHE_DIR
     if let Some(parent) = effective_db_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    // Initialize DB (creates file and applies schema). Engine sidecars left
-    // behind without a database file would make the fresh open fail
-    // (beads_rust-avhq), so move them aside first.
-    if !db_existed {
-        crate::config::quarantine_orphaned_sidecars(&effective_db_path, &beads_dir);
-    }
-    let mut storage = SqliteStorage::open(&effective_db_path)?;
+    let mut storage = preservation::open_storage(
+        &beads_dir,
+        &effective_db_path,
+        db_existed,
+        write_authority,
+        lock_timeout_ms,
+    )?;
 
     // Set prefix in config table if provided, otherwise derive from directory name
     // Normalize to lowercase since ID validation requires lowercase prefixes
@@ -533,6 +552,7 @@ fn append_step(content: &mut Text, step: &InitStep, theme: &crate::output::Theme
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::SqliteStorage;
     use tempfile::TempDir;
     use tracing::info;
 
