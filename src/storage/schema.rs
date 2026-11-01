@@ -8,6 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
+pub(crate) mod hash_refresh;
 pub(crate) mod legacy_v4;
 
 #[cfg(test)]
@@ -1030,9 +1031,9 @@ fn validate_reviewed_schema_migration(
 ///
 /// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (4 and 13 through 18) are
 /// accepted, each running exactly the version-gated step chain up to
-/// `CURRENT_SCHEMA_VERSION` (#398). `marked_at` is written verbatim to every
-/// `dirty_issues` row rewritten by the v13 content-hash step, making the
-/// bookkeeping timestamp explicit and reviewable.
+/// `CURRENT_SCHEMA_VERSION` (#398). Hash refreshes update only the derived
+/// issue hashes; every existing dirty marker and export receipt stays exact.
+/// `marked_at` remains required by the receipt-bound calling contract.
 ///
 /// # Errors
 ///
@@ -1051,7 +1052,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
         legacy_v4::apply_in_transaction(conn)?
     } else if from == 13 {
         tracing::info!("Migrating database to schema version 14 (length-prefixed content hashes)");
-        rebuild_content_hashes_for_current_format_in_transaction(conn, marked_at)?
+        hash_refresh::apply_in_transaction(conn)?
     } else {
         0
     };
@@ -6041,7 +6042,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reviewed_v13_to_v15_steps_use_explicit_timestamp_and_preserve_legacy_gates() {
+    fn test_reviewed_v13_steps_preserve_bookkeeping_and_legacy_gates() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("reviewed-v13.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
@@ -6054,8 +6055,8 @@ mod tests {
         )
         .expect("seed issue");
         conn.execute(
-            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
-             VALUES ('bd-reviewed-v13', 'pre-v14-hash', '2026-04-03T01:00:00Z')",
+            "INSERT INTO export_hashes (rowid, issue_id, content_hash, exported_at) \
+             VALUES (83, 'bd-reviewed-v13', 'pre-v14-hash', '2026-04-03T01:00:00Z')",
         )
         .expect("seed export hash");
         conn.execute(
@@ -6065,6 +6066,11 @@ mod tests {
         .expect("seed legacy gate result");
         conn.execute("DELETE FROM dirty_issues")
             .expect("clear trigger-created dirty marker");
+        conn.execute(
+            "INSERT INTO dirty_issues (rowid, issue_id, marked_at) \
+             VALUES (71, 'bd-reviewed-v13', '2026-04-02T20:00:00Z')",
+        )
+        .expect("seed original dirty marker");
         conn.execute("DROP TABLE gate_result_history")
             .expect("restore pre-v15 shape");
         conn.execute("PRAGMA user_version = 13")
@@ -6102,33 +6108,33 @@ mod tests {
             Some("c42bf13dfd6447e08d119f8b0ad0a503d23ccaa92b211348fb6dfbc55a4e0779")
         );
         let dirty = conn
-            .query_row("SELECT marked_at FROM dirty_issues WHERE issue_id = 'bd-reviewed-v13'")
-            .expect("read explicit dirty marker");
+            .query_row(
+                "SELECT rowid, marked_at FROM dirty_issues WHERE issue_id = 'bd-reviewed-v13'",
+            )
+            .expect("read preserved dirty marker");
+        assert_eq!(dirty.get(0).and_then(SqliteValue::as_integer), Some(71));
         assert_eq!(
-            dirty.get(0).and_then(SqliteValue::as_text),
-            Some(marked_at),
-            "reviewed migration must write the caller-provided timestamp verbatim"
+            dirty.get(1).and_then(SqliteValue::as_text),
+            Some("2026-04-02T20:00:00Z"),
+            "the receipt timestamp must not replace durable dirty-marker metadata"
         );
         let export_count = conn
-            .query_row("SELECT COUNT(*) FROM export_hashes")
-            .expect("count export hashes");
+            .query_row("SELECT COUNT(*) FROM export_hashes WHERE rowid=83 AND content_hash='pre-v14-hash' AND exported_at='2026-04-03T01:00:00Z'")
+            .expect("count preserved export receipt");
         assert_eq!(
             export_count.get(0).and_then(SqliteValue::as_integer),
-            Some(0)
+            Some(1)
         );
-        let legacy_count = conn
-            .query_row("SELECT COUNT(*) FROM gate_results")
-            .expect("count legacy gate results");
+        let gate_counts = conn
+            .query_row("SELECT (SELECT COUNT(*) FROM gate_results), (SELECT COUNT(*) FROM gate_result_history)")
+            .expect("count preserved and new gate records");
         assert_eq!(
-            legacy_count.get(0).and_then(SqliteValue::as_integer),
+            gate_counts.get(0).and_then(SqliteValue::as_integer),
             Some(1),
             "v15 must preserve legacy unscoped evidence"
         );
-        let history_count = conn
-            .query_row("SELECT COUNT(*) FROM gate_result_history")
-            .expect("count scoped history");
         assert_eq!(
-            history_count.get(0).and_then(SqliteValue::as_integer),
+            gate_counts.get(1).and_then(SqliteValue::as_integer),
             Some(0),
             "legacy rows must not be promoted into a transition scope"
         );

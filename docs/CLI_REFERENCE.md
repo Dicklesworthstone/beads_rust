@@ -2535,6 +2535,16 @@ active after the upgrade. The plan reports this proof in
 `legacy_v4_conversion`; apply and undo verify the complete projected state
 before replacing the active database.
 
+The schema-13 hash refresh also preserves every original dirty marker and
+export receipt, including timestamps, raw SQL values, orphan records, and row
+IDs. It changes only the derived issue hashes after strictly decoding every
+input. Its forecast includes
+`content_hash_refresh_profile: "v13-preserve-bookkeeping-v1"`; the plan token
+binds that record-preserving behavior, and verification checks the exact
+destination hashes. Unsupported hash inputs refuse before a migration run or
+backup is created. Old, unfinished plans must be regenerated. Receipts for
+already installed historical migrations remain available for verified undo.
+
 Each source runs exactly the version-gated step chain it is missing —
 content-hash rebuild (13→14), transition-scoped gate history (→15), capacity exemptions (→16), and
 capacity occupancy (→17), the prerequisite field (→18), and typed dependency

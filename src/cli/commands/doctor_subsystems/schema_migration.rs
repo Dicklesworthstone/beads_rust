@@ -49,6 +49,7 @@ use crate::storage::schema::{
 };
 use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
 
+mod hash_refresh;
 mod legacy_v4;
 use legacy_v4::LegacyV4Projection;
 
@@ -107,6 +108,7 @@ struct ReviewedTablePreservation {
     name: String,
     columns: Vec<String>,
     projection: LegacyTableProjection,
+    candidate: Option<hash_refresh::CandidateIssueProjection>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -153,6 +155,8 @@ struct MigrationForecast {
     legacy_v15_conversion: Option<LegacyV15Projection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_v4_conversion: Option<LegacyV4Projection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_hash_refresh_profile: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     post_migration_maintenance: bool,
 }
@@ -2815,6 +2819,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 dependency_type_key_added: false,
                 legacy_v15_conversion: None,
                 legacy_v4_conversion: None,
+                content_hash_refresh_profile: None,
                 post_migration_maintenance: true,
             };
             let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -2878,6 +2883,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     let legacy_v4_conversion = (from == 4)
         .then(|| legacy_v4::projection(&conn, true))
         .transpose()?;
+    let content_hash_refresh_profile = hash_refresh::plan_profile(&conn, from)?;
     let issue_count = query_count(&conn, "SELECT COUNT(*) FROM issues")?;
     let gate_result_history_created = !named_table_exists(&conn, "gate_result_history")?;
     close_connection(conn)?;
@@ -2899,6 +2905,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
         dependency_type_key_added: !legacy_v15,
         legacy_v15_conversion,
         legacy_v4_conversion,
+        content_hash_refresh_profile,
         post_migration_maintenance: true,
     };
     let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -2922,6 +2929,13 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
              derived issue content hashes change; dirty markers and export receipts remain \
              exact. The token binds the complete projected destination before candidate \
              construction, installation, recovery, and undo"
+                .to_string()
+        } else if from == 13 {
+            "the schema13 hash refresh preserves every existing dirty marker and export receipt, \
+             including raw values and hidden rowids. Only derived issue hashes change to their \
+             strictly decoded values; the versioned forecast binds this behavior into the token. \
+             Apply retains the complete original SQLite family and verifies the exact projected \
+             state before installation, recovery, and undo"
                 .to_string()
         } else if integrity_clean {
             "review the forecast and retain this receipt; apply will recompute the complete \
@@ -3267,6 +3281,7 @@ fn validate_commit_ready_marker(
     run_dir: &Path,
 ) -> Result<()> {
     validate_raw_family_witness(&marker.raw_before)?;
+    hash_refresh::preserves_bookkeeping(&marker.forecast)?;
     let run_id = run_dir
         .file_name()
         .and_then(|value| value.to_str())
@@ -3856,6 +3871,9 @@ fn run_post_migration_maintenance(
     write_authority: &Arc<DatabaseFamilyWriteLock>,
     failed_stage: &mut Option<String>,
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
+    // An old receipt may recognize an already-installed generation for undo,
+    // but cannot authorize another candidate using destructive v13 semantics.
+    hash_refresh::require_fresh_profile(forecast)?;
     let from = forecast.from_version;
     let to = forecast.to_version;
     mark_stage(failed_stage, "source-witness");
@@ -5730,6 +5748,7 @@ fn capture_reviewed_state_preservation(
     db_path: &Path,
     forecast: &MigrationForecast,
 ) -> Result<Option<ReviewedStatePreservation>> {
+    let preserve_hash_bookkeeping = hash_refresh::preserves_bookkeeping(forecast)?;
     if forecast.legacy_v15_conversion.is_some() || forecast.legacy_v4_conversion.is_some() {
         // These profiles already bind their exact projected destination,
         // including raw values, rowids, sequence reservations, and schema.
@@ -5742,16 +5761,22 @@ fn capture_reviewed_state_preservation(
         {
             let name = preservation_text(row.get(0), "table name")?;
             if forecast.from_version == 13
+                && !preserve_hash_bookkeeping
                 && matches!(name.as_str(), "dirty_issues" | "export_hashes")
             {
-                // v14 deliberately invalidates these derived export caches.
+                // Compatibility only for already-installed old v1 receipts.
+                // Fresh v13 plans require the record-preserving hash profile.
                 continue;
             }
             let escaped = name.replace('\'', "''");
             let mut columns = Vec::new();
             for column in conn.query(&format!("PRAGMA main.table_xinfo('{escaped}')"))? {
                 let column = preservation_text(column.get(1), "column name")?;
-                if forecast.from_version != 13 || name != "issues" || column != "content_hash" {
+                if forecast.from_version != 13
+                    || preserve_hash_bookkeeping
+                    || name != "issues"
+                    || column != "content_hash"
+                {
                     columns.push(column);
                 }
             }
@@ -5762,10 +5787,20 @@ fn capture_reviewed_state_preservation(
                 )));
             }
             let projection = reviewed_table_projection(conn, &name, &columns, &[])?;
+            let candidate = (preserve_hash_bookkeeping && name == "issues")
+                .then(|| {
+                    hash_refresh::project_source_issues(
+                        conn,
+                        &columns,
+                        forecast.prerequisites_column_added,
+                    )
+                })
+                .transpose()?;
             tables.push(ReviewedTablePreservation {
                 name,
                 columns,
                 projection,
+                candidate,
             });
         }
         let close_metadata_column_added = tables.iter().any(|table| {
@@ -5911,8 +5946,18 @@ fn verify_reviewed_state_preservation(
             } else {
                 &[]
             };
-            let observed = reviewed_table_projection(conn, &table.name, &table.columns, sequences)?;
-            if observed != table.projection {
+            let (columns, projection) = if candidate {
+                table
+                    .candidate
+                    .as_ref()
+                    .map_or((table.columns.as_slice(), &table.projection), |projected| {
+                        (projected.columns.as_slice(), &projected.projection)
+                    })
+            } else {
+                (table.columns.as_slice(), &table.projection)
+            };
+            let observed = reviewed_table_projection(conn, &table.name, columns, sequences)?;
+            if &observed != projection {
                 return Err(BeadsError::Config(format!(
                     "reviewed migration preservation refused: table {} changed an authoritative \
                      value, row multiplicity, or hidden rowid at {}; the original database remains \
@@ -9002,6 +9047,7 @@ mod tests {
             dependency_type_key_added: false,
             legacy_v15_conversion: None,
             legacy_v4_conversion: None,
+            content_hash_refresh_profile: None,
             post_migration_maintenance: true,
         };
         let first = compute_plan_token("db", &logical, &forecast).unwrap();
@@ -9202,11 +9248,11 @@ mod tests {
         reviewed_source_migration_context(database_name, 14)
     }
 
-    fn reviewed_source_migration_context(
+    pub(super) fn reviewed_source_migration_context(
         database_name: &str,
         version: u32,
     ) -> (TempDir, MigrationContext) {
-        assert!(matches!(version, 14 | 17 | 18));
+        assert!(matches!(version, 13 | 14 | 17 | 18));
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
         fs::create_dir(&beads_dir).expect("create beads dir");
@@ -9231,9 +9277,30 @@ mod tests {
              )",
         )
         .expect("seed issue");
-        if version == 14 {
+        if version < 15 {
             conn.execute("DROP TABLE gate_result_history")
-                .expect("restore v14 shape");
+                .expect("restore pre-v15 shape");
+        }
+        if version == 13 {
+            for table in [
+                "capacity_exemption_history",
+                "capacity_exemptions",
+                "capacity_occupancy",
+            ] {
+                conn.execute(&format!("DROP TABLE {table}"))
+                    .expect("restore synthetic v13 shape");
+            }
+            crate::storage::schema::execute_batch(
+                &conn,
+                r"
+                UPDATE issues SET content_hash='pre-v14-hash';
+                INSERT INTO dirty_issues (rowid, issue_id, marked_at)
+                    VALUES (71, 'bd-schema-rehearsal', '2026-07-01T00:00:00Z');
+                INSERT INTO export_hashes (rowid, issue_id, content_hash, exported_at)
+                    VALUES (83, 'bd-schema-rehearsal', 'previous-export', '2026-06-01T00:00:00Z');
+            ",
+            )
+            .expect("seed durable v13 bookkeeping");
         }
         conn.execute(&format!("PRAGMA user_version = {version}"))
             .expect("stamp matching source version");
@@ -9339,6 +9406,7 @@ mod tests {
             dependency_type_key_added: true,
             legacy_v15_conversion: None,
             legacy_v4_conversion: None,
+            content_hash_refresh_profile: None,
             post_migration_maintenance: false,
         };
         (temp, db_path, forecast)
@@ -9403,7 +9471,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_preservation_allows_only_declared_derived_hash_changes() {
+    fn legacy_v13_receipt_preservation_recognizes_historical_hash_changes() {
         let (_temp, db_path, mut forecast) = preservation_fixture();
         forecast.from_version = 13;
         let proof = capture_reviewed_state_preservation(&db_path, &forecast).unwrap();

@@ -7,12 +7,14 @@
 
 use super::{
     BeadsError, CLOSE_METADATA_INDEXES, Connection, GATE_RESULTS_INDEXES, ISSUES_RUNTIME_INDEXES,
-    IssueType, Priority, Result, Row, SCHEMA_SQL, SqliteValue, Status,
-    attest_reviewed_source_core_tables, canonical_index_creation_statements,
-    connection_user_version, content_hash_from_parts, partial_index_predicate_matches,
-    runtime_index_key_shape_canonical, runtime_index_row_canonical,
-    semantic_partial_index_predicate_canonical, split_sql_statements, sql_contains_token_sequence,
+    Result, Row, SCHEMA_SQL, SqliteValue, attest_reviewed_source_core_tables,
+    canonical_index_creation_statements, connection_user_version, hash_refresh,
+    partial_index_predicate_matches, runtime_index_key_shape_canonical,
+    runtime_index_row_canonical, semantic_partial_index_predicate_canonical, split_sql_statements,
+    sql_contains_token_sequence,
 };
+
+pub use super::hash_refresh::content_hashes;
 
 pub const PROFILE: &str = "released-v0.1.27-schema4-preserve-records-v1";
 pub const NEW_TABLES: &[&str] = &[
@@ -177,70 +179,6 @@ fn text<'a>(value: Option<&'a SqliteValue>, field: &str) -> Result<&'a str> {
         .ok_or_else(|| refused(format!("{field} is not stored as TEXT")))
 }
 
-fn optional_text<'a>(value: Option<&'a SqliteValue>, field: &str) -> Result<Option<&'a str>> {
-    match value {
-        Some(SqliteValue::Null) => Ok(None),
-        Some(SqliteValue::Text(value)) => Ok(Some(value.as_ref())),
-        _ => Err(refused(format!("{field} is neither TEXT nor NULL"))),
-    }
-}
-
-fn flag(value: Option<&SqliteValue>, field: &str) -> Result<bool> {
-    match value.and_then(SqliteValue::as_integer) {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        _ => Err(refused(format!("{field} is not an integer boolean"))),
-    }
-}
-
-/// Recompute the current issue identity without normalizing or discarding any
-/// source field. Returning values before mutation also lets the plan bind the
-/// exact destination hashes instead of excluding hashes from preservation.
-pub fn content_hashes(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut hashes = Vec::new();
-    for row in conn.query(
-        "SELECT id, title, description, design, acceptance_criteria, notes, \
-         status, priority, issue_type, assignee, owner, created_by, external_ref, \
-         source_system, pinned, is_template FROM main.issues ORDER BY id",
-    )? {
-        let id = text(row.get(0), "issues.id")?;
-        let status_text = text(row.get(6), "issues.status")?;
-        let status = status_text
-            .parse::<Status>()
-            .unwrap_or_else(|_| Status::Custom(status_text.to_owned()));
-        let type_text = text(row.get(8), "issues.issue_type")?;
-        let issue_type = type_text
-            .parse::<IssueType>()
-            .unwrap_or_else(|_| IssueType::Custom(type_text.to_owned()));
-        let priority = row
-            .get(7)
-            .and_then(SqliteValue::as_integer)
-            .filter(|value| (0..=4).contains(value))
-            .and_then(|value| i32::try_from(value).ok())
-            .ok_or_else(|| refused(format!("issue {id} has an unsupported priority value")))?;
-        let hash = content_hash_from_parts(
-            text(row.get(1), "issues.title")?,
-            Some(text(row.get(2), "issues.description")?),
-            Some(text(row.get(3), "issues.design")?),
-            Some(text(row.get(4), "issues.acceptance_criteria")?),
-            None,
-            Some(text(row.get(5), "issues.notes")?),
-            &status,
-            &Priority(priority),
-            &issue_type,
-            optional_text(row.get(9), "issues.assignee")?,
-            optional_text(row.get(10), "issues.owner")?,
-            optional_text(row.get(11), "issues.created_by")?,
-            optional_text(row.get(12), "issues.external_ref")?,
-            optional_text(row.get(13), "issues.source_system")?,
-            flag(row.get(14), "issues.pinned")?,
-            flag(row.get(15), "issues.is_template")?,
-        );
-        hashes.push((id.to_owned(), hash));
-    }
-    Ok(hashes)
-}
-
 fn create_canonical_table(conn: &Connection, table: &str) -> Result<()> {
     let declaration = split_sql_statements(SCHEMA_SQL)
         .into_iter()
@@ -290,16 +228,7 @@ pub(super) fn apply_in_transaction(conn: &Connection) -> Result<usize> {
             .ok_or_else(|| refused(format!("canonical index {} is missing", index.name)))?;
         conn.execute(declaration)?;
     }
-    for (id, hash) in &hashes {
-        conn.execute_with_params(
-            "UPDATE main.issues SET content_hash = ? WHERE id = ?",
-            &[
-                SqliteValue::from(hash.as_str()),
-                SqliteValue::from(id.as_str()),
-            ],
-        )?;
-    }
-    Ok(hashes.len())
+    hash_refresh::write_hashes(conn, &hashes)
 }
 
 #[cfg(test)]
