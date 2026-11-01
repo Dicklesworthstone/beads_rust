@@ -693,6 +693,11 @@ run automatic import/export there. A slow or blocked preview output must not
 hold up destination writers. Actual routed deletions still acquire authority
 before planning and retain it through their writes and teardown.
 
+`br create --dry-run` and Markdown-import previews also leave pending exports
+untouched. They do not flush dirty database records, create a missing JSONL
+snapshot, publish history, or update the last-touched ID. The pending changes
+remain available for a later real mutation or explicit synchronization.
+
 If the protected recheck discovers a pending merge, automatic synchronization
 is disabled immediately. Its warning is emitted after the read handoff has
 released authority, so a full stderr pipe cannot make that warning hold up

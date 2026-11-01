@@ -1,6 +1,8 @@
 use assert_cmd::assert::OutputAssertExt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use tempfile::TempDir;
 use toon_rust::try_decode;
 
@@ -34,6 +36,236 @@ fn extract_issues_array(stdout: &[u8]) -> Vec<serde_json::Value> {
         .and_then(serde_json::Value::as_array)
         .cloned()
         .expect("list output issues array")
+}
+
+fn create_preview_command(root: &Path) -> assert_cmd::Command {
+    let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("br"));
+    command.current_dir(root).timeout(Duration::from_secs(10));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("BD_")
+            || name.starts_with("BEADS_")
+            || matches!(
+                name.as_ref(),
+                "BR_DISABLE_READ_ONLY_FAST_OPEN"
+                    | "BR_OUTPUT_FORMAT"
+                    | "TOON_DEFAULT_FORMAT"
+                    | "TOON_STATS"
+            )
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("BD_NO_DB", "false")
+        .env("BD_SYNC_AUTO_FLUSH", "true")
+        .env("BD_SYNC_AUTO_IMPORT", "true")
+        .env("BD_SYNC_HISTORY_ENABLED", "true")
+        .env("RUST_LOG", "error")
+        .args(["--actor", "create-preview-test", "--no-color"]);
+    command
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CreatePreviewDatabaseState {
+    issues: usize,
+    events: usize,
+    dirty: Vec<(String, String)>,
+    metadata: BTreeMap<&'static str, Option<String>>,
+}
+
+fn create_preview_database_state(beads_dir: &Path) -> CreatePreviewDatabaseState {
+    let observed = beads_rust::config::open_storage_with_cli(
+        beads_dir,
+        &beads_rust::config::CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            no_db: Some(false),
+            read_only_storage: true,
+            no_auto_import: Some(true),
+            no_auto_flush: Some(true),
+            ..Default::default()
+        },
+    )
+    .expect("inspect source state through a private read snapshot");
+    let mut dirty = observed.storage.get_dirty_issue_metadata().unwrap();
+    dirty.sort();
+    CreatePreviewDatabaseState {
+        issues: observed.storage.count_issues().unwrap(),
+        events: observed.storage.get_all_events(0).unwrap().len(),
+        dirty,
+        metadata: [
+            "needs_flush",
+            beads_rust::sync::METADATA_JSONL_CONTENT_HASH,
+            beads_rust::sync::METADATA_JSONL_MTIME,
+            beads_rust::sync::METADATA_JSONL_SIZE,
+            beads_rust::sync::METADATA_JSONL_FAST_WITNESS,
+            beads_rust::sync::METADATA_LAST_EXPORT_TIME,
+            beads_rust::sync::METADATA_LAST_IMPORT_TIME,
+            "portable_history_warnings",
+        ]
+        .into_iter()
+        .map(|key| (key, observed.storage.get_metadata(key).unwrap()))
+        .collect(),
+    }
+}
+
+type CreatePreviewFiles = BTreeMap<PathBuf, Option<Vec<u8>>>;
+
+fn collect_create_preview_files(root: &Path, dir: &Path, files: &mut CreatePreviewFiles) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let relative = path.strip_prefix(root).unwrap().to_path_buf();
+        if entry.file_type().unwrap().is_dir() {
+            files.insert(relative, None);
+            collect_create_preview_files(root, &path, files);
+        } else {
+            assert!(entry.file_type().unwrap().is_file());
+            files.insert(relative, Some(std::fs::read(&path).unwrap()));
+        }
+    }
+}
+
+fn create_preview_files(beads_dir: &Path) -> CreatePreviewFiles {
+    let mut files = BTreeMap::new();
+    collect_create_preview_files(beads_dir, beads_dir, &mut files);
+    files
+}
+
+fn assert_create_preview_files_unchanged(beads_dir: &Path, before: &CreatePreviewFiles) {
+    let after = create_preview_files(beads_dir);
+    let changed: BTreeSet<_> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "preview changed workspace files: {changed:?}"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_586_create_previews_preserve_pending_exports_and_last_touched() {
+    for missing_jsonl in [false, true] {
+        let temp = isolated_tempdir();
+        let root = temp.path();
+        let beads_dir = root.join(".beads");
+        let jsonl = beads_dir.join("issues.jsonl");
+        create_preview_command(root).arg("init").assert().success();
+        create_preview_command(root)
+            .args(["create", "Published seed", "--json"])
+            .assert()
+            .success();
+        create_preview_command(root)
+            .args(["--no-auto-flush", "create", "Unexported seed", "--json"])
+            .assert()
+            .success();
+        assert!(beads_dir.join("issues.history.jsonl").is_file());
+        if missing_jsonl {
+            std::fs::rename(&jsonl, root.join("retained-issues.jsonl")).unwrap();
+        }
+        std::fs::write(root.join("preview.md"), "## Preview from markdown\n").unwrap();
+        let state_before = create_preview_database_state(&beads_dir);
+        assert_eq!(state_before.issues, 2);
+        assert!(
+            !state_before.dirty.is_empty(),
+            "fixture needs a pending export"
+        );
+
+        // Holding real JSONL authority proves previews do not join the
+        // exporter; the bounded command timeout catches the old 30s wait.
+        // Repeat without contention to catch publication that would otherwise
+        // be masked by the held lock.
+        for hold_jsonl_authority in [true, false] {
+            let owner = hold_jsonl_authority.then(|| {
+                beads_rust::sync::blocking_jsonl_family_write_lock_with_timeout(&jsonl, Some(0))
+                    .unwrap()
+            });
+            if owner.is_some() {
+                assert!(matches!(
+                    beads_rust::sync::blocking_jsonl_family_write_lock_with_timeout(
+                        &jsonl,
+                        Some(0)
+                    ),
+                    Err(beads_rust::BeadsError::WriteLockTimeout { .. })
+                ));
+            }
+            let files_before = create_preview_files(&beads_dir);
+            for bulk in [false, true] {
+                let mut command = create_preview_command(root);
+                command.args(["create", "--dry-run", "--json", "--lock-timeout", "0"]);
+                if bulk {
+                    command.args(["--file", "preview.md"]);
+                } else {
+                    command.arg("Preview only");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "preview failed or waited for export: {output:?}"
+                );
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("AUTO_FLUSH_FAILED"));
+                let preview = if bulk {
+                    extract_issues_array(&output.stdout).remove(0)
+                } else {
+                    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+                };
+                assert!(
+                    preview["id"].as_str().is_some(),
+                    "preview still emits an issue"
+                );
+                if let Some(owner) = owner.as_ref() {
+                    owner.verify_jsonl_authority().unwrap();
+                    assert!(matches!(
+                        beads_rust::sync::blocking_jsonl_family_write_lock_with_timeout(
+                            &jsonl,
+                            Some(0),
+                        ),
+                        Err(beads_rust::BeadsError::WriteLockTimeout { .. })
+                    ));
+                }
+                assert_create_preview_files_unchanged(&beads_dir, &files_before);
+                assert_eq!(create_preview_database_state(&beads_dir), state_before);
+            }
+        }
+
+        // Ordinary single and markdown creation must still publish the
+        // existing dirty work, clear its markers, and update last-touched.
+        for bulk in [false, true] {
+            let mut command = create_preview_command(root);
+            command.args(["create", "--json"]);
+            if bulk {
+                command.args(["--file", "preview.md"]);
+            } else {
+                command.arg("Actually created");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "ordinary create failed: {output:?}"
+            );
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("AUTO_FLUSH_FAILED"));
+            let created = if bulk {
+                extract_issues_array(&output.stdout).remove(0)
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+            };
+            let created_id = created["id"].as_str().unwrap();
+            let published = std::fs::read_to_string(&jsonl).unwrap();
+            assert!(published.contains(created_id));
+            assert!(published.contains("Unexported seed"));
+            let touched = std::fs::read_to_string(beads_dir.join("last-touched")).unwrap();
+            assert_eq!(touched.lines().next(), Some(created_id));
+            let state = create_preview_database_state(&beads_dir);
+            assert!(
+                state.dirty.is_empty(),
+                "ordinary create must finalize its export"
+            );
+            assert_eq!(state.issues, if bulk { 4 } else { 3 });
+        }
+    }
 }
 
 /// Test that the --title flag works as an alternative to positional argument

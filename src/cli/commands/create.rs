@@ -95,9 +95,10 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 }
 
 /// Execute the create command, optionally reusing a pre-opened storage
-/// connection. When `pre_opened` is `Some`, the caller's connection is used
-/// directly, avoiding a redundant second open that would compete for the
-/// WAL write lock under concurrent access.
+/// connection. Actual creation uses the caller's connection directly,
+/// avoiding a redundant second open that would compete for the WAL write
+/// lock under concurrent access. A preview first completes the supplied
+/// context's read-only handoff; unfinished JSONL write authority is refused.
 #[allow(clippy::too_many_lines)]
 pub fn execute_with_storage(
     args: &CreateArgs,
@@ -105,6 +106,27 @@ pub fn execute_with_storage(
     ctx: &OutputContext,
     pre_opened: Option<config::OpenStorageResult>,
 ) -> Result<()> {
+    // Direct command callers do not pass through main's read-intent classifier.
+    // Establish preview intent before either open, and release authority owned
+    // by a supplied context before file/stdin reads or output can block.
+    let preview_cli = args.dry_run.then(|| {
+        let mut preview_cli = cli.clone();
+        preview_cli.read_only_storage = true;
+        preview_cli.no_auto_import = Some(true);
+        preview_cli.no_auto_flush = Some(true);
+        preview_cli.mark_no_db_write_intent(false);
+        preview_cli.clear_database_family_lock_marker();
+        preview_cli
+    });
+    let cli = preview_cli.as_ref().unwrap_or(cli);
+    let pre_opened = if args.dry_run {
+        pre_opened
+            .map(config::OpenStorageResult::finish_read_only_startup)
+            .transpose()?
+    } else {
+        pre_opened
+    };
+
     if let Some(ref file_path) = args.file {
         if args.title.is_some() || args.title_flag.is_some() {
             return Err(BeadsError::validation(
@@ -166,12 +188,14 @@ pub fn execute_with_storage(
     let created_id = issue.id.clone();
     let last_touched_dir = storage_ctx.paths.beads_dir.clone();
     let update_last_touched_after_flush = storage_ctx.no_db;
-    if !args.dry_run && !update_last_touched_after_flush {
-        crate::util::set_last_touched_id(&last_touched_dir, &created_id);
-    }
-    storage_ctx.flush_no_db_if_dirty()?;
-    if !args.dry_run && update_last_touched_after_flush {
-        crate::util::set_last_touched_id(&last_touched_dir, &created_id);
+    if !args.dry_run {
+        if !update_last_touched_after_flush {
+            crate::util::set_last_touched_id(&last_touched_dir, &created_id);
+        }
+        storage_ctx.flush_no_db_if_dirty()?;
+        if update_last_touched_after_flush {
+            crate::util::set_last_touched_id(&last_touched_dir, &created_id);
+        }
     }
 
     // Output
@@ -241,7 +265,9 @@ pub fn execute_with_storage(
             ctx.warning(&warning.to_string());
         }
     }
-    auto_flush_after_create(&mut storage_ctx, ctx);
+    if !args.dry_run {
+        auto_flush_after_create(&mut storage_ctx, ctx);
+    }
     Ok(())
 }
 
@@ -1469,12 +1495,17 @@ fn execute_import(
 
     let last_touched_dir = storage_ctx.paths.beads_dir.clone();
     let update_last_touched_after_flush = storage_ctx.no_db;
-    if !update_last_touched_after_flush && let Some(last_created_id) = last_created_id.as_deref() {
-        crate::util::set_last_touched_id(&last_touched_dir, last_created_id);
-    }
-    storage_ctx.flush_no_db_if_dirty()?;
-    if update_last_touched_after_flush && let Some(last_created_id) = last_created_id.as_deref() {
-        crate::util::set_last_touched_id(&last_touched_dir, last_created_id);
+    if !args.dry_run {
+        if !update_last_touched_after_flush
+            && let Some(last_created_id) = last_created_id.as_deref()
+        {
+            crate::util::set_last_touched_id(&last_touched_dir, last_created_id);
+        }
+        storage_ctx.flush_no_db_if_dirty()?;
+        if update_last_touched_after_flush && let Some(last_created_id) = last_created_id.as_deref()
+        {
+            crate::util::set_last_touched_id(&last_touched_dir, last_created_id);
+        }
     }
 
     if created_ids.is_empty() {
@@ -1515,7 +1546,9 @@ fn execute_import(
             ctx.warning(&warning.to_string());
         }
     }
-    auto_flush_after_create(&mut storage_ctx, ctx);
+    if !args.dry_run {
+        auto_flush_after_create(&mut storage_ctx, ctx);
+    }
     Ok(())
 }
 
@@ -1781,6 +1814,187 @@ mod tests {
         let loaded = storage.get_issue(&issue.id).expect("get issue");
         assert!(loaded.is_none(), "dry run should not persist issue");
         info!("test_create_issue_dry_run_no_writes: assertions passed");
+    }
+
+    fn create_preview_fixture() -> (tempfile::TempDir, std::path::PathBuf, config::CliOverrides) {
+        let temp = tempfile::tempdir().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(beads_dir.join("config.yaml"), "issue_prefix: bd\n").unwrap();
+        let database = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&database).unwrap();
+        storage.set_config("issue_prefix", "bd").unwrap();
+        let issue =
+            create_issue_impl(&mut storage, &default_args(), &default_config(), None).unwrap();
+        storage.set_metadata("needs_flush", "true").unwrap();
+        drop(storage);
+        std::fs::write(
+            beads_dir.join("issues.jsonl"),
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+        std::fs::write(beads_dir.join("last-touched"), format!("{}\n", issue.id)).unwrap();
+        std::fs::write(temp.path().join("preview.md"), "## Preview from markdown\n").unwrap();
+        let cli = config::CliOverrides {
+            db: Some(database),
+            no_db: Some(false),
+            lock_timeout: Some(0),
+            no_auto_import: Some(false),
+            no_auto_flush: Some(false),
+            ..Default::default()
+        };
+        (temp, beads_dir, cli)
+    }
+
+    fn create_preview_source_bytes(beads_dir: &Path) -> Vec<(&'static str, Option<Vec<u8>>)> {
+        [
+            "beads.db",
+            "beads.db-wal",
+            "beads.db-shm",
+            "beads.db-journal",
+            "beads.db-fsqlite-ns-gate",
+            "beads.db-fsqlite-ns-use",
+            "issues.jsonl",
+            "issues.history.jsonl",
+            "last-touched",
+        ]
+        .into_iter()
+        .map(|name| {
+            let path = beads_dir.join(name);
+            (name, path.exists().then(|| std::fs::read(path).unwrap()))
+        })
+        .collect()
+    }
+
+    fn create_preview_args(root: &Path, bulk: bool) -> CreateArgs {
+        let mut args = default_args();
+        args.dry_run = true;
+        args.title = Some("Preview only".to_string());
+        if bulk {
+            args.title = None;
+            args.file = Some(root.join("preview.md"));
+        }
+        args
+    }
+
+    #[test]
+    fn direct_create_previews_bypass_database_and_jsonl_writer_authority() {
+        let (temp, beads_dir, cli) = create_preview_fixture();
+        let database = beads_dir.join("beads.db");
+        let owner = crate::sync::blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &database,
+            Some(0),
+        )
+        .unwrap();
+        let jsonl_owner = crate::sync::blocking_jsonl_family_write_lock_with_timeout(
+            &beads_dir.join("issues.jsonl"),
+            Some(0),
+        )
+        .unwrap();
+        let before = create_preview_source_bytes(&beads_dir);
+        let output = OutputContext::from_flags(false, true, true);
+        for bulk in [false, true] {
+            let mut args = create_preview_args(temp.path(), bulk);
+            execute(&args, &cli, &output)
+                .expect("a direct preview must not require either writer authority");
+            assert!(create_preview_source_bytes(&beads_dir) == before);
+            owner.verify_database_authority().unwrap();
+            jsonl_owner.verify_jsonl_authority().unwrap();
+
+            args.dry_run = false;
+            assert!(matches!(
+                execute(&args, &cli, &output),
+                Err(BeadsError::WriteLockTimeout { .. })
+            ));
+            assert!(create_preview_source_bytes(&beads_dir) == before);
+        }
+        let observed = config::open_sqlite_storage_read_only(&database).unwrap();
+        assert_eq!(observed.get_dirty_issue_count().unwrap(), 1);
+        assert_eq!(
+            observed.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn create_previews_preserve_dirty_preopened_views_without_publication() {
+        for bulk in [false, true] {
+            for no_db in [false, true] {
+                let (temp, beads_dir, mut cli) = create_preview_fixture();
+                cli.no_db = Some(no_db);
+                let mut storage_ctx = config::open_storage_with_cli(&beads_dir, &cli).unwrap();
+                if no_db {
+                    // This private view deliberately has pending work and no
+                    // JSONL authority. A preview must not try to flush it.
+                    storage_ctx
+                        .storage
+                        .set_metadata("needs_flush", "true")
+                        .unwrap();
+                }
+                let before = create_preview_source_bytes(&beads_dir);
+                let args = create_preview_args(temp.path(), bulk);
+                execute_with_storage(
+                    &args,
+                    &cli,
+                    &OutputContext::from_flags(false, true, true),
+                    Some(storage_ctx),
+                )
+                .expect("preview an existing view without exporting its pending work");
+                assert!(create_preview_source_bytes(&beads_dir) == before);
+                drop(
+                    crate::sync::blocking_database_family_write_lock_with_timeout(
+                        &beads_dir,
+                        &beads_dir.join("beads.db"),
+                        Some(0),
+                    )
+                    .expect("a consumed preview context must release its database authority"),
+                );
+                let observed =
+                    config::open_sqlite_storage_read_only(&beads_dir.join("beads.db")).unwrap();
+                assert_eq!(observed.get_dirty_issue_count().unwrap(), 1);
+                assert_eq!(
+                    observed.get_metadata("needs_flush").unwrap().as_deref(),
+                    Some("true")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_preview_refuses_unfinished_no_db_writer_without_exporting() {
+        for bulk in [false, true] {
+            let (temp, beads_dir, mut cli) = create_preview_fixture();
+            cli.no_db = Some(true);
+            cli.mark_no_db_write_intent(true);
+            let mut storage_ctx = config::open_storage_with_cli(&beads_dir, &cli).unwrap();
+            storage_ctx
+                .storage
+                .set_metadata("needs_flush", "true")
+                .unwrap();
+            let before = create_preview_source_bytes(&beads_dir);
+            let args = create_preview_args(temp.path(), bulk);
+            let error = execute_with_storage(
+                &args,
+                &cli,
+                &OutputContext::from_flags(false, true, true),
+                Some(storage_ctx),
+            )
+            .expect_err("a preview cannot adopt unfinished JSONL mutation authority");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unfinished JSONL write authority")
+            );
+            assert!(create_preview_source_bytes(&beads_dir) == before);
+            drop(
+                crate::sync::blocking_jsonl_family_write_lock_with_timeout(
+                    &beads_dir.join("issues.jsonl"),
+                    Some(0),
+                )
+                .expect("refusing the context must release its JSONL authority"),
+            );
+        }
     }
 
     #[test]
