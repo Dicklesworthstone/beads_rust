@@ -724,6 +724,13 @@ that executes the read while retaining writer authority. An import already
 committed before a later snapshot failure remains committed; that failure is
 not an import rollback.
 
+An unfinished namespace transition also remains a refusal if its companion
+gate file is missing. A read validates surviving transition evidence inside its
+private copy before querying it; it does not discard the evidence because the
+sidecar pair is incomplete. Preserve the original database family and inspect
+it with `br doctor` before retrying. Healthy partial namespace layouts remain
+readable; missing one sidecar alone is not diagnosed as unfinished recovery.
+
 `--lock-timeout` bounds acquisition waits, not the duration of an import,
 checkpoint, filesystem I/O, query, or output operation. A required startup
 write can still occupy the lock while it completes safely. Increasing the

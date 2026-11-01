@@ -1709,6 +1709,8 @@ impl CapturedReadOnlySnapshot {
     /// operates only on another private copy and retains its own lifetime.
     pub(crate) fn open(self) -> Result<Option<SqliteStorage>> {
         let copy_path = self.directory.path().join("snapshot.db");
+        #[cfg(any(unix, windows))]
+        admit_private_snapshot_namespace(&self.directory)?;
         let mut storage = SqliteStorage::open_current_read_only(&copy_path)?;
         if let Some(storage) = storage.as_mut()
             && storage.read_snapshot_dir.is_none()
@@ -18768,6 +18770,55 @@ pub(crate) fn copy_database_family_read_snapshot(path: &Path, destination: &Path
     verify_read_snapshot_family(&mut family)
 }
 
+/// Validate namespace transition evidence only in an owned, verified copy.
+/// Both callers copy to this fixed filename inside their private directory;
+/// accepting the directory keeps this operation separate from live admission.
+#[cfg(any(unix, windows))]
+fn admit_private_snapshot_namespace(directory: &tempfile::TempDir) -> Result<()> {
+    let path = directory.path().join("snapshot.db");
+    let use_path = database_sidecar_path(&path, "-fsqlite-ns-use");
+    match std::fs::symlink_metadata(&use_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+
+    // ReadOnlyExisting admits either missing sidecar without parsing a
+    // surviving use ledger. Shared admission creates a missing private gate
+    // and checks that ledger before rebinding it to the private main inode.
+    // The engine permits completed/copied records here, but refuses unfinished
+    // transition evidence. Do not parse or discard that evidence ourselves.
+    let main = std::fs::File::open(&path)?;
+    let identity =
+        fsqlite_vfs::FileIdentity::from_file(&main)?.ok_or_else(|| BeadsError::SyncConflict {
+            message: "Cannot establish the private read snapshot's database identity".to_string(),
+        })?;
+    let namespace = fsqlite_vfs::namespace::PendingNamespaceOpen::begin(
+        &path,
+        fsqlite_vfs::namespace::NamespaceOpenIntent::Shared,
+    )
+    .and_then(|pending| pending.bind_replacing_quiescent_record(identity))
+    .and_then(|namespace| {
+        namespace.finish_bootstrap()?;
+        Ok(namespace)
+    })
+    .map_err(|error| match error {
+        FrankenError::CannotOpen { .. } => BeadsError::SyncConflict {
+            message: "Refusing read-only snapshot because its copied fsqlite namespace could not \
+                      be validated; preserve the original database family and inspect it with \
+                      `br doctor` before retrying"
+                .to_string(),
+        },
+        other => BeadsError::Database(other),
+    })?;
+    // Missing-index recovery binds its source before opening the engine, so
+    // a healthy copied record must already name this private inode. Release
+    // every bootstrap lock and descriptor before entering either open path.
+    drop(namespace);
+    drop(main);
+    Ok(())
+}
+
 /// Whether a read-only open that the engine just refused with `BusyRecovery`
 /// (after its own transient retries) is facing a settled WAL index the engine
 /// can never admit read-only: one left by br 0.6.0's engine, which never
@@ -20485,8 +20536,10 @@ fn query_external_project_capabilities(
         )));
     }
     let snapshot_dir = tempfile::tempdir()?;
-    let snapshot_path = snapshot_dir.path().join("external.db");
+    let snapshot_path = snapshot_dir.path().join("snapshot.db");
     copy_database_family_read_snapshot(db_path, &snapshot_path)?;
+    #[cfg(any(unix, windows))]
+    admit_private_snapshot_namespace(&snapshot_dir)?;
     let conn = open_existing_read_only_connection(&snapshot_path)?;
     let labels: Vec<String> = capabilities
         .iter()
@@ -37017,6 +37070,214 @@ required_fields:
             drop(reader);
             verify_read_snapshot_family(&mut live_family).unwrap();
             next_authority.verify_database_authority().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_readers_refuse_unfinished_namespace_transition_even_without_gate() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("snapshot.db");
+        seed_closed_database(&db_path, "bd-ns-pending");
+        let capabilities = HashSet::from(["proof".to_string()]);
+
+        // Both readers must work before the real unfinished transition is
+        // installed; an unrelated schema or fixture failure cannot pass.
+        let reader = SqliteStorage::open_current_read_only_snapshot(&db_path)
+            .unwrap()
+            .expect("healthy current-schema snapshot");
+        assert!(reader.get_issue("bd-ns-pending").unwrap().is_some());
+        drop(reader);
+        assert!(
+            query_external_project_capabilities(&db_path, &capabilities)
+                .unwrap()
+                .is_empty()
+        );
+
+        let use_path = database_sidecar_path(&db_path, "-fsqlite-ns-use");
+        let initial_record = fs::read(&use_path).unwrap();
+        let main = fs::File::open(&db_path).unwrap();
+        let identity = fsqlite_vfs::FileIdentity::from_file(&main)
+            .unwrap()
+            .expect("native database identity");
+        let transition = fsqlite_vfs::namespace::begin_database_namespace_generation_transition(
+            &db_path, identity,
+        )
+        .expect("prepare a real namespace generation transition");
+        drop(main);
+        drop(transition); // Deliberately leave the durable prepare unfinished.
+        let prepared_record = fs::read(&use_path).unwrap();
+        assert!(prepared_record.starts_with(&initial_record));
+        assert!(prepared_record.len() > initial_record.len());
+
+        for missing_gate in [false, true] {
+            if missing_gate {
+                fs::rename(
+                    database_sidecar_path(&db_path, "-fsqlite-ns-gate"),
+                    temp.path().join("retained-namespace-gate"),
+                )
+                .unwrap();
+            }
+            let before = directory_bytes_and_modes(temp.path());
+            let mut witness = capture_read_snapshot_family(&db_path).unwrap();
+
+            let error = SqliteStorage::open_current_read_only_snapshot(&db_path)
+                .expect_err("a private copy cannot complete or ignore a namespace transition");
+            assert!(
+                error.to_string().contains("copied fsqlite namespace"),
+                "missing_gate={missing_gate}: {error}"
+            );
+            assert_eq!(directory_bytes_and_modes(temp.path()), before);
+            verify_read_snapshot_family(&mut witness).unwrap();
+
+            let error = query_external_project_capabilities(&db_path, &capabilities)
+                .expect_err("external capability reads must retain the same recovery boundary");
+            assert!(
+                error.to_string().contains("copied fsqlite namespace"),
+                "missing_gate={missing_gate}: {error}"
+            );
+            assert_eq!(directory_bytes_and_modes(temp.path()), before);
+            verify_read_snapshot_family(&mut witness).unwrap();
+            assert_eq!(fs::read(&use_path).unwrap(), prepared_record);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_readers_accept_quiescent_and_partial_namespace_families() {
+        let capabilities = HashSet::from(["proof".to_string()]);
+        for topology in [
+            "paired",
+            "both_absent",
+            "gate_only",
+            "use_only",
+            "completed_pair",
+            "completed_use_only",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("snapshot.db");
+            seed_closed_database(&db_path, "bd-ns-healthy");
+            assert_eq!(existing_namespace_sidecars(&db_path).len(), 2);
+
+            if topology.starts_with("completed_") {
+                let main = fs::File::open(&db_path).unwrap();
+                let identity = fsqlite_vfs::FileIdentity::from_file(&main)
+                    .unwrap()
+                    .expect("native database identity");
+                let mut transition =
+                    fsqlite_vfs::namespace::begin_database_namespace_generation_transition(
+                        &db_path, identity,
+                    )
+                    .unwrap();
+                transition.finish().unwrap();
+                drop(transition);
+                drop(main);
+            }
+            if matches!(topology, "both_absent" | "use_only" | "completed_use_only") {
+                fs::rename(
+                    database_sidecar_path(&db_path, "-fsqlite-ns-gate"),
+                    temp.path().join("retained-namespace-gate"),
+                )
+                .unwrap();
+            }
+            if matches!(topology, "both_absent" | "gate_only") {
+                fs::rename(
+                    database_sidecar_path(&db_path, "-fsqlite-ns-use"),
+                    temp.path().join("retained-namespace-use"),
+                )
+                .unwrap();
+            }
+            let before = directory_bytes_and_modes(temp.path());
+            let mut witness = capture_read_snapshot_family(&db_path).unwrap();
+
+            let reader = SqliteStorage::open_current_read_only_snapshot(&db_path)
+                .unwrap_or_else(|error| panic!("{topology}: {error}"))
+                .expect("current-schema private snapshot");
+            assert!(reader.get_issue("bd-ns-healthy").unwrap().is_some());
+            assert!(reader.read_snapshot_dir.is_some());
+            assert!(reader.attached_write_authority().is_none());
+            drop(reader);
+            assert_eq!(directory_bytes_and_modes(temp.path()), before, "{topology}");
+            verify_read_snapshot_family(&mut witness).unwrap();
+
+            assert!(
+                query_external_project_capabilities(&db_path, &capabilities)
+                    .unwrap_or_else(|error| panic!("{topology}: {error}"))
+                    .is_empty()
+            );
+            assert_eq!(directory_bytes_and_modes(temp.path()), before, "{topology}");
+            verify_read_snapshot_family(&mut witness).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_read_snapshot_rebinds_namespace_before_private_wal_recovery() {
+        for missing_gate in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("snapshot.db");
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            storage.conn.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+            let checkpointed_main = fs::read(&db_path).unwrap();
+            let sentinel = "committed WAL-only namespace snapshot";
+            storage
+                .set_metadata("namespace_snapshot_sentinel", sentinel)
+                .unwrap();
+            // Keep teardown from checkpointing the sentinel, independently of
+            // how many application mutations the metadata operation records.
+            let peer = crate::sync::DatabaseOpenerLease::register(&db_path).unwrap();
+            drop(storage);
+            drop(peer);
+            assert_eq!(fs::read(&db_path).unwrap(), checkpointed_main);
+            assert!(
+                !checkpointed_main
+                    .windows(sentinel.len())
+                    .any(|bytes| bytes == sentinel.as_bytes())
+            );
+            assert!(
+                fs::read(database_sidecar_path(&db_path, "-wal"))
+                    .unwrap()
+                    .windows(sentinel.len())
+                    .any(|bytes| bytes == sentinel.as_bytes())
+            );
+            assert!(
+                sqlite_wal_schema_preflight(&db_path)
+                    .unwrap()
+                    .has_committed_frames
+            );
+
+            let shm_path = database_sidecar_path(&db_path, "-shm");
+            fs::rename(&shm_path, temp.path().join("retained-shm")).unwrap();
+            if missing_gate {
+                fs::rename(
+                    database_sidecar_path(&db_path, "-fsqlite-ns-gate"),
+                    temp.path().join("retained-namespace-gate"),
+                )
+                .unwrap();
+            }
+            let before = directory_bytes_and_modes(temp.path());
+            let mut witness = capture_read_snapshot_family(&db_path).unwrap();
+            let reader = SqliteStorage::open_current_read_only_snapshot(&db_path)
+                .unwrap_or_else(|error| panic!("missing_gate={missing_gate}: {error}"))
+                .expect("current-schema private WAL snapshot");
+            assert_eq!(
+                reader
+                    .get_metadata("namespace_snapshot_sentinel")
+                    .unwrap()
+                    .as_deref(),
+                Some(sentinel)
+            );
+            assert!(reader.read_snapshot_dir.is_some());
+            assert!(reader.attached_write_authority().is_none());
+            assert!(!shm_path.exists());
+            drop(reader);
+            assert!(!shm_path.exists());
+            assert_eq!(directory_bytes_and_modes(temp.path()), before);
+            verify_read_snapshot_family(&mut witness).unwrap();
         }
     }
 

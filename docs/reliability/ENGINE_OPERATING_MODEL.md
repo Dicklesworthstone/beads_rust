@@ -125,6 +125,17 @@ An existing protected read snapshot can be reused without another capture.
 A shared lock on `.write.lock` would still exclude writers and is not an
 appropriate downgrade.
 
+Private snapshot admission must also validate surviving namespace transition
+evidence. A missing `-fsqlite-ns-gate` must not make the engine ignore an
+unfinished ledger in `-fsqlite-ns-use`. Before opening the captured family or
+an external capability snapshot, the owned copy uses the engine's guarded
+quiescent-record admission to validate and bind that record to its private
+main-file identity. This may create a gate or rewrite completed namespace
+history only inside the temporary copy. Unfinished or malformed transition
+evidence refuses the read; the original family, namespace files and modes stay
+unchanged. Healthy partial layouts and families with both sidecars absent remain
+supported.
+
 Read intent also applies to command-local opens and external routes. An
 explicit `delete --dry-run` normalizes its own storage and synchronization
 policy before planning, including callers that bypass the CLI startup funnel.
