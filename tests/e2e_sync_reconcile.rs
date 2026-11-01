@@ -4042,8 +4042,54 @@ fn retention_restored_omissions_preserve_local_state_without_republishing() {
 
 #[test]
 fn restored_export_no_op_import_does_not_starve_concurrent_commands() {
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
+
+    struct Importer(Child);
+
+    impl Drop for Importer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn held_lock(path: &Path) -> bool {
+        let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(error) => panic!("inspect lock {}: {error}", path.display()),
+        };
+        match file.try_lock() {
+            Ok(()) => false,
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(error)) => {
+                panic!("probe lock {}: {error}", path.display())
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn child_owns_workspace(child: &Child, lock: &Path) -> bool {
+        let pid = child.id().to_string();
+        fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| fs::read_link(entry.path()).ok().as_deref() == Some(lock))
+            .any(|entry| {
+                fs::read_to_string(
+                    PathBuf::from(format!("/proc/{pid}/fdinfo")).join(entry.file_name()),
+                )
+                .is_ok_and(|info| {
+                    info.lines().any(|line| {
+                        let fields: Vec<_> = line.split_whitespace().collect();
+                        fields.first() == Some(&"lock:")
+                            && fields.get(2..6)
+                                == Some(&["FLOCK", "ADVISORY", "WRITE", pid.as_str()])
+                    })
+                })
+            })
+    }
 
     let ws = BrWorkspace::new();
     init_workspace(&ws, "skip_contention");
@@ -4065,6 +4111,30 @@ fn restored_export_no_op_import_does_not_starve_concurrent_commands() {
     assert!(local.status.success(), "{}", local.stderr);
     fs::write(jsonl_path(&ws), &old_export).unwrap();
 
+    // An independent workspace holds only an alias's inode authority. The
+    // importer can acquire this workspace and canonical-family flocks first,
+    // then must wait at the shared database inode. Its competitors therefore
+    // queue behind an actual authority owner, regardless of waiter ordering.
+    let blocker_beads = ws.root.join("import-blocker/.beads");
+    fs::create_dir_all(&blocker_beads).unwrap();
+    let alias = blocker_beads.join("alias.db");
+    fs::hard_link(db_path(&ws), &alias).unwrap();
+    let blocker = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+        &blocker_beads,
+        &alias,
+        Some(1_000),
+    )
+    .unwrap();
+    let workspace_lock = fs::canonicalize(beads_dir(&ws).join(".write.lock")).unwrap();
+    let family_locks = fs::read_dir(beads_dir(&ws))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            name.starts_with(".br-db-write-") && name.ends_with(".lock")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(family_locks.len(), 1, "one original database family");
     let log_path = ws.root.join("skip_import.log");
     let log = fs::File::create(&log_path).unwrap();
     let started = Instant::now();
@@ -4084,37 +4154,45 @@ fn restored_export_no_op_import_does_not_starve_concurrent_commands() {
             command.env_remove(key);
         }
     }
-    let mut importer = command
-        .current_dir(&ws.root)
-        .env("HOME", &ws.root)
-        .env("RUST_LOG", "error,beads_rust::sync=debug")
-        .env("NO_COLOR", "1")
-        .env("PATH", common::cli::deduplicated_br_path())
-        .env("BR_HISTORY_MIN_INTERVAL_SECS", "0")
-        .args(["--no-auto-flush", "-v", "show", &seed, "--json"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .unwrap();
-    // Wait for the actual import apply phase, rather than merely racing
-    // process startup. A fast importer may finish before this poll observes it.
+    let mut importer = Importer(
+        command
+            .current_dir(&ws.root)
+            .env("HOME", &ws.root)
+            .env("RUST_LOG", "error,beads_rust::sync=debug")
+            .env("NO_COLOR", "1")
+            .env("PATH", common::cli::deduplicated_br_path())
+            .env("BR_HISTORY_MIN_INTERVAL_SECS", "0")
+            .args(["--no-auto-flush", "-v", "show", &seed, "--json"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    );
+    // Tracing is deliberately deferred until read startup releases authority.
+    // Kernel locks, not a delayed log marker, establish the overlap here.
     loop {
-        let log = fs::read_to_string(&log_path).unwrap();
-        if log.contains("collision plan ready; applying rows") {
+        assert!(
+            importer.0.try_wait().unwrap().is_none(),
+            "importer exited before admission"
+        );
+        #[cfg(target_os = "linux")]
+        let child_owns_lock = child_owns_workspace(&importer.0, &workspace_lock);
+        #[cfg(not(target_os = "linux"))]
+        let child_owns_lock = true; // Only this child can own the original workspace.
+        if held_lock(&workspace_lock) && held_lock(&family_locks[0]) && child_owns_lock {
             break;
-        }
-        if let Some(status) = importer.try_wait().unwrap() {
-            assert!(status.success(), "{log}");
-            panic!("auto-import apply phase was not observed: {log}");
         }
         assert!(
             started.elapsed() < Duration::from_secs(30),
-            "import did not reach apply: {log}"
+            "importer never acquired the workspace and canonical-family authority"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
 
     std::thread::scope(|scope| {
+        // On assertion failure this local releases the inode before the
+        // scope joins its competing commands, so cleanup remains bounded.
+        let inode_blocker = blocker;
         let reader = scope.spawn(|| {
             run_br(
                 &ws,
@@ -4144,13 +4222,41 @@ fn restored_export_no_op_import_does_not_starve_concurrent_commands() {
                 "skip_writer",
             )
         });
+        let queue = beads_dir(&ws).join(".write-waiters.lock");
+        let queued_at = Instant::now();
+        loop {
+            let waiters = match fs::read_dir(&queue) {
+                Ok(entries) => entries
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        path.extension()
+                            .is_some_and(|extension| extension == "waiter")
+                    })
+                    .filter(|path| held_lock(path))
+                    .count(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => panic!("read live workspace waiters: {error}"),
+            };
+            if waiters == 2 {
+                break;
+            }
+            assert!(
+                queued_at.elapsed() < Duration::from_secs(5),
+                "both competing commands must queue before import admission"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(importer.0.try_wait().unwrap().is_none());
+        assert!(held_lock(&workspace_lock));
+        inode_blocker.verify_database_authority().unwrap();
+        drop(inode_blocker);
         let reader = reader.join().unwrap();
         let writer = writer.join().unwrap();
         assert!(reader.status.success(), "reader starved: {}", reader.stderr);
         assert!(writer.status.success(), "writer starved: {}", writer.stderr);
     });
     assert!(
-        importer.wait().unwrap().success(),
+        importer.0.wait().unwrap().success(),
         "{}",
         fs::read_to_string(&log_path).unwrap()
     );

@@ -151,6 +151,20 @@ must acquire its nonblocking sync lock before reopening writable storage. A
 busy sync lock leaves the protected private snapshot intact and avoids an
 unnecessary live open, teardown, and second capture.
 
+The CLI's tracing stderr writer also defers diagnostics for the entire read
+startup scope. This covers nested import and engine traces, partial lock
+acquisition, and destructor diagnostics, not just the final handoff event.
+The scope starts before storage or authority owners exist and ends after the
+handoff; on early return its destructor runs after those owners have unwound.
+All logging threads share the deferral state, and no stderr write or flush
+holds its buffer mutex. Retained output is capped at 256 KiB, split between the
+first and most recent 128 KiB, with an explicit omitted-middle-byte notice on
+overflow. Delivery may block after authority has ended. A read checks for a
+pending shutdown signal again after diagnostic and pending-warning delivery,
+before dispatching its query.
+The CLI configures only this stderr sink; the library's optional JSON log file
+writer has its own immediate-output behavior.
+
 The non-repairing reopen for automatic import also refuses a torn WAL or a WAL
 index that requires recovery before entering the writable engine open. A private
 read snapshot's successful recovery does not authorize repair of the live family.

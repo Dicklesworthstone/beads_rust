@@ -62,6 +62,12 @@ fn main() {
 
 #[allow(clippy::too_many_lines)]
 fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
+    // Declare this first so all storage and authority owners unwind before
+    // buffered tracing can touch stderr on an error/cancellation return. This
+    // includes nested engine and protected-close diagnostics, not just the
+    // orchestration events immediately before the read-only handoff.
+    let startup_diagnostics = requires_read_only_storage(&cli.command)
+        .then(beads_rust::logging::defer_read_startup_diagnostics);
     let output_ctx = OutputContext::from_args(&cli);
     let is_mutating = is_mutating_command(&cli.command);
     let command_supports_auto_import = should_auto_import(&cli.command);
@@ -672,7 +678,10 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             {
                 Some(Ok(Some(lock))) => Some(lock),
                 Some(Ok(None)) => {
-                    tracing::debug!("Auto-import skipped because .sync.lock is held");
+                    tracing::debug!(
+                        target: "br::startup",
+                        "Auto-import skipped because .sync.lock is held"
+                    );
                     None
                 }
                 Some(Err(e)) => return Err(e),
@@ -786,11 +795,29 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         } else {
             write_lock
         };
+    if let Some(diagnostics) = startup_diagnostics {
+        // Output backpressure may delay this reader, but every startup write
+        // authority owner has now been released and other writers can proceed.
+        diagnostics.finish();
+    }
     if let Some(state) = deferred_pending_merge_warning {
         // stderr can block indefinitely on its consumer. The pending verdict
         // has already disabled every mutation; publish its warning only after
         // all startup authority has ended, including the context's Arc owners.
         emit_pending_sync_merge_warning(&state, json_error_mode);
+    }
+    // The diagnostic flush or pending warning may itself have waited on a
+    // stopped consumer after handoff. Honor signals received during that wait
+    // before starting the query; all database authority is already released.
+    if requires_read_only_storage(&cli.command)
+        && let Some(exit_code) = beads_rust::shutdown::exit_code()
+    {
+        tracing::debug!(
+            target: "br::startup",
+            exit_code,
+            "Read interrupted after startup; skipping query execution"
+        );
+        return Ok(exit_code);
     }
 
     // Phase 4: Command Execution
@@ -3773,14 +3800,10 @@ mod tests {
             // A previous writer can change freshness or publish a pending
             // receipt after the advisory read but before this reader owns
             // authority. Both protected no-import outcomes need a handoff.
-            let mut previous_writer = config::open_storage_with_cli(
-                &beads_dir,
-                &config::CliOverrides {
-                    lock_timeout: Some(100),
-                    ..config::CliOverrides::default()
-                },
-            )
-            .expect("previous writer");
+            let mut writer_overrides = config::CliOverrides::default();
+            writer_overrides.lock_timeout = Some(100);
+            let mut previous_writer = config::open_storage_with_cli(&beads_dir, &writer_overrides)
+                .expect("previous writer");
             previous_writer
                 .storage
                 .set_metadata("fast_open_reprobe_marker", "protected")
@@ -3968,14 +3991,10 @@ mod tests {
             .expect("canonical snapshot retained")
             .finish_read_only_startup()
             .expect("canonical snapshot handoff");
-        let mut next_writer = config::open_storage_with_cli(
-            &beads_dir,
-            &config::CliOverrides {
-                lock_timeout: Some(100),
-                ..config::CliOverrides::default()
-            },
-        )
-        .expect("a writer can reopen the replacement while the read snapshot remains alive");
+        let mut writer_overrides = config::CliOverrides::default();
+        writer_overrides.lock_timeout = Some(100);
+        let mut next_writer = config::open_storage_with_cli(&beads_dir, &writer_overrides)
+            .expect("a writer can reopen the replacement while the read snapshot remains alive");
         next_writer
             .storage
             .set_metadata("fast_open_inode_marker", "after-handoff")

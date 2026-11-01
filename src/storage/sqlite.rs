@@ -3309,7 +3309,7 @@ impl SqliteStorage {
 
         conn.execute(&format!("PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}"))?;
         if let Err(e) = apply_schema(&conn) {
-            eprintln!("apply_schema failed: {:?}", e);
+            tracing::error!(error = ?e, "apply_schema failed");
             return Err(e);
         }
         Self::ensure_known_metadata_defaults(&conn)?;

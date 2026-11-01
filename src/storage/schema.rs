@@ -830,10 +830,7 @@ pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
             if is_index && is_stale_schema {
                 continue;
             }
-            eprintln!(
-                "execute_batch failed on statement: {}\nError: {:?}",
-                stmt, e
-            );
+            tracing::error!(statement = stmt, error = ?e, "execute_batch failed");
             return Err(BeadsError::Database(e));
         }
     }
@@ -864,7 +861,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     // This must run BEFORE execute_batch because the batch includes CREATE INDEX
     // statements that will fail if old tables have missing columns
     let issues_rebuilt = run_pre_schema_migrations(conn).map_err(|e| {
-        eprintln!("run_pre_schema_migrations failed: {:?}", e);
+        tracing::error!(error = ?e, "run_pre_schema_migrations failed");
         e
     })?;
 
@@ -876,7 +873,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         // current version. Skip migrations and stamp user_version directly.
         conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
             .map_err(|e| {
-                eprintln!("PRAGMA user_version failed: {:?}", e);
+                tracing::error!(error = ?e, "PRAGMA user_version failed");
                 BeadsError::Database(e)
             })?;
     } else {
@@ -885,20 +882,20 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         // that reference newly-added columns because fsqlite's in-memory schema
         // cache may not have been updated yet.
         run_migrations(conn, issues_rebuilt).map_err(|e| {
-            eprintln!("run_migrations failed: {:?}", e);
+            tracing::error!(error = ?e, "run_migrations failed");
             e
         })?;
 
         // Mark schema as applied so future opens can skip DDL/migration work.
         conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
             .map_err(|e| {
-                eprintln!("PRAGMA user_version failed: {:?}", e);
+                tracing::error!(error = ?e, "PRAGMA user_version failed");
                 BeadsError::Database(e)
             })?;
     }
 
     apply_runtime_pragmas(conn).map_err(|e| {
-        eprintln!("apply_runtime_pragmas failed: {:?}", e);
+        tracing::error!(error = ?e, "apply_runtime_pragmas failed");
         e
     })?;
 

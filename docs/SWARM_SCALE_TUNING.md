@@ -136,7 +136,22 @@ the handoff and search boundaries without logging the query text. Handoff
 diagnostics are emitted after writer authority is released. The release event
 records `snapshot_captured_ms` and `elapsed_ms` at capture and release, measured
 from the handoff's start before writing to stderr. Blocking on those diagnostics
-cannot extend the critical section. The original production trigger reported in
+cannot extend the critical section.
+
+The CLI buffers tracing output to stderr throughout read startup, including
+lock admission, the protected recheck, automatic import, and connection teardown.
+It drains that buffer after startup authority has ended; an early error or
+interruption also closes storage and releases authority before draining. This
+keeps a stalled diagnostic consumer from indefinitely delaying writers while
+the read completes its required startup work. The buffer retains at most
+256 KiB: the first 128 KiB and the most recent 128 KiB. If verbose logging
+exceeds that limit, a notice reports the omitted middle bytes. This preserves
+initial startup decisions and final import/teardown diagnostics. Event timestamps
+describe when the events occurred, although the output arrives later. Use these
+logs to reconstruct startup after release;
+they are not a live progress stream while startup retains authority.
+
+The original production trigger reported in
 [#586](https://github.com/Dicklesworthstone/beads_rust/issues/586)
 remains unidentified; the historical override reproduction does not establish
 that the override was present in that incident.

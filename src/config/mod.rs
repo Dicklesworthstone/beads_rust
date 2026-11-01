@@ -12876,7 +12876,7 @@ routing:
 
     #[test]
     fn read_only_startup_handoff_refuses_snapshot_failure_without_repair() {
-        let (_temp, mut context) = writable_startup_handoff_fixture();
+        let (_temp, context) = writable_startup_handoff_fixture();
         context
             .storage
             .execute_test_sql("DROP TABLE labels")
