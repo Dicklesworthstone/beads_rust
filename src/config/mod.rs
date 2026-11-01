@@ -4328,7 +4328,7 @@ impl OpenStorageResult {
         authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
     ) -> Result<()> {
         use crate::cli::commands::doctor_subsystems::schema_migration::{
-            torn_wal_present, wal_index_needs_recovery,
+            engine_wal_index_needs_recovery, torn_wal_present,
         };
 
         if self.no_db
@@ -4366,7 +4366,8 @@ impl OpenStorageResult {
         // recovery. Do not bypass the startup recovery contract (sole opener,
         // retained evidence, and refusal of frame-bearing WAL recovery) merely
         // because JSONL freshness now requires an import.
-        if torn_wal_present(&self.paths.db_path)? || wal_index_needs_recovery(&self.paths.db_path)?
+        if torn_wal_present(&self.paths.db_path)?
+            || engine_wal_index_needs_recovery(&self.paths.db_path)?
         {
             return Err(BeadsError::SyncConflict {
                 message: format!(
@@ -13120,11 +13121,12 @@ routing:
     #[allow(clippy::too_many_lines)]
     fn current_auto_import_reopen_refuses_live_wal_recovery_without_touching_source() {
         for condition in ["missing-index", "stale-index", "torn-wal"] {
-            // Match the platform capability of the existing startup probe:
-            // native Unix index recovery is supported on Linux/Android/macOS/iOS.
-            // Torn WAL refusal is independent of that capability.
+            // Every native Unix engine consumes the on-disk index, including
+            // targets that cannot execute Beads' quarantine procedure. Only
+            // private-index engines skip these fixtures; torn WAL refusal is
+            // independent of the index implementation.
             if condition != "torn-wal"
-                && !crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
+                && !crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX
             {
                 continue;
             }

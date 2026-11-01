@@ -687,6 +687,12 @@ Those final private checks must succeed before query execution. The result
 describes the captured snapshot; a later writer's changes appear in a later
 command.
 
+The same read intent applies to `br delete --dry-run`, including IDs routed to
+another workspace. A preview does not acquire the destination's write lock or
+run automatic import/export there. A slow or blocked preview output must not
+hold up destination writers. Actual routed deletions still acquire authority
+before planning and retain it through their writes and teardown.
+
 If the protected recheck discovers a pending merge, automatic synchronization
 is disabled immediately. Its warning is emitted after the read handoff has
 released authority, so a full stderr pipe cannot make that warning hold up
@@ -706,6 +712,9 @@ A readable private snapshot is not permission to repair the original family.
 Inspect the reported condition with `br doctor --json` and use the applicable
 reviewed recovery procedure. Healthy WAL-backed databases remain eligible for
 automatic import.
+This refusal also applies on native Unix platforms where Beads cannot perform
+its verified quarantine procedure; unavailable recovery is not evidence that
+the live index is safe for a writable open.
 
 This handoff keeps normal writers serialized, preserves sole-opener checkpoint
 admission, and does not let database replacement change an in-flight query.

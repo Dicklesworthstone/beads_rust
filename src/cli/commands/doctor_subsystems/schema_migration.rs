@@ -810,8 +810,8 @@ pub fn quarantine_torn_wal_for_startup(
     result.and_then(|quarantine| released.map(|()| quarantine))
 }
 
-/// Whether the derived WAL index must be recovered before the engine can be
-/// trusted to admit this family. Always false where the engine never reads
+/// Whether ordinary startup can enter WAL-index recovery for this family.
+/// Always false where the engine never reads
 /// the on-disk index (Windows): there is nothing to recover, and attempting it
 /// would wedge every command on an unsupported quarantine (GH #520).
 /// Also false on Unix targets without the quarantine primitive, where
@@ -823,6 +823,23 @@ pub fn wal_index_needs_recovery(db_path: &Path) -> Result<bool> {
     wal_index_needs_recovery_for_engine(
         db_path,
         crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY,
+    )
+}
+
+/// Whether the engine would need to recover this family's on-disk WAL index.
+///
+/// This read-only classification is independent of whether this platform can
+/// execute Beads' verified quarantine procedure. Automatic import uses this
+/// refusal gate on every native Unix target, including
+/// those where [`wal_index_needs_recovery`] declines unsupported recovery.
+/// Engines with a private in-memory index still have no live index to repair.
+///
+/// # Errors
+/// Returns an error for unsafe paths or failed filesystem inspection.
+pub(crate) fn engine_wal_index_needs_recovery(db_path: &Path) -> Result<bool> {
+    wal_index_needs_recovery_for_engine(
+        db_path,
+        crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX,
     )
 }
 
@@ -7684,6 +7701,7 @@ mod tests {
         assert!(!wal_index_needs_recovery_for_engine(&db, true).unwrap());
         assert!(!wal_index_needs_recovery_for_engine(&db, false).unwrap());
         assert!(!wal_index_needs_recovery(&db).unwrap());
+        assert!(!engine_wal_index_needs_recovery(&db).unwrap());
 
         // Same split for a complete WAL whose index file is absent.
         let shm = family_component_path(&db, "-shm");
@@ -7696,6 +7714,35 @@ mod tests {
             missing_wal_index(&db).unwrap(),
             crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
         );
+        let missing_before = recovery_family_witness(&db).unwrap();
+        assert_eq!(
+            engine_wal_index_needs_recovery(&db).unwrap(),
+            crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX,
+            "read admission must classify native recovery even without quarantine support"
+        );
+        assert_eq!(
+            wal_index_needs_recovery(&db).unwrap(),
+            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY,
+            "ordinary startup must retain its quarantine capability gate"
+        );
+        assert_eq!(recovery_family_witness(&db).unwrap(), missing_before);
+
+        // An uninitialized index needs recovery only for an engine that reads
+        // its bytes. Neither classifier may repair or replace that evidence.
+        fs::write(&shm, vec![0_u8; 32_768]).unwrap();
+        let stale_before = recovery_family_witness(&db).unwrap();
+        assert!(wal_index_needs_recovery_for_engine(&db, true).unwrap());
+        assert!(!wal_index_needs_recovery_for_engine(&db, false).unwrap());
+        assert_eq!(
+            engine_wal_index_needs_recovery(&db).unwrap(),
+            crate::franken_sync::wal_index::ENGINE_READS_ON_DISK_WAL_INDEX
+        );
+        assert_eq!(
+            wal_index_needs_recovery(&db).unwrap(),
+            crate::franken_sync::wal_index::STARTUP_WAL_INDEX_RECOVERY
+        );
+        assert_eq!(recovery_family_witness(&db).unwrap(), stale_before);
+        fs::rename(&shm, temp.path().join("retained-stale-shm")).unwrap();
 
         // GH #561: an existing zero-byte WAL plus a missing SHM is exactly
         // the 0.4.12 generation-binding case. It enters recovery on engines

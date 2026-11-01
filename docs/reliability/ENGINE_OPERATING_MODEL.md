@@ -125,6 +125,13 @@ An existing protected read snapshot can be reused without another capture.
 A shared lock on `.write.lock` would still exclude writers and is not an
 appropriate downgrade.
 
+Read intent also applies to command-local opens and external routes. An
+explicit `delete --dry-run` normalizes its own storage and synchronization
+policy before planning, including callers that bypass the CLI startup funnel.
+Routed previews acquire no destination writer authority and render from their
+observational plan; real routed deletions retain authority through planning,
+application, and writable teardown.
+
 Pending-merge verdicts disable automatic synchronization before any subsequent
 storage action, but their user-facing warnings are deferred until this handoff
 has completed. Backpressure on stderr must not retain authority for a warning
@@ -138,6 +145,9 @@ index that requires recovery before entering the writable engine open. A private
 read snapshot's successful recovery does not authorize repair of the live family.
 This keeps the sole-opener, preserved-evidence and reviewed-recovery requirements
 in force; a healthy WAL remains eligible for an ordinary import.
+The refusal classifies recovery needs using the engine's on-disk index behavior,
+independently of platform quarantine support. An unsupported quarantine operation
+cannot authorize implicit live index repair during a read's automatic import.
 
 The snapshot retains the committed startup state independently of later writes
 or database-family replacement. An unfinished recovery or an unverifiable

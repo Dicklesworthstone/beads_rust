@@ -89,6 +89,20 @@ pub fn execute(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
+    // Direct command callers do not pass through main's read-intent classifier.
+    // Establish preview intent before local, routed, or tombstone-purge opens.
+    // A preview must neither inherit mutation authority nor start automatic sync.
+    let preview_cli = args.dry_run.then(|| {
+        let mut preview_cli = cli.clone();
+        preview_cli.read_only_storage = true;
+        preview_cli.no_auto_import = Some(true);
+        preview_cli.no_auto_flush = Some(true);
+        preview_cli.mark_no_db_write_intent(false);
+        preview_cli.clear_database_family_lock_marker();
+        preview_cli
+    });
+    let cli = preview_cli.as_ref().unwrap_or(cli);
+
     // 1. Collect IDs from args and/or file
     let mut ids: Vec<String> = args.ids.clone();
 
@@ -614,8 +628,11 @@ fn prepare_delete_route(
     cli: &config::CliOverrides,
     auto_flush_external: bool,
 ) -> Result<PreparedDeleteRoute> {
-    let routed_write_lock =
-        acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
+    let routed_write_lock = acquire_routed_workspace_write_lock(
+        beads_dir,
+        auto_flush_external && !cli.read_only_storage,
+        cli.lock_timeout,
+    )?;
     // Reuse the routed authority for every storage open on this route (both
     // the preparation open below and the later `apply_delete_route` reopen
     // through the stored `route_cli`); acquiring the same database-family
@@ -1368,6 +1385,100 @@ mod tests {
         assert!(display.contains("\\n"));
         assert!(display.contains("\\u{7}"));
         assert!(display.contains("\\u{9b}"));
+    }
+
+    #[test]
+    fn direct_dry_run_delete_and_purge_preserve_database_under_writer_authority() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("config.yaml"), "issue_prefix: bd\n").unwrap();
+        let database = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&database).unwrap();
+        storage.set_config("issue_prefix", "bd").unwrap();
+        storage
+            .create_issue(&create_test_issue("bd-live", "Keep this issue"), "tester")
+            .unwrap();
+        storage
+            .create_issue(
+                &create_test_issue("bd-dead", "Keep this tombstone"),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .delete_issue("bd-dead", "tester", "fixture", None)
+            .unwrap();
+        drop(storage);
+        // Even stale, importable JSONL cannot authorize sync during a preview.
+        fs::write(
+            beads_dir.join("issues.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&create_test_issue("bd-incoming", "Do not import")).unwrap()
+            ),
+        )
+        .unwrap();
+        let owner = crate::sync::blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &database,
+            Some(100),
+        )
+        .unwrap();
+        let family = || {
+            [
+                "beads.db",
+                "beads.db-wal",
+                "beads.db-shm",
+                "beads.db-journal",
+                "beads.db-fsqlite-ns-gate",
+                "beads.db-fsqlite-ns-use",
+                "issues.jsonl",
+            ]
+            .map(|name| {
+                let path = beads_dir.join(name);
+                (name, path.exists().then(|| fs::read(path).unwrap()))
+            })
+        };
+        let before = family();
+        // These overrides deliberately have no read-only intent; this calls
+        // the public command directly without main's classifier.
+        let cli = config::CliOverrides {
+            db: Some(database),
+            lock_timeout: Some(0),
+            no_auto_import: Some(false),
+            no_auto_flush: Some(false),
+            ..Default::default()
+        };
+        let output = OutputContext::from_flags(false, true, true);
+        for (ids, hard) in [(vec!["bd-live".to_string()], false), (Vec::new(), true)] {
+            let args = DeleteArgs {
+                ids,
+                reason: "preview".to_string(),
+                from_file: None,
+                cascade: false,
+                force: false,
+                hard,
+                dry_run: true,
+            };
+            execute(&args, false, &cli, &output)
+                .expect("direct dry-run must not join the writer queue or import JSONL");
+            assert_eq!(family(), before, "preview must preserve the whole family");
+        }
+        let mutation = DeleteArgs {
+            ids: vec!["bd-live".to_string()],
+            reason: "real delete".to_string(),
+            from_file: None,
+            cascade: false,
+            force: false,
+            hard: false,
+            dry_run: false,
+        };
+        assert!(matches!(
+            execute(&mutation, false, &cli, &output),
+            Err(BeadsError::WriteLockTimeout { .. })
+        ));
+        assert_eq!(family(), before, "refused mutation must remain unchanged");
+        drop(owner);
     }
 
     #[test]

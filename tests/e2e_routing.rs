@@ -82,6 +82,140 @@ fn write_single_issue_jsonl(workspace: &BrWorkspace, issue: &Value) {
     fs::write(&jsonl_path, format!("{serialized}\n")).expect("write issues.jsonl");
 }
 
+#[cfg(target_os = "linux")]
+struct RoutedPreviewChild(Option<std::process::Child>);
+
+#[cfg(target_os = "linux")]
+impl RoutedPreviewChild {
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0.as_mut().expect("owned routed preview")
+    }
+
+    fn drain_pipe(
+        mut pipe: impl std::io::Read + Send + 'static,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).expect("drain preview output");
+            bytes
+        })
+    }
+
+    fn finish(mut self) -> std::process::Output {
+        let stdout = Self::drain_pipe(self.child().stdout.take().unwrap());
+        let stderr = Self::drain_pipe(self.child().stderr.take().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while self.child().try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "routed preview did not finish after its output was drained"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::process::Output {
+            status: self.0.take().unwrap().wait().unwrap(),
+            stdout: stdout.join().expect("preview stdout reader"),
+            stderr: stderr.join().expect("preview stderr reader"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RoutedPreviewChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Hold ID collection at its real input boundary, then fill stdout before
+/// allowing the one-record preview to run. The child must block on its own
+/// output regardless of the machine's pipe capacity or query speed.
+#[cfg(target_os = "linux")]
+fn stalled_routed_delete_preview(workspace: &BrWorkspace, issue_id: &str) -> RoutedPreviewChild {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("br"));
+    command.current_dir(&workspace.root).args([
+        "--no-auto-import",
+        "--no-auto-flush",
+        "--lock-timeout",
+        "1000",
+        "delete",
+        "--from-file",
+        "/dev/stdin",
+        "--dry-run",
+        "--force",
+        "--json",
+    ]);
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("BD_")
+            || name.starts_with("BEADS_")
+            || matches!(
+                name.as_ref(),
+                "BR_DISABLE_READ_ONLY_FAST_OPEN"
+                    | "BR_OUTPUT_FORMAT"
+                    | "TOON_DEFAULT_FORMAT"
+                    | "TOON_STATS"
+            )
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("HOME", &workspace.root)
+        .env("PATH", common::cli::deduplicated_br_path())
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
+        .env("BR_DISABLE_READ_ONLY_FAST_OPEN", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut preview = RoutedPreviewChild(Some(command.spawn().expect("spawn routed preview")));
+    // A separate open-file description leaves the child's stdout blocking.
+    let mut pipe = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(format!("/proc/{}/fd/1", preview.child().id()))
+        .expect("open nonblocking preview stdout");
+    let padding = [b' '; 4096];
+    for chunk in [padding.as_slice(), &padding[..1]] {
+        loop {
+            match pipe.write(chunk) {
+                Ok(0) => panic!("preview stdout stopped accepting bytes without WouldBlock"),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill preview stdout: {error}"),
+            }
+        }
+    }
+    drop(pipe);
+    let mut input = preview.child().stdin.take().unwrap();
+    writeln!(input, "{issue_id}").expect("supply routed preview ID");
+    drop(input);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            preview.child().try_wait().unwrap().is_none(),
+            "routed preview exited before output backpressure"
+        );
+        let channel = fs::read_to_string(format!("/proc/{}/wchan", preview.child().id()));
+        if channel.is_ok_and(|channel| channel.contains("pipe_write")) {
+            return preview;
+        }
+        assert!(Instant::now() < deadline, "preview never blocked on stdout");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn last_touched_path(workspace: &BrWorkspace) -> PathBuf {
     beads_rust::util::last_touched_path(&workspace.root.join(".beads"))
 }
@@ -2324,6 +2458,178 @@ fn e2e_routing_delete_force_dry_run_reports_orphans_not_cascade() {
     assert_eq!(child_issue["status"].as_str(), Some("open"));
     let grandchild_issue = issue_from_jsonl(&external_workspace, &grandchild_id);
     assert_eq!(grandchild_issue["status"].as_str(), Some("open"));
+}
+
+#[test]
+fn e2e_586_routed_delete_dry_run_bypasses_held_external_authority() {
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+    init_workspace(&main_workspace, "init_delete_preview_main");
+    init_workspace(&external_workspace, "init_delete_preview_external");
+    configure_external_route(&main_workspace, &external_workspace);
+    let issue_id = create_issue_and_get_id(
+        &external_workspace,
+        "Routed dry-run preserves this issue",
+        "create_routed_preview_target",
+    );
+    let beads_dir = external_workspace.root.join(".beads");
+    let owner = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+        &beads_dir,
+        &beads_dir.join("beads.db"),
+        Some(1000),
+    )
+    .expect("hold external database-family authority");
+    let snapshot = || {
+        [
+            "beads.db",
+            "beads.db-wal",
+            "beads.db-journal",
+            "issues.jsonl",
+        ]
+        .map(|name| {
+            let path = beads_dir.join(name);
+            path.exists().then(|| fs::read(path).unwrap())
+        })
+    };
+    let before = snapshot();
+    for disable_fast_open in ["0", "1"] {
+        let preview = run_br_with_env(
+            &main_workspace,
+            [
+                "--no-auto-import",
+                "--no-auto-flush",
+                "--lock-timeout",
+                "1",
+                "delete",
+                &issue_id,
+                "--dry-run",
+                "--force",
+                "--json",
+            ],
+            [("BR_DISABLE_READ_ONLY_FAST_OPEN", disable_fast_open)],
+            &format!("routed_delete_preview_held_authority_{disable_fast_open}"),
+        );
+        assert!(
+            preview.status.success(),
+            "dry-run must finish while external authority remains held: {preview:?}"
+        );
+        let value: Value = serde_json::from_str(&extract_json_payload(&preview.stdout)).unwrap();
+        assert_eq!(value["preview"], true);
+        assert_eq!(value["would_delete"], serde_json::json!([issue_id]));
+        assert_eq!(
+            snapshot(),
+            before,
+            "preview changed the external database family"
+        );
+    }
+
+    let deletion = run_br(
+        &main_workspace,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "--lock-timeout",
+            "1",
+            "delete",
+            &issue_id,
+            "--force",
+            "--json",
+        ],
+        "real_routed_delete_held_authority",
+    );
+    assert!(
+        !deletion.status.success(),
+        "real deletion must still wait for authority"
+    );
+    assert!(
+        deletion
+            .stdout
+            .contains("Routed external workspace is busy"),
+        "expected the external lock refusal: {deletion:?}"
+    );
+    assert_eq!(snapshot(), before, "refused deletion changed external data");
+    drop(owner);
+    let shown = show_issue_json(
+        &main_workspace,
+        &issue_id,
+        "show_after_refused_routed_delete",
+    );
+    assert_eq!(shown[0]["status"], "open");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_routed_delete_preview_output_does_not_retain_writer_authority() {
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+    init_workspace(&main_workspace, "init_blocked_preview_main");
+    init_workspace(&external_workspace, "init_blocked_preview_external");
+    configure_external_route(&main_workspace, &external_workspace);
+    let issue_id = create_issue_and_get_id(
+        &external_workspace,
+        "Routed preview with blocked output",
+        "create_blocked_preview_target",
+    );
+    let jsonl = external_workspace.root.join(".beads/issues.jsonl");
+    let jsonl_before = fs::read(&jsonl).unwrap();
+    let mut preview = stalled_routed_delete_preview(&main_workspace, &issue_id);
+    let probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(external_workspace.root.join(".beads/.write.lock"))
+        .unwrap();
+    probe
+        .try_lock()
+        .expect("a blocked dry-run preview must not retain external workspace authority");
+    assert!(preview.child().try_wait().unwrap().is_none());
+    drop(probe);
+    let writer = run_br(
+        &external_workspace,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "--lock-timeout",
+            "1000",
+            "update",
+            &issue_id,
+            "--notes",
+            "updated while routed preview output was blocked",
+            "--json",
+        ],
+        "write_during_routed_preview_output",
+    );
+    assert!(
+        writer.status.success(),
+        "competing writer failed: {writer:?}"
+    );
+    assert!(preview.child().try_wait().unwrap().is_none());
+    let output = preview.finish();
+    assert!(output.status.success(), "preview failed: {output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).expect("padded preview JSON");
+    assert_eq!(value["preview"], true);
+    assert_eq!(value["would_delete"], serde_json::json!([issue_id]));
+    let shown = run_br(
+        &external_workspace,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            &issue_id,
+            "--json",
+        ],
+        "show_after_routed_preview_writer",
+    );
+    assert!(
+        shown.status.success(),
+        "post-write verification failed: {shown:?}"
+    );
+    let issues: Vec<Value> = serde_json::from_str(&extract_json_payload(&shown.stdout)).unwrap();
+    assert_eq!(issues[0]["status"], "open");
+    assert_eq!(
+        issues[0]["notes"],
+        "updated while routed preview output was blocked"
+    );
+    assert_eq!(fs::read(jsonl).unwrap(), jsonl_before);
 }
 
 #[test]
