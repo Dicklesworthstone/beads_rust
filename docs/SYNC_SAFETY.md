@@ -132,6 +132,23 @@ worktrees; it has its own operator-facing result and exit-code contract.
 
 ## Safety Guards
 
+### Existing database preservation
+
+Automatic recovery does not replace an existing SQLite database with JSONL
+after an open, probe, or mutation failure. JSONL cannot establish preservation
+of event history, configuration, metadata, allocation reservations, or
+operator-owned tables. Refusal retains the original database family and directs
+the operator to `br doctor --json` for inspection. An ordinary import also
+refuses implicit reconstruction when its integrity check reports damage.
+
+Duplicate configuration and metadata keys remain visible in doctor diagnostics
+without triggering reconstruction. Reads use the highest row ID for each key;
+reading a duplicate never removes the other records. Deliberately requested
+`sync --import-only --rebuild` remains a separate, best-effort operation. It
+retains the original family for rollback, but JSONL alone cannot restore every
+database-only record. A missing database can still be initialized from JSONL
+when no retained WAL or journal data makes that unsafe.
+
 ### Export Guards
 
 | Guard | What it prevents | Override |
@@ -158,6 +175,17 @@ revert or an older branch; timestamps and a clean database cannot distinguish
 those intentions. The refusal occurs before the requested command and rolls
 back the whole import, including earlier rows and synchronization receipts.
 JSONL and the merge anchor remain intact for explicit reconciliation.
+
+Automatic import also refuses when JSONL assigns a different issue to an ID
+that already exists locally, even if the original issue appears under a new
+ID in that file. Matching issue content cannot establish that its database-only
+events, gate approvals, capacity evidence, allocation reservations, local paths,
+or operator-owned records moved with it. The refusal happens before any import
+rows or receipts change and leaves the original identities and evidence intact.
+Preserve the database and reconcile issue identities together with their owned
+records before importing. Explicit import retains its existing behavior and can
+attach local evidence to the wrong issue; choosing it does not prove a lossless
+identity transfer.
 
 Automatic import also refuses if existing database records reference missing
 issues and import would discard them through relation replacement or orphan

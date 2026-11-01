@@ -1007,11 +1007,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                 &anomaly,
                 beads_dir,
                 paths,
-                lock_timeout,
-                bootstrap_layer,
-                allow_external_jsonl,
                 recovery_strategy,
-                write_authority,
                 &prepare_fresh_storage,
             ),
             Err(probe_err) => {
@@ -1027,11 +1023,7 @@ fn open_sqlite_storage_with_recovery_strategy(
                     &probe_err,
                     beads_dir,
                     paths,
-                    lock_timeout,
-                    bootstrap_layer,
-                    allow_external_jsonl,
                     recovery_strategy,
-                    write_authority,
                     &prepare_fresh_storage,
                 )
             }
@@ -1381,8 +1373,8 @@ fn automatic_recovery_preservation_refusal(
         message: format!(
             "Automatic database recovery refused because unflushed-state preservation could not be established:\n- {}\n\
              The database was not replaced. Keep the current database family at '{}' and any previously retained recovery files in '{}'. \
-             Run `br doctor` to inspect the damage, then use `br doctor --repair` for explicit best-effort repair and review its preservation warnings. \
-             A repair can only preserve state it can read; retained files are not proof that unreadable changes can be recovered.",
+             Run `br doctor --json` to inspect the source before making an explicit recovery decision. \
+             JSONL and retained files do not establish preservation of unreadable changes or other database-only records.",
             warnings.join("\n- "),
             db_path.display(),
             recovery_dir_for_db_path(db_path, beads_dir).display(),
@@ -1504,61 +1496,23 @@ fn is_recoverable_database_internal_error(detail: &str) -> bool {
         || detail_lower.contains("missing from index")
 }
 
-/// Handle the `Ok(Some(anomaly))` branch from
-/// `detect_recoverable_open_anomaly`: either rebuild from JSONL while
-/// preserving local unflushed tombstones, or move the DB family aside
-/// and open a fresh placeholder for the explicit-import path.
-///
-/// Split out of `open_sqlite_storage_with_recovery_strategy` so the
-/// caller stays under the pedantic `too_many_lines` budget; the
-/// preservation comment lives here so the behavior is documented next to
-/// the code that performs it.
-#[allow(clippy::too_many_arguments)]
+/// An open connection does not prove that JSONL represents every durable
+/// record. Automatic recovery refuses before replacing this database; an
+/// explicitly requested import retains its deliberate reconstruction path.
 fn rebuild_or_defer_after_recoverable_anomaly(
     storage: SqliteStorage,
     anomaly: &str,
     beads_dir: &Path,
     paths: &ConfigPaths,
-    lock_timeout: Option<u64>,
-    bootstrap_layer: &ConfigLayer,
-    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
-    write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<SqliteRecoveryOpenResult> {
     match recovery_strategy {
-        JsonlRecoveryStrategy::RebuildFromJsonl => {
-            warn!(
-                db_path = %paths.db_path.display(),
-                jsonl_path = %paths.jsonl_path.display(),
-                anomaly = %anomaly,
-                "Detected recoverable database anomaly after open; checking preservation before JSONL rebuild"
-            );
-            // Snapshot tombstones from the anomalous (but still queryable)
-            // storage BEFORE we drop it. The anomaly detector only flags
-            // duplicates on `blocked_issues_cache` / its index and on
-            // `config`/`metadata` kv duplicates — none of which break a
-            // plain `SELECT … FROM issues`. Without this snapshot, any
-            // unflushed local tombstones that haven't landed in JSONL
-            // would be silently dropped by the rebuild (which only
-            // imports what's in JSONL), taking their deletion-retention
-            // state with them.
-            let (storage, recovered_jsonl) = rebuild_with_tombstone_preservation(
-                storage,
-                beads_dir,
-                paths,
-                lock_timeout,
-                bootstrap_layer,
-                allow_external_jsonl,
-                write_authority,
-            )?;
-            Ok(SqliteRecoveryOpenResult {
-                storage,
-                auto_rebuilt: true,
-                pending_recovery_backup: None,
-                recovered_jsonl: Some(recovered_jsonl),
-            })
-        }
+        JsonlRecoveryStrategy::RebuildFromJsonl => Err(automatic_database_replacement_refusal(
+            beads_dir,
+            &paths.db_path,
+            anomaly,
+        )),
         JsonlRecoveryStrategy::DeferToExplicitImport => {
             warn!(
                 db_path = %paths.db_path.display(),
@@ -1578,132 +1532,42 @@ fn rebuild_or_defer_after_recoverable_anomaly(
     }
 }
 
-/// Handle the `Err(probe_err)` branch from
-/// `detect_recoverable_open_anomaly`. Counterpart of
-/// `rebuild_or_defer_after_recoverable_anomaly`; split out for the same
-/// reason and sharing the same preservation helper so both anomaly
-/// surfaces rescue unflushed tombstones consistently.
-#[allow(clippy::too_many_arguments)]
+/// A failed post-open probe has the same preservation requirements as an
+/// observed structural anomaly; a readable issue subset cannot authorize a
+/// replacement of the entire database.
 fn rebuild_or_defer_after_probe_error(
     storage: SqliteStorage,
     probe_err: &BeadsError,
     beads_dir: &Path,
     paths: &ConfigPaths,
-    lock_timeout: Option<u64>,
-    bootstrap_layer: &ConfigLayer,
-    allow_external_jsonl: bool,
     recovery_strategy: JsonlRecoveryStrategy,
-    write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<SqliteRecoveryOpenResult> {
-    match recovery_strategy {
-        JsonlRecoveryStrategy::RebuildFromJsonl => {
-            warn!(
-                db_path = %paths.db_path.display(),
-                jsonl_path = %paths.jsonl_path.display(),
-                probe_error = %probe_err,
-                "Post-open database probe failed; checking preservation before JSONL rebuild"
-            );
-            // A failed probe may still leave issue rows readable. Attempt
-            // preservation, but refuse replacement if any snapshot read
-            // fails instead of treating an empty or partial set as complete.
-            let (storage, recovered_jsonl) = rebuild_with_tombstone_preservation(
-                storage,
-                beads_dir,
-                paths,
-                lock_timeout,
-                bootstrap_layer,
-                allow_external_jsonl,
-                write_authority,
-            )?;
-            Ok(SqliteRecoveryOpenResult {
-                storage,
-                auto_rebuilt: true,
-                pending_recovery_backup: None,
-                recovered_jsonl: Some(recovered_jsonl),
-            })
-        }
-        JsonlRecoveryStrategy::DeferToExplicitImport => {
-            warn!(
-                db_path = %paths.db_path.display(),
-                jsonl_path = %paths.jsonl_path.display(),
-                probe_error = %probe_err,
-                "Post-open database probe failed; deferring JSONL recovery to explicit import semantics"
-            );
-            drop(storage);
-            let (storage, backup_set) = prepare_fresh_storage()?;
-            Ok(SqliteRecoveryOpenResult {
-                storage,
-                auto_rebuilt: false,
-                pending_recovery_backup: Some(backup_set),
-                recovered_jsonl: None,
-            })
-        }
-    }
-}
-
-/// Snapshot unflushed tombstones and dirty live issues from `storage`,
-/// drop the old connection, rebuild from JSONL, and restore the preserved
-/// state atomically. Without the dirty-issue half, an automatic rebuild
-/// would silently drop any local creation or edit that had not yet been
-/// flushed to the JSONL (GitHub #394).
-fn rebuild_with_tombstone_preservation(
-    storage: SqliteStorage,
-    beads_dir: &Path,
-    paths: &ConfigPaths,
-    lock_timeout: Option<u64>,
-    bootstrap_layer: &ConfigLayer,
-    allow_external_jsonl: bool,
-    write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
-) -> Result<(SqliteStorage, RecoveredJsonlSource)> {
-    let write_authority = write_authority.ok_or_else(|| BeadsError::SyncConflict {
-        message: "Database recovery has no database-family authority".to_string(),
-    })?;
-    let import_config = import_config_for_resolved_jsonl(
-        beads_dir,
-        &paths.db_path,
-        &paths.jsonl_path,
-        allow_external_jsonl,
-        paths.metadata.deletions_retention_days,
-    );
-    validate_sync_path_with_external(
-        &paths.jsonl_path,
-        beads_dir,
-        import_config.allow_external_jsonl,
-    )?;
-    let jsonl_authority = Arc::new(crate::sync::blocking_jsonl_family_write_lock_with_timeout(
-        &paths.jsonl_path,
-        lock_timeout,
-    )?);
-    jsonl_authority.verify_jsonl_authority()?;
-    let source = Arc::new(crate::sync::capture_jsonl_source_snapshot(
-        &paths.jsonl_path,
-    )?);
-    let preserved = preserved_unflushed_state(&storage, &source, beads_dir, &paths.db_path)?;
-    drop(storage);
-    let mut storage = rebuild_database_from_jsonl_snapshot(
+    rebuild_or_defer_after_recoverable_anomaly(
+        storage,
+        &format!("post-open database probe failed: {probe_err}"),
         beads_dir,
         paths,
-        lock_timeout,
-        bootstrap_layer,
-        import_config,
-        &source,
-        &jsonl_authority,
-        write_authority,
-    )?;
-    restore_tombstones_after_automatic_rebuild(
-        &mut storage,
-        &preserved.tombstones,
-        &preserved.import_omitted_tombstones,
-    )?;
-    restore_dirty_issues_after_rebuild(&mut storage, &preserved.dirty)?;
-    Ok((
-        storage,
-        RecoveredJsonlSource {
-            source,
-            authority: jsonl_authority,
-        },
-    ))
+        recovery_strategy,
+        prepare_fresh_storage,
+    )
+}
+
+fn automatic_database_replacement_refusal(
+    beads_dir: &Path,
+    db_path: &Path,
+    reason: &str,
+) -> BeadsError {
+    BeadsError::SyncConflict {
+        message: format!(
+            "Automatic database recovery refused because JSONL cannot establish complete database preservation: {reason}. \
+             Event history, configuration, metadata, allocation reservations, and operator-owned records may exist only in SQLite. \
+             The database was not replaced. Preserve the database family at '{}' and retained recovery files in '{}'. \
+             Run `br doctor --json` to inspect the source before making an explicit recovery decision",
+            db_path.display(),
+            recovery_dir_for_db_path(db_path, beads_dir).display(),
+        ),
+    }
 }
 
 fn rebuild_database_from_jsonl(
@@ -4498,18 +4362,23 @@ impl OpenStorageResult {
         self.database_transition_failed_closed = true;
     }
 
-    /// Rebuild the current SQLite database from the resolved JSONL export.
-    ///
-    /// On success, `auto_rebuilt` is set to `true` so downstream code can
-    /// detect that the storage is now a fresh import of the JSONL and skip
-    /// redundant rebuilds (for example, `br sync --import-only --rebuild`
-    /// short-circuits when it sees this flag).
+    /// A failed ordinary command cannot authorize replacing the database with
+    /// an issue-only interchange snapshot. Preserve the live handle, pending
+    /// attribution, and workflow policy so an explicit decision remains possible.
     ///
     /// # Errors
     ///
-    /// Returns an error if recovery fails or if this context is in `--no-db`
-    /// mode.
-    pub(crate) fn recover_database_from_jsonl(&mut self) -> Result<()> {
+    /// Always returns a preservation refusal without replacing the database.
+    pub(crate) fn recover_database_from_jsonl(&self) -> Result<()> {
+        self.validate_jsonl_recovery_context()?;
+        Err(automatic_database_replacement_refusal(
+            &self.paths.beads_dir,
+            &self.paths.db_path,
+            "a failed command does not establish a lossless reconstruction of the existing database",
+        ))
+    }
+
+    fn validate_jsonl_recovery_context(&self) -> Result<()> {
         if self.no_db {
             return Err(BeadsError::Config(
                 "cannot rebuild SQLite database from JSONL while --no-db mode is active"
@@ -4522,6 +4391,26 @@ impl OpenStorageResult {
                     .to_string(),
             });
         }
+        Ok(())
+    }
+
+    /// Perform a deliberately requested JSONL reconstruction. Only the explicit
+    /// `sync --import-only --rebuild` dispatcher may select this path; automatic
+    /// mutation recovery must use the refusal above. This preserves the existing
+    /// best-effort dirty/tombstone behavior without claiming that JSONL contains
+    /// all event, configuration, or operator-owned records.
+    ///
+    /// On success, `auto_rebuilt` is set to `true` so downstream code can
+    /// detect that the storage is now a fresh import of the JSONL and skip
+    /// redundant rebuilds (for example, `br sync --import-only --rebuild`
+    /// short-circuits when it sees this flag).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if recovery fails or if this context is in `--no-db`
+    /// mode.
+    pub(crate) fn rebuild_database_from_jsonl_explicit(&mut self) -> Result<()> {
+        self.validate_jsonl_recovery_context()?;
         let write_authority =
             self.write_authority
                 .clone()
@@ -10025,7 +9914,7 @@ routing:
                 "{message}"
             );
             assert!(message.contains("could not be opened"), "{message}");
-            assert!(message.contains("br doctor --repair"), "{message}");
+            assert!(message.contains("br doctor --json"), "{message}");
             assert!(message.contains(".br_recovery"), "{message}");
             assert_eq!(fs::read(&db_path).unwrap(), b"not a sqlite database");
             assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
@@ -10155,7 +10044,7 @@ routing:
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn automatic_recovery_keeps_clean_peer_omissions_and_exports_dirty_tombstones() {
+    fn explicit_rebuild_keeps_clean_peer_omissions_and_exports_dirty_tombstones() {
         for (locally_deleted, reintroduced) in [(false, false), (true, false), (false, true)] {
             let (_temp, mut context, original_omitted) =
                 context_with_imported_omission(!locally_deleted);
@@ -10218,7 +10107,7 @@ routing:
                 .unwrap();
             let source_before = fs::read(&context.paths.jsonl_path).unwrap();
 
-            context.recover_database_from_jsonl().unwrap();
+            context.rebuild_database_from_jsonl_explicit().unwrap();
 
             assert!(context.auto_rebuilt);
             assert_eq!(fs::read(&context.paths.jsonl_path).unwrap(), source_before);
@@ -10316,7 +10205,7 @@ routing:
     }
 
     #[test]
-    fn automatic_recovery_refuses_malformed_imported_tombstone_omissions() {
+    fn explicit_rebuild_refuses_malformed_imported_tombstone_omissions() {
         for malformed in ["''", "X'5b5d'", "'{\"invalid\":true}'"] {
             let (_temp, mut context, omitted) = context_with_imported_omission(true);
             context
@@ -10332,7 +10221,7 @@ routing:
             assert_eq!(checkpoint[0][0].as_integer(), Some(0), "{checkpoint:?}");
             let before = database_family_snapshot(&context.paths.db_path).unwrap();
             let source_before = fs::read(&context.paths.jsonl_path).unwrap();
-            let error = context.recover_database_from_jsonl().unwrap_err();
+            let error = context.rebuild_database_from_jsonl_explicit().unwrap_err();
             assert!(matches!(error, BeadsError::SyncConflict { .. }));
             assert!(error.to_string().contains("omission evidence"), "{error}");
             assert!(!context.auto_rebuilt);
@@ -10379,8 +10268,11 @@ routing:
             .expect_err("unreadable dirty state must prevent replacement");
 
         assert!(matches!(error, BeadsError::SyncConflict { .. }));
-        assert!(error.to_string().contains("bd-unreadable"), "{error}");
-        assert!(error.to_string().contains("br doctor --repair"), "{error}");
+        assert!(
+            error.to_string().contains("complete database preservation"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("br doctor --json"), "{error}");
         assert_eq!(
             context.storage.pending_event_attribution_for_review(),
             attribution
@@ -10416,16 +10308,19 @@ routing:
             &probe_error,
             &beads_dir,
             &context.paths,
-            context.resolved_lock_timeout,
-            &context.bootstrap_layer,
-            context.allow_external_jsonl,
             JsonlRecoveryStrategy::RebuildFromJsonl,
-            context.write_authority.as_ref(),
             &|| panic!("automatic refusal must not prepare fresh storage"),
         )
         .expect_err("failed probe must not bypass preservation");
         assert!(matches!(error, BeadsError::SyncConflict { .. }));
-        assert!(error.to_string().contains("bd-unreadable"), "{error}");
+        assert!(
+            error.to_string().contains("damaged startup probe page"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("complete database preservation"),
+            "{error}"
+        );
         assert_eq!(fs::read(&db_path).unwrap(), before);
         assert!(!recovery_dir_for_db_path(&db_path, &beads_dir).exists());
     }
@@ -10464,7 +10359,7 @@ routing:
             "Automatic database recovery refused",
             "could not be opened",
             "unflushed",
-            "br doctor --repair",
+            "br doctor --json",
             ".br_recovery",
         ] {
             assert!(message.contains(diagnostic), "{message}");
@@ -10552,7 +10447,7 @@ routing:
         for diagnostic in [
             "Automatic database recovery refused",
             "could not be opened",
-            "br doctor --repair",
+            "br doctor --json",
             ".br_recovery",
         ] {
             assert!(message.contains(diagnostic), "{message}");
@@ -10615,7 +10510,7 @@ routing:
     }
 
     #[test]
-    fn open_storage_with_cli_recovers_when_post_open_probe_finds_duplicate_config_rows() {
+    fn open_storage_with_cli_preserves_duplicate_config_rows_without_reconstruction() {
         for read_only_fast_open in [false, true] {
             let mut temp = TempDir::new().expect("tempdir");
             temp.disable_cleanup(true);
@@ -10628,8 +10523,31 @@ routing:
             storage
                 .set_config("issue_prefix", "bd")
                 .expect("seed issue prefix");
+            storage
+                .create_issue(
+                    &Issue {
+                        id: "bd-local".to_string(),
+                        title: "Local issue and history absent from JSONL".to_string(),
+                        ..Issue::default()
+                    },
+                    "local-actor",
+                )
+                .unwrap();
+            storage
+                .set_config("compact_model", "operator-model")
+                .unwrap();
             drop(storage);
             insert_duplicate_issue_prefix_config_row(&db_path, "bd");
+            let source_rows = |storage: &SqliteStorage| {
+                ["issues", "events", "config"].map(|table| {
+                    storage
+                        .execute_raw_query(&format!("SELECT rowid, * FROM {table} ORDER BY rowid"))
+                        .unwrap()
+                })
+            };
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            let before = source_rows(&storage);
+            drop(storage);
             if read_only_fast_open {
                 let fixture = Connection::open(db_path.to_string_lossy().into_owned())
                     .expect("open fast-open-miss fixture");
@@ -10642,39 +10560,47 @@ routing:
             write_single_issue_jsonl(
                 &jsonl_path,
                 "bd-rdup01",
-                "Recovered from duplicate config rows",
+                "JSONL does not represent the authoritative database",
             );
+            let jsonl_before = fs::read(&jsonl_path).unwrap();
 
             let cli = CliOverrides {
                 read_only_fast_open,
                 ..CliOverrides::default()
             };
             let storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
-            let issue = storage_ctx
-                .storage
-                .get_issue("bd-rdup01")
-                .expect("query issue")
-                .expect("issue should exist after duplicate-config recovery");
-
-            assert_eq!(issue.title, "Recovered from duplicate config rows");
-            assert!(!storage_ctx.no_db);
-            assert!(storage_ctx.auto_rebuilt);
-
-            let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
-            let backups: Vec<_> = fs::read_dir(&recovery_dir)
-                .expect("list recovery dir")
-                .filter_map(std::result::Result::ok)
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect();
+            assert_eq!(source_rows(&storage_ctx.storage), before);
             assert!(
-                backups.iter().any(|name| {
-                    name.starts_with("beads.db.")
-                        && Path::new(name)
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
-                }),
-                "duplicate-config database should be preserved in the recovery directory"
+                storage_ctx
+                    .storage
+                    .get_issue("bd-rdup01")
+                    .unwrap()
+                    .is_none()
             );
+            assert!(
+                storage_ctx
+                    .storage
+                    .detect_anomalies()
+                    .unwrap()
+                    .iter()
+                    .any(|anomaly| {
+                        matches!(
+                            anomaly,
+                            crate::health::AnomalyClass::DuplicateConfigKeys { .. }
+                        )
+                    })
+            );
+            assert_eq!(
+                storage_ctx
+                    .storage
+                    .detect_recoverable_open_anomaly()
+                    .unwrap(),
+                None
+            );
+            assert!(!storage_ctx.no_db);
+            assert!(!storage_ctx.auto_rebuilt);
+            assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+            assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
         }
     }
 
@@ -11606,7 +11532,7 @@ routing:
         let error = open_storage_with_cli(&beads_dir, &cli)
             .expect_err("external JSONL does not establish preservation of an unreadable DB");
         assert!(matches!(error, BeadsError::SyncConflict { .. }));
-        assert!(error.to_string().contains("br doctor --repair"), "{error}");
+        assert!(error.to_string().contains("br doctor --json"), "{error}");
         assert!(
             error
                 .to_string()
@@ -11663,7 +11589,7 @@ routing:
                 assert!(matches!(error, BeadsError::SyncConflict { .. }));
                 assert!(error.to_string().contains("orphaned sidecar"), "{error}");
                 assert!(error.to_string().contains(suffix), "{error}");
-                assert!(error.to_string().contains("br doctor --repair"), "{error}");
+                assert!(error.to_string().contains("br doctor --json"), "{error}");
                 assert!(!db_path.exists(), "refusal must not install a blank DB");
                 assert_eq!(
                     fs::read(&sidecar).unwrap(),
@@ -12557,12 +12483,22 @@ routing:
             },
         )
         .unwrap();
+        assert_eq!(
+            context.storage.detect_recoverable_open_anomaly().unwrap(),
+            None
+        );
         assert!(
             context
                 .storage
-                .detect_recoverable_open_anomaly()
+                .detect_anomalies()
                 .unwrap()
-                .is_some_and(|anomaly| anomaly.contains("config contains duplicate"))
+                .iter()
+                .any(|anomaly| {
+                    matches!(
+                        anomaly,
+                        crate::health::AnomalyClass::DuplicateConfigKeys { .. }
+                    )
+                })
         );
         assert!(!context.storage.get_all_events(0).unwrap().is_empty());
         let source_rows = |storage: &SqliteStorage| {
@@ -13458,7 +13394,7 @@ routing:
 
         let error = open_storage_with_cli(&beads_dir, &CliOverrides::default())
             .expect_err("unreadable family must not be replaced automatically");
-        assert!(error.to_string().contains("br doctor --repair"), "{error}");
+        assert!(error.to_string().contains("br doctor --json"), "{error}");
         assert_eq!(fs::read(&db_path).unwrap(), b"not a sqlite database");
         assert_eq!(
             fs::read_to_string(wal_dir.join("sentinel.txt")).unwrap(),
@@ -13512,7 +13448,7 @@ routing:
 
         let error = open_storage_with_cli(&beads_dir, &CliOverrides::default())
             .expect_err("unreadable family must not be replaced automatically");
-        assert!(error.to_string().contains("br doctor --repair"), "{error}");
+        assert!(error.to_string().contains("br doctor --json"), "{error}");
         assert_eq!(fs::read(&db_path).unwrap(), b"not a sqlite database");
         assert_eq!(
             fs::read_to_string(journal_dir.join("sentinel.txt")).unwrap(),

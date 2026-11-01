@@ -3325,13 +3325,9 @@ impl SqliteStorage {
         Ok(())
     }
 
-    /// Detect recoverable on-disk anomalies that should trigger JSONL rebuild.
-    ///
-    /// These checks run after the database opens successfully because some
-    /// malformed states remain queryable enough to reach startup, then fail on
-    /// the next single-row lookup.
-    ///
     /// Detect structured anomalies suitable for the canonical health classifier.
+    /// Duplicate configuration and metadata keys remain observable here, but
+    /// their supported rowid precedence does not authorize database replacement.
     ///
     /// # Errors
     ///
@@ -3369,6 +3365,10 @@ impl SqliteStorage {
         Ok(anomalies)
     }
 
+    /// Queryable duplicate KV records are deliberately excluded: getters use
+    /// deterministic rowid precedence, and reconstructing them from JSONL would
+    /// discard unrelated history, configuration, and operator-owned state.
+    ///
     /// # Errors
     ///
     /// Returns an error if probing the database fails.
@@ -3394,18 +3394,6 @@ impl SqliteStorage {
             let row_count = row.get(2).and_then(SqliteValue::as_integer).unwrap_or(2);
             return Ok(Some(format!(
                 "sqlite_master contains duplicate {object_type} entries for '{name}' ({row_count} rows)"
-            )));
-        }
-
-        if let Some((key, row_count)) = self.first_duplicate_kv_key("config")? {
-            return Ok(Some(format!(
-                "config contains duplicate rows for key '{key}' ({row_count} rows)"
-            )));
-        }
-
-        if let Some((key, row_count)) = self.first_duplicate_kv_key("metadata")? {
-            return Ok(Some(format!(
-                "metadata contains duplicate rows for key '{key}' ({row_count} rows)"
             )));
         }
 
@@ -8064,7 +8052,7 @@ impl SqliteStorage {
             tracing::warn!(
                 id = %id,
                 "update_issue: row not found inside write transaction \
-                 (possible DB corruption — run `br doctor --repair`)"
+                 (possible DB corruption — inspect with `br doctor --json`)"
             );
             BeadsError::IssueNotFound { id: id.to_string() }
         })?;
@@ -16102,14 +16090,14 @@ impl SqliteStorage {
         Ok(map)
     }
 
-    /// Fetch a config value.
+    /// Fetch a config value using the latest row for a duplicate key.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
         match self.conn.query_row_with_params(
-            "SELECT value FROM config WHERE key = ?",
+            "SELECT value FROM config WHERE key = ? ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
@@ -16118,13 +16106,15 @@ impl SqliteStorage {
         }
     }
 
-    /// Fetch all config values from the config table.
+    /// Fetch all config values, giving the latest row precedence for each key.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     pub fn get_all_config(&self) -> Result<HashMap<String, String>> {
-        let rows = self.conn.query("SELECT key, value FROM config")?;
+        let rows = self
+            .conn
+            .query("SELECT key, value FROM config ORDER BY rowid ASC")?;
 
         let mut map = HashMap::new();
         for row in &rows {
@@ -42203,6 +42193,48 @@ required_fields:
             Some("false".to_string())
         );
         assert_eq!(storage.get_metadata(BLOCKED_CACHE_STATE_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn test_config_duplicate_rows_read_latest_without_modifying_any_record() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO config (rowid, key, value) VALUES
+                 (9901, 'operator.setting', 'middle'),
+                 (9903, 'operator.setting', 'latest'),
+                 (9899, 'operator.setting', 'oldest')",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute("CREATE INDEX operator_config_order ON config(key, value DESC)")
+            .unwrap();
+        let before = storage
+            .execute_raw_query("SELECT rowid, * FROM config ORDER BY rowid")
+            .unwrap();
+        let missing = "operator.missing";
+        assert_eq!(storage.get_config(missing).unwrap(), None);
+        assert_eq!(
+            storage.get_config("operator.setting").unwrap(),
+            Some("latest".to_string())
+        );
+        assert_eq!(
+            storage.get_all_config().unwrap()["operator.setting"],
+            "latest"
+        );
+        assert_eq!(storage.detect_recoverable_open_anomaly().unwrap(), None);
+        assert!(storage.detect_anomalies().unwrap().iter().any(|anomaly| {
+            matches!(anomaly, crate::health::AnomalyClass::DuplicateConfigKeys { key, count }
+                if key == "operator.setting" && *count == 3)
+        }));
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, * FROM config ORDER BY rowid")
+                .unwrap(),
+            before
+        );
     }
 
     #[test]

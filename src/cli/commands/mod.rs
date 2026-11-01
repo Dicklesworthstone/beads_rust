@@ -704,8 +704,7 @@ where
             // the fix is to quarantine the sidecar pair (verified backups in
             // `.br_recovery`; the `-wal` file is real data and is never
             // touched), reopen the healthy database in place, and retry the
-            // write once — without the JSONL rebuild below, which is heavier
-            // and wedges when the JSONL merge anchor is stale. Only attempted
+            // write once without reconstructing durable state from JSONL. Only attempted
             // while the main database file is present: a missing database is
             // the orphaned-sidecar open path's job, not this one's.
             if let Some(result) = retry_after_stale_wal_certificate(
@@ -753,7 +752,7 @@ where
                 probe_error = %probe_error_display,
                 db_path = %storage_ctx.paths.db_path.display(),
                 jsonl_path = %storage_ctx.paths.jsonl_path.display(),
-                "Mutation hit a recoverable database corruption path; rebuilding from JSONL and retrying once"
+                "Mutation hit a database corruption signal; refusing automatic JSONL reconstruction to preserve the existing database"
             );
 
             let original_error = operation_err.to_string();
@@ -762,12 +761,12 @@ where
                     context: probe_issue_id.map_or_else(
                         || {
                             format!(
-                                "automatic database recovery failed after {command} write; original write error: {original_error}"
+                                "automatic database recovery refused after {command} write; original write error: {original_error}"
                             )
                         },
                         |issue_id| {
                         format!(
-                            "automatic database recovery failed after {command} write for issue '{issue_id}'; original write error: {original_error}"
+                            "automatic database recovery refused after {command} write for issue '{issue_id}'; original write error: {original_error}"
                         )
                         },
                     ),
@@ -791,15 +790,16 @@ mod tests {
     };
     use crate::config::{CliOverrides, ConfigLayer, OpenStorageResult, open_storage_with_cli};
     use crate::error::BeadsError;
-    use crate::franken_sync::Connection;
+    use crate::franken_sync::{Connection, SqliteValue};
     use crate::model::Issue;
     use crate::storage::SqliteStorage;
     use crate::storage::sqlite::{database_family_read_only_diffs, database_family_snapshot};
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
     use chrono::Utc;
     use fsqlite_error::FrankenError;
+    use std::collections::BTreeMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn storage_ctx_with_exported_issue() -> (TempDir, OpenStorageResult) {
@@ -847,6 +847,53 @@ mod tests {
         };
         let json = serde_json::to_string(&issue).expect("serialize issue");
         fs::write(path, format!("{json}\n")).expect("write jsonl");
+    }
+
+    fn tracker_artifact_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    snapshot.insert(relative, None);
+                    visit(root, &path, snapshot);
+                } else {
+                    assert!(kind.is_file(), "unexpected fixture artifact: {path:?}");
+                    snapshot.insert(relative, Some(fs::read(path).unwrap()));
+                }
+            }
+        }
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    fn raw_storage_record_state(
+        storage: &SqliteStorage,
+    ) -> BTreeMap<String, Vec<Vec<SqliteValue>>> {
+        let mut state = BTreeMap::new();
+        for row in storage
+            .execute_raw_query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+        {
+            let name = row[0].as_text().unwrap();
+            let quoted = name.replace('"', "\"\"");
+            state.insert(
+                name.to_string(),
+                storage
+                    .execute_raw_query(&format!("SELECT rowid, * FROM \"{quoted}\" ORDER BY rowid"))
+                    .unwrap(),
+            );
+        }
+        state.insert(
+            "schema".to_string(),
+            storage
+                .execute_raw_query("SELECT * FROM sqlite_master ORDER BY type, name")
+                .unwrap(),
+        );
+        state
     }
 
     #[test]
@@ -1155,11 +1202,35 @@ mod tests {
     }
 
     #[test]
-    fn retry_mutation_recovers_from_recoverable_database_error() {
+    fn mutation_corruption_refuses_reconstruction_and_preserves_all_records() {
         let (_temp, mut storage_ctx) = storage_ctx_with_exported_issue();
+        storage_ctx
+            .storage
+            .execute_test_sql(
+                "INSERT INTO events (issue_id, event_type, actor, new_value)
+                 VALUES ('bd-1', 'updated', 'original-actor', X'00FF');
+                 INSERT INTO config (key, value) VALUES ('operator.setting', 'non-default');
+                 INSERT INTO metadata (key, value) VALUES ('operator.proof', X'FF00');
+                 INSERT INTO child_counters (parent_id, last_child) VALUES ('bd-1', 47);
+                 CREATE TABLE operator_records (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     issue_id TEXT REFERENCES issues(id),
+                     payload BLOB
+                 );
+                 INSERT INTO operator_records VALUES (31, 'bd-1', X'00FF01');
+                 UPDATE sqlite_sequence SET seq = 99 WHERE name = 'operator_records';",
+            )
+            .unwrap();
+        let records_before = raw_storage_record_state(&storage_ctx.storage);
+        let files_before = tracker_artifact_snapshot(&storage_ctx.paths.beads_dir);
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&storage_ctx.paths.db_path).unwrap().ino()
+        };
         let mut attempts = 0;
 
-        let result = retry_mutation_with_jsonl_recovery(
+        let error = retry_mutation_with_jsonl_recovery(
             &mut storage_ctx,
             true,
             "test-mutation",
@@ -1175,10 +1246,38 @@ mod tests {
                 }
             },
         )
-        .expect("recovered mutation");
+        .expect_err("corruption does not authorize loss of database-only records");
 
-        assert_eq!(result, "recovered");
-        assert_eq!(attempts, 2);
+        assert_eq!(attempts, 1, "refusal must not retry the failed mutation");
+        let message = error.to_string();
+        for expected in [
+            "complete database preservation",
+            "The database was not replaced",
+            "br doctor --json",
+            "test-mutation",
+            "bd-1",
+            "synthetic corruption",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+        assert_eq!(
+            tracker_artifact_snapshot(&storage_ctx.paths.beads_dir),
+            files_before
+        );
+        assert_eq!(
+            raw_storage_record_state(&storage_ctx.storage),
+            records_before
+        );
+        assert!(!storage_ctx.auto_rebuilt);
+        assert!(!storage_ctx.paths.beads_dir.join(".br_recovery").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(&storage_ctx.paths.db_path).unwrap().ino(),
+                inode_before
+            );
+        }
         assert!(
             storage_ctx
                 .storage
@@ -1228,25 +1327,35 @@ mod tests {
     }
 
     #[test]
-    fn retry_preserves_staged_attribution_across_jsonl_recovery() {
-        // #312 hardening (F1): attribution staged ONCE before the retry helper
-        // must survive a recoverable first-attempt failure and still be stamped
-        // by the post-recovery retry. The attribution is staged exactly once,
-        // OUTSIDE the operation closure, so this genuinely exercises the
-        // take-after-commit fix (not a re-stage workaround).
+    fn mutation_recovery_refusal_preserves_staged_attribution_and_workflow() {
+        // An automatic recovery refusal leaves both the original storage and
+        // its unconsumed mutation intent intact. A subsequent deliberate
+        // mutation must still enforce the policy and stamp that attribution.
         let (_temp, mut storage_ctx) = storage_ctx_with_exported_issue();
         let mut attempts = 0;
-
+        let workflow = crate::close_policy::Workflow {
+            strict: true,
+            statuses: vec!["open".to_string(), "in_progress".to_string()],
+            transitions: BTreeMap::from([("open".to_string(), vec!["in_progress".to_string()])]),
+            ..Default::default()
+        };
+        storage_ctx.storage.set_workflow_policy(workflow.clone());
+        let attribution = crate::storage::EventAttribution::new(
+            Some("agent-retained"),
+            None,
+            Some("opus-4"),
+            None,
+        );
         storage_ctx
             .storage
-            .set_pending_event_attribution(crate::storage::EventAttribution::new(
-                Some("agent-recovered"),
-                None,
-                Some("opus-4"),
-                None,
-            ));
+            .set_pending_event_attribution(attribution.clone());
+        let records_before = raw_storage_record_state(&storage_ctx.storage);
+        let update = crate::storage::IssueUpdate {
+            status: Some(crate::model::Status::InProgress),
+            ..Default::default()
+        };
 
-        retry_mutation_with_jsonl_recovery(
+        let error = retry_mutation_with_jsonl_recovery(
             &mut storage_ctx,
             true,
             "update_issue",
@@ -1254,25 +1363,31 @@ mod tests {
             |storage| {
                 attempts += 1;
                 if attempts == 1 {
-                    // First attempt: a recoverable corruption error that does NOT
-                    // commit. The staged attribution must NOT be consumed.
                     Err(BeadsError::Database(FrankenError::DatabaseCorrupt {
                         detail: "synthetic corruption".to_string(),
                     }))
                 } else {
-                    // Post-recovery retry: a real committing mutation that should
-                    // stamp the still-staged attribution onto its event.
-                    let update = crate::storage::IssueUpdate {
-                        status: Some(crate::model::Status::InProgress),
-                        ..Default::default()
-                    };
                     storage.update_issue("bd-1", &update, "tester").map(|_| ())
                 }
             },
         )
-        .expect("recovered mutation should stamp staged attribution");
+        .expect_err("automatic recovery must not retry through a reconstructed database");
 
-        assert_eq!(attempts, 2, "should recover and retry exactly once");
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("complete database preservation"));
+        assert_eq!(
+            raw_storage_record_state(&storage_ctx.storage),
+            records_before
+        );
+        assert_eq!(storage_ctx.storage.workflow_policy(), workflow);
+        assert_eq!(
+            storage_ctx.storage.pending_event_attribution_for_review(),
+            attribution
+        );
+        storage_ctx
+            .storage
+            .update_issue("bd-1", &update, "tester")
+            .expect("subsequent deliberate update uses the retained original handle");
 
         let events = storage_ctx
             .storage
@@ -1281,13 +1396,19 @@ mod tests {
         let status_event = events
             .iter()
             .find(|e| e.event_type == crate::model::EventType::StatusChanged)
-            .expect("status_changed event present after recovery");
+            .expect("status_changed event present after the deliberate update");
         assert_eq!(
             status_event.agent_name.as_deref(),
-            Some("agent-recovered"),
-            "attribution must survive the JSONL-recovery retry (F1)"
+            Some("agent-retained"),
+            "recovery refusal must retain staged attribution until a real commit"
         );
         assert_eq!(status_event.model.as_deref(), Some("opus-4"));
+        assert!(
+            storage_ctx
+                .storage
+                .pending_event_attribution_for_review()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1406,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_recovery_can_be_signaled_by_probe_after_constraint_style_error() {
+    fn mutation_recovery_refusal_can_be_signaled_by_probe_after_constraint_style_error() {
         let (_temp, storage_ctx) = storage_ctx_with_exported_issue();
         let operation_err = BeadsError::Database(FrankenError::Internal(
             "constraint verification failed".to_string(),
@@ -1421,7 +1542,7 @@ mod tests {
         );
         assert!(
             should_attempt_mutation_jsonl_recovery(&storage_ctx, &operation_err, Some(&probe_err)),
-            "a recoverable rollback-only write probe should trigger JSONL recovery"
+            "a corruption probe must reach the complete-preservation refusal"
         );
     }
 }

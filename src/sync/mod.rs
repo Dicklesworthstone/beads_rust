@@ -15332,6 +15332,7 @@ struct ImportMetadataMaps {
 #[derive(Debug, Default)]
 struct ImportCollisionPlan {
     renames: HashMap<String, String>,
+    displaced_issue_ids: Vec<String>,
     comment_owner_ids_to_replace: Vec<String>,
     comments_by_target: HashMap<String, Vec<Comment>>,
 }
@@ -15657,6 +15658,7 @@ fn scan_import_collision_renames(
 ) -> Result<ImportCollisionPlan> {
     let mut seen_external_refs = HashSet::new();
     let mut renames = HashMap::new();
+    let mut displaced_issue_ids = BTreeSet::new();
     let mut comment_owner_ids_to_replace = BTreeSet::new();
     let mut comments_by_target: HashMap<String, Vec<Comment>> = HashMap::new();
     let progress =
@@ -15686,6 +15688,16 @@ fn scan_import_collision_renames(
             CollisionResult::Match { existing_id, .. } => existing_id.clone(),
             CollisionResult::NewIssue => issue.id.clone(),
         };
+
+        if matches!(
+            collision,
+            CollisionResult::Match {
+                match_type: MatchType::DisplacedId,
+                ..
+            }
+        ) {
+            displaced_issue_ids.insert(target_id.clone());
+        }
 
         if target_id != issue.id {
             renames.insert(issue.id.clone(), target_id.clone());
@@ -15732,8 +15744,31 @@ fn scan_import_collision_renames(
     progress.finish_with_message("Scan complete");
     Ok(ImportCollisionPlan {
         renames,
+        displaced_issue_ids: displaced_issue_ids.into_iter().collect(),
         comment_owner_ids_to_replace: comment_owner_ids_to_replace.into_iter().collect(),
         comments_by_target,
+    })
+}
+
+/// JSONL can carry a relocated issue without carrying its database-only
+/// evidence. Reusing its former ID would silently attach that evidence to a
+/// different issue. Refuse every such automatic replacement, including when
+/// no known relation table currently has rows: operator-owned records and
+/// machine-local state are not an enumerable JSONL preservation contract.
+fn refuse_automatic_import_with_displaced_issue_ids(plan: &ImportCollisionPlan) -> Result<()> {
+    if plan.displaced_issue_ids.is_empty() {
+        return Ok(());
+    }
+    Err(BeadsError::SyncConflict {
+        message: format!(
+            "Automatic import refused: JSONL assigns a different issue identity to existing \
+             ID(s) {}; no import was applied. JSONL cannot relocate database-only event \
+             history, gate approvals, allocation reservations, or other owned records. \
+             Preserve the database and reconcile issue identities together with their \
+             owned records before importing. Explicit import retains its existing behavior \
+             and can assign local evidence to a different issue",
+            plan.displaced_issue_ids.join(", "),
+        ),
     })
 }
 
@@ -16922,6 +16957,7 @@ fn import_from_jsonl_snapshot_impl(
 
     let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
         if mode == ImportMode::Automatic {
+            refuse_automatic_import_with_displaced_issue_ids(&collision_plan)?;
             refuse_automatic_import_with_existing_orphans(storage)?;
         }
         // One query proves that no owned relation rows (labels, dependencies,
@@ -31343,6 +31379,133 @@ mod tests {
             additive_raw_rows(storage, "SELECT * FROM sqlite_master ORDER BY type, name").unwrap(),
         );
         state
+    }
+
+    fn seed_displaced_issue_evidence(storage: &SqliteStorage) {
+        storage
+            .execute_test_sql(
+                "UPDATE issues SET source_repo_path = '/local/original' WHERE id = 'bd-owner';
+                 INSERT INTO events (id, issue_id, event_type, actor, new_value)
+                 VALUES (107, 'bd-owner', 'updated', 'original-actor', X'00FF');
+                 INSERT INTO gate_results (issue_id, gate, provider, passed, recorded_by)
+                 VALUES ('bd-owner', 'review', 'operator', 1, 'original-reviewer');
+                 INSERT INTO gate_result_history
+                     (issue_id, from_status, to_status, status_revision, gate, provider, passed)
+                 VALUES ('bd-owner', 'open', 'closed', 0, 'review', 'operator', 1);
+                 INSERT INTO close_metadata (issue_id, bypassed_policy, bypass_reason)
+                 VALUES ('bd-owner', 1, 'original closure evidence');
+                 INSERT INTO capacity_exemptions
+                     (issue_id, capacity_kind, capacity_name, provider, reason, granted_by)
+                 VALUES ('bd-owner', 'status', 'in_progress', 'operator', 'original grant', 'actor');
+                 INSERT INTO capacity_exemption_history
+                     (issue_id, capacity_kind, capacity_name, action, provider, actor)
+                 VALUES ('bd-owner', 'status', 'in_progress', 'grant', 'operator', 'actor');
+                 INSERT INTO capacity_occupancy (issue_id, actor, session)
+                 VALUES ('bd-owner', 'original-actor', 'original-session');
+                 INSERT INTO child_counters (rowid, parent_id, last_child)
+                 VALUES (101, 'bd-owner', 47);
+                 INSERT INTO dependencies (issue_id, depends_on_id, type)
+                 VALUES ('bd-owner', 'bd-neighbor', 'related'),
+                        ('bd-neighbor', 'bd-owner', 'related');
+                 INSERT INTO labels (issue_id, label) VALUES ('bd-owner', 'original-label');
+                 INSERT INTO config (key, value) VALUES ('operator.setting', 'non-default');
+                 INSERT INTO metadata (key, value) VALUES ('operator.proof', X'FF00');
+                 CREATE TABLE operator_owned (
+                     id INTEGER PRIMARY KEY,
+                     issue_id TEXT REFERENCES issues(id),
+                     payload BLOB
+                 );
+                 INSERT INTO operator_owned VALUES (17, 'bd-owner', X'00FF01');",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn automatic_import_refuses_displaced_issue_identity_before_any_change() {
+        for (reverse_source, with_owned_records) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+            let original = issue_created_at("bd-owner", "Original issue", 25, 100);
+            let neighbor = issue_created_at("bd-neighbor", "Other local issue", 15, 80);
+            write_jsonl_issues(&jsonl_path, &[&original, &neighbor]);
+            import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd"),
+            )
+            .unwrap();
+            if with_owned_records {
+                seed_displaced_issue_evidence(&storage);
+            }
+            let original_before = storage.get_issue(&original.id).unwrap().unwrap();
+            let replacement = issue_created_at("bd-owner", "Different issue", 20, 20);
+            let mut relocated = original.clone();
+            relocated.id = "bd-relocated".to_string();
+            let fresh = issue_created_at("bd-new", "Must not be inserted", 150, 200);
+            let ordered = if reverse_source {
+                [&fresh, &relocated, &replacement]
+            } else {
+                [&fresh, &replacement, &relocated]
+            };
+            write_jsonl_issues(&jsonl_path, &ordered);
+            let source_before = fs::read(&jsonl_path).unwrap();
+            let before = raw_import_refusal_state(&storage);
+
+            let error = auto_import_if_stale(
+                &mut storage,
+                &beads_dir,
+                &jsonl_path,
+                Some("bd"),
+                None,
+                false,
+                false,
+                false,
+            )
+            .expect_err("automatic import cannot transfer database-only ownership");
+            let message = error.to_string();
+            for expected in [
+                "Automatic import refused:",
+                "issue identity",
+                "bd-owner",
+                "database-only",
+                "no import was applied",
+            ] {
+                assert!(message.contains(expected), "{message}");
+            }
+            assert_eq!(raw_import_refusal_state(&storage), before);
+            assert_eq!(fs::read(&jsonl_path).unwrap(), source_before);
+            assert_eq!(
+                storage.get_issue(&original.id).unwrap(),
+                Some(original_before)
+            );
+            assert!(storage.get_issue(&relocated.id).unwrap().is_none());
+            assert!(storage.get_issue(&fresh.id).unwrap().is_none());
+            if with_owned_records {
+                assert_eq!(storage.next_child_number(&original.id).unwrap(), 48);
+            } else {
+                // This scoped safety gate does not change deliberate import
+                // semantics. With no owned evidence, its existing relocation
+                // path still imports the source after the automatic refusal.
+                import_from_jsonl(
+                    &mut storage,
+                    &jsonl_path,
+                    &ImportConfig::default(),
+                    Some("bd"),
+                )
+                .unwrap();
+                assert_eq!(
+                    storage.get_issue(&replacement.id).unwrap().unwrap().title,
+                    replacement.title,
+                );
+                assert_eq!(
+                    storage.get_issue(&relocated.id).unwrap().unwrap().title,
+                    original.title,
+                );
+            }
+        }
     }
 
     #[test]

@@ -97,7 +97,7 @@ fn assert_preservation_refusal(refused: &Output) {
         "unflushed",
         "beads.db-wal",
         ".br_recovery",
-        "br doctor --repair",
+        "br doctor --json",
     ] {
         assert!(message.contains(detail), "missing {detail:?}: {message}");
     }

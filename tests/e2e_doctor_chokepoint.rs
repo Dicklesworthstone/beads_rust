@@ -34,7 +34,7 @@ use assert_cmd::Command;
 use beads_rust::cli::commands::doctor_subsystems::mutate::{
     Capabilities, DbArg, MutateContext, Op, mutate,
 };
-use beads_rust::franken_sync::Connection;
+use beads_rust::franken_sync::{Connection, SqliteValue};
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -2409,6 +2409,31 @@ impl StartupRecoveryBefore {
 
     fn assert_refusal_retained_sources(&self, fixture: &StartupRecoveryFixture) {
         let beads = fixture.root.join(".beads");
+        let mut current_committed_family = BTreeMap::new();
+        for name in ["beads.db", "beads.db-wal", "beads.db-journal"] {
+            let path = beads.join(name);
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    current_committed_family.insert(path, bytes);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot inspect {}: {error}", path.display()),
+            }
+        }
+        let original_committed_family: BTreeMap<_, _> = self
+            .family
+            .iter()
+            .filter(|(path, _)| {
+                path.file_name().is_some_and(|name| {
+                    name == "beads.db" || name == "beads.db-wal" || name == "beads.db-journal"
+                })
+            })
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect();
+        assert_eq!(
+            current_committed_family, original_committed_family,
+            "refusal created, removed, or changed a data-bearing database-family member"
+        );
         for (path, bytes) in &self.family {
             assert!(
                 path.is_file(),
@@ -2593,16 +2618,68 @@ fn assert_partial_preservation_repair(
     repair
 }
 
-fn assert_startup_refuses_with_diagnostics(
+fn assert_observational_storage_error(
+    error: &Value,
     fixture: &StartupRecoveryFixture,
-    details: &[&str],
+    value_diagnostic: Option<&str>,
+) {
+    let code = error["error"]["code"]
+        .as_str()
+        .expect("structured storage error code");
+    let message = error["error"]["message"]
+        .as_str()
+        .expect("storage diagnostic");
+    if message.contains("Read-only storage open refused") {
+        assert!(
+            matches!(
+                code,
+                "DATABASE_ERROR"
+                    | "CONFIG_ERROR"
+                    | "DATABASE_NOT_FOUND"
+                    | "IO_ERROR"
+                    | "SYNC_CONFLICT"
+            ),
+            "{error}"
+        );
+        assert!(
+            message.contains(&fixture.root.join(".beads/beads.db").display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains("writable recovery and schema changes")
+                && message.contains("br doctor --json"),
+            "{message}"
+        );
+    } else if code == "CONFIG_ERROR" {
+        let diagnostic =
+            value_diagnostic.expect("only the deliberately malformed value may fail decoding");
+        assert!(
+            message.contains(diagnostic),
+            "unrelated configuration failure: {message}"
+        );
+    } else {
+        assert_eq!(code, "DATABASE_ERROR", "unrelated read failure: {error}");
+        let lower = message.to_ascii_lowercase();
+        assert!(
+            ["corrupt", "malformed", "invalid page"]
+                .iter()
+                .any(|detail| lower.contains(detail)),
+            "missing underlying storage failure: {message}"
+        );
+    }
+}
+
+fn assert_startup_reads_retain_sources(
+    fixture: &StartupRecoveryFixture,
     check_fast_fallback: bool,
+    value_diagnostic: Option<&str>,
 ) {
     let before = StartupRecoveryBefore::capture(fixture);
+    let beads = fixture.root.join(".beads");
+    let reader_inventory = complete_workspace_inventory(&beads);
     // Observational reads may safely query unaffected tables or refuse the
     // damaged storage. Neither result may reconstruct the database or audit
-    // it by opening a writable connection. Mutation startup below still
-    // exercises the original #539 preservation guard and detailed diagnosis.
+    // it by opening a writable connection.
     let mut reads = vec![(vec!["stats", "--json"], "observational_stats")];
     if check_fast_fallback {
         reads.push((vec!["list", "--json"], "observational_list"));
@@ -2612,42 +2689,42 @@ fn assert_startup_refuses_with_diagnostics(
         let payload: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|err| panic!("read must return one JSON document: {err}; {out:?}"));
         if !out.status.success() {
-            assert!(
-                payload["error"]["message"]
-                    .as_str()
-                    .is_some_and(|message| !message.is_empty())
-            );
+            assert_observational_storage_error(&payload, fixture, value_diagnostic);
         }
+        assert_complete_workspace_unchanged(&beads, &reader_inventory);
         before.assert_refusal_retained_sources(fixture);
     }
-    let probes = [
-        (
-            vec![
-                "create",
-                "Refused recovery mutation",
-                "--no-auto-flush",
-                "--json",
-            ],
-            "refused_mutation_json",
-            true,
-        ),
-        (
-            vec!["create", "Refused recovery mutation", "--no-auto-flush"],
-            "refused_mutation",
-            false,
-        ),
-    ];
-    for (args, label, json) in probes {
+}
+
+fn assert_startup_refuses_with_diagnostics(
+    fixture: &StartupRecoveryFixture,
+    mutation: &[&str],
+    details: &[&str],
+    check_fast_fallback: bool,
+) {
+    assert_startup_reads_retain_sources(fixture, check_fast_fallback, None);
+    let before = StartupRecoveryBefore::capture(fixture);
+    for (json, label) in [(true, "refused_mutation_json"), (false, "refused_mutation")] {
+        let mut args = mutation.to_vec();
+        args.extend(["--no-auto-import", "--no-auto-flush"]);
+        if json {
+            args.push("--json");
+        }
         let out = startup_fixture_run(&fixture.root, &args, label);
-        assert_eq!(
-            out.status.code(),
-            Some(6),
-            "expected SYNC_CONFLICT: {out:?}"
+        assert!(
+            !out.status.success(),
+            "damaged-table mutation succeeded: {out:?}"
         );
         let message = if json {
             let payload: Value = serde_json::from_slice(&out.stdout)
                 .unwrap_or_else(|err| panic!("stdout must be one error document: {err}; {out:?}"));
-            assert_eq!(payload["error"]["code"], "SYNC_CONFLICT", "{payload}");
+            assert!(
+                matches!(
+                    payload["error"]["code"].as_str(),
+                    Some("SYNC_CONFLICT" | "DATABASE_ERROR")
+                ),
+                "{payload}"
+            );
             payload["error"]["message"]
                 .as_str()
                 .expect("structured error message")
@@ -2659,23 +2736,35 @@ fn assert_startup_refuses_with_diagnostics(
             );
             String::from_utf8(out.stderr).expect("plain diagnostic")
         };
-        for detail in [
-            "Automatic database recovery refused",
-            "br doctor --repair",
-            ".br_recovery",
-        ]
-        .into_iter()
-        .chain(details.iter().copied())
-        {
+        if message.contains("Automatic database recovery refused") {
+            assert_eq!(out.status.code(), Some(6));
+            for detail in ["br doctor --json", ".br_recovery"]
+                .into_iter()
+                .chain(details.iter().copied())
+            {
+                assert!(
+                    message.contains(detail),
+                    "missing {detail:?} in diagnostic: {message}"
+                );
+            }
             assert!(
-                message.contains(detail),
-                "missing {detail:?} in diagnostic: {message}"
+                message.contains(&fixture.root.join(".beads/beads.db").display().to_string()),
+                "diagnostic must identify retained database: {message}"
+            );
+        } else {
+            // A command can fail while reading the damaged relation before
+            // reaching its mutation retry wrapper. Preserve that concrete
+            // engine diagnostic instead of forcing a reconstruction path.
+            assert!(details.is_empty(), "expected automatic refusal: {message}");
+            assert_eq!(out.status.code(), Some(2));
+            let lower = message.to_ascii_lowercase();
+            assert!(
+                ["corrupt", "malformed", "invalid page"]
+                    .iter()
+                    .any(|detail| lower.contains(detail)),
+                "missing underlying storage failure: {message}"
             );
         }
-        assert!(
-            message.contains(&fixture.root.join(".beads/beads.db").display().to_string()),
-            "diagnostic must identify retained database: {message}"
-        );
         assert!(
             !message.contains('\u{1b}'),
             "ANSI in refusal diagnostic: {message}"
@@ -2684,11 +2773,131 @@ fn assert_startup_refuses_with_diagnostics(
     }
 }
 
+fn readable_source_records(
+    fixture: &StartupRecoveryFixture,
+) -> BTreeMap<String, Vec<Vec<SqliteValue>>> {
+    let scratch = isolated_tempdir();
+    let source = fixture.root.join(".beads/beads.db");
+    let copy = scratch.path().join("copy.db");
+    fs::copy(&source, &copy).unwrap();
+    for suffix in ["-wal", "-journal"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", source.display()));
+        if sidecar.exists() {
+            fs::copy(sidecar, scratch.path().join(format!("copy.db{suffix}"))).unwrap();
+        }
+    }
+    let conn = Connection::open(copy.to_string_lossy().into_owned()).unwrap();
+    let rows = |sql: &str| {
+        conn.query(sql)
+            .unwrap()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>()
+    };
+    let mut records = BTreeMap::new();
+    records.insert(
+        "schema".to_owned(),
+        rows("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"),
+    );
+    for table in rows("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name") {
+        let name = table[0].as_text().unwrap();
+        if name == "blocked_issues_cache" {
+            continue;
+        }
+        let quoted = name.replace('"', "\"\"");
+        let sql = if name == "metadata" {
+            "SELECT rowid, * FROM metadata WHERE key NOT IN ('needs_flush', 'blocked_cache_state') ORDER BY rowid".to_owned()
+        } else if name == "sqlite_sequence" {
+            "SELECT name, seq FROM sqlite_sequence ORDER BY name".to_owned()
+        } else {
+            format!("SELECT rowid, * FROM \"{quoted}\" ORDER BY rowid")
+        };
+        records.insert(name.to_owned(), rows(&sql));
+    }
+    conn.close().unwrap();
+    records
+}
+
+fn assert_safe_write_retains_unreadable_values(fixture: &StartupRecoveryFixture, diagnostic: &str) {
+    assert_startup_reads_retain_sources(fixture, false, Some(diagnostic));
+    for json in [true, false] {
+        let before = StartupRecoveryBefore::capture(fixture);
+        let records = readable_source_records(fixture);
+        let mut args = vec![
+            "create",
+            "Unrelated write preserves original raw values",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let out = startup_fixture_run(&fixture.root, &args, "preserve_readable_malformed_source");
+        if out.status.success() {
+            let after = readable_source_records(fixture);
+            assert_eq!(after["schema"], records["schema"]);
+            for (table, original) in &records {
+                if table == "sqlite_sequence" {
+                    for reservation in original {
+                        assert!(
+                            after[table].iter().any(|row| row[0] == reservation[0]
+                                && row[1].as_integer().unwrap()
+                                    >= reservation[1].as_integer().unwrap()),
+                            "lost sequence reservation: {reservation:?}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        original.iter().all(|row| after[table].contains(row)),
+                        "unrelated write changed original {table} cells/rowids"
+                    );
+                }
+            }
+            assert_eq!(after["issues"].len(), records["issues"].len() + 1);
+            assert_eq!(after["events"].len(), records["events"].len() + 1);
+            assert_eq!(
+                fs::read(fixture.root.join(".beads/issues.jsonl")).unwrap(),
+                fixture.jsonl
+            );
+            assert_eq!(
+                hash_workspace(&fixture.root.join(".beads/.br_recovery")),
+                before.recovery_hashes
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let source = before.database_metadata.as_ref().unwrap();
+                let current = fs::metadata(fixture.root.join(".beads/beads.db")).unwrap();
+                assert_eq!(
+                    (current.dev(), current.ino()),
+                    (source.dev(), source.ino()),
+                    "unrelated write replaced the original database"
+                );
+            }
+        } else {
+            let message = if json {
+                let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(error["error"]["code"], "CONFIG_ERROR", "{error}");
+                error["error"]["message"].as_str().unwrap().to_owned()
+            } else {
+                assert!(out.stdout.is_empty());
+                String::from_utf8(out.stderr).unwrap()
+            };
+            assert_eq!(out.status.code(), Some(7));
+            assert!(
+                message.contains(diagnostic),
+                "missing precise decode failure: {message}"
+            );
+            before.assert_refusal_retained_sources(fixture);
+        }
+    }
+}
+
 #[test]
-fn startup_auto_recovery_refuses_unreadable_dirty_issue() {
+fn startup_keeps_unreadable_dirty_issue_without_anomaly_reconstruction() {
     let fixture = StartupRecoveryFixture::new("dirty-row");
     fixture.damage_issue_timestamp(&fixture.db_only_id);
-    assert_startup_refuses_with_diagnostics(&fixture, &[&fixture.db_only_id, "dirty"], false);
+    assert_safe_write_retains_unreadable_values(&fixture, "damaged timestamp");
 }
 
 fn assert_preservation_failure_report(report: &Value, failed_issue_id: &str) {
@@ -3058,7 +3267,7 @@ fn repair_rebuild_reports_unreadable_dirty_issue_and_repeated_loss() {
 }
 
 #[test]
-fn startup_auto_recovery_refuses_unrepresentable_dirty_notes() {
+fn startup_keeps_unrepresentable_dirty_notes_without_anomaly_reconstruction() {
     let fixture = StartupRecoveryFixture::new("dirty-notes");
     fixture.add_recoverable_anomaly();
     let db_path = fixture.root.join(".beads/beads.db");
@@ -3075,21 +3284,26 @@ fn startup_auto_recovery_refuses_unrepresentable_dirty_notes() {
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         .expect("checkpoint unrepresentable notes");
     conn.close().expect("close unrepresentable-notes fixture");
-    assert_startup_refuses_with_diagnostics(&fixture, &[&fixture.issue_id, "notes"], false);
+    assert_safe_write_retains_unreadable_values(&fixture, "notes");
 }
 
 #[test]
-fn startup_auto_recovery_refuses_unreadable_tombstone() {
+fn startup_keeps_unreadable_tombstone_without_anomaly_reconstruction() {
     let fixture = StartupRecoveryFixture::new("tombstone");
     fixture.damage_issue_timestamp(&fixture.tombstone_id);
-    assert_startup_refuses_with_diagnostics(&fixture, &[&fixture.tombstone_id, "tombstone"], false);
+    assert_safe_write_retains_unreadable_values(&fixture, "damaged timestamp");
 }
 
 #[test]
 fn startup_auto_recovery_refuses_unreadable_dirty_markers() {
     let fixture = StartupRecoveryFixture::new("dirty-markers");
     fixture.damage_table_page("dirty_issues");
-    assert_startup_refuses_with_diagnostics(&fixture, &["dirty"], false);
+    assert_startup_refuses_with_diagnostics(
+        &fixture,
+        &["create", "Refused dirty-marker write"],
+        &[],
+        false,
+    );
 }
 
 #[test]
@@ -3260,7 +3474,13 @@ fn startup_auto_recovery_refuses_unreadable_relationships() {
     for table in ["comments", "labels", "dependencies"] {
         let fixture = StartupRecoveryFixture::new(table);
         fixture.damage_table_page(table);
-        assert_startup_refuses_with_diagnostics(&fixture, &[&fixture.issue_id, table], false);
+        let mutation = match table {
+            "comments" => vec!["comments", "add", &fixture.issue_id, "Must not be added"],
+            "labels" => vec!["label", "add", &fixture.issue_id, "must-not-be-added"],
+            "dependencies" => vec!["dep", "add", &fixture.db_only_id, &fixture.dependency_id],
+            _ => unreachable!(),
+        };
+        assert_startup_refuses_with_diagnostics(&fixture, &mutation, &[], false);
         let before = StartupRecoveryBefore::capture(&fixture);
         let out = startup_fixture_run(
             &fixture.root,
@@ -3335,7 +3555,12 @@ fn startup_auto_recovery_refuses_open_error() {
             .windows(fixture.db_only_id.len())
             .any(|bytes| bytes == fixture.db_only_id.as_bytes())
     );
-    assert_startup_refuses_with_diagnostics(&fixture, &["open", "unflushed"], true);
+    assert_startup_refuses_with_diagnostics(
+        &fixture,
+        &["create", "Refused open-error mutation"],
+        &["open", "unflushed"],
+        true,
+    );
 
     let out = startup_fixture_run(
         &fixture.root,
@@ -3396,7 +3621,12 @@ fn startup_auto_recovery_refuses_orphan_wal_before_explicit_repair() {
     fs::create_dir_all(retained_main.parent().unwrap()).unwrap();
     fs::rename(&db_path, &retained_main).expect("retain the now-missing main database");
 
-    assert_startup_refuses_with_diagnostics(&fixture, &["orphaned sidecar", "beads.db-wal"], true);
+    assert_startup_refuses_with_diagnostics(
+        &fixture,
+        &["create", "Refused orphan-WAL mutation"],
+        &["orphaned sidecar", "beads.db-wal"],
+        true,
+    );
     assert!(
         !db_path.exists(),
         "automatic refusal must leave the main file absent"

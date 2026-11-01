@@ -815,14 +815,14 @@ fn resolve_sync_startup_paths(
     Ok((beads_dir, startup, path_policy))
 }
 
-/// For `--rename-prefix` imports, defer any implicit JSONL recovery until the
-/// explicit import path below so the command's import semantics (ID rewrites and
-/// duplicate external_ref cleanup) are applied in the same invocation instead
-/// of being skipped by open-time recovery.
+/// Explicit rebuilds may prepare a fresh database when the original cannot
+/// open; the command retains its original backup until import succeeds.
+/// Rename and salvage imports also defer recovery so their requested import
+/// semantics are applied by the command instead of an implicit startup import.
 fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
     args.reconcile_additive
         || args.migrate_source_repo_path
-        || (args.import_only && (args.rename_prefix || args.skip_invalid_records))
+        || (args.import_only && (args.rebuild || args.rename_prefix || args.skip_invalid_records))
 }
 
 /// Reject argument combinations that must fail BEFORE opening storage or
@@ -1068,26 +1068,28 @@ fn merge_conflict_resolution_label(strategy: ConflictResolution) -> &'static str
     }
 }
 
-/// When `--rebuild` is requested against an existing (non-auto-rebuilt)
-/// DB, delegate the actual rebuild to the same proven path that auto-
-/// recovery uses: backup the DB family, open a fresh connection, import
-/// JSONL, checkpoint, VACUUM/REINDEX. The in-place
+/// When `--rebuild` is requested against an existing database, use the
+/// explicit reconstruction path: back up the DB family, open a fresh
+/// connection, import JSONL, checkpoint, and validate. The in-place
 /// `reset_data_tables`+`import_from_jsonl` code path inside
 /// `execute_import` is fragile on fsqlite — it trips stale-pager/MVCC
 /// bugs that leave "never used" pages and partial-index mismatches that
-/// VACUUM can't always reclaim. Using `recover_database_from_jsonl`
+/// VACUUM can't always reclaim. Using `rebuild_database_from_jsonl_explicit`
 /// sidesteps all of that, and `execute_import` then sees
 /// `auto_rebuilt == true` and short-circuits.
+/// A deferred startup may already have installed a fresh placeholder while
+/// retaining the original family for rollback. Import into that placeholder;
+/// a second reconstruction must not replace or finalize its original backup.
 ///
 /// Only fire this for the request that will actually go through
 /// `execute_import`: `--rebuild --import-only`. All other mode pairings
 /// are rejected before storage opens. Also require the JSONL to exist —
-/// `recover_database_from_jsonl` runs a preflight that fails hard if the
+/// `rebuild_database_from_jsonl_explicit` runs a preflight that fails hard if the
 /// file is missing, whereas `execute_import` already handles a missing
 /// JSONL gracefully, so leave that case to the normal path.
 ///
 /// Skip the delegation when the caller asked for behavior that the
-/// auto-recovery path does not replicate: `--rename-prefix` rewrites
+/// delegated reconstruction does not replicate: `--rename-prefix` rewrites
 /// imported IDs into the configured prefix, while
 /// `repair_database_from_jsonl` always runs with
 /// `rename_on_import = false`. That means the delegation would silently
@@ -1108,6 +1110,7 @@ fn maybe_delegate_rebuild(
         && args.import_only
         && !open_result.no_db
         && !open_result.auto_rebuilt
+        && open_result.pending_recovery_dir().is_none()
         && open_result.paths.jsonl_path.is_file()
         && !delegation_would_drop_user_flags;
     if !should_delegate {
@@ -1117,7 +1120,7 @@ fn maybe_delegate_rebuild(
     info!(
         db_path = %open_result.paths.db_path.display(),
         jsonl_path = %open_result.paths.jsonl_path.display(),
-        "--rebuild requested on existing DB: delegating to auto-recovery rebuild path"
+        "--rebuild requested on existing DB: performing explicit JSONL reconstruction"
     );
     // Recovery itself now captures the JSONL once before inspecting
     // tombstones or replacing the database. It preserves unflushed
@@ -1125,8 +1128,24 @@ fn maybe_delegate_rebuild(
     // immutable generation, then imports the identical bytes. Keeping this
     // at the recovery boundary prevents a path replacement from mixing
     // filter state from A with rows from B.
-    open_result.recover_database_from_jsonl()?;
+    open_result.rebuild_database_from_jsonl_explicit()?;
     Ok(())
+}
+
+fn import_args_for_prepared_storage(
+    args: &SyncArgs,
+    open_result: &config::OpenStorageResult,
+) -> SyncArgs {
+    let mut import_args = args.clone();
+    if !open_result.auto_rebuilt && open_result.pending_recovery_dir().is_some() {
+        // Deferred startup already performed the requested replacement and
+        // retained the original family. Import into its empty database without
+        // a second replacement releasing the original inode/rollback authority.
+        // Rename, salvage, and all other source interpretation remain unchanged.
+        import_args.force = false;
+        import_args.rebuild = false;
+    }
+    import_args
 }
 
 /// Dispatch to the appropriate sync-subcommand implementation based on
@@ -1268,6 +1287,7 @@ fn dispatch_publishing_sync_subcommand(
             )
         }
         SyncOperation::Import => {
+            let import_args = import_args_for_prepared_storage(args, open_result);
             let auto_rebuilt = open_result.auto_rebuilt;
             let (storage, retained_source, retained_authority) = open_result.import_context();
             execute_import(
@@ -1275,7 +1295,7 @@ fn dispatch_publishing_sync_subcommand(
                 beads_dir,
                 cli,
                 path_policy,
-                args,
+                &import_args,
                 options.use_json,
                 options.show_progress,
                 options.retention_days,
@@ -3459,42 +3479,26 @@ fn replace_database_from_jsonl_snapshot(
     Ok(import_result)
 }
 
-fn repair_import_integrity_if_needed(
-    storage: &mut crate::storage::SqliteStorage,
-    beads_dir: &Path,
-    cli: &config::CliOverrides,
-    source: &JsonlSourceSnapshot,
-    jsonl_authority: &crate::sync::JsonlFamilyWriteLock,
+fn verify_post_import_integrity(
+    storage: &crate::storage::SqliteStorage,
     db_path: &Path,
-    import_config: &ImportConfig,
 ) -> Result<()> {
     let messages = storage.integrity_check_messages()?;
     if integrity_check_is_clean(&messages) {
         return Ok(());
     }
 
-    warn!(
-        db_path = %db_path.display(),
-        integrity_messages = ?messages,
-        "Post-import maintenance left SQLite integrity warnings; rebuilding DB from JSONL with original import semantics"
-    );
-
-    let jsonl_filter = scan_jsonl_snapshot_for_tombstone_filter(source)?;
-    let preserved_tombstones =
-        tombstones_missing_from_jsonl_tombstones(snapshot_tombstones(storage), &jsonl_filter);
-
-    replace_database_from_jsonl_snapshot(
-        storage,
-        beads_dir,
-        cli,
-        source,
-        jsonl_authority,
-        db_path,
-        import_config,
-        None,
-        &preserved_tombstones,
-    )?;
-    Ok(())
+    Err(BeadsError::SyncConflict {
+        message: format!(
+            "Post-import integrity validation failed for '{}': {}. Refusing automatic JSONL \
+             reconstruction because it cannot preserve database-only event history, \
+             configuration, or operator-owned records. The database was not reconstructed \
+             from JSONL. The import may already have applied changes; preserve the database \
+             family and run `br doctor --json` before choosing an explicit recovery",
+            db_path.display(),
+            messages.join("; "),
+        ),
+    })
 }
 
 fn auto_rebuild_semantic_flag_conflict_reason(
@@ -4128,15 +4132,7 @@ fn execute_import(
                 return Err(err);
             }
         }
-        repair_import_integrity_if_needed(
-            storage,
-            beads_dir,
-            cli,
-            source,
-            jsonl_authority,
-            db_path,
-            &import_config,
-        )?;
+        verify_post_import_integrity(storage, db_path)?;
     }
 
     crate::sync::verify_jsonl_source_snapshot_current(source, jsonl_authority)?;
@@ -6027,12 +6023,13 @@ mod tests {
         GitExportStatus, PostImportCompactionReason, PostImportDatabaseProbe, SyncOperation,
         additive_conflict_human_lines, auto_rebuild_semantic_conflict_field,
         auto_rebuild_semantic_flag_conflict_reason, classify_sync_status_workspace,
-        detect_prefix_from_jsonl, execute, freelist_warrants_compaction,
+        detect_prefix_from_jsonl, dispatch_sync_subcommand, execute, finalize_sync_result,
+        freelist_warrants_compaction, import_args_for_prepared_storage,
         jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
-        merge_conflict_resolution, post_import_compaction_reason, prepare_sync_startup,
-        should_defer_jsonl_recovery, should_render_human_sync_output, sync_operation,
-        validate_operator_requested_sync_path, validate_sync_mode_args, validate_sync_paths,
-        write_manifest_atomically,
+        maybe_delegate_rebuild, merge_conflict_resolution, post_import_compaction_reason,
+        prepare_sync_startup, should_defer_jsonl_recovery, should_render_human_sync_output,
+        sync_operation, validate_operator_requested_sync_path, validate_sync_mode_args,
+        validate_sync_paths, write_manifest_atomically,
     };
     use crate::cli::SyncArgs;
     use crate::config::{self, CliOverrides};
@@ -6827,6 +6824,160 @@ mod tests {
             ..SyncArgs::default()
         };
         assert!(should_defer_jsonl_recovery(&reconcile_apply));
+    }
+
+    #[test]
+    fn explicit_rebuild_requires_import_mode_before_startup_deferral() {
+        let rebuild = SyncArgs {
+            import_only: true,
+            rebuild: true,
+            ..SyncArgs::default()
+        };
+        validate_sync_mode_args(&rebuild).unwrap();
+        assert!(should_defer_jsonl_recovery(&rebuild));
+        let plain_import = SyncArgs {
+            rebuild: false,
+            ..rebuild.clone()
+        };
+        assert!(!should_defer_jsonl_recovery(&plain_import));
+        let bare_rebuild = SyncArgs {
+            import_only: false,
+            ..rebuild
+        };
+        assert!(validate_sync_mode_args(&bare_rebuild).is_err());
+        assert!(!should_defer_jsonl_recovery(&bare_rebuild));
+    }
+
+    fn damaged_database_for_explicit_rebuild() -> (TempDir, CliOverrides, Vec<u8>) {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let original = b"damaged original database evidence that must remain recoverable".to_vec();
+        fs::write(&db_path, &original).unwrap();
+        let issue = make_test_issue("bd-explicit", "Explicit recovery source");
+        fs::write(
+            beads_dir.join("issues.jsonl"),
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+        fs::write(beads_dir.join("config.yaml"), "issue_prefix: bd\n").unwrap();
+        let cli = CliOverrides {
+            db: Some(db_path),
+            lock_timeout: Some(1_000),
+            ..CliOverrides::default()
+        };
+        (temp, cli, original)
+    }
+
+    #[test]
+    fn explicit_rebuild_import_retains_original_backup_until_late_failure() {
+        let (_temp, cli, original) = damaged_database_for_explicit_rebuild();
+        let args = SyncArgs {
+            import_only: true,
+            rebuild: true,
+            ..SyncArgs::default()
+        };
+        validate_sync_mode_args(&args).unwrap();
+        let mut startup = prepare_sync_startup(&args, &cli, false)
+            .expect("explicit rebuild must prepare a damaged database for import");
+        let pending_dir = startup
+            .open_result
+            .pending_recovery_dir()
+            .unwrap()
+            .to_path_buf();
+        let db_path = startup.open_result.paths.db_path.clone();
+        let source_before = fs::read(&startup.path_policy.jsonl_path).unwrap();
+        let placeholder_before = fs::read(&db_path).unwrap();
+
+        maybe_delegate_rebuild(&args, &mut startup.open_result).unwrap();
+        assert_eq!(fs::read(&db_path).unwrap(), placeholder_before);
+        assert_eq!(
+            startup.open_result.pending_recovery_dir(),
+            Some(pending_dir.as_path())
+        );
+        let import_args = import_args_for_prepared_storage(&args, &startup.open_result);
+        assert!(!import_args.rebuild);
+        assert!(!import_args.force);
+        let ctx = OutputContext::from_flags(true, false, true);
+        dispatch_sync_subcommand(
+            &args,
+            &cli,
+            &ctx,
+            &startup.beads_dir,
+            &startup.path_policy,
+            &mut startup.open_result,
+        )
+        .expect("import must populate the retained placeholder without a second rebuild");
+        assert!(
+            startup
+                .open_result
+                .storage
+                .get_issue("bd-explicit")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            startup.open_result.pending_recovery_dir(),
+            Some(pending_dir.as_path())
+        );
+
+        let error = finalize_sync_result(
+            Err(BeadsError::Config(
+                "injected late command failure".to_string(),
+            )),
+            &mut startup.open_result,
+        )
+        .expect_err("a late failure must restore the exact original database family");
+        assert!(error.to_string().contains("injected late command failure"));
+        assert_eq!(fs::read(&db_path).unwrap(), original);
+        assert_eq!(
+            fs::read(&startup.path_policy.jsonl_path).unwrap(),
+            source_before
+        );
+    }
+
+    #[test]
+    fn deferred_rebuild_keeps_observation_precedence_and_import_interpretation() {
+        let (_temp, mut cli, original) = damaged_database_for_explicit_rebuild();
+        let mut args = SyncArgs {
+            import_only: true,
+            rebuild: true,
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        validate_sync_mode_args(&args).unwrap();
+        cli.read_only_storage = true;
+        let error = prepare_sync_startup(&args, &cli, false)
+            .err()
+            .expect("strict observation overrides a deferred recovery strategy");
+        assert!(error.to_string().contains("Read-only storage open refused"));
+        assert_eq!(fs::read(cli.db.as_ref().unwrap()).unwrap(), original);
+        assert!(
+            !cli.db
+                .as_ref()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".br_recovery")
+                .exists()
+        );
+
+        cli.read_only_storage = false;
+        let mut startup = prepare_sync_startup(&args, &cli, false).unwrap();
+        let prepared = import_args_for_prepared_storage(&args, &startup.open_result);
+        assert!(prepared.rename_prefix);
+        assert!(!prepared.rebuild);
+        args.rebuild = false;
+        args.rename_prefix = false;
+        args.skip_invalid_records = true;
+        validate_sync_mode_args(&args).unwrap();
+        assert!(import_args_for_prepared_storage(&args, &startup.open_result).skip_invalid_records);
+        let _ = finalize_sync_result(
+            Err(BeadsError::Config("fixture rollback".to_string())),
+            &mut startup.open_result,
+        );
+        assert_eq!(fs::read(cli.db.as_ref().unwrap()).unwrap(), original);
     }
 
     #[test]
