@@ -1778,7 +1778,9 @@ main() {
     # Verify installation
     if [ "$VERIFY" -eq 1 ]; then
         log_step "Running self-test..."
-        "$DEST/$BINARY_NAME" --version || true
+        if ! "$DEST/$BINARY_NAME" doctor --selftest --json; then
+            die "Installed binary failed its self-test: $DEST/$BINARY_NAME"
+        fi
         log_success "Self-test complete"
     fi
 
