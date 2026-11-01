@@ -132,8 +132,12 @@ For a slow read, distinguish acquisition wait, required startup work, query
 execution, and output backpressure. `--lock-timeout` bounds acquisition, not the
 time spent importing or creating the protected snapshot. Enable
 `RUST_LOG=br::startup=debug,br::startup_authority=debug,br::search=debug` to identify
-the handoff and search boundaries without logging the query text. The original
-production trigger reported in [#586](https://github.com/Dicklesworthstone/beads_rust/issues/586)
+the handoff and search boundaries without logging the query text. Handoff
+diagnostics are emitted after writer authority is released. The release event
+records `snapshot_captured_ms` and `elapsed_ms` at capture and release, measured
+from the handoff's start before writing to stderr. Blocking on those diagnostics
+cannot extend the critical section. The original production trigger reported in
+[#586](https://github.com/Dicklesworthstone/beads_rust/issues/586)
 remains unidentified; the historical override reproduction does not establish
 that the override was present in that incident.
 

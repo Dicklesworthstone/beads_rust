@@ -995,7 +995,10 @@ fn fill_child_stderr_pipe(pid: u32) {
             }
         }
     }
-    assert!(written > 0, "stderr was empty before the pending warning");
+    assert!(
+        written > 0,
+        "stderr must have available capacity before prefill"
+    );
 }
 
 /// A pending receipt can appear after the advisory check while a reader is
@@ -1166,6 +1169,125 @@ fn e2e_586_pending_reprobe_releases_authority_before_blocked_stderr_warning() {
             .as_deref(),
         Some("legacy-pending-after-reader-queued")
     );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
+fn e2e_586_auto_import_handoff_releases_authority_before_blocked_stderr() {
+    const IMPORTED_NOTES: &str = "import completed before blocked handoff diagnostic";
+    let workspace = snapshot_search_workspace_with_description(String::new());
+    let root = &workspace.root;
+    let jsonl_before = update_snapshot_jsonl_for_import(root, IMPORTED_NOTES);
+    let owner = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+    let results = root.join("logs/handoff-stdout.json");
+    let mut command = br_child_command_in_dir_with_env(
+        root,
+        [
+            "--lock-timeout",
+            "30000",
+            "--no-auto-flush",
+            "search",
+            "snapshot",
+            "--all",
+            "--json",
+        ],
+        [("RUST_LOG", "br::startup_authority=debug")],
+    );
+    // A regular stdout file makes the observed pipe_write unambiguously
+    // stderr backpressure; the query must not have emitted a result yet.
+    command.stdout(fs::File::create(&results).unwrap());
+    let mut reader = QueuedBrChildren(vec![command.spawn().unwrap()]);
+    wait_for_workspace_waiters(root, 1);
+    wait_for_child_owned_workspace_registration(root, &mut reader.0[0]);
+    fill_child_stderr_pipe(reader.0[0].id());
+    drop(owner);
+
+    // This target emits no messages before handoff. The first diagnostic
+    // must follow committed import, verified capture, and protected close;
+    // it cannot block while retaining any live-family writer authority.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let child = &mut reader.0[0];
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "read exited before the handoff diagnostic encountered stderr backpressure"
+        );
+        let channel = read_child_wait_channel(child.id());
+        if channel
+            .as_deref()
+            .is_some_and(|value| value.contains("pipe_write"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "handoff diagnostic never blocked on stderr; last wait channel: {channel:?}"
+        );
+        thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+    }
+    assert_eq!(fs::metadata(&results).unwrap().len(), 0);
+    assert_read_has_no_workspace_authority(root, &mut reader.0[0]);
+
+    let shown = run_br_in_dir(
+        root,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            "test-read",
+            "--json",
+        ],
+    );
+    assert!(
+        shown.success,
+        "completed import verification failed: {shown:?}"
+    );
+    assert_eq!(
+        extract_issues_array(&shown.stdout)[0]["notes"],
+        IMPORTED_NOTES
+    );
+    let writer = competing_snapshot_writer(root, "test-read");
+    assert!(
+        writer.status.success(),
+        "writer during blocked handoff diagnostic failed: {writer:?}"
+    );
+    assert_read_has_no_workspace_authority(root, &mut reader.0[0]);
+
+    let output = reader.finish(Duration::from_secs(20)).remove(0);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "read failed: {stderr}");
+    let issues = extract_issues_array(&fs::read_to_string(results).unwrap());
+    assert_eq!(issues.len(), 1);
+    assert_eq!(
+        issues[0]["notes"], IMPORTED_NOTES,
+        "read must retain the captured state from before its authority release"
+    );
+    let released = "Read-only startup writer authority released; validating private snapshot";
+    assert!(
+        import_debug_value(&stderr, released, "snapshot_captured_ms")
+            <= import_debug_value(&stderr, released, "elapsed_ms")
+    );
+    assert!(stderr.contains("Read-only startup storage detached from write authority"));
+    let shown = run_br_in_dir(
+        root,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            "test-read",
+            "--json",
+        ],
+    );
+    assert!(
+        shown.success,
+        "concurrent writer verification failed: {shown:?}"
+    );
+    assert_eq!(
+        extract_issues_array(&shown.stdout)[0]["notes"],
+        "after concurrent writer"
+    );
+    assert!(fs::read(root.join(".beads/issues.jsonl")).unwrap() == jsonl_before);
 }
 
 #[test]
@@ -2000,7 +2122,6 @@ fn assert_writable_startup_precedes_query(trace: &str) {
         1
     );
     for phase in [
-        "Read-only startup handoff started under writer authority",
         "Read-only startup writer authority released; validating private snapshot",
         "Read-only startup storage detached from write authority",
     ] {

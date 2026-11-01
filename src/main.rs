@@ -728,11 +728,16 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     }
 
     // Honor interruption after any import transaction completes. A canceled
-    // read needs no new snapshot: returning drops storage before the older
-    // authority guards, so writable checkpoint/close remains protected.
+    // read needs no new snapshot. Close storage under its retained authority,
+    // then release every orchestration owner before logging the cancellation:
+    // a full stderr pipe must not postpone that cleanup indefinitely.
     if requires_read_only_storage(&cli.command)
         && let Some(exit_code) = beads_rust::shutdown::exit_code()
     {
+        overrides.clear_database_family_lock_marker();
+        ctx.overrides.clear_database_family_lock_marker();
+        drop(storage_result);
+        drop(write_lock);
         tracing::debug!(
             target: "br::startup",
             exit_code,

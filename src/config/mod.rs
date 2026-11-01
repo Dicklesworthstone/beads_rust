@@ -4258,10 +4258,6 @@ impl OpenStorageResult {
         };
         verify_authority()?;
         let handoff_started = std::time::Instant::now();
-        tracing::debug!(
-            target: "br::startup_authority",
-            "Read-only startup handoff started under writer authority"
-        );
         let snapshot_reused = self
             .storage
             .release_write_authority_for_private_read_snapshot();
@@ -4278,11 +4274,7 @@ impl OpenStorageResult {
                 .ok_or_else(|| BeadsError::Config(read_only_storage_refusal_context(db_path)))?;
             verify_authority()?;
             let workflow = self.storage.workflow_policy();
-            tracing::debug!(
-                target: "br::startup_authority",
-                elapsed_ms = handoff_started.elapsed().as_millis(),
-                "Read-only startup snapshot captured; closing writable storage"
-            );
+            let snapshot_captured_ms = handoff_started.elapsed().as_millis();
 
             // Closing the previous handle may checkpoint its committed startup
             // writes. The captured family is already independent of that work.
@@ -4292,9 +4284,14 @@ impl OpenStorageResult {
             self.write_authority = None;
             self.jsonl_write_authority = None;
             drop(authority);
+            // Logging writes synchronously to stderr. Record stage timings
+            // while protected, but publish no handoff event until teardown
+            // releases authority: a stalled consumer must not exclude writers.
+            let authority_released_ms = handoff_started.elapsed().as_millis();
             tracing::debug!(
                 target: "br::startup_authority",
-                elapsed_ms = handoff_started.elapsed().as_millis(),
+                snapshot_captured_ms,
+                elapsed_ms = authority_released_ms,
                 "Read-only startup writer authority released; validating private snapshot"
             );
             self.storage = open_snapshot(db_path, snapshot)?;
@@ -12710,6 +12707,97 @@ routing:
                     .set_config("compact_model", "forbidden")
                     .is_err(),
                 "handoff must replace the writable connection, not merely drop its guard"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_startup_handoff_logs_only_after_releasing_authority() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct RequireReleasedAuthority {
+            beads_dir: PathBuf,
+            database_path: PathBuf,
+            events: Arc<AtomicUsize>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequireReleasedAuthority {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "br::startup_authority" {
+                    return;
+                }
+                let _authority = crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &self.beads_dir,
+                    &self.database_path,
+                    Some(0),
+                )
+                .expect("every handoff diagnostic must follow release of all family authority");
+                self.events.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for reuse_snapshot in [false, true] {
+            let (_temp, mut context) = writable_startup_handoff_fixture();
+            if reuse_snapshot {
+                let authority = context.retained_database_write_authority().unwrap();
+                let reader = open_storage_with_startup_config_under_write_lock(
+                    context.retained_startup_config(),
+                    &CliOverrides {
+                        read_only_storage: true,
+                        ..CliOverrides::default()
+                    },
+                    false,
+                    &authority,
+                )
+                .unwrap();
+                context
+                    .storage
+                    .set_config("compact_model", "changed-after-capture")
+                    .unwrap();
+                drop(context);
+                drop(authority);
+                context = reader;
+            }
+            assert!(matches!(
+                crate::sync::blocking_write_lock_with_timeout(&context.paths.beads_dir, Some(0)),
+                Err(BeadsError::WriteLockTimeout { .. })
+            ));
+            let events = Arc::new(AtomicUsize::new(0));
+            let subscriber = tracing_subscriber::registry().with(RequireReleasedAuthority {
+                beads_dir: context.paths.beads_dir.clone(),
+                database_path: context.paths.db_path.clone(),
+                events: Arc::clone(&events),
+            });
+            let mut reader = tracing::subscriber::with_default(subscriber, || {
+                context.finish_read_only_startup()
+            })
+            .expect("handoff with observed diagnostics");
+
+            assert!(
+                events.load(Ordering::Relaxed) > 0,
+                "must observe a milestone"
+            );
+            assert!(reader.retained_database_write_authority().is_none());
+            assert!(reader.storage.attached_write_authority().is_none());
+            assert_eq!(
+                reader
+                    .storage
+                    .get_config("compact_model")
+                    .unwrap()
+                    .as_deref(),
+                Some("before"),
+                "deferred diagnostics must preserve the captured generation"
+            );
+            assert!(
+                reader
+                    .storage
+                    .set_config("compact_model", "forbidden")
+                    .is_err()
             );
         }
     }
