@@ -311,6 +311,7 @@ mod tests {
             dependency_type_key_added: true,
             legacy_v15_conversion: None,
             legacy_v4_conversion: Some(projection(&conn, true).unwrap()),
+            content_hash_refresh_profile: None,
             post_migration_maintenance: true,
         };
         let token_before = compute_plan_token("/released-schema4.db", &before, &forecast).unwrap();
