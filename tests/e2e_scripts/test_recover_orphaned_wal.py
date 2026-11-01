@@ -283,8 +283,8 @@ class RecoveryTests(unittest.TestCase):
 
     def test_source_change_before_publication_refused(self):
         witness = recovery.logical_witness
-        def changing(db, *, immutable):
-            result = witness(db, immutable=immutable)
+        def changing(db, *, immutable, **kwargs):
+            result = witness(db, immutable=immutable, **kwargs)
             if immutable:
                 recovery.component(self.db, '-shm').write_bytes(b'changed by noncooperating I/O')
             return result
@@ -392,8 +392,8 @@ if stage == 'replay':
     module.replay = crash
 elif stage == 'verify':
     witness = module.logical_witness
-    def crash(db, *, immutable):
-        result = witness(db, immutable=immutable)
+    def crash(db, *, immutable, **kwargs):
+        result = witness(db, immutable=immutable, **kwargs)
         if immutable:
             os._exit(73)
         return result
@@ -576,8 +576,8 @@ os._exit(0)
         witness = recovery.logical_witness
         for offset in (12, 40, 96, 136, 16384):
             with self.subTest(offset=offset):
-                def corrupt(db, *, immutable):
-                    result = witness(db, immutable=immutable)
+                def corrupt(db, *, immutable, **kwargs):
+                    result = witness(db, immutable=immutable, **kwargs)
                     if not immutable and db.parent.name == 'oracle':
                         path = recovery.component(db, '-shm')
                         with path.open('r+b') as file:
@@ -603,8 +603,8 @@ os._exit(0)
 
     def test_restore_rejects_private_reader_wal_rewrite(self):
         witness = recovery.logical_witness
-        def change_wal(db, *, immutable):
-            result = witness(db, immutable=immutable)
+        def change_wal(db, *, immutable, **kwargs):
+            result = witness(db, immutable=immutable, **kwargs)
             if not immutable and db.parent.name == 'oracle':
                 with recovery.component(db, '-wal').open('ab') as file:
                     file.write(b'private engine changed WAL')

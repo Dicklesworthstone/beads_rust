@@ -11,7 +11,7 @@ stage="${2:?usage: assert.sh <target_dir> <stage>}"
 tool_bin="${TOOL_BIN:-br}"
 cd "$target_dir"
 
-threshold=$((100 * 1024 * 1024))
+threshold=$((50 * 1024 * 1024))
 
 assert_size_warn() {
   local out="$1"
