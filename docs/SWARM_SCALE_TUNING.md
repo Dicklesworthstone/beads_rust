@@ -118,11 +118,15 @@ Opening, recovering, and validating that private copy then proceed without
 excluding writers on the original database. The private checks must succeed
 before query or output begins. A failed handoff refuses the read.
 
-A first termination signal remains cooperative. Once required startup work
-finishes, a pending interruption ends the read before query execution, including
-when the signal arrives during the snapshot handoff. An automatic import that
-already committed is preserved; interruption does not imply that startup rolled
-back its changes.
+A first termination signal remains cooperative. During automatic-import lock
+polling, a canceled read withdraws its queue registration and releases any
+workspace, database-family, or inode authority it already acquired. It does not
+wait for the other owner to finish or begin an import after cancellation is
+observed. A signal received during the protected freshness recheck is honored
+before writable reopen. Once an import starts, it retains its transaction and
+teardown protection; a pending interruption ends the read before query execution,
+including when the signal arrives during the snapshot handoff. An import that
+already committed is preserved; interruption does not imply rollback.
 
 For a slow read, distinguish acquisition wait, required startup work, query
 execution, and output backpressure. `--lock-timeout` bounds acquisition, not the

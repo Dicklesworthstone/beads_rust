@@ -21114,6 +21114,61 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::incompatible_msrv)]
+    fn cancellation_after_kernel_acquisition_releases_the_lock() {
+        for queued in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let lock_path = temp.path().join(".write.lock");
+            let queue = temp.path().join(WRITE_WAITER_DIRECTORY);
+            let probe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+                .unwrap();
+            let owner =
+                std::cell::RefCell::new(queued.then(|| blocking_write_lock(temp.path()).unwrap()));
+            // Release the predecessor only after a live registration exists.
+            // Then cancel only when the new acquisition actually excludes a
+            // separate file description, for both fast and queued admission.
+            let should_cancel = || {
+                let waiting_for_registration = owner.borrow().is_some();
+                if waiting_for_registration {
+                    if !live_workspace_waiters(&queue).unwrap().is_empty() {
+                        drop(owner.borrow_mut().take());
+                    }
+                    return false;
+                }
+                match probe.try_lock() {
+                    Ok(()) => {
+                        probe.unlock().unwrap();
+                        false
+                    }
+                    Err(TryLockError::WouldBlock) => true,
+                    Err(TryLockError::Error(error)) => panic!("lock probe failed: {error}"),
+                }
+            };
+            let error = open_and_lock_regular_file(
+                &lock_path,
+                Some(if queued { 1_000 } else { 0 }),
+                false,
+                "workspace write lock",
+                false,
+                ExclusiveLockMechanism::LockSidecar,
+                LockWaitPolicy::new(LockRetrySafety::BeforeMutation, Some(&should_cancel)),
+            )
+            .expect_err("cancellation after kernel acquisition must release authority");
+            assert!(matches!(error, BeadsError::ShuttingDown));
+            probe
+                .try_lock()
+                .expect("cancelled admission released its lock");
+            if queued {
+                assert_eq!(fs::read_dir(&queue).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn read_authority_cancelled_at_workspace_wait_removes_registration() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");

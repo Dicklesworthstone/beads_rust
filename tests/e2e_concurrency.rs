@@ -686,10 +686,15 @@ fn stalled_snapshot_read(
 /// workspace inode. An open file or a waiter filename alone is not ownership.
 #[cfg(target_os = "linux")]
 fn process_workspace_lock_records(pid: u32, root: &Path) -> Vec<String> {
+    process_file_lock_records(pid, &root.join(".beads/.write.lock"))
+}
+
+#[cfg(target_os = "linux")]
+fn process_file_lock_records(pid: u32, path: &Path) -> Vec<String> {
     let process = PathBuf::from(format!("/proc/{pid}"));
-    let lock_path = fs::canonicalize(root.join(".beads"))
+    let lock_path = fs::canonicalize(path.parent().unwrap())
         .unwrap()
-        .join(".write.lock");
+        .join(path.file_name().unwrap());
     let mut records = Vec::new();
     for entry in fs::read_dir(process.join("fd")).expect("inspect live child descriptors") {
         let entry = entry.unwrap();
@@ -711,6 +716,7 @@ fn process_workspace_lock_records(pid: u32, root: &Path) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::incompatible_msrv)]
 fn workspace_lock_probe(
     root: &Path,
 ) -> (
@@ -1610,6 +1616,249 @@ fn e2e_586_cancelled_search_preserves_completed_auto_import() {
     assert_eq!(issues[0]["title"], incoming["title"]);
     assert_eq!(issues[0]["notes"], "after concurrent writer");
     assert_eq!(fs::read(jsonl_path).unwrap(), jsonl_before);
+}
+
+#[cfg(target_os = "linux")]
+fn update_snapshot_jsonl_for_import(root: &Path, notes: &str) -> Vec<u8> {
+    let jsonl_path = root.join(".beads/issues.jsonl");
+    let mut incoming: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&jsonl_path).unwrap()).unwrap();
+    incoming["notes"] = notes.into();
+    incoming["updated_at"] = "2999-01-01T00:00:00Z".into();
+    let bytes = format!("{}\n", serde_json::to_string(&incoming).unwrap()).into_bytes();
+    fs::write(jsonl_path, &bytes).unwrap();
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn database_payload_bytes(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut payloads: Vec<_> = fs::read_dir(root.join(".beads"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("beads.db"))
+        .map(|entry| {
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    payloads.sort_by(|left, right| left.0.cmp(&right.0));
+    assert!(payloads.iter().any(|(name, _)| name == "beads.db"));
+    payloads
+}
+
+#[cfg(target_os = "linux")]
+fn assert_cancelled_import_preserves_sources(
+    root: &Path,
+    database_before: &[(String, Vec<u8>)],
+    jsonl_before: &[u8],
+) {
+    assert!(
+        database_payload_bytes(root) == database_before,
+        "a read cancelled before authority admission must preserve every database-family payload"
+    );
+    assert!(
+        fs::read(root.join(".beads/issues.jsonl")).unwrap() == jsonl_before,
+        "a read cancelled before authority admission must preserve its JSONL source"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_pending_import_reader(root: &Path, diagnostics: &Path) -> QueuedBrChildren {
+    let mut command = br_child_command_in_dir_with_env(
+        root,
+        [
+            "--lock-timeout",
+            "30000",
+            "--no-auto-flush",
+            "search",
+            "snapshot",
+            "--all",
+            "--json",
+        ],
+        [(
+            "RUST_LOG",
+            "br::startup=debug,br::search=debug,beads_rust::sync=debug",
+        )],
+    );
+    command.stderr(fs::File::create(diagnostics).unwrap());
+    QueuedBrChildren(vec![command.spawn().unwrap()])
+}
+
+#[cfg(target_os = "linux")]
+fn finish_cancelled_import_reader(mut reader: QueuedBrChildren, diagnostics: &Path) {
+    let interrupted_at = Instant::now();
+    request_and_observe_cooperative_shutdown(&mut reader.0[0]);
+    // The blocker remains held by the caller. Cancellation must finish well
+    // before the 30s authority budget, without waiting for that owner to exit.
+    let output = reader.finish(Duration::from_secs(5)).remove(0);
+    eprintln!(
+        "GH586 queued read TERM handling and exit observed within {:?}",
+        interrupted_at.elapsed()
+    );
+    let diagnostics = fs::read_to_string(diagnostics).unwrap();
+    assert_eq!(output.status.code(), Some(143), "{diagnostics}");
+    assert!(
+        output.stdout.is_empty(),
+        "cancelled read must not emit a result"
+    );
+    assert!(
+        diagnostics.contains("Read interrupted before automatic import; skipping query execution"),
+        "{diagnostics}"
+    );
+    for forbidden in [
+        "Import phase:",
+        "Auto-import completed",
+        "Search query execution started",
+    ] {
+        assert!(!diagnostics.contains(forbidden), "{diagnostics}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn database_family_lock_sidecar(root: &Path) -> PathBuf {
+    let mut candidates: Vec<_> = fs::read_dir(root.join(".beads"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".br-db-write-") && name.ends_with(".lock")
+        })
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "one database authority in the isolated workspace"
+    );
+    candidates.remove(0)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_partial_import_authority(
+    root: &Path,
+    child: &mut std::process::Child,
+    diagnostics: &Path,
+    family_lock: &Path,
+    blocked_role: &str,
+) {
+    let deadline = Instant::now() + WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT;
+    let role_field = format!("role=\"{blocked_role}\"");
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "import reader exited before contention"
+        );
+        let log = fs::read_to_string(diagnostics).unwrap();
+        let observed_later_wait = log.lines().any(|line| {
+            line.contains("write authority is held by another process; waiting with timeout")
+                && line.contains(&role_field)
+        });
+        if observed_later_wait && !process_workspace_lock_records(child.id(), root).is_empty() {
+            if blocked_role == "database write authority" {
+                assert!(
+                    !process_file_lock_records(child.id(), family_lock).is_empty(),
+                    "an inode waiter must already own the canonical-family lock"
+                );
+            }
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reader never reached {blocked_role} contention: {log}"
+        );
+        thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+    }
+}
+
+/// A real signal must release locks already acquired by a read even when a
+/// later authority component stays blocked in an independent workspace.
+#[test]
+#[cfg(target_os = "linux")]
+#[allow(clippy::incompatible_msrv)]
+fn e2e_586_interrupted_import_releases_partial_authority() {
+    for block_inode in [false, true] {
+        let workspace = snapshot_search_workspace();
+        let root = &workspace.root;
+        let db = root.join(".beads/beads.db");
+        let jsonl_before =
+            update_snapshot_jsonl_for_import(root, "must not import after partial admission");
+        let database_before = database_payload_bytes(root);
+        let blocker_beads = root.join("blocking-workspace/.beads");
+        fs::create_dir_all(&blocker_beads).unwrap();
+        let blocker_db = if block_inode {
+            let alias = blocker_beads.join("alias.db");
+            fs::hard_link(&db, &alias).unwrap();
+            alias
+        } else {
+            db.clone()
+        };
+        let blocker = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+            &blocker_beads,
+            &blocker_db,
+            Some(1_000),
+        )
+        .unwrap();
+        let family_lock = database_family_lock_sidecar(root);
+        let diagnostics = root.join("logs/interrupted-partial-import-stderr.log");
+        let mut reader = spawn_pending_import_reader(root, &diagnostics);
+        wait_for_partial_import_authority(
+            root,
+            &mut reader.0[0],
+            &diagnostics,
+            &family_lock,
+            if block_inode {
+                "database write authority"
+            } else {
+                "database-family write lock"
+            },
+        );
+        let (_, acquired, _) = workspace_lock_probe(root);
+        assert!(
+            matches!(acquired, Err(std::fs::TryLockError::WouldBlock)),
+            "partial admission really holds the reader's workspace authority"
+        );
+        finish_cancelled_import_reader(reader, &diagnostics);
+        wait_for_workspace_waiters(root, 0);
+        // The independent blocker is deliberately still alive. A reader
+        // cancelled at a later component must immediately relinquish every
+        // earlier component, including the workspace flock it already owned.
+        let (probe, acquired, latency) = workspace_lock_probe(root);
+        acquired.expect("cancelled partial admission must release its workspace flock");
+        eprintln!(
+            "GH586 cancelled partial-admission flock acquisition: {} ns",
+            latency.as_nanos()
+        );
+        drop(probe);
+        let family_probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&family_lock)
+            .unwrap();
+        if block_inode {
+            family_probe
+                .try_lock()
+                .expect("cancelled inode waiter must release the canonical-family flock too");
+        } else {
+            assert!(matches!(
+                family_probe.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        }
+        drop(family_probe);
+        blocker.verify_database_authority().unwrap();
+        assert_cancelled_import_preserves_sources(root, &database_before, &jsonl_before);
+        drop(blocker);
+        let next_writer = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+            &root.join(".beads"),
+            &db,
+            Some(1_000),
+        )
+        .expect("all authority components become available after the blocker exits");
+        drop(next_writer);
+    }
 }
 
 #[cfg(target_os = "linux")]
