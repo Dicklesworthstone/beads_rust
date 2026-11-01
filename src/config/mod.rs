@@ -4175,6 +4175,101 @@ impl OpenStorageResult {
         self.write_authority.as_ref().map(Arc::clone)
     }
 
+    /// Finish writable startup before a read command begins executing.
+    ///
+    /// Capture a verified private database snapshot while the original family
+    /// authority is still held, then close the writable connection before
+    /// relinquishing this context's authority. A live read connection or a
+    /// shared workspace lock would still tie the query to database replacement
+    /// or exclude writers for its entire lifetime (GitHub #586).
+    ///
+    /// Callers must also release any authority retained in their own guards or
+    /// CLI overrides. Contexts that never acquired write authority are already
+    /// observational (or private JSONL views) and need no second snapshot.
+    ///
+    /// # Errors
+    /// Refuses incomplete recovery, mismatched authority, or an unavailable
+    /// read snapshot. Failure leaves the existing context and authority intact
+    /// for orderly cleanup; callers must not proceed to command execution.
+    #[doc(hidden)]
+    pub fn finish_read_only_startup(&mut self) -> Result<()> {
+        if self.pending_recovery_backup.is_some() || self.database_transition_failed_closed {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Refusing read-only command execution while database recovery is incomplete"
+                        .to_string(),
+            });
+        }
+        let storage_authority = self.storage.attached_write_authority();
+        if let (Some(context), Some(storage)) =
+            (self.write_authority.as_ref(), storage_authority.as_ref())
+            && !Arc::ptr_eq(context, storage)
+        {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Read-only startup context and storage retain different database authorities"
+                        .to_string(),
+            });
+        }
+        let Some(authority) = self.write_authority.clone().or(storage_authority) else {
+            if self.jsonl_write_authority.is_some() {
+                return Err(BeadsError::SyncConflict {
+                    message: "Read-only startup cannot discard unfinished JSONL write authority"
+                        .to_string(),
+                });
+            }
+            return Ok(());
+        };
+        if self.no_db {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Read-only startup cannot hand off database authority from a JSONL-only context"
+                        .to_string(),
+            });
+        }
+        let db_path = &self.paths.db_path;
+        let verify_authority = || -> Result<()> {
+            authority.verify_database_authority()?;
+            if crate::sync::database_write_authority_sha256(db_path)?
+                != authority.authority_path_sha256()
+                || crate::sync::canonical_database_authority_path(db_path)?
+                    != authority.canonical_database_path()
+            {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Read-only startup database routing does not match the held write authority"
+                            .to_string(),
+                });
+            }
+            Ok(())
+        };
+        verify_authority()?;
+        let snapshot_reused = self
+            .storage
+            .release_write_authority_for_private_read_snapshot();
+        if !snapshot_reused {
+            let mut read_only_storage = open_sqlite_storage_read_only(db_path)?;
+            verify_authority()?;
+            read_only_storage.set_workflow_policy(self.storage.workflow_policy());
+
+            // Closing the previous handle may checkpoint its committed startup
+            // writes. Keep authority alive through that teardown, and never
+            // leave the command with a writable connection after releasing it.
+            let previous_storage = std::mem::replace(&mut self.storage, read_only_storage);
+            drop(previous_storage);
+        }
+        self.write_authority = None;
+        self.jsonl_write_authority = None;
+        tracing::debug!(
+            target: "br::startup_authority",
+            database = %self.paths.db_path.display(),
+            snapshot_reused,
+            "Read-only startup storage detached from write authority"
+        );
+        drop(authority);
+        Ok(())
+    }
+
     /// Reopen the existing current-schema database solely for an authorized
     /// automatic import, without startup repair, migration, or reconstruction.
     ///
@@ -12440,6 +12535,284 @@ routing:
         assert_eq!(fs::read(&jsonl_path).unwrap(), before);
         assert!(!beads_dir.join("beads.db").exists());
         assert!(!beads_dir.join(".br_recovery").exists());
+    }
+
+    fn writable_startup_handoff_fixture() -> (TempDir, OpenStorageResult) {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create workspace");
+        let mut context =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("writable startup");
+        context.storage.set_config("issue_prefix", "bd").unwrap();
+        context
+            .storage
+            .set_config("compact_model", "before")
+            .unwrap();
+        context
+            .storage
+            .create_issue(
+                &Issue {
+                    id: "bd-before".to_string(),
+                    title: "Committed before the handoff".to_string(),
+                    ..Issue::default()
+                },
+                "startup-actor",
+            )
+            .unwrap();
+        (temp, context)
+    }
+
+    #[test]
+    fn read_only_startup_handoff_releases_writer_and_preserves_snapshot() {
+        for storage_only_authority in [false, true] {
+            let (_temp, mut reader) = writable_startup_handoff_fixture();
+            let startup = reader.retained_startup_config();
+            let policy = crate::close_policy::Workflow {
+                strict: true,
+                statuses: vec!["open".to_string()],
+                ..crate::close_policy::Workflow::default()
+            };
+            reader.storage.set_workflow_policy(policy.clone());
+            if storage_only_authority {
+                reader.write_authority = None;
+            }
+            assert!(
+                crate::sync::blocking_write_lock_with_timeout(&reader.paths.beads_dir, Some(1))
+                    .is_err(),
+                "the writable startup handle must retain exclusive authority"
+            );
+
+            reader.finish_read_only_startup().expect("safe handoff");
+
+            assert!(reader.retained_database_write_authority().is_none());
+            assert!(reader.storage.attached_write_authority().is_none());
+            assert_eq!(reader.storage.workflow_policy(), policy);
+            assert_eq!(reader.paths, startup.paths);
+            assert_eq!(reader.startup_layers, startup.layers);
+            let mut writer = open_storage_with_cli(
+                &reader.paths.beads_dir,
+                &CliOverrides {
+                    lock_timeout: Some(100),
+                    ..CliOverrides::default()
+                },
+            )
+            .expect("another writer proceeds while the read snapshot remains alive");
+            writer.storage.set_config("compact_model", "after").unwrap();
+            writer
+                .storage
+                .create_issue(
+                    &Issue {
+                        id: "bd-after".to_string(),
+                        title: "Committed by the next writer".to_string(),
+                        ..Issue::default()
+                    },
+                    "next-actor",
+                )
+                .unwrap();
+            reader
+                .finish_read_only_startup()
+                .expect("an observational context needs no fresh snapshot or authority");
+            assert_eq!(
+                reader
+                    .storage
+                    .get_config("compact_model")
+                    .unwrap()
+                    .as_deref(),
+                Some("before")
+            );
+            assert!(reader.storage.get_issue("bd-before").unwrap().is_some());
+            assert!(reader.storage.get_issue("bd-after").unwrap().is_none());
+            assert!(writer.storage.get_issue("bd-after").unwrap().is_some());
+            assert!(
+                reader
+                    .storage
+                    .set_config("compact_model", "forbidden")
+                    .is_err(),
+                "handoff must replace the writable connection, not merely drop its guard"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_startup_handoff_reuses_the_protected_private_snapshot() {
+        let (_temp, mut writer) = writable_startup_handoff_fixture();
+        let authority = writer.retained_database_write_authority().unwrap();
+        let mut reader = open_storage_with_startup_config_under_write_lock(
+            writer.retained_startup_config(),
+            &CliOverrides {
+                read_only_storage: true,
+                ..CliOverrides::default()
+            },
+            false,
+            &authority,
+        )
+        .expect("capture the protected freshness-reprobe snapshot");
+        writer
+            .storage
+            .set_config("compact_model", "changed-after-capture")
+            .unwrap();
+        drop(writer);
+        drop(authority);
+
+        reader
+            .finish_read_only_startup()
+            .expect("reuse a complete snapshot");
+
+        assert_eq!(
+            reader
+                .storage
+                .get_config("compact_model")
+                .unwrap()
+                .as_deref(),
+            Some("before"),
+            "finishing startup must not recapture a different source generation"
+        );
+        let current = open_storage_with_cli(
+            &reader.paths.beads_dir,
+            &CliOverrides {
+                lock_timeout: Some(100),
+                ..CliOverrides::default()
+            },
+        )
+        .expect("reusing the private snapshot releases the original writer lock");
+        assert_eq!(
+            current
+                .storage
+                .get_config("compact_model")
+                .unwrap()
+                .as_deref(),
+            Some("changed-after-capture")
+        );
+        assert!(reader.storage.attached_write_authority().is_none());
+    }
+
+    #[test]
+    fn read_only_startup_handoff_refuses_changed_routing_without_releasing_authority() {
+        let (_temp, mut context) = writable_startup_handoff_fixture();
+        let paths = context.paths.clone();
+        context.paths.db_path = paths.beads_dir.join("another.db");
+
+        let error = context
+            .finish_read_only_startup()
+            .expect_err("mismatched route");
+
+        assert!(error.to_string().contains("routing does not match"));
+        assert!(context.retained_database_write_authority().is_some());
+        assert!(context.storage.attached_write_authority().is_some());
+        assert!(crate::sync::blocking_write_lock_with_timeout(&paths.beads_dir, Some(1)).is_err());
+        assert!(context.storage.get_issue("bd-before").unwrap().is_some());
+        assert!(!context.paths.db_path.exists());
+    }
+
+    #[test]
+    fn read_only_startup_handoff_refuses_snapshot_failure_without_repair() {
+        let (_temp, mut context) = writable_startup_handoff_fixture();
+        context
+            .storage
+            .execute_test_sql("DROP TABLE labels")
+            .unwrap();
+        let before = database_family_snapshot(&context.paths.db_path).unwrap();
+
+        let error = context
+            .finish_read_only_startup()
+            .expect_err("incomplete runtime schema");
+
+        assert!(error.to_string().contains("runtime schema is incomplete"));
+        assert!(context.retained_database_write_authority().is_some());
+        assert!(context.storage.attached_write_authority().is_some());
+        assert!(
+            crate::sync::blocking_write_lock_with_timeout(&context.paths.beads_dir, Some(1))
+                .is_err()
+        );
+        let diffs = database_family_read_only_diffs(
+            &before,
+            &database_family_snapshot(&context.paths.db_path).unwrap(),
+        );
+        assert!(diffs.is_empty(), "handoff repaired the source: {diffs:?}");
+        assert!(!context.paths.beads_dir.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn read_only_startup_handoff_refuses_deferred_recovery_before_import() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        write_single_issue_jsonl(&jsonl, "bd-source", "Recovery is not yet committed");
+        let mut context =
+            open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, &CliOverrides::default())
+                .expect("prepare a real deferred recovery");
+        assert!(context.pending_recovery_backup.is_some());
+        let before = database_family_snapshot(&context.paths.db_path).unwrap();
+        let jsonl_before = fs::read(&jsonl).unwrap();
+
+        let error = context
+            .finish_read_only_startup()
+            .expect_err("pending import");
+
+        assert!(error.to_string().contains("recovery is incomplete"));
+        assert!(context.pending_recovery_backup.is_some());
+        assert!(context.retained_database_write_authority().is_some());
+        assert!(crate::sync::blocking_write_lock_with_timeout(&beads_dir, Some(1)).is_err());
+        assert_eq!(
+            database_family_snapshot(&context.paths.db_path).unwrap(),
+            before
+        );
+        assert_eq!(fs::read(&jsonl).unwrap(), jsonl_before);
+    }
+
+    #[test]
+    fn read_only_startup_handoff_refuses_failed_database_transition() {
+        let (_temp, mut context) = writable_startup_handoff_fixture();
+        context.mark_database_transition_failed_closed_for_test();
+        let error = context
+            .finish_read_only_startup()
+            .expect_err("failed transition");
+        assert!(error.to_string().contains("recovery is incomplete"));
+        assert!(context.retained_database_write_authority().is_some());
+        assert!(
+            crate::sync::blocking_write_lock_with_timeout(&context.paths.beads_dir, Some(1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn read_only_startup_handoff_releases_completed_recovery_authorities() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl = beads_dir.join("issues.jsonl");
+        write_single_issue_jsonl(&jsonl, "bd-source", "Completed recovery snapshot");
+        let mut context = open_storage_with_cli(&beads_dir, &CliOverrides::default())
+            .expect("complete the authorized missing-database recovery");
+        assert!(context.auto_rebuilt);
+        assert!(context.pending_recovery_backup.is_none());
+        assert!(context.jsonl_write_authority.is_some());
+
+        context
+            .finish_read_only_startup()
+            .expect("completed recovery handoff");
+
+        let _writer = crate::sync::blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &context.paths.db_path,
+            Some(100),
+        )
+        .expect("database authority is released");
+        let _jsonl_writer =
+            crate::sync::blocking_jsonl_family_write_lock_with_timeout(&jsonl, Some(100))
+                .expect("completed recovery's JSONL authority is released");
+        assert_eq!(
+            context
+                .storage
+                .get_issue("bd-source")
+                .unwrap()
+                .unwrap()
+                .title,
+            "Completed recovery snapshot"
+        );
+        assert!(context.jsonl_write_authority.is_none());
+        assert!(context.storage.attached_write_authority().is_none());
     }
 
     #[test]

@@ -2306,6 +2306,23 @@ impl SqliteStorage {
         self.write_authority.clone()
     }
 
+    /// Detach startup authority only when this handle already owns a private
+    /// read snapshot. `read_snapshot_dir` is populated exclusively after an
+    /// engine read-only open; a zero mutation count alone is not sufficient
+    /// because a writable connection could still have an uncommitted write.
+    #[must_use]
+    pub(crate) fn release_write_authority_for_private_read_snapshot(&mut self) -> bool {
+        if self.read_snapshot_dir.is_none() || self.mutation_count != 0 {
+            return false;
+        }
+        self.write_authority = None;
+        // Private WAL recovery may retain a lease on its original source.
+        // The private connection no longer reads that family, so it must not
+        // prevent the next writer from checkpointing it during a long query.
+        self.opener_lease = None;
+        true
+    }
+
     fn verify_attached_database_authority(&self) -> Result<()> {
         if let Some(authority) = self.write_authority.as_ref() {
             authority.verify_database_authority()?;

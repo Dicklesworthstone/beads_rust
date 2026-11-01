@@ -664,9 +664,73 @@ br doctor --json
 ```
 
 **Prevention:**
-- Avoid running multiple br commands simultaneously
-- Don't leave interactive sessions open
-- Use `--lock-timeout` for agent workflows
+- Use `--lock-timeout` to bound writer admission waits in agent workflows.
+- Investigate the owning process before retrying a persistently contended write.
+- Preserve live lock files: removing `.write.lock` can let two processes hold
+  different lock inodes and invalidate writer exclusion.
+
+### A read command is holding `.write.lock` (#586)
+
+Workspace writer authority must cover writes and their teardown, but must end
+before a read command starts its query or renders output. A slow search or a
+blocked stdout pipe must not extend that critical section.
+
+Ordinary reads open a coherent private snapshot of the current database. If an
+automatic-import probe finds work, the command can still join the writer queue.
+It then reopens the canonical database and checks freshness and pending-merge
+state again under the same database-family authority. When startup finishes,
+the command captures a verified private read snapshot and closes the writable
+connection while the authority is still held. Only then does it release every
+retained authority token and execute the query. The result describes that
+snapshot; a later writer's changes appear in a later command.
+
+This handoff keeps normal writers serialized, preserves sole-opener checkpoint
+admission, and does not let database replacement change an in-flight query.
+Incomplete recovery, changed database routing or identity, and an unavailable
+safe read snapshot cause an error before query execution. There is no fallback
+that executes the read while retaining writer authority. An import already
+committed before a later snapshot failure remains committed; that failure is
+not an import rollback.
+
+`--lock-timeout` bounds acquisition waits, not the duration of an import,
+checkpoint, filesystem I/O, query, or output operation. A required startup
+write can still occupy the lock while it completes safely. Increasing the
+timeout does not fix an excessively long holder. To read the current database
+without automatic synchronization, use:
+
+```bash
+br --no-auto-import --no-auto-flush search QUERY --all --json
+```
+
+These flags do not make JSONL equivalent to the current database. `--no-db`
+reads JSONL, which may omit database-only records. Older-schema issue queries
+can use that view only with the existing explicit warning; diagnostic commands
+inspect the original through their legacy-schema readers. Read commands never
+authorize migration or repair, even with `BR_DISABLE_READ_ONLY_FAST_OPEN=1`.
+Use the reviewed migration or explicit recovery commands when required.
+
+**Interpreting the reported incident.** Issue #586 tested 0.5.7 at `c807e36`.
+Healthy fast-open searches did not acquire `.write.lock`; the controlled case
+disabled fast-open on the reader and demonstrated a writer exhausting its
+three-second admission budget. It established lock ownership during startup or
+execution, not that the search query had already begun. The separate reported
+ten-minute production hold did not identify its startup trigger.
+
+At that revision, plausible routes into writable startup included the debugging
+override, an older or incomplete runtime schema, a read-only engine-open miss
+(including namespace permission repair), startup recovery, and a positive or
+failed automatic-import probe. These are source-derived candidates, not a
+diagnosis of the production incident. Current read-intent protection from #585
+refuses the repair/migration fallback; #586's handoff also ends authority after
+an automatic-import escalation, including when the protected reprobe finds
+that another writer already completed the import or a sync merge is pending.
+
+When investigating a new incident, capture the binary revision, flags and
+fast-open override, verbose startup logs, the holder's PID and lock descriptors,
+and a bounded scratch-only reproduction. Separate time waiting for authority
+from time holding it, and distinguish startup from query/output. Total command
+wall time alone does not show a workspace-lock wait. Keep the database, WAL,
+sidecars, JSONL, and recovery evidence intact.
 
 ---
 

@@ -91,6 +91,29 @@ checkpoints are skipped while peers are present; `br doctor` reports `wal_size`
 and the sole-opener state (`beads_rust-dk45.5` adds an `engine` block with the
 lease holder).
 
+### Read startup authority handoff (#586)
+
+Read intent and writer authority have separate lifetimes. Ordinary reads never
+request schema migration or recovery of the original family (#585), but a
+freshness probe may require an automatic import. That escalation must retain
+the same workspace, canonical-path and database-inode authority through the
+protected freshness/pending-merge reprobe, the import, and writable teardown.
+
+Before command dispatch, `OpenStorageResult::finish_read_only_startup` verifies
+the routing and authority, obtains an actual private read-only snapshot, and
+closes the writable connection while its authority is still live. The existing
+sole-opener checkpoint gate remains in force during that close. The context,
+storage, CLI override markers, and top-level guard must all release their
+authority tokens before query execution or output can begin. A shared lock on
+`.write.lock` would still exclude writers and is not an appropriate downgrade.
+
+The snapshot retains the committed startup state independently of later writes
+or database-family replacement. An unfinished recovery or an unverifiable
+snapshot refuses the command; it never falls back to a long read under exclusive
+authority. The acquisition deadline is unchanged and is not a wall-clock bound
+on required imports, checkpoints, or filesystem calls. No authority is released
+in the middle of a write or recovery operation to satisfy a timeout.
+
 ### Explicit trusted Unix group sharing (#533)
 
 The default namespace-sidecar policy is single-UID ownership. A setgid tracker

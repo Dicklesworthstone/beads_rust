@@ -47,7 +47,10 @@ fn should_clear_inherited_br_env(key: &OsStr) -> bool {
         || key.starts_with("BEADS_")
         || matches!(
             key.as_ref(),
-            "BR_OUTPUT_FORMAT" | "TOON_DEFAULT_FORMAT" | "TOON_STATS"
+            "BR_DISABLE_READ_ONLY_FAST_OPEN"
+                | "BR_OUTPUT_FORMAT"
+                | "TOON_DEFAULT_FORMAT"
+                | "TOON_STATS"
         )
 }
 
@@ -593,6 +596,364 @@ impl Drop for QueuedBrChildren {
             let _ = child.wait();
         }
     }
+}
+
+/// GH #586: make the command lifetime deterministic without a production
+/// sleep hook or relying on the speed of a large query. The search result is
+/// larger than a pipe buffer. Linux's wait channel proves that the child has
+/// reached output and cannot complete until the test drains its stdout.
+#[cfg(target_os = "linux")]
+fn stalled_snapshot_search(
+    root: &Path,
+    disable_fast_open: bool,
+    auto_import: bool,
+) -> QueuedBrChildren {
+    let db_path = root.join(".beads/beads.db");
+    let mut args = vec![
+        "--db",
+        db_path.to_str().unwrap(),
+        "--lock-timeout",
+        "1500",
+        "--no-auto-flush",
+    ];
+    if !auto_import {
+        args.push("--no-auto-import");
+    }
+    args.extend(["search", "snapshot", "--all", "--limit", "0", "--json"]);
+    let mut children = QueuedBrChildren(vec![spawn_br_child_in_dir_with_env(
+        root,
+        args,
+        [(
+            "BR_DISABLE_READ_ONLY_FAST_OPEN",
+            if disable_fast_open { "1" } else { "0" },
+        )],
+    )]);
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let child = &mut children.0[0];
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = children.0.remove(0).wait_with_output().unwrap();
+            panic!(
+                "search exited before output backpressure: {status}; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let channel = read_child_wait_channel(child.id());
+        if channel
+            .as_deref()
+            .is_some_and(|value| value.contains("pipe_write"))
+        {
+            return children;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "search never reached output backpressure; last wait channel: {channel:?}"
+        );
+        thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_search_body() -> String {
+    "snapshot payload retained while a separate writer runs. ".repeat(32_768)
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_search_workspace() -> common::cli::BrWorkspace {
+    let workspace = common::cli::BrWorkspace::new();
+    let init = run_br_in_dir(&workspace.root, ["init", "--prefix", "test"]);
+    assert!(init.success, "init failed: {init:?}");
+    let mut issue = common::fixtures::issue("Original snapshot search result");
+    issue.id = "test-read".to_string();
+    issue.description = Some(snapshot_search_body());
+    issue.notes = Some("before concurrent writer".to_string());
+    fs::write(
+        workspace.root.join(".beads/issues.jsonl"),
+        format!("{}\n", serde_json::to_string(&issue).unwrap()),
+    )
+    .unwrap();
+    let imported = run_br_in_dir(&workspace.root, ["sync", "--import-only", "--json"]);
+    assert!(imported.success, "seed import failed: {imported:?}");
+    let flushed = run_br_in_dir(&workspace.root, ["sync", "--flush-only", "--json"]);
+    assert!(flushed.success, "seed flush failed: {flushed:?}");
+    workspace
+}
+
+#[cfg(target_os = "linux")]
+fn competing_snapshot_writer(root: &Path, issue_id: &str) -> std::process::Output {
+    QueuedBrChildren(vec![spawn_br_child_in_dir(
+        root,
+        [
+            "--lock-timeout",
+            "1000",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "update",
+            issue_id,
+            "--notes",
+            "after concurrent writer",
+            "--json",
+        ],
+    )])
+    .finish(Duration::from_secs(20))
+    .remove(0)
+}
+
+#[cfg(target_os = "linux")]
+fn finish_snapshot_search(search: QueuedBrChildren) -> (Vec<serde_json::Value>, String) {
+    let output = search.finish(Duration::from_secs(20)).remove(0);
+    assert!(
+        output.status.success(),
+        "search failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        extract_issues_array(&String::from_utf8_lossy(&output.stdout)),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn assert_snapshot_writer_succeeds(disable_fast_open: bool, auto_import: bool) {
+    let workspace = snapshot_search_workspace();
+    let root = &workspace.root;
+    let jsonl_path = root.join(".beads/issues.jsonl");
+    if auto_import {
+        let mut incoming: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&jsonl_path).unwrap()).unwrap();
+        incoming["title"] = "Imported snapshot search result".into();
+        incoming["notes"] = "imported before concurrent writer".into();
+        incoming["updated_at"] = "2999-01-01T00:00:00Z".into();
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&incoming).unwrap()),
+        )
+        .unwrap();
+    }
+    let jsonl_before = fs::read(&jsonl_path).unwrap();
+    let mut search = stalled_snapshot_search(root, disable_fast_open, auto_import);
+    let writer = competing_snapshot_writer(root, "test-read");
+    assert!(
+        writer.status.success(),
+        "writer must finish while search remains blocked on output (disabled_fast_open={disable_fast_open}, auto_import={auto_import}): stdout={} stderr={}",
+        String::from_utf8_lossy(&writer.stdout),
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    assert!(search.0[0].try_wait().unwrap().is_none());
+    let (issues, _) = finish_snapshot_search(search);
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["id"], "test-read");
+    assert_eq!(issues[0]["description"], snapshot_search_body());
+    assert_eq!(
+        issues[0]["notes"],
+        if auto_import {
+            "imported before concurrent writer"
+        } else {
+            "before concurrent writer"
+        },
+        "the search must return its coherent pre-writer view"
+    );
+    if auto_import {
+        assert_eq!(issues[0]["title"], "Imported snapshot search result");
+    }
+    let shown = run_br_in_dir(
+        root,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            "test-read",
+            "--json",
+        ],
+    );
+    assert!(shown.success, "writer verification failed: {shown:?}");
+    assert_eq!(
+        extract_issues_array(&shown.stdout)[0]["notes"],
+        "after concurrent writer"
+    );
+    assert_eq!(fs::read(jsonl_path).unwrap(), jsonl_before);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_fast_open_search_does_not_hold_writer_authority() {
+    assert_snapshot_writer_succeeds(false, false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_forced_startup_search_does_not_hold_writer_authority() {
+    assert_snapshot_writer_succeeds(true, false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_auto_import_search_releases_writer_authority() {
+    for disable_fast_open in [false, true] {
+        assert_snapshot_writer_succeeds(disable_fast_open, true);
+    }
+}
+
+/// GH #585 keeps ordinary reads observational even on old schemas. Its
+/// labelled JSONL snapshot must not stop a separate writer from performing a
+/// reviewed lossless migration while search output is still blocked.
+#[test]
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
+fn e2e_586_legacy_search_allows_concurrent_lossless_migration() {
+    const EVENTS_QUERY: &str = "SELECT id, issue_id, event_type, actor, old_value, new_value, \
+                               comment, created_at FROM events ORDER BY id";
+    let workspace = common::cli::BrWorkspace::new();
+    let root = &workspace.root;
+    let beads = root.join(".beads");
+    fs::create_dir_all(&beads).unwrap();
+    let db = beads.join("beads.db");
+    let mut decoder = flate2::read::GzDecoder::new(
+        &include_bytes!("fixtures/schema_migration/schema16_v0219_release.db.gz")[..],
+    );
+    std::io::copy(&mut decoder, &mut fs::File::create(&db).unwrap()).unwrap();
+    fs::write(beads.join("config.yaml"), "issue_prefix: v15ws\n").unwrap();
+    let mut jsonl = String::new();
+    for line in include_str!("fixtures/schema_migration/schema16_issues.jsonl").lines() {
+        let mut issue: serde_json::Value = serde_json::from_str(line).unwrap();
+        if issue["id"] == "v15ws-9nx" {
+            issue["description"] = snapshot_search_body().into();
+        }
+        writeln!(&mut jsonl, "{}", serde_json::to_string(&issue).unwrap()).unwrap();
+    }
+    fs::write(beads.join("issues.jsonl"), &jsonl).unwrap();
+    let fixture = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    fixture
+        .execute("INSERT INTO config (key, value) VALUES ('gh586_preserved', 'database-only')")
+        .unwrap();
+    let events_before: Vec<_> = fixture
+        .query(EVENTS_QUERY)
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect();
+    assert!(!events_before.is_empty());
+    fixture.close().unwrap();
+    let db_before = fs::read(&db).unwrap();
+    let mut search = stalled_snapshot_search(root, true, false);
+    assert_eq!(fs::read(&db).unwrap(), db_before, "read must not migrate");
+    let writer = competing_snapshot_writer(root, "v15ws-9nx");
+    assert!(
+        writer.status.success(),
+        "migration writer failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&writer.stdout),
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    assert!(String::from_utf8_lossy(&writer.stderr).contains("migrated it in place"));
+    assert!(search.0[0].try_wait().unwrap().is_none());
+    let (issues, diagnostic) = finish_snapshot_search(search);
+    assert!(
+        diagnostic.contains("reads issues.jsonl directly"),
+        "{diagnostic}"
+    );
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["id"], "v15ws-9nx");
+    assert_eq!(issues[0]["description"], snapshot_search_body());
+    let migrated = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    assert_eq!(
+        migrated.query("PRAGMA user_version").unwrap()[0]
+            .get(0)
+            .and_then(SqliteValue::as_integer),
+        Some(i64::from(
+            beads_rust::storage::schema::CURRENT_SCHEMA_VERSION
+        ))
+    );
+    assert_eq!(
+        migrated
+            .query("SELECT value FROM config WHERE key = 'gh586_preserved'")
+            .unwrap()[0]
+            .get(0)
+            .and_then(SqliteValue::as_text),
+        Some("database-only")
+    );
+    assert_eq!(
+        migrated
+            .query("SELECT notes FROM issues WHERE id = 'v15ws-9nx'")
+            .unwrap()[0]
+            .get(0)
+            .and_then(SqliteValue::as_text),
+        Some("after concurrent writer")
+    );
+    let events_after: Vec<_> = migrated
+        .query(EVENTS_QUERY)
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect();
+    assert!(events_after.starts_with(&events_before));
+    migrated.close().unwrap();
+    assert_eq!(
+        fs::read_to_string(beads.join("issues.jsonl")).unwrap(),
+        jsonl
+    );
+}
+
+/// A stable private read view does not authorize unsafe live recovery. Keep
+/// committed WAL frames and the retained original index intact while the
+/// competing writer reports the existing bounded recovery refusal.
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_search_preserves_framed_wal_recovery_refusal() {
+    const WAL_TITLE: &[u8] = b"WAL-only snapshot result";
+    let workspace = snapshot_search_workspace();
+    let root = &workspace.root;
+    let beads = root.join(".beads");
+    let db = beads.join("beads.db");
+    let fixture = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    fixture.execute("PRAGMA journal_mode=WAL").unwrap();
+    fixture.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+    fixture
+        .execute("UPDATE issues SET title='WAL-only snapshot result' WHERE id='test-read'")
+        .unwrap();
+    // Drop deliberately retains committed frames; close() would checkpoint.
+    drop(fixture);
+    let retained_index = root.join("retained-matching-shm");
+    fs::rename(beads.join("beads.db-shm"), &retained_index).unwrap();
+    let index_before = fs::read(&retained_index).unwrap();
+    let main_before = fs::read(&db).unwrap();
+    let wal_before = fs::read(beads.join("beads.db-wal")).unwrap();
+    let jsonl_before = fs::read(beads.join("issues.jsonl")).unwrap();
+    assert!(
+        wal_before
+            .windows(WAL_TITLE.len())
+            .any(|bytes| bytes == WAL_TITLE)
+    );
+    assert!(
+        !main_before
+            .windows(WAL_TITLE.len())
+            .any(|bytes| bytes == WAL_TITLE)
+    );
+    let mut search = stalled_snapshot_search(root, true, false);
+    let writer = competing_snapshot_writer(root, "test-read");
+    assert!(!writer.status.success(), "unsafe WAL recovery must refuse");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&writer.stdout),
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    assert!(
+        diagnostic.contains("WAL contains frames that may hold committed, uncheckpointed changes"),
+        "writer must report recovery refusal, not a search-held workspace lock: {diagnostic}"
+    );
+    assert!(search.0[0].try_wait().unwrap().is_none());
+    let authority = beads_rust::sync::blocking_write_lock_with_timeout(&beads, Some(0))
+        .expect("refused recovery releases authority while the search remains alive");
+    drop(authority);
+    let (issues, _) = finish_snapshot_search(search);
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["title"], "WAL-only snapshot result");
+    assert_eq!(fs::read(db).unwrap(), main_before);
+    assert_eq!(fs::read(beads.join("beads.db-wal")).unwrap(), wal_before);
+    assert_eq!(fs::read(beads.join("issues.jsonl")).unwrap(), jsonl_before);
+    assert_eq!(fs::read(retained_index).unwrap(), index_before);
+    assert!(!beads.join("beads.db-shm").exists());
 }
 
 /// Helper to parse created issue ID from stdout.

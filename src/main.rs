@@ -276,17 +276,14 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     }
 
     // Phase 1.5: Acquire exclusive write lock before any DB-family open that
-    // may apply schema, recover, quarantine sidecars, write metadata, or read
-    // from SQLite while another process is in a write transaction.
+    // may apply schema, recover, quarantine sidecars, or write metadata.
     //
     // Issue #243 established the cross-process authority boundary: serialize
     // all mutating operations through a blocking flock on
-    // `.beads/.write.lock`. Normal
-    // storage open is not guaranteed read-only in recovery/schema paths, so
-    // DB-family commands hold authority even when they first try the
-    // current-schema read-only fast-open path. That keeps the pending-saga
-    // verdict stable and prevents a fast-open miss from entering writable
-    // recovery without a definitive gate.
+    // `.beads/.write.lock`. Strict observational opens never enter writable
+    // recovery. A read that needs an automatic import acquires authority
+    // below and repeats its advisory probes under that authority. After
+    // startup, it must hand off to a verified read snapshot before dispatch.
     let ordinary_database_authority_required = should_acquire_startup_write_lock(
         command_needs_write_lock,
         should_preopen_storage,
@@ -559,29 +556,31 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                 None => None,
             };
         }
-        let mut should_attempt_auto_import = {
-            match storage_result.as_mut() {
-                Some(res)
-                    if ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage =>
-                {
-                    auto_import_probe(
-                        &res.storage,
-                        &paths.beads_dir,
-                        &paths.jsonl_path,
-                        allow_external_jsonl,
-                    )
-                    .unwrap_or(true)
-                }
-                Some(res) => auto_import_probe_refreshing_witnesses(
-                    &mut res.storage,
+        let import_probe = match storage_result.as_mut() {
+            Some(res) if ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage => {
+                auto_import_probe(
+                    &res.storage,
                     &paths.beads_dir,
                     &paths.jsonl_path,
                     allow_external_jsonl,
                 )
-                .unwrap_or(true),
-                None => false,
             }
+            Some(res) => auto_import_probe_refreshing_witnesses(
+                &mut res.storage,
+                &paths.beads_dir,
+                &paths.jsonl_path,
+                allow_external_jsonl,
+            ),
+            None => Ok(false),
         };
+        let mut should_attempt_auto_import = import_probe.unwrap_or_else(|error| {
+            tracing::debug!(
+                target: "br::startup",
+                error = %error,
+                "Automatic-import probe failed; retrying under database-family authority"
+            );
+            true
+        });
 
         if should_attempt_auto_import {
             if (ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage)
@@ -589,6 +588,11 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                 && auto_import_write_lock.is_none()
             {
                 let lock_timeout = ctx.write_lock_timeout();
+                tracing::debug!(
+                    target: "br::startup",
+                    database = %paths.db_path.display(),
+                    "Read startup is acquiring write authority for automatic import"
+                );
                 auto_import_write_lock = match ctx.beads_dir.as_deref().map(|beads_dir| {
                     beads_rust::sync::blocking_database_family_write_lock_with_timeout(
                         beads_dir,
@@ -621,6 +625,15 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                     authority,
                     allow_external_jsonl,
                 )?;
+                tracing::debug!(
+                    target: "br::startup",
+                    outcome = match &reprobe {
+                        FastOpenAutoImportReprobe::Current => "current",
+                        FastOpenAutoImportReprobe::ImportRequired => "import_required",
+                        FastOpenAutoImportReprobe::Pending(_) => "pending_merge",
+                    },
+                    "Protected automatic-import probe complete"
+                );
                 should_attempt_auto_import = apply_fast_open_auto_import_reprobe(
                     reprobe,
                     &mut pending_merge_warning_emitted,
@@ -686,6 +699,33 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             // sync_lock drops here, releasing the advisory lock before command execution
         }
     }
+
+    // Phase 3.5: A read command's import authority ends with startup, not
+    // with its potentially unbounded query or output (GH #586). The storage
+    // transition captures a coherent private snapshot and closes the live
+    // writable connection while authority still protects its teardown. If
+    // that transition cannot be proved safe, return the error and unwind;
+    // never continue the read while retaining exclusive workspace access.
+    //
+    // Every Arc owner matters: the context, its storage, both CLI override
+    // sets, and this outer guard can each keep the same flock alive. Move
+    // the guard out explicitly; shadowing without dropping the old binding
+    // would extend its lifetime through command execution.
+    let write_lock = if requires_read_only_storage(&cli.command) {
+        if let Some(res) = storage_result.as_mut() {
+            res.finish_read_only_startup()?;
+        }
+        overrides.clear_database_family_lock_marker();
+        ctx.overrides.clear_database_family_lock_marker();
+        drop(write_lock);
+        tracing::debug!(
+            target: "br::startup",
+            "Read startup complete; query execution has no retained writer authority"
+        );
+        None
+    } else {
+        write_lock
+    };
 
     // Phase 4: Command Execution
     let result = match cli.command {
@@ -2507,8 +2547,8 @@ fn lock_mode_octal(_lock_path: &Path) -> Option<String> {
 fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
     // `--lock-timeout` deliberately does NOT disable the fast path. The
     // timeout governs how long to wait *when a lock is required*, and a
-    // read-only fast open acquires none; on a fast-open miss the fallback
-    // still takes the write lock and honors the timeout. Gating on it meant
+    // strict read-only open acquires none. An automatic import still takes
+    // the write lock and honors the timeout. Gating on it meant
     // any scripted caller that passed `--lock-timeout` silently lost lock-free
     // reads and serialized every read command behind an exclusive flock,
     // which shows up as spurious lock-timeout failures under parallel reads.
