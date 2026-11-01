@@ -1018,6 +1018,148 @@ fn run_size_gate_with_source(
     Ok(receipt)
 }
 
+#[cfg(unix)]
+#[test]
+fn ci_macos_native_guard_accepts_matching_architectures() -> Result<(), String> {
+    for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        let (fixture, output) = run_native_macos_fixture(target, &[])?;
+        require_success(&output)?;
+        assert_eq!(
+            read_to_string(&fixture.root().join("selftest-args"))?,
+            "doctor\n--selftest\n--json\n",
+            "{target}: the checked release binary must execute the selftest"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn ci_macos_native_guard_rejects_mismatches_before_execution() -> Result<(), String> {
+    for (key, value, expected_exit) in [
+        ("BR_CI_TARGET", "aarch64-unknown-linux-gnu", 1),
+        ("MOCK_RUNNER_ARCH", "x86_64", 1),
+        ("MOCK_RUST_HOST", "x86_64-apple-darwin", 1),
+        ("MOCK_RUST_HOST", "", 1),
+        ("MOCK_BINARY_ARCH", "x86_64", 1),
+        ("MOCK_BINARY_ARCH", "", 1),
+        ("MOCK_BINARY_ARCH", "arm64 x86_64", 1),
+        ("MOCK_RUST_EXIT", "41", 41),
+        ("MOCK_LIPO_EXIT", "42", 42),
+    ] {
+        let (fixture, output) = run_native_macos_fixture("aarch64-apple-darwin", &[(key, value)])?;
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{key}={value:?}: {}\n{}",
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            !fixture.root().join("selftest-args").exists(),
+            "{key}={value:?}: invalid native observations must prevent binary execution"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn ci_macos_native_guard_propagates_selftest_failure() -> Result<(), String> {
+    let (fixture, output) =
+        run_native_macos_fixture("aarch64-apple-darwin", &[("MOCK_SELFTEST_EXIT", "47")])?;
+    assert_eq!(
+        output.status.code(),
+        Some(47),
+        "{}\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(
+        read_to_string(&fixture.root().join("selftest-args"))?,
+        "doctor\n--selftest\n--json\n"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_native_macos_fixture(
+    target: &str,
+    overrides: &[(&str, &str)],
+) -> Result<(WorkflowFixture, ShellOutput), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // These command fixtures exercise the actual workflow's control flow.
+    // They are not Mach-O binaries or evidence of native macOS execution.
+    const MOCK_TOOLS: &str = r#"
+uname() {
+  [[ "$#" == 1 && "$1" == "-m" ]] || return 90
+  printf '%s\n' "$MOCK_RUNNER_ARCH"
+}
+rustc() {
+  [[ "$#" == 1 && "$1" == "-vV" ]] || return 91
+  printf 'rustc fixture\nhost: %s\n' "$MOCK_RUST_HOST"
+  return "$MOCK_RUST_EXIT"
+}
+lipo() {
+  [[ "$#" == 2 && "$1" == "-archs" ]] || return 92
+  [[ "$2" == "$GITHUB_WORKSPACE/target/$BR_CI_TARGET/release/br" ]] || return 93
+  [[ -x "$2" ]] || return 94
+  printf '%s\n' "$MOCK_BINARY_ARCH"
+  return "$MOCK_LIPO_EXIT"
+}
+"#;
+
+    let raw = read_to_string(Path::new(".github/workflows/ci.yml"))?;
+    let workflow: Workflow =
+        serde_yml::from_str(&raw).map_err(|error| format!("parse CI workflow: {error}"))?;
+    let script = workflow
+        .jobs
+        .get("build")
+        .and_then(|job| {
+            job.steps
+                .iter()
+                .find(|step| step.name.as_deref() == Some("Verify native macOS binary"))
+        })
+        .and_then(|step| step.run.as_deref())
+        .ok_or_else(|| "CI lacks its native macOS verification script".to_owned())?;
+
+    let fixture = WorkflowFixture::new()?;
+    let workspace = fixture.root().join("workspace with spaces");
+    let release = workspace.join("target").join(target).join("release");
+    fs::create_dir_all(&release).map_err(|error| error.to_string())?;
+    let binary = release.join("br");
+    fs::write(
+        &binary,
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$MOCK_SELFTEST_LOG\"\nexit \"$MOCK_SELFTEST_EXIT\"\n",
+    )
+    .map_err(|error| error.to_string())?;
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+
+    let architecture = if target == "x86_64-apple-darwin" {
+        "x86_64"
+    } else {
+        "arm64"
+    };
+    let workspace = path_string(&workspace);
+    let selftest_log = path_string(&fixture.root().join("selftest-args"));
+    let mut envs = vec![
+        ("BR_CI_TARGET", target),
+        ("GITHUB_WORKSPACE", workspace.as_str()),
+        ("MOCK_RUNNER_ARCH", architecture),
+        ("MOCK_RUST_HOST", target),
+        ("MOCK_BINARY_ARCH", architecture),
+        ("MOCK_RUST_EXIT", "0"),
+        ("MOCK_LIPO_EXIT", "0"),
+        ("MOCK_SELFTEST_EXIT", "0"),
+        ("MOCK_SELFTEST_LOG", selftest_log.as_str()),
+    ];
+    envs.extend_from_slice(overrides);
+    let output = run_bash_step(&format!("{MOCK_TOOLS}\n{script}"), fixture.root(), &envs)?;
+    Ok((fixture, output))
+}
+
 fn release_step_script(step_name: &str) -> Result<String, String> {
     let workflow = parse_release_workflow()?;
 

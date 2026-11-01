@@ -302,7 +302,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Verify binary runs (Unix)
         if: runner.os != 'Windows'
@@ -311,6 +311,37 @@ jobs:
       - name: Verify binary runs (Windows)
         if: runner.os == 'Windows'
         run: ./target/${{ matrix.target }}/release/br.exe --version
+
+      - name: Verify native macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          BR_CI_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$BR_CI_TARGET" in
+            aarch64-apple-darwin) expected_arch=arm64 ;;
+            x86_64-apple-darwin) expected_arch=x86_64 ;;
+            *) echo "Unexpected macOS target: $BR_CI_TARGET" >&2; exit 1 ;;
+          esac
+          host_arch="$(uname -m)"
+          rust_version="$(rustc -vV)"
+          rust_host="$(printf '%s\n' "$rust_version" | sed -n 's/^host: //p')"
+          printf '%s\n' "$rust_version"
+          if [[ "$host_arch" != "$expected_arch" || "$rust_host" != "$BR_CI_TARGET" ]]; then
+            echo "Native macOS host mismatch: expected $expected_arch/$BR_CI_TARGET, got $host_arch/$rust_host" >&2
+            exit 1
+          fi
+          binary="$GITHUB_WORKSPACE/target/$BR_CI_TARGET/release/br"
+          binary_arch="$(lipo -archs "$binary")"
+          if [[ "$binary_arch" != "$expected_arch" ]]; then
+            echo "Mach-O architecture mismatch: expected $expected_arch, got $binary_arch" >&2
+            exit 1
+          fi
+          printf 'Native macOS validation: target=%s host=%s binary=%s\n' "$BR_CI_TARGET" "$host_arch" "$binary_arch"
+          # Exercise this exact release binary's storage and CLI lifecycle in
+          # the selftest's isolated temporary workspace before uploading it.
+          "$binary" doctor --selftest --json
 
       - name: Upload artifact (Unix)
         if: runner.os != 'Windows'
