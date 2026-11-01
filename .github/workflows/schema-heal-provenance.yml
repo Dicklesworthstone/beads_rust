@@ -51,4 +51,4 @@ jobs:
         run: cargo test --lib --locked schema_heal -- --test-threads=1
       - name: Run restoration and import regressions
         if: ${{ !cancelled() }}
-        run: cargo test --lib --locked sync:: -- --test-threads=1
+        run: "cargo test --lib --locked sync:: -- --test-threads=1"
