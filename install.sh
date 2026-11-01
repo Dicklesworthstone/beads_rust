@@ -16,7 +16,7 @@
 #   --checksum-url URL Provide a custom checksum URL
 #   --insecure-skip-checksum
 #                      Allow installation without checksum verification
-#   --from-source      Build from source instead of downloading binary
+#   --from-source      Build --version tag, or the repository default branch
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
 #   --skip-skills      Don't install any Claude Code / Codex skills
@@ -415,7 +415,7 @@ usage() {
         gum style --faint "    --checksum SHA     Provide expected SHA256 checksum"
         gum style --faint "    --checksum-url URL Provide a custom checksum URL"
         gum style --faint "    --insecure-skip-checksum  Allow unverified binary install"
-        gum style --faint "    --from-source      Build from source instead of binary"
+        gum style --faint "    --from-source      Build --version tag, or the repository default branch"
         echo ""
         gum style --foreground 39 "  Behavior"
         gum style --faint "    --easy-mode        Auto-update PATH in shell rc files"
@@ -480,7 +480,7 @@ Options:
                       Allow installation without checksum verification
   --easy-mode        Auto-update PATH in shell rc files
   --verify           Run self-test after install
-  --from-source      Build from source instead of downloading binary
+  --from-source      Build --version tag, or the repository default branch
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
   --skip-skills      Don't install any Claude Code / Codex skills
@@ -1248,35 +1248,43 @@ build_from_source() {
     prepare_for_build
 
     local build_dir="$TMP/src"
+    local repository_url="https://github.com/${OWNER}/${REPO}.git"
 
-    run_with_spinner "Cloning repository..." \
-        git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$build_dir"
-
-    if [ ! -d "$build_dir" ]; then
-        die "Failed to clone repository"
-    fi
-
-    # Clone frankensqlite next to beads_rust — Cargo.toml [patch.crates-io]
-    # overrides fsqlite crates with path deps at ../frankensqlite/crates/*
-    local franken_dir="$TMP/frankensqlite"
-    run_with_spinner "Cloning frankensqlite dependency..." \
-        git clone --depth 1 "https://github.com/${OWNER}/frankensqlite.git" "$franken_dir"
-
-    if [ ! -d "$franken_dir" ]; then
-        die "Failed to clone frankensqlite (required path dependency)"
+    if [ -n "$VERSION" ]; then
+        local source_tag
+        source_tag=$(release_download_tag "$VERSION")
+        if ! git init --quiet "$build_dir" ||
+            ! git -C "$build_dir" remote add origin "$repository_url"; then
+            die "Failed to initialize source checkout"
+        fi
+        # Fetch the tag namespace explicitly: --branch also accepts a branch
+        # with the same name, which could build different code than requested.
+        if ! run_with_spinner "Fetching release $source_tag..." \
+            git -C "$build_dir" fetch --depth 1 origin "refs/tags/$source_tag"; then
+            die "Failed to fetch requested release tag: $source_tag"
+        fi
+        if ! git -C "$build_dir" checkout --quiet --detach FETCH_HEAD; then
+            die "Failed to check out requested release tag: $source_tag"
+        fi
+    else
+        if ! run_with_spinner "Cloning repository..." \
+            git clone --depth 1 "$repository_url" "$build_dir"; then
+            die "Failed to clone repository"
+        fi
     fi
 
     log_step "Building with Cargo (this may take a few minutes)..."
 
-    # Build with explicit target dir to avoid conflicts
+    # Build from the selected checkout so rustup uses its toolchain pin and
+    # Cargo uses its lockfile. Registry dependencies need no sibling clones.
     local target_dir="$TMP/target"
-    if [[ "$GUM_AVAILABLE" == "true" && "$QUIET" -eq 0 ]]; then
-        if ! gum spin --spinner dot --title "Compiling br (release mode)..." -- \
-            bash -c "cd '$build_dir' && CARGO_TARGET_DIR='$target_dir' cargo build --release"; then
-            die "Build failed"
-        fi
-    else
-        (cd "$build_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --release) || die "Build failed"
+    if ! (
+        cd "$build_dir" || exit 1
+        export CARGO_TARGET_DIR="$target_dir"
+        run_with_spinner "Compiling br (release mode)..." \
+            cargo build --locked --release --bin br
+    ); then
+        die "Build failed"
     fi
 
     # Find the binary
