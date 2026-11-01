@@ -242,6 +242,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         }
     }
     let mut pending_merge_warning_emitted = false;
+    let mut deferred_pending_merge_warning = None;
     if ctx.is_initialized()
         && !ctx.no_db()
         && (command_needs_write_lock || should_preopen_storage)
@@ -456,7 +457,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             }
             Ok(Some(state)) => {
                 if !pending_merge_warning_emitted {
-                    emit_pending_sync_merge_warning(&state, json_error_mode);
+                    deferred_pending_merge_warning = Some(state);
                 }
                 should_auto_import_now = false;
                 force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
@@ -636,36 +637,15 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                 );
                 should_attempt_auto_import = apply_fast_open_auto_import_reprobe(
                     reprobe,
-                    &mut pending_merge_warning_emitted,
+                    pending_merge_warning_emitted,
+                    &mut deferred_pending_merge_warning,
                     &mut overrides,
                     &mut ctx.overrides,
-                    json_error_mode,
                 );
             }
         }
 
         if should_attempt_auto_import {
-            if ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage {
-                let authority = auto_import_write_lock
-                    .as_ref()
-                    .or(write_lock.as_ref())
-                    .ok_or_else(|| BeadsError::SyncConflict {
-                        message: "Writable fast-open reopen has no database-family authority"
-                            .to_string(),
-                    })?;
-                // The positive probe grants import authority only. A generic
-                // writable open could still repair/reconstruct the database
-                // on an anomaly, silently discarding non-JSONL state (#585).
-                // Reopen the witnessed current schema without recovery,
-                // migrations, creation, or default seeding.
-                storage_result
-                    .as_mut()
-                    .ok_or_else(|| BeadsError::SyncConflict {
-                        message: "Writable fast-open reopen lost its startup snapshot".to_string(),
-                    })?
-                    .reopen_current_for_auto_import(authority)?;
-            }
-
             let _ = auto_import_write_lock.as_ref();
             let sync_lock = match ctx
                 .beads_dir
@@ -683,6 +663,21 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             if sync_lock.is_some()
                 && let Some(res) = storage_result.as_mut()
             {
+                if ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage {
+                    let authority = auto_import_write_lock
+                        .as_ref()
+                        .or(write_lock.as_ref())
+                        .ok_or_else(|| BeadsError::SyncConflict {
+                            message: "Writable fast-open reopen has no database-family authority"
+                                .to_string(),
+                        })?;
+                    // A positive probe grants import authority only. Wait for
+                    // sync admission before opening writable storage: a skipped
+                    // import must retain its already verified private snapshot.
+                    // This exact-current reopen still forbids schema migration,
+                    // database creation, or reconstruction from JSONL (GH #585).
+                    res.reopen_current_for_auto_import(authority)?;
+                }
                 let expected_prefix =
                     Some(resolve_auto_import_expected_prefix(res, &ctx.overrides)?);
                 auto_import_if_stale(
@@ -727,32 +722,39 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     // verified capture and writable teardown finish. Private snapshot recovery
     // and validation can then proceed without blocking the original's writers.
     // Move the guard explicitly: shadowing alone extends the old binding.
-    let write_lock = if requires_read_only_storage(&cli.command) {
-        overrides.clear_database_family_lock_marker();
-        ctx.overrides.clear_database_family_lock_marker();
-        drop(write_lock);
-        if let Some(res) = storage_result.take() {
-            storage_result = Some(res.finish_read_only_startup()?);
-        }
-        tracing::debug!(
-            target: "br::startup",
-            "Read startup complete; query execution has no retained writer authority"
-        );
-        // A signal can also arrive while capturing the snapshot or closing
-        // the writable handle. Do not start the query or block on output
-        // before honoring it; this return still runs context destructors.
-        if let Some(exit_code) = beads_rust::shutdown::exit_code() {
+    let write_lock =
+        if requires_read_only_storage(&cli.command) || deferred_pending_merge_warning.is_some() {
+            overrides.clear_database_family_lock_marker();
+            ctx.overrides.clear_database_family_lock_marker();
+            drop(write_lock);
+            if let Some(res) = storage_result.take() {
+                storage_result = Some(res.finish_read_only_startup()?);
+            }
             tracing::debug!(
                 target: "br::startup",
-                exit_code,
-                "Read interrupted after startup; skipping query execution"
+                "Read startup complete; query execution has no retained writer authority"
             );
-            return Ok(exit_code);
-        }
-        None
-    } else {
-        write_lock
-    };
+            // A signal can also arrive while capturing the snapshot or closing
+            // the writable handle. Do not start the query or block on output
+            // before honoring it; this return still runs context destructors.
+            if let Some(exit_code) = beads_rust::shutdown::exit_code() {
+                tracing::debug!(
+                    target: "br::startup",
+                    exit_code,
+                    "Read interrupted after startup; skipping query execution"
+                );
+                return Ok(exit_code);
+            }
+            None
+        } else {
+            write_lock
+        };
+    if let Some(state) = deferred_pending_merge_warning {
+        // stderr can block indefinitely on its consumer. The pending verdict
+        // has already disabled every mutation; publish its warning only after
+        // all startup authority has ended, including the context's Arc owners.
+        emit_pending_sync_merge_warning(&state, json_error_mode);
+    }
 
     // Phase 4: Command Execution
     let result = match cli.command {
@@ -1752,18 +1754,17 @@ fn reopen_and_reprobe_fast_open_auto_import_under_authority(
 
 fn apply_fast_open_auto_import_reprobe(
     reprobe: FastOpenAutoImportReprobe,
-    pending_merge_warning_emitted: &mut bool,
+    pending_merge_warning_emitted: bool,
+    deferred_pending_merge_warning: &mut Option<commands::doctor::PendingSyncMergeState>,
     overrides: &mut config::CliOverrides,
     startup_overrides: &mut config::CliOverrides,
-    json_error_mode: bool,
 ) -> bool {
     match reprobe {
         FastOpenAutoImportReprobe::ImportRequired => true,
         FastOpenAutoImportReprobe::Current => false,
         FastOpenAutoImportReprobe::Pending(state) => {
-            if !*pending_merge_warning_emitted {
-                emit_pending_sync_merge_warning(&state, json_error_mode);
-                *pending_merge_warning_emitted = true;
+            if !pending_merge_warning_emitted {
+                *deferred_pending_merge_warning = Some(state);
             }
             force_pending_merge_read_only_overrides(overrides);
             force_pending_merge_read_only_overrides(startup_overrides);
@@ -3593,6 +3594,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn fast_open_import_reprobe_rechecks_freshness_and_pending_receipt_under_authority() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -3677,22 +3679,37 @@ mod tests {
         dispatch_overrides.read_only_fast_open = false;
         let mut pending_ctx = StartupContext::empty(fast_overrides.clone());
         pending_ctx.overrides.read_only_fast_open = false;
-        let mut warning_emitted = false;
+        let mut deferred_warning = None;
         let should_attempt_auto_import = apply_fast_open_auto_import_reprobe(
             pending_reprobe,
-            &mut warning_emitted,
+            false,
+            &mut deferred_warning,
             &mut dispatch_overrides,
             &mut pending_ctx.overrides,
-            false,
         );
 
         assert!(!should_attempt_auto_import);
-        assert!(warning_emitted);
+        let pending_warning = deferred_warning
+            .take()
+            .expect("the protected warning must be retained for emission after authority release");
+        assert_eq!(pending_warning.condition_name(), "legacy");
+        assert_eq!(pending_warning.metadata_key, "sync_merge_pending_v1");
         for forced in [&dispatch_overrides, &pending_ctx.overrides] {
             assert_eq!(forced.no_auto_import, Some(true));
             assert_eq!(forced.no_auto_flush, Some(true));
             assert!(forced.read_only_fast_open);
         }
+        assert!(!apply_fast_open_auto_import_reprobe(
+            FastOpenAutoImportReprobe::Pending(pending_warning),
+            true,
+            &mut deferred_warning,
+            &mut dispatch_overrides,
+            &mut pending_ctx.overrides,
+        ));
+        assert!(
+            deferred_warning.is_none(),
+            "an advisory warning already emitted before locking must not be queued again"
+        );
     }
 
     #[test]

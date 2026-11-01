@@ -687,6 +687,13 @@ Those final private checks must succeed before query execution. The result
 describes the captured snapshot; a later writer's changes appear in a later
 command.
 
+If the protected recheck discovers a pending merge, automatic synchronization
+is disabled immediately. Its warning is emitted after the read handoff has
+released authority, so a full stderr pipe cannot make that warning hold up
+other writers. If `.sync.lock` is already held, startup skips automatic import
+without opening the original database writable; it keeps the verified private
+snapshot already obtained by the recheck.
+
 This handoff keeps normal writers serialized, preserves sole-opener checkpoint
 admission, and does not let database replacement change an in-flight query.
 Incomplete recovery, changed database routing or identity, and an unavailable

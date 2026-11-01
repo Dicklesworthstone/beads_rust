@@ -961,6 +961,207 @@ fn e2e_586_fast_open_search_does_not_hold_writer_authority() {
     assert_snapshot_writer_succeeds(false, false);
 }
 
+/// Fill stderr through a separate open-file description. Setting NONBLOCK
+/// here does not change the child's blocking stderr descriptor, so its next
+/// diagnostic must wait until the test starts draining the pipe.
+#[cfg(target_os = "linux")]
+fn fill_child_stderr_pipe(pid: u32) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut pipe = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(format!("/proc/{pid}/fd/2"))
+        .expect("open separate nonblocking child stderr descriptor");
+    let padding = [b' '; 4096];
+    let mut written = 0;
+    // A full atomic write can be refused while a smaller write still fits.
+    // Finish a byte at a time so even a short warning encounters backpressure.
+    for chunk in [padding.as_slice(), &padding[..1]] {
+        loop {
+            match pipe.write(chunk) {
+                Ok(0) => panic!("stderr pipe stopped accepting bytes without WouldBlock"),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill child stderr pipe: {error}"),
+            }
+        }
+    }
+    assert!(written > 0, "stderr was empty before the pending warning");
+}
+
+/// A pending receipt can appear after the advisory check while a reader is
+/// queued for auto-import. Its warning must not keep the completed startup
+/// authority alive when a caller stops consuming stderr.
+#[test]
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
+fn e2e_586_pending_reprobe_releases_authority_before_blocked_stderr_warning() {
+    let workspace = common::cli::BrWorkspace::new();
+    let root = &workspace.root;
+    let init = run_br_in_dir(root, ["init", "--prefix", "test"]);
+    assert!(init.success, "init failed: {init:?}");
+    let beads = root.join(".beads");
+    let db = beads.join("beads.db");
+    let jsonl = beads.join("issues.jsonl");
+    let mut issue = common::fixtures::issue("Original pending warning snapshot");
+    issue.id = "test-read".to_string();
+    issue.description = None;
+    issue.notes = Some("before pending warning".to_string());
+    fs::write(
+        &jsonl,
+        format!("{}\n", serde_json::to_string(&issue).unwrap()),
+    )
+    .unwrap();
+    let imported = run_br_in_dir(root, ["sync", "--import-only", "--json"]);
+    assert!(imported.success, "seed import failed: {imported:?}");
+    let flushed = run_br_in_dir(root, ["sync", "--flush-only", "--json"]);
+    assert!(flushed.success, "seed flush failed: {flushed:?}");
+
+    let mut initial_writer = beads_rust::config::open_storage_with_cli(
+        &beads,
+        &beads_rust::config::CliOverrides::default(),
+    )
+    .expect("hold original workspace writer");
+    let initial_authority = initial_writer
+        .retained_database_write_authority()
+        .expect("retain authority through writer teardown");
+    let mut incoming: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&jsonl).unwrap()).unwrap();
+    incoming["title"] = "Incoming snapshot must not import over pending merge".into();
+    incoming["updated_at"] = "2999-01-01T00:00:00Z".into();
+    fs::write(
+        &jsonl,
+        format!("{}\n", serde_json::to_string(&incoming).unwrap()),
+    )
+    .unwrap();
+    let jsonl_before = fs::read(&jsonl).unwrap();
+    let mut search = QueuedBrChildren(vec![spawn_br_child_in_dir(
+        root,
+        [
+            "--lock-timeout",
+            "30000",
+            "--no-auto-flush",
+            "search",
+            "snapshot",
+            "--all",
+            "--limit",
+            "0",
+            "--json",
+        ],
+    )]);
+    wait_for_workspace_waiters(root, 1);
+    wait_for_child_owned_workspace_registration(root, &mut search.0[0]);
+    fill_child_stderr_pipe(search.0[0].id());
+
+    // The registration proves the child already passed the advisory pending
+    // check and found JSONL changes. Its protected reprobe must see this new
+    // receipt, disable import, and warn only after relinquishing authority.
+    initial_writer
+        .storage
+        .set_metadata(
+            "sync_merge_pending_v1",
+            "legacy-pending-after-reader-queued",
+        )
+        .unwrap();
+    drop(initial_writer);
+    let database_before = fs::read(&db).unwrap();
+    let wal_before = fs::read(beads.join("beads.db-wal")).ok();
+    let journal_before = fs::read(beads.join("beads.db-journal")).ok();
+    drop(initial_authority);
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let child = &mut search.0[0];
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "search exited before its pending warning encountered stderr backpressure"
+        );
+        let channel = read_child_wait_channel(child.id());
+        if channel
+            .as_deref()
+            .is_some_and(|value| value.contains("pipe_write"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pending warning never blocked on stderr; last wait channel: {channel:?}"
+        );
+        thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+    }
+    let competing_authority = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+        &beads,
+        &db,
+        Some(1_000),
+    )
+    .expect("blocked pending-warning output must not retain startup writer authority");
+    competing_authority.verify_database_authority().unwrap();
+    drop(competing_authority);
+
+    let writer = competing_snapshot_writer(root, "test-read");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&writer.stdout),
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    assert!(
+        !writer.status.success(),
+        "pending merge must still bar writes"
+    );
+    assert!(
+        diagnostic.contains("pending") && diagnostic.contains("sync --merge"),
+        "writer must reach the pending-state refusal: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.to_ascii_lowercase().contains("timed out"),
+        "pending warning must not cause a lock timeout: {diagnostic}"
+    );
+    assert!(search.0[0].try_wait().unwrap().is_none());
+
+    let output = search.finish(Duration::from_secs(20)).remove(0);
+    assert!(
+        output.status.success(),
+        "pending read failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.len() < 4096, "stdout cannot fill a pipe page");
+    let issues = extract_issues_array(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["title"], "Original pending warning snapshot");
+    assert_eq!(issues[0]["notes"], "before pending warning");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(warning["code"], "sync_merge_pending");
+    assert_eq!(warning["pending_sync_merge"]["condition"], "legacy");
+    assert_eq!(stderr.matches("\"code\":\"sync_merge_pending\"").count(), 1);
+    assert_eq!(fs::read(&db).unwrap(), database_before);
+    assert_eq!(fs::read(beads.join("beads.db-wal")).ok(), wal_before);
+    assert_eq!(
+        fs::read(beads.join("beads.db-journal")).ok(),
+        journal_before
+    );
+    assert_eq!(fs::read(&jsonl).unwrap(), jsonl_before);
+    let observed = beads_rust::config::open_storage_with_cli(
+        &beads,
+        &beads_rust::config::CliOverrides {
+            read_only_storage: true,
+            ..beads_rust::config::CliOverrides::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        observed
+            .storage
+            .get_metadata("sync_merge_pending_v1")
+            .unwrap()
+            .as_deref(),
+        Some("legacy-pending-after-reader-queued")
+    );
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn e2e_586_disabled_fast_open_search_does_not_hold_writer_authority() {
@@ -1546,6 +1747,92 @@ fn e2e_586_expensive_search_allows_writers_during_query_execution() {
     for (disable_fast_open, auto_import) in [(false, false), (true, false), (false, true)] {
         assert_writer_progress_during_expensive_search(disable_fast_open, auto_import);
     }
+}
+
+/// A busy sync owner prevents automatic import. Keep the protected read
+/// snapshot instead of opening the live family writable for an operation
+/// that cannot run; that open could otherwise fail or recreate a missing SHM.
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_busy_sync_skips_live_reopen_before_search() {
+    const WAL_TITLE: &[u8] = b"WAL-only snapshot before skipped import";
+    let workspace = snapshot_search_workspace();
+    let root = &workspace.root;
+    let beads = root.join(".beads");
+    let db = beads.join("beads.db");
+    let jsonl_path = beads.join("issues.jsonl");
+    let fixture = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    fixture.execute("PRAGMA journal_mode=WAL").unwrap();
+    fixture.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+    fixture
+        .execute(
+            "UPDATE issues SET title='WAL-only snapshot before skipped import' WHERE id='test-read'",
+        )
+        .unwrap();
+    drop(fixture);
+    let retained_index = root.join("retained-matching-shm");
+    fs::rename(beads.join("beads.db-shm"), &retained_index).unwrap();
+    let mut incoming: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&jsonl_path).unwrap()).unwrap();
+    incoming["title"] = "Pending snapshot JSONL import".into();
+    incoming["updated_at"] = "2999-01-01T00:00:00Z".into();
+    fs::write(
+        &jsonl_path,
+        format!("{}\n", serde_json::to_string(&incoming).unwrap()),
+    )
+    .unwrap();
+    let main_before = fs::read(&db).unwrap();
+    let wal_before = fs::read(beads.join("beads.db-wal")).unwrap();
+    let index_before = fs::read(&retained_index).unwrap();
+    let jsonl_before = fs::read(&jsonl_path).unwrap();
+    assert!(
+        wal_before
+            .windows(WAL_TITLE.len())
+            .any(|bytes| bytes == WAL_TITLE)
+    );
+    assert!(
+        !main_before
+            .windows(WAL_TITLE.len())
+            .any(|bytes| bytes == WAL_TITLE)
+    );
+    let probe = beads_rust::config::open_storage_with_cli(
+        &beads,
+        &beads_rust::config::CliOverrides {
+            read_only_storage: true,
+            ..beads_rust::config::CliOverrides::default()
+        },
+    )
+    .expect("the retained WAL must admit an observational snapshot");
+    assert!(
+        beads_rust::sync::auto_import_probe(&probe.storage, &beads, &jsonl_path, false).unwrap(),
+        "the child must reach the automatic-import decision"
+    );
+    drop(probe);
+
+    let _sync_owner = beads_rust::sync::try_sync_lock(&beads)
+        .unwrap()
+        .expect("hold sync authority in a separate process from the reader");
+    let mut search = stalled_snapshot_search(root, false, true);
+    let _next_writer =
+        beads_rust::sync::blocking_database_family_write_lock_with_timeout(&beads, &db, Some(100))
+            .expect("a skipped import must release writer authority before search output");
+    assert!(search.0[0].try_wait().unwrap().is_none());
+    let (issues, diagnostic) = finish_snapshot_search(search);
+    assert!(
+        !diagnostic.contains("sync_merge_pending"),
+        "pending-state uncertainty must not silently disable the import under test: {diagnostic}"
+    );
+    assert_eq!(issues.len(), 1);
+    assert_eq!(
+        issues[0]["title"],
+        "WAL-only snapshot before skipped import"
+    );
+    assert_eq!(issues[0]["description"], snapshot_search_body());
+    assert_eq!(fs::read(db).unwrap(), main_before);
+    assert_eq!(fs::read(beads.join("beads.db-wal")).unwrap(), wal_before);
+    assert_eq!(fs::read(jsonl_path).unwrap(), jsonl_before);
+    assert_eq!(fs::read(retained_index).unwrap(), index_before);
+    assert!(!beads.join("beads.db-shm").exists());
 }
 
 /// GH #585 keeps ordinary reads observational even on old schemas. Its

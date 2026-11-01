@@ -112,6 +112,14 @@ An existing protected read snapshot can be reused without another capture.
 A shared lock on `.write.lock` would still exclude writers and is not an
 appropriate downgrade.
 
+Pending-merge verdicts disable automatic synchronization before any subsequent
+storage action, but their user-facing warnings are deferred until this handoff
+has completed. Backpressure on stderr must not retain authority for a warning
+after the no-import decision is final. Likewise, the automatic-import path
+must acquire its nonblocking sync lock before reopening writable storage. A
+busy sync lock leaves the protected private snapshot intact and avoids an
+unnecessary live open, teardown, and second capture.
+
 The snapshot retains the committed startup state independently of later writes
 or database-family replacement. An unfinished recovery or an unverifiable
 snapshot refuses the command; it never falls back to a long read under exclusive
