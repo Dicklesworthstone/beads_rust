@@ -93,6 +93,7 @@ impl Drop for ActiveDiagnosticOutput<'_> {
     fn drop(&mut self) {
         let mut state = diagnostic_state(self.state);
         state.active_outputs = state.active_outputs.saturating_sub(1);
+        drop(state);
         self.state.output_idle.notify_all();
     }
 }
@@ -134,6 +135,7 @@ impl<'a, W: Write> ReadStartupDiagnostics<'a, W> {
                     .wait(buffer)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
+            drop(buffer);
             scope
         };
         Self {
@@ -234,7 +236,6 @@ impl<W: Write> Drop for ReadStartupDiagnostics<'_, W> {
 }
 
 /// Start bounded tracing-stderr deferral for a read command's startup.
-#[must_use]
 pub fn defer_read_startup_diagnostics() -> ReadStartupDiagnostics<'static> {
     ReadStartupDiagnostics::start(&READ_STARTUP_DIAGNOSTICS, io::stderr())
 }
@@ -253,7 +254,9 @@ impl<W: Write> Write for StartupDiagnosticWriter<'_, W> {
                 return Ok(bytes.len());
             }
             buffer.active_outputs += 1;
-            ActiveDiagnosticOutput { state: self.state }
+            let active_output = ActiveDiagnosticOutput { state: self.state };
+            drop(buffer);
+            active_output
         };
         self.output.write(bytes)
     }
@@ -265,7 +268,9 @@ impl<W: Write> Write for StartupDiagnosticWriter<'_, W> {
                 return Ok(());
             }
             buffer.active_outputs += 1;
-            ActiveDiagnosticOutput { state: self.state }
+            let active_output = ActiveDiagnosticOutput { state: self.state };
+            drop(buffer);
+            active_output
         };
         self.output.flush()
     }
@@ -461,6 +466,7 @@ mod tests {
             while !*released {
                 released = changed.wait(released).expect("release wait");
             }
+            drop(released);
             Ok(bytes.len())
         }
 
@@ -591,6 +597,7 @@ mod tests {
             assert_eq!(pending.head.len(), READ_STARTUP_DIAGNOSTIC_HEAD);
             assert_eq!(pending.tail.len(), READ_STARTUP_DIAGNOSTIC_TAIL);
             assert_eq!(pending.discarded_bytes, 15);
+            drop(state);
         }
         assert!(bytes.lock().expect("bytes").is_empty());
         guard.finish();
@@ -600,6 +607,7 @@ mod tests {
         assert!(bytes.ends_with(LATE));
         assert!(text.contains("17 diagnostic bytes were omitted"));
         assert!(!text.contains('�'));
+        drop(bytes);
     }
 
     #[test]

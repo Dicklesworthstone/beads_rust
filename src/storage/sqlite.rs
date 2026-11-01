@@ -23546,10 +23546,14 @@ impl Drop for SqliteStorage {
                     // authority changed; closing must not resume mutation.
                     if let Err(e) = self.verify_attached_database_authority() {
                         tracing::debug!(error = %e, "Skipping exit WAL checkpoint: database authority changed");
-                    } else if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
-                        tracing::debug!(error = %e, "WAL checkpoint on drop failed (non-fatal)");
-                    } else if let Err(e) = self.verify_attached_database_authority() {
-                        tracing::warn!(error = %e, "Database authority changed during exit WAL checkpoint");
+                    } else {
+                        let checkpoint_result =
+                            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+                        if let Err(e) = checkpoint_result {
+                            tracing::debug!(error = %e, "WAL checkpoint on drop failed (non-fatal)");
+                        } else if let Err(e) = self.verify_attached_database_authority() {
+                            tracing::warn!(error = %e, "Database authority changed during exit WAL checkpoint");
+                        }
                     }
                 }
                 CheckpointAdmission::PeersPresent => {

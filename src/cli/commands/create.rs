@@ -1898,7 +1898,7 @@ mod tests {
             let mut args = create_preview_args(temp.path(), bulk);
             execute(&args, &cli, &output)
                 .expect("a direct preview must not require either writer authority");
-            assert!(create_preview_source_bytes(&beads_dir) == before);
+            assert_eq!(create_preview_source_bytes(&beads_dir), before);
             owner.verify_database_authority().unwrap();
             jsonl_owner.verify_jsonl_authority().unwrap();
 
@@ -1907,7 +1907,7 @@ mod tests {
                 execute(&args, &cli, &output),
                 Err(BeadsError::WriteLockTimeout { .. })
             ));
-            assert!(create_preview_source_bytes(&beads_dir) == before);
+            assert_eq!(create_preview_source_bytes(&beads_dir), before);
         }
         let observed = config::open_sqlite_storage_read_only(&database).unwrap();
         assert_eq!(observed.get_dirty_issue_count().unwrap(), 1);
@@ -1941,7 +1941,7 @@ mod tests {
                     Some(storage_ctx),
                 )
                 .expect("preview an existing view without exporting its pending work");
-                assert!(create_preview_source_bytes(&beads_dir) == before);
+                assert_eq!(create_preview_source_bytes(&beads_dir), before);
                 drop(
                     crate::sync::blocking_database_family_write_lock_with_timeout(
                         &beads_dir,
@@ -1986,7 +1986,7 @@ mod tests {
                     .to_string()
                     .contains("unfinished JSONL write authority")
             );
-            assert!(create_preview_source_bytes(&beads_dir) == before);
+            assert_eq!(create_preview_source_bytes(&beads_dir), before);
             drop(
                 crate::sync::blocking_jsonl_family_write_lock_with_timeout(
                     &beads_dir.join("issues.jsonl"),

@@ -75,18 +75,14 @@ struct CreatePreviewDatabaseState {
 }
 
 fn create_preview_database_state(beads_dir: &Path) -> CreatePreviewDatabaseState {
-    let observed = beads_rust::config::open_storage_with_cli(
-        beads_dir,
-        &beads_rust::config::CliOverrides {
-            db: Some(beads_dir.join("beads.db")),
-            no_db: Some(false),
-            read_only_storage: true,
-            no_auto_import: Some(true),
-            no_auto_flush: Some(true),
-            ..Default::default()
-        },
-    )
-    .expect("inspect source state through a private read snapshot");
+    let mut overrides = beads_rust::config::CliOverrides::default();
+    overrides.db = Some(beads_dir.join("beads.db"));
+    overrides.no_db = Some(false);
+    overrides.read_only_storage = true;
+    overrides.no_auto_import = Some(true);
+    overrides.no_auto_flush = Some(true);
+    let observed = beads_rust::config::open_storage_with_cli(beads_dir, &overrides)
+        .expect("inspect source state through a private read snapshot");
     let mut dirty = observed.storage.get_dirty_issue_metadata().unwrap();
     dirty.sort();
     CreatePreviewDatabaseState {

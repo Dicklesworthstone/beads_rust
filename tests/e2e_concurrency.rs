@@ -1283,7 +1283,7 @@ fn assert_skipped_import_diagnostics_release_authority(sync_busy: bool) {
     .expect("skipped-import diagnostics must release every authority component");
     authority.verify_database_authority().unwrap();
     drop(authority);
-    assert!(database_payload_bytes(root) == database_before);
+    assert_eq!(database_payload_bytes(root), database_before);
     let writer = competing_snapshot_writer(root, "test-read");
     assert!(
         writer.status.success(),
