@@ -700,6 +700,20 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         }
     }
 
+    // Honor interruption after any import transaction completes. A canceled
+    // read needs no new snapshot: returning drops storage before the older
+    // authority guards, so writable checkpoint/close remains protected.
+    if requires_read_only_storage(&cli.command)
+        && let Some(exit_code) = beads_rust::shutdown::exit_code()
+    {
+        tracing::debug!(
+            target: "br::startup",
+            exit_code,
+            "Read interrupted after startup; skipping query execution"
+        );
+        return Ok(exit_code);
+    }
+
     // Phase 3.5: A read command's import authority ends with startup, not
     // with its potentially unbounded query or output (GH #586). The storage
     // transition captures a coherent private snapshot and closes the live
@@ -724,6 +738,17 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             target: "br::startup",
             "Read startup complete; query execution has no retained writer authority"
         );
+        // A signal can also arrive while capturing the snapshot or closing
+        // the writable handle. Do not start the query or block on output
+        // before honoring it; this return still runs context destructors.
+        if let Some(exit_code) = beads_rust::shutdown::exit_code() {
+            tracing::debug!(
+                target: "br::startup",
+                exit_code,
+                "Read interrupted after startup; skipping query execution"
+            );
+            return Ok(exit_code);
+        }
         None
     } else {
         write_lock

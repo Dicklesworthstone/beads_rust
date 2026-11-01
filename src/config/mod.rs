@@ -4257,6 +4257,11 @@ impl OpenStorageResult {
             Ok(())
         };
         verify_authority()?;
+        let handoff_started = std::time::Instant::now();
+        tracing::debug!(
+            target: "br::startup_authority",
+            "Read-only startup handoff started under writer authority"
+        );
         let snapshot_reused = self
             .storage
             .release_write_authority_for_private_read_snapshot();
@@ -4273,6 +4278,11 @@ impl OpenStorageResult {
                 .ok_or_else(|| BeadsError::Config(read_only_storage_refusal_context(db_path)))?;
             verify_authority()?;
             let workflow = self.storage.workflow_policy();
+            tracing::debug!(
+                target: "br::startup_authority",
+                elapsed_ms = handoff_started.elapsed().as_millis(),
+                "Read-only startup snapshot captured; closing writable storage"
+            );
 
             // Closing the previous handle may checkpoint its committed startup
             // writes. The captured family is already independent of that work.
@@ -4282,6 +4292,11 @@ impl OpenStorageResult {
             self.write_authority = None;
             self.jsonl_write_authority = None;
             drop(authority);
+            tracing::debug!(
+                target: "br::startup_authority",
+                elapsed_ms = handoff_started.elapsed().as_millis(),
+                "Read-only startup writer authority released; validating private snapshot"
+            );
             self.storage = open_snapshot(db_path, snapshot)?;
             self.storage.set_workflow_policy(workflow);
         }
@@ -4289,6 +4304,7 @@ impl OpenStorageResult {
             target: "br::startup_authority",
             database = %self.paths.db_path.display(),
             snapshot_reused,
+            elapsed_ms = handoff_started.elapsed().as_millis(),
             "Read-only startup storage detached from write authority"
         );
         Ok(self)

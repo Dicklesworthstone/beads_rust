@@ -95,6 +95,19 @@ where
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
+    br_child_command_in_dir_with_env(root, args, env_vars)
+        .spawn()
+        .expect("spawn br child")
+}
+
+fn br_child_command_in_dir_with_env<I, S, E, K, V>(root: &Path, args: I, env_vars: E) -> StdCommand
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
     let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("br"));
     cmd.current_dir(root);
     cmd.args(args);
@@ -109,7 +122,7 @@ where
     cmd.env("PATH", common::cli::deduplicated_br_path());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.spawn().expect("spawn br child")
+    cmd
 }
 
 #[cfg(target_os = "linux")]
@@ -560,8 +573,8 @@ impl QueuedBrChildren {
             .iter_mut()
             .map(|child| {
                 (
-                    Self::drain_pipe(child.stdout.take().expect("piped child stdout")),
-                    Self::drain_pipe(child.stderr.take().expect("piped child stderr")),
+                    child.stdout.take().map(Self::drain_pipe),
+                    child.stderr.take().map(Self::drain_pipe),
                 )
             })
             .collect::<Vec<_>>();
@@ -581,8 +594,12 @@ impl QueuedBrChildren {
             .zip(readers)
             .map(|(mut child, (stdout, stderr))| std::process::Output {
                 status: child.wait().unwrap(),
-                stdout: stdout.join().expect("stdout reader panicked").unwrap(),
-                stderr: stderr.join().expect("stderr reader panicked").unwrap(),
+                stdout: stdout
+                    .map(|reader| reader.join().expect("stdout reader panicked").unwrap())
+                    .unwrap_or_default(),
+                stderr: stderr
+                    .map(|reader| reader.join().expect("stderr reader panicked").unwrap())
+                    .unwrap_or_default(),
             })
             .collect()
     }
@@ -608,18 +625,29 @@ fn stalled_snapshot_search(
     disable_fast_open: bool,
     auto_import: bool,
 ) -> QueuedBrChildren {
+    stalled_snapshot_read(
+        root,
+        disable_fast_open,
+        if auto_import {
+            &["--no-auto-flush"]
+        } else {
+            &["--no-auto-import", "--no-auto-flush"]
+        },
+        &["search", "snapshot", "--all", "--limit", "0", "--json"],
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn stalled_snapshot_read(
+    root: &Path,
+    disable_fast_open: bool,
+    sync_flags: &[&str],
+    command: &[&str],
+) -> QueuedBrChildren {
     let db_path = root.join(".beads/beads.db");
-    let mut args = vec![
-        "--db",
-        db_path.to_str().unwrap(),
-        "--lock-timeout",
-        "1500",
-        "--no-auto-flush",
-    ];
-    if !auto_import {
-        args.push("--no-auto-import");
-    }
-    args.extend(["search", "snapshot", "--all", "--limit", "0", "--json"]);
+    let mut args = vec!["--db", db_path.to_str().unwrap(), "--lock-timeout", "1500"];
+    args.extend_from_slice(sync_flags);
+    args.extend_from_slice(command);
     let mut children = QueuedBrChildren(vec![spawn_br_child_in_dir_with_env(
         root,
         args,
@@ -634,7 +662,7 @@ fn stalled_snapshot_search(
         if let Some(status) = child.try_wait().unwrap() {
             let output = children.0.remove(0).wait_with_output().unwrap();
             panic!(
-                "search exited before output backpressure: {status}; stdout={} stderr={}",
+                "read exited before output backpressure: {status}; stdout={} stderr={}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -648,9 +676,153 @@ fn stalled_snapshot_search(
         }
         assert!(
             Instant::now() < deadline,
-            "search never reached output backpressure; last wait channel: {channel:?}"
+            "read never reached output backpressure; last wait channel: {channel:?}"
         );
         thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+    }
+}
+
+/// `fdinfo` ties the kernel's lock record to this process and the opened
+/// workspace inode. An open file or a waiter filename alone is not ownership.
+#[cfg(target_os = "linux")]
+fn process_workspace_lock_records(pid: u32, root: &Path) -> Vec<String> {
+    let process = PathBuf::from(format!("/proc/{pid}"));
+    let lock_path = fs::canonicalize(root.join(".beads"))
+        .unwrap()
+        .join(".write.lock");
+    let mut records = Vec::new();
+    for entry in fs::read_dir(process.join("fd")).expect("inspect live child descriptors") {
+        let entry = entry.unwrap();
+        if fs::read_link(entry.path()).ok().as_deref() != Some(lock_path.as_path()) {
+            continue;
+        }
+        let Ok(info) = fs::read_to_string(process.join("fdinfo").join(entry.file_name())) else {
+            // A descriptor can close between read_dir and fdinfo. The
+            // independent nonblocking flock below still tests admission.
+            continue;
+        };
+        records.extend(
+            info.lines()
+                .filter(|line| line.starts_with("lock:"))
+                .map(str::to_owned),
+        );
+    }
+    records
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_lock_probe(
+    root: &Path,
+) -> (
+    std::fs::File,
+    std::result::Result<(), std::fs::TryLockError>,
+    Duration,
+) {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".beads/.write.lock"))
+        .unwrap();
+    let started = Instant::now();
+    let acquired = file.try_lock();
+    (file, acquired, started.elapsed())
+}
+
+#[cfg(target_os = "linux")]
+fn assert_read_has_no_workspace_authority(root: &Path, child: &mut std::process::Child) {
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "reader must remain alive"
+    );
+    let records = process_workspace_lock_records(child.id(), root);
+    assert!(
+        records.is_empty(),
+        "reader still owns workspace authority: {records:?}"
+    );
+    let (probe, acquired, latency) = workspace_lock_probe(root);
+    acquired.expect("nonblocking kernel flock must succeed while reader is still alive");
+    eprintln!(
+        "GH586 workspace flock acquisition: {} ns",
+        latency.as_nanos()
+    );
+    assert!(
+        latency < Duration::from_secs(1),
+        "unexpected flock acquisition latency: {latency:?}"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "probe must overlap reader lifetime"
+    );
+    drop(probe);
+}
+
+#[cfg(target_os = "linux")]
+fn sleeping_thread_switches(status: &str) -> Option<u64> {
+    if !status.lines().any(|line| line.starts_with("State:\tS")) {
+        return None;
+    }
+    status.lines().find_map(|line| {
+        line.strip_prefix("voluntary_ctxt_switches:")
+            .and_then(|value| value.trim().parse().ok())
+    })
+}
+
+/// Observe the dedicated signal thread return to its blocking poll after
+/// TERM. This happens after it publishes the cooperative shutdown flag, so
+/// releasing the startup lock cannot race a merely delivered signal.
+#[cfg(target_os = "linux")]
+fn request_and_observe_cooperative_shutdown(child: &mut std::process::Child) {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let deadline = Instant::now() + WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT;
+    let (status_path, switches_before, channel_before) = loop {
+        let mut sleeping = None;
+        for entry in fs::read_dir(format!("/proc/{}/task", child.id())).unwrap() {
+            let task = entry.unwrap().path();
+            if fs::read_to_string(task.join("comm")).is_ok_and(|name| name.trim() == "br-shutdown")
+            {
+                let status = fs::read_to_string(task.join("status")).unwrap();
+                let channel = fs::read_to_string(task.join("wchan")).unwrap();
+                if let Some(switches) = sleeping_thread_switches(&status)
+                    && (channel.contains("unix") || channel.contains("sock"))
+                {
+                    sleeping = Some((task.join("status"), switches, channel));
+                    break;
+                }
+            }
+        }
+        if let Some(sleeping) = sleeping {
+            break sleeping;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "signal handler did not enter its poll"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::TERM).expect("interrupt owned read cooperatively");
+    let deadline = Instant::now() + WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        if fs::read_to_string(&status_path)
+            .ok()
+            .and_then(|status| sleeping_thread_switches(&status))
+            .is_some_and(|switches| switches > switches_before)
+            && fs::read_to_string(status_path.with_file_name("wchan"))
+                .is_ok_and(|channel| channel == channel_before)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "signal handler did not consume TERM"
+        );
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -661,12 +833,17 @@ fn snapshot_search_body() -> String {
 
 #[cfg(target_os = "linux")]
 fn snapshot_search_workspace() -> common::cli::BrWorkspace {
+    snapshot_search_workspace_with_description(snapshot_search_body())
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_search_workspace_with_description(description: String) -> common::cli::BrWorkspace {
     let workspace = common::cli::BrWorkspace::new();
     let init = run_br_in_dir(&workspace.root, ["init", "--prefix", "test"]);
     assert!(init.success, "init failed: {init:?}");
     let mut issue = common::fixtures::issue("Original snapshot search result");
     issue.id = "test-read".to_string();
-    issue.description = Some(snapshot_search_body());
+    issue.description = Some(description);
     issue.notes = Some("before concurrent writer".to_string());
     fs::write(
         workspace.root.join(".beads/issues.jsonl"),
@@ -734,6 +911,7 @@ fn assert_snapshot_writer_succeeds(disable_fast_open: bool, auto_import: bool) {
     }
     let jsonl_before = fs::read(&jsonl_path).unwrap();
     let mut search = stalled_snapshot_search(root, disable_fast_open, auto_import);
+    assert_read_has_no_workspace_authority(root, &mut search.0[0]);
     let writer = competing_snapshot_writer(root, "test-read");
     assert!(
         writer.status.success(),
@@ -742,6 +920,7 @@ fn assert_snapshot_writer_succeeds(disable_fast_open: bool, auto_import: bool) {
         String::from_utf8_lossy(&writer.stderr)
     );
     assert!(search.0[0].try_wait().unwrap().is_none());
+    assert_read_has_no_workspace_authority(root, &mut search.0[0]);
     let (issues, _) = finish_snapshot_search(search);
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0]["id"], "test-read");
@@ -784,7 +963,7 @@ fn e2e_586_fast_open_search_does_not_hold_writer_authority() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn e2e_586_forced_startup_search_does_not_hold_writer_authority() {
+fn e2e_586_disabled_fast_open_search_does_not_hold_writer_authority() {
     assert_snapshot_writer_succeeds(true, false);
 }
 
@@ -793,6 +972,579 @@ fn e2e_586_forced_startup_search_does_not_hold_writer_authority() {
 fn e2e_586_auto_import_search_releases_writer_authority() {
     for disable_fast_open in [false, true] {
         assert_snapshot_writer_succeeds(disable_fast_open, true);
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_kernel_probe_detects_held_workspace_authority() {
+    let workspace = snapshot_search_workspace();
+    let owner = beads_rust::sync::blocking_write_lock(&workspace.root.join(".beads")).unwrap();
+    let records = process_workspace_lock_records(std::process::id(), &workspace.root);
+    assert!(
+        records.iter().any(|record| {
+            let fields: Vec<_> = record.split_whitespace().collect();
+            fields.get(2..5) == Some(&["FLOCK", "ADVISORY", "WRITE"])
+        }),
+        "positive control must identify the real exclusive lock: {records:?}"
+    );
+    let (_, acquired, _) = workspace_lock_probe(&workspace.root);
+    assert!(matches!(acquired, Err(std::fs::TryLockError::WouldBlock)));
+    drop(owner);
+    let (_, acquired, latency) = workspace_lock_probe(&workspace.root);
+    acquired.expect("positive control releases the same workspace lock");
+    eprintln!(
+        "GH586 positive-control flock acquisition: {} ns",
+        latency.as_nanos()
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_list_and_show_release_startup_authority() {
+    for disable_fast_open in [false, true] {
+        for command in [
+            &["list", "--all", "--limit", "0", "--json"][..],
+            &["show", "test-read", "--json"][..],
+        ] {
+            let workspace = snapshot_search_workspace();
+            let mut reader = stalled_snapshot_read(
+                &workspace.root,
+                disable_fast_open,
+                &["--no-auto-import", "--no-auto-flush"],
+                command,
+            );
+            assert_read_has_no_workspace_authority(&workspace.root, &mut reader.0[0]);
+            let writer = competing_snapshot_writer(&workspace.root, "test-read");
+            assert!(writer.status.success(), "writer failed: {writer:?}");
+            let (issues, _) = finish_snapshot_search(reader);
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0]["notes"], "before concurrent writer");
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_healthy_reads_bypass_an_existing_workspace_writer() {
+    let workspace = snapshot_search_workspace();
+    let root = &workspace.root;
+    let owner = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+    // The seed import and flush leave a fresh JSONL witness. Exercise actual
+    // defaults as well as the reporter's explicit no-auto control flags.
+    for sync_flags in [&[][..], &["--no-auto-import", "--no-auto-flush"][..]] {
+        for command in [
+            &["list", "--all", "--limit", "0", "--json"][..],
+            &["show", "test-read", "--json"][..],
+            &["search", "snapshot", "--all", "--limit", "0", "--json"][..],
+        ] {
+            let reader = stalled_snapshot_read(root, false, sync_flags, command);
+            assert!(process_workspace_lock_records(reader.0[0].id(), root).is_empty());
+            let (_, acquired, _) = workspace_lock_probe(root);
+            assert!(
+                matches!(acquired, Err(std::fs::TryLockError::WouldBlock)),
+                "control writer remains the authority while a healthy read proceeds"
+            );
+            let (issues, _) = finish_snapshot_search(reader);
+            assert_eq!(issues[0]["notes"], "before concurrent writer");
+        }
+    }
+    drop(owner);
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_stalled_snapshot_writer(
+    root: &Path,
+    writers: &mut QueuedBrChildren,
+    available_at: Instant,
+) -> (usize, Duration) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = None;
+    loop {
+        let mut holders = Vec::new();
+        for (index, child) in writers.0.iter_mut().enumerate() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "queued writer exited early"
+            );
+            if !process_workspace_lock_records(child.id(), root).is_empty() {
+                holders.push(index);
+            }
+        }
+        assert!(
+            holders.len() <= 1,
+            "multiple writers own exclusive authority: {holders:?}"
+        );
+        if let Some(&index) = holders.first() {
+            observed.get_or_insert_with(|| available_at.elapsed());
+            if read_child_wait_channel(writers.0[index].id())
+                .is_some_and(|channel| channel.contains("pipe_write"))
+            {
+                return (index, observed.unwrap());
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no writer acquired and reached output"
+        );
+        thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_simultaneous_writers_serialize_while_search_remains_alive() {
+    let workspace = snapshot_search_workspace();
+    let root = &workspace.root;
+    let mut reader = stalled_snapshot_search(root, true, false);
+    assert_read_has_no_workspace_authority(root, &mut reader.0[0]);
+    let owner = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+    let bodies: Vec<_> = (0..3)
+        .map(|index| format!("queued writer {index}: {}", "payload ".repeat(12_000)))
+        .collect();
+    let mut writers = QueuedBrChildren::default();
+    for body in &bodies {
+        writers.0.push(spawn_br_child_in_dir(
+            root,
+            [
+                "--lock-timeout",
+                "10000",
+                "--no-auto-import",
+                "--no-auto-flush",
+                "comments",
+                "add",
+                "test-read",
+                body,
+                "--json",
+            ],
+        ));
+    }
+    wait_for_workspace_waiters(root, bodies.len());
+    let mut available_at = Instant::now();
+    drop(owner);
+    let mut committed = Vec::new();
+    while !writers.0.is_empty() {
+        let (holder, observed) = wait_for_stalled_snapshot_writer(root, &mut writers, available_at);
+        eprintln!(
+            "GH586 queued writer lock acquisition observed within {observed:?} of predecessor release beginning"
+        );
+        let (_, acquired, _) = workspace_lock_probe(root);
+        assert!(
+            matches!(acquired, Err(std::fs::TryLockError::WouldBlock)),
+            "an active writer must still exclude other writers"
+        );
+        assert!(reader.0[0].try_wait().unwrap().is_none());
+        available_at = Instant::now();
+        let output = QueuedBrChildren(vec![writers.0.remove(holder)])
+            .finish(Duration::from_secs(20))
+            .remove(0);
+        assert!(output.status.success(), "queued writer failed: {output:?}");
+        let comment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        committed.push(comment["text"].as_str().expect("comment text").to_string());
+    }
+    committed.sort();
+    assert_eq!(committed, bodies);
+    assert_read_has_no_workspace_authority(root, &mut reader.0[0]);
+    let (issues, _) = finish_snapshot_search(reader);
+    assert_eq!(issues[0]["notes"], "before concurrent writer");
+    let comments = run_br_in_dir(
+        root,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "comments",
+            "list",
+            "test-read",
+            "--json",
+        ],
+    );
+    assert!(
+        comments.success,
+        "comments verification failed: {comments:?}"
+    );
+    let persisted: Vec<serde_json::Value> = serde_json::from_str(&comments.stdout).unwrap();
+    let mut persisted: Vec<_> = persisted
+        .iter()
+        .map(|comment| comment["text"].as_str().unwrap().to_string())
+        .collect();
+    persisted.sort();
+    assert_eq!(
+        persisted, bodies,
+        "every acknowledged concurrent write must persist"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_interrupted_read_does_not_strand_writer_authority() {
+    use rustix::process::{Pid, Signal, kill_process};
+    use std::os::unix::process::ExitStatusExt;
+
+    for signal in [Signal::TERM, Signal::KILL] {
+        let workspace = snapshot_search_workspace();
+        let mut reader = stalled_snapshot_search(&workspace.root, true, false);
+        assert_read_has_no_workspace_authority(&workspace.root, &mut reader.0[0]);
+        if signal == Signal::TERM {
+            request_and_observe_cooperative_shutdown(&mut reader.0[0]);
+        } else {
+            let pid = Pid::from_raw(i32::try_from(reader.0[0].id()).unwrap()).unwrap();
+            kill_process(pid, signal).expect("interrupt owned reader");
+        }
+        let output = reader.finish(Duration::from_secs(10)).remove(0);
+        if signal == Signal::TERM {
+            assert_eq!(output.status.code(), Some(143), "reader must honor TERM");
+        } else {
+            assert_eq!(
+                output.status.signal(),
+                Some(9),
+                "reader must terminate on KILL"
+            );
+        }
+        let (_, acquired, latency) = workspace_lock_probe(&workspace.root);
+        acquired.expect("interrupted reader cannot retain its former startup authority");
+        eprintln!(
+            "GH586 post-interruption flock acquisition: {} ns",
+            latency.as_nanos()
+        );
+        let writer = competing_snapshot_writer(&workspace.root, "test-read");
+        assert!(
+            writer.status.success(),
+            "writer after interruption failed: {writer:?}"
+        );
+        let shown = run_br_in_dir(
+            &workspace.root,
+            [
+                "--no-auto-import",
+                "--no-auto-flush",
+                "show",
+                "test-read",
+                "--json",
+            ],
+        );
+        assert!(shown.success, "post-interruption read failed: {shown:?}");
+        assert_eq!(
+            extract_issues_array(&shown.stdout)[0]["notes"],
+            "after concurrent writer"
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_interrupted_import_finishes_startup_without_running_search() {
+    let workspace = snapshot_search_workspace();
+    let root = &workspace.root;
+    let jsonl_path = root.join(".beads/issues.jsonl");
+    let mut incoming: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&jsonl_path).unwrap()).unwrap();
+    incoming["notes"] = "import completed before interruption was honored".into();
+    incoming["updated_at"] = "2999-01-01T00:00:00Z".into();
+    fs::write(
+        &jsonl_path,
+        format!("{}\n", serde_json::to_string(&incoming).unwrap()),
+    )
+    .unwrap();
+    let jsonl_before = fs::read(&jsonl_path).unwrap();
+    let owner = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+    let diagnostics = root.join("logs/interrupted-import-stderr.log");
+    let mut command = br_child_command_in_dir_with_env(
+        root,
+        [
+            "--lock-timeout",
+            "10000",
+            "--no-auto-flush",
+            "search",
+            "snapshot",
+            "--all",
+            "--json",
+        ],
+        [("RUST_LOG", "br::startup=debug,br::search=debug")],
+    );
+    command.stderr(fs::File::create(&diagnostics).unwrap());
+    let mut reader = QueuedBrChildren(vec![command.spawn().unwrap()]);
+    wait_for_workspace_waiters(root, 1);
+    wait_for_child_owned_workspace_registration(root, &mut reader.0[0]);
+    request_and_observe_cooperative_shutdown(&mut reader.0[0]);
+    drop(owner);
+    let output = reader.finish(Duration::from_secs(20)).remove(0);
+    let diagnostics = fs::read_to_string(diagnostics).unwrap();
+    assert_eq!(output.status.code(), Some(143), "{diagnostics}");
+    assert!(
+        output.stdout.is_empty(),
+        "cancelled read must not emit a result"
+    );
+    assert!(
+        diagnostics.contains("Read interrupted after startup; skipping query execution"),
+        "{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("Search query execution started"),
+        "{diagnostics}"
+    );
+    let (_, acquired, latency) = workspace_lock_probe(root);
+    acquired.expect("cancelled startup releases the workspace lock");
+    eprintln!(
+        "GH586 cancelled-startup flock acquisition: {} ns",
+        latency.as_nanos()
+    );
+    let shown = run_br_in_dir(
+        root,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            "test-read",
+            "--json",
+        ],
+    );
+    assert!(
+        shown.success,
+        "post-interruption verification failed: {shown:?}"
+    );
+    assert_eq!(
+        extract_issues_array(&shown.stdout)[0]["notes"],
+        incoming["notes"]
+    );
+    assert_eq!(fs::read(jsonl_path).unwrap(), jsonl_before);
+}
+
+#[cfg(target_os = "linux")]
+fn process_cpu_ticks(pid: u32) -> u64 {
+    // Only the query's main thread counts. Thread-group totals could advance
+    // because an engine worker ran while the main thread was descheduled.
+    let stat = fs::read_to_string(format!("/proc/{pid}/task/{pid}/stat")).unwrap();
+    // The command name may contain spaces or parentheses. The remaining
+    // fields start with state (field 3); utime/stime are fields 14 and 15.
+    let mut fields = stat[stat.rfind(')').unwrap() + 1..].split_whitespace();
+    let user: u64 = fields.nth(11).unwrap().parse().unwrap();
+    let system: u64 = fields.next().unwrap().parse().unwrap();
+    user + system
+}
+
+#[cfg(target_os = "linux")]
+fn pause_during_search_query(child: &mut std::process::Child, diagnostics: &Path) {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut started_at_ticks = None;
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "search exited before query observation"
+        );
+        let log = fs::read_to_string(diagnostics).unwrap();
+        assert!(
+            !log.contains("Search query execution completed"),
+            "fixture did not expose a running query; output backpressure is not a substitute"
+        );
+        if log.contains("Search query execution started") {
+            let ticks = process_cpu_ticks(child.id());
+            let initial = started_at_ticks.get_or_insert(ticks);
+            if ticks.saturating_sub(*initial) >= 2 {
+                eprintln!(
+                    "GH586 observed {} CPU tick(s) during search collection",
+                    ticks - *initial
+                );
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "search never executed observable query work: {log}"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::STOP).expect("pause search during query collection");
+    loop {
+        let status = fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap();
+        if status.lines().any(|line| line.starts_with("State:\tT")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "search did not stop");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !fs::read_to_string(diagnostics)
+            .unwrap()
+            .contains("Search query execution completed"),
+        "search finished before suspension; no query-time concurrency proof"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn expensive_search_workspace(auto_import: bool) -> (common::cli::BrWorkspace, usize) {
+    use std::io::Write as _;
+
+    let body = "unrelated corpus text ".repeat(3_000_000);
+    let body_len = body.len();
+    // Build a coherent large DB/JSONL pair through the supported import and
+    // flush paths once per isolated case. No direct SQL mutation leaves a
+    // stale content hash or a conflicting short JSONL description behind.
+    let workspace = snapshot_search_workspace_with_description(body);
+    if auto_import {
+        let mut incoming = common::fixtures::issue("Imported before query execution");
+        incoming.id = "test-imported".to_string();
+        incoming.updated_at = "2999-01-01T00:00:00Z".parse().unwrap();
+        incoming.notes = Some("added by automatic startup import".to_string());
+        // Append just the new record. The large existing record remains
+        // byte-for-byte intact and does not need to be rewritten to make
+        // the source genuinely newer than the fixture's stored witness.
+        let mut jsonl = OpenOptions::new()
+            .append(true)
+            .open(workspace.root.join(".beads/issues.jsonl"))
+            .unwrap();
+        serde_json::to_writer(&mut jsonl, &incoming).unwrap();
+        writeln!(jsonl).unwrap();
+    }
+    (workspace, body_len)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_expensive_search_persisted_state(root: &Path, body_len: usize, auto_import: bool) {
+    let db = root.join(".beads/beads.db");
+    let storage = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    assert_eq!(
+        storage
+            .query("SELECT length(description) FROM issues WHERE id = 'test-read'")
+            .unwrap()[0]
+            .get(0)
+            .and_then(SqliteValue::as_integer),
+        Some(i64::try_from(body_len).unwrap()),
+        "startup import and the concurrent writer must preserve the large issue"
+    );
+    assert_eq!(
+        storage
+            .query("SELECT count(*) FROM issues WHERE title = 'gh586-added-during-query'")
+            .unwrap()[0]
+            .get(0)
+            .and_then(SqliteValue::as_integer),
+        Some(1),
+        "the acknowledged concurrent create must persist"
+    );
+    if auto_import {
+        assert_eq!(
+            storage
+                .query("SELECT notes FROM issues WHERE id = 'test-imported'")
+                .unwrap()[0]
+                .get(0)
+                .and_then(SqliteValue::as_text),
+            Some("added by automatic startup import"),
+            "the real startup import must persist before search begins"
+        );
+    }
+    storage.close().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn assert_writable_startup_precedes_query(trace: &str) {
+    let startup_trace = trace
+        .split("Search query execution started")
+        .next()
+        .unwrap();
+    assert_eq!(
+        import_debug_value(startup_trace, "Auto-import completed", "imported_count"),
+        1
+    );
+    for phase in [
+        "Read-only startup handoff started under writer authority",
+        "Read-only startup writer authority released; validating private snapshot",
+        "Read-only startup storage detached from write authority",
+    ] {
+        assert!(
+            startup_trace.contains(phase),
+            "missing genuine writable-startup phase {phase}: {trace}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_writer_progress_during_expensive_search(disable_fast_open: bool, auto_import: bool) {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let (workspace, body_len) = expensive_search_workspace(auto_import);
+    let root = &workspace.root;
+    let query = "gh586-added-during-query";
+    let diagnostics = root.join("logs/query-stderr.log");
+    let results = root.join("logs/query-stdout.json");
+    let mut args = vec!["--lock-timeout", "1500", "--no-auto-flush"];
+    if !auto_import {
+        args.push("--no-auto-import");
+    }
+    args.extend(["search", query, "--all", "--limit", "0", "--json"]);
+    let mut command = br_child_command_in_dir_with_env(
+        root,
+        args,
+        [
+            (
+                "RUST_LOG",
+                "br::startup=debug,br::startup_authority=debug,br::search=debug,beads_rust::sync=debug",
+            ),
+            (
+                "BR_DISABLE_READ_ONLY_FAST_OPEN",
+                if disable_fast_open { "1" } else { "0" },
+            ),
+        ],
+    );
+    command.stderr(fs::File::create(&diagnostics).unwrap());
+    command.stdout(fs::File::create(&results).unwrap());
+    let mut reader = QueuedBrChildren(vec![command.spawn().unwrap()]);
+    pause_during_search_query(&mut reader.0[0], &diagnostics);
+    if auto_import {
+        assert_writable_startup_precedes_query(&fs::read_to_string(&diagnostics).unwrap());
+    }
+    assert_read_has_no_workspace_authority(root, &mut reader.0[0]);
+    assert_eq!(
+        fs::metadata(&results).unwrap().len(),
+        0,
+        "query has not reached output"
+    );
+    let writer = QueuedBrChildren(vec![spawn_br_child_in_dir(
+        root,
+        [
+            "--lock-timeout",
+            "1000",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "create",
+            query,
+            "--json",
+        ],
+    )])
+    .finish(Duration::from_secs(20))
+    .remove(0);
+    assert!(
+        writer.status.success(),
+        "writer during search query failed: {writer:?}"
+    );
+    let created: serde_json::Value = serde_json::from_slice(&writer.stdout).unwrap();
+    assert_eq!(created["title"], query);
+    assert_read_has_no_workspace_authority(root, &mut reader.0[0]);
+    let pid = Pid::from_raw(i32::try_from(reader.0[0].id()).unwrap()).unwrap();
+    kill_process(pid, Signal::CONT).expect("resume owned query");
+    let output = reader.finish(Duration::from_secs(45)).remove(0);
+    let trace = fs::read_to_string(diagnostics).unwrap();
+    assert!(output.status.success(), "query failed: {trace}");
+    assert!(
+        trace.contains("Search query execution completed"),
+        "{trace}"
+    );
+    assert!(
+        extract_issues_array(&fs::read_to_string(results).unwrap()).is_empty(),
+        "query must finish using its snapshot from before the concurrent create"
+    );
+    assert_expensive_search_persisted_state(root, body_len, auto_import);
+}
+
+/// Exercise work inside the actual collection phase, separately from the
+/// deterministic slow-output cases. CPU accounting after the start marker
+/// proves query work began; suspension and absence of the completion marker
+/// keep the writer overlap inside that phase without a production sleep hook.
+#[test]
+#[cfg(target_os = "linux")]
+fn e2e_586_expensive_search_allows_writers_during_query_execution() {
+    for (disable_fast_open, auto_import) in [(false, false), (true, false), (false, true)] {
+        assert_writer_progress_during_expensive_search(disable_fast_open, auto_import);
     }
 }
 
@@ -839,6 +1591,7 @@ fn e2e_586_legacy_search_allows_concurrent_lossless_migration() {
     let db_before = fs::read(&db).unwrap();
     let mut search = stalled_snapshot_search(root, true, false);
     assert_eq!(fs::read(&db).unwrap(), db_before, "read must not migrate");
+    assert_read_has_no_workspace_authority(root, &mut search.0[0]);
     let writer = competing_snapshot_writer(root, "v15ws-9nx");
     assert!(
         writer.status.success(),
@@ -848,6 +1601,7 @@ fn e2e_586_legacy_search_allows_concurrent_lossless_migration() {
     );
     assert!(String::from_utf8_lossy(&writer.stderr).contains("migrated it in place"));
     assert!(search.0[0].try_wait().unwrap().is_none());
+    assert_read_has_no_workspace_authority(root, &mut search.0[0]);
     let (issues, diagnostic) = finish_snapshot_search(search);
     assert!(
         diagnostic.contains("reads issues.jsonl directly"),
@@ -931,6 +1685,7 @@ fn e2e_586_search_preserves_framed_wal_recovery_refusal() {
             .any(|bytes| bytes == WAL_TITLE)
     );
     let mut search = stalled_snapshot_search(root, true, false);
+    assert_read_has_no_workspace_authority(root, &mut search.0[0]);
     let writer = competing_snapshot_writer(root, "test-read");
     assert!(!writer.status.success(), "unsafe WAL recovery must refuse");
     let diagnostic = format!(

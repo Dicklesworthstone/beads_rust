@@ -99,9 +99,7 @@ git status --short
 ```
 
 Read-heavy commands use a current-schema read-only fast-open path when it can
-avoid startup recovery and writer-lock work. If you need to compare behavior
-against the conservative locked path, or temporarily disable the optimization
-while debugging, set:
+avoid writer-lock work. To disable the optimization while debugging, set:
 
 ```bash
 BR_DISABLE_READ_ONLY_FAST_OPEN=1 RUST_LOG=error br list --json --limit 1
@@ -109,6 +107,31 @@ BR_DISABLE_READ_ONLY_FAST_OPEN=1 RUST_LOG=error br list --json --limit 1
 
 Only truthy values (`1`, `true`, `yes`, `on`) disable the fast path. Unset or
 false-like values keep the default fast-open behavior.
+
+Read intent remains observational even with this override: it does not grant
+permission to repair, migrate, or reconstruct the live database. A required
+automatic import still acquires exclusive database-family authority and repeats
+the freshness and pending-merge checks under that authority. Once that startup
+work finishes, the reader captures and verifies a private copy of the database
+family, closes the writable connection, and releases its writer authority.
+Opening, recovering, and validating that private copy then proceed without
+excluding writers on the original database. The private checks must succeed
+before query or output begins. A failed handoff refuses the read.
+
+A first termination signal remains cooperative. Once required startup work
+finishes, a pending interruption ends the read before query execution, including
+when the signal arrives during the snapshot handoff. An automatic import that
+already committed is preserved; interruption does not imply that startup rolled
+back its changes.
+
+For a slow read, distinguish acquisition wait, required startup work, query
+execution, and output backpressure. `--lock-timeout` bounds acquisition, not the
+time spent importing or creating the protected snapshot. Enable
+`RUST_LOG=br::startup=debug,br::startup_authority=debug,br::search=debug` to identify
+the handoff and search boundaries without logging the query text. The original
+production trigger reported in [#586](https://github.com/Dicklesworthstone/beads_rust/issues/586)
+remains unidentified; the historical override reproduction does not establish
+that the override was present in that incident.
 
 ## Agent Mail And Beads
 

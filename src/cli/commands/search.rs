@@ -83,7 +83,17 @@ pub fn execute_with_storage_ctx(
         outer_ctx.inherited_output_mode(),
         false,
     );
+    // Separate query work from startup and output in incident traces. Do not
+    // log the query or issue contents: searches can contain private text.
+    let query_started = std::time::Instant::now();
+    tracing::debug!(target: "br::search", "Search query execution started");
     let issues = collect_search_results_for_output(storage, query, &args.filters, output_format)?;
+    tracing::debug!(
+        target: "br::search",
+        elapsed_ms = query_started.elapsed().as_millis(),
+        matches = issues.issues.len(),
+        "Search query execution completed"
+    );
     render_search_results(
         storage,
         issues,
