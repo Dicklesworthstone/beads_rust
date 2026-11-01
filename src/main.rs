@@ -708,16 +708,18 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     // never continue the read while retaining exclusive workspace access.
     //
     // Every Arc owner matters: the context, its storage, both CLI override
-    // sets, and this outer guard can each keep the same flock alive. Move
-    // the guard out explicitly; shadowing without dropping the old binding
-    // would extend its lifetime through command execution.
+    // sets, and this outer guard can each keep the same flock alive. Release
+    // the orchestration owners first; storage retains authority until its
+    // verified capture and writable teardown finish. Private snapshot recovery
+    // and validation can then proceed without blocking the original's writers.
+    // Move the guard explicitly: shadowing alone extends the old binding.
     let write_lock = if requires_read_only_storage(&cli.command) {
-        if let Some(res) = storage_result.as_mut() {
-            res.finish_read_only_startup()?;
-        }
         overrides.clear_database_family_lock_marker();
         ctx.overrides.clear_database_family_lock_marker();
         drop(write_lock);
+        if let Some(res) = storage_result.take() {
+            storage_result = Some(res.finish_read_only_startup()?);
+        }
         tracing::debug!(
             target: "br::startup",
             "Read startup complete; query execution has no retained writer authority"
@@ -3669,7 +3671,110 @@ mod tests {
     }
 
     #[test]
+    fn fast_open_import_reprobe_current_and_pending_release_authority_before_reading() {
+        for pending in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let beads_dir = temp.path().join(".beads");
+            fs::create_dir_all(&beads_dir).expect("create beads dir");
+            let mut bootstrap =
+                config::open_storage_with_cli(&beads_dir, &config::CliOverrides::default())
+                    .expect("bootstrap storage");
+            bootstrap
+                .storage
+                .set_metadata("fast_open_reprobe_marker", "advisory")
+                .expect("mark advisory generation");
+            let paths = bootstrap.paths.clone();
+            drop(bootstrap);
+
+            let fast_overrides = build_cli_overrides(&Cli::parse_from(["br", "ready"]));
+            let mut fast_storage = Some(
+                config::open_storage_with_cli(&beads_dir, &fast_overrides)
+                    .expect("advisory read snapshot"),
+            );
+            // A previous writer can change freshness or publish a pending
+            // receipt after the advisory read but before this reader owns
+            // authority. Both protected no-import outcomes need a handoff.
+            let mut previous_writer = config::open_storage_with_cli(
+                &beads_dir,
+                &config::CliOverrides {
+                    lock_timeout: Some(100),
+                    ..config::CliOverrides::default()
+                },
+            )
+            .expect("previous writer");
+            previous_writer
+                .storage
+                .set_metadata("fast_open_reprobe_marker", "protected")
+                .expect("mark protected generation");
+            if pending {
+                previous_writer
+                    .storage
+                    .set_metadata("sync_merge_pending_v1", "legacy-receipt")
+                    .expect("publish pending receipt");
+            }
+            drop(previous_writer);
+            let authority = Arc::new(
+                beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                    &beads_dir,
+                    &paths.db_path,
+                    Some(1_000),
+                )
+                .expect("protected reprobe authority"),
+            );
+            let outcome = reopen_and_reprobe_fast_open_auto_import_under_authority(
+                &mut fast_storage,
+                &paths,
+                &fast_overrides,
+                &authority,
+                false,
+            )
+            .expect("protected reprobe");
+            assert!(matches!(
+                (pending, outcome),
+                (false, FastOpenAutoImportReprobe::Current)
+                    | (true, FastOpenAutoImportReprobe::Pending(_))
+            ));
+            drop(authority);
+            assert!(
+                beads_rust::sync::blocking_write_lock_with_timeout(&beads_dir, Some(0)).is_err(),
+                "the protected snapshot still owns the startup lock before handoff"
+            );
+
+            let reader = fast_storage
+                .take()
+                .expect("protected snapshot retained")
+                .finish_read_only_startup()
+                .expect("protected no-import handoff");
+            let _next_writer = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &paths.db_path,
+                Some(100),
+            )
+            .expect("the next writer acquires authority while the reader remains alive");
+            assert_eq!(
+                reader
+                    .storage
+                    .get_metadata("fast_open_reprobe_marker")
+                    .unwrap()
+                    .as_deref(),
+                Some("protected"),
+                "handoff must preserve the protected generation, not the advisory snapshot"
+            );
+            assert_eq!(
+                reader
+                    .storage
+                    .get_metadata("sync_merge_pending_v1")
+                    .unwrap()
+                    .as_deref(),
+                pending.then_some("legacy-receipt"),
+                "releasing authority must not resolve or erase a pending receipt"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
     fn fast_open_import_reprobe_reopens_the_canonical_database_inode() {
         use std::os::unix::fs::MetadataExt;
 
@@ -3777,6 +3882,48 @@ mod tests {
                 .as_deref(),
             Some("replacement"),
             "the protected reprobe must replace the pre-lock orphaned handle"
+        );
+        drop(authority);
+        let mut reader = fast_storage
+            .take()
+            .expect("canonical snapshot retained")
+            .finish_read_only_startup()
+            .expect("canonical snapshot handoff");
+        let mut next_writer = config::open_storage_with_cli(
+            &beads_dir,
+            &config::CliOverrides {
+                lock_timeout: Some(100),
+                ..config::CliOverrides::default()
+            },
+        )
+        .expect("a writer can reopen the replacement while the read snapshot remains alive");
+        next_writer
+            .storage
+            .set_metadata("fast_open_inode_marker", "after-handoff")
+            .expect("write to the current canonical generation");
+        assert_eq!(
+            next_writer
+                .storage
+                .get_metadata("fast_open_inode_marker")
+                .unwrap()
+                .as_deref(),
+            Some("after-handoff")
+        );
+        assert_eq!(
+            reader
+                .storage
+                .get_metadata("fast_open_inode_marker")
+                .unwrap()
+                .as_deref(),
+            Some("replacement"),
+            "the detached reader must keep its protected replacement snapshot"
+        );
+        assert!(
+            reader
+                .storage
+                .set_metadata("fast_open_inode_marker", "forbidden")
+                .is_err(),
+            "the handoff must not leave a writable handle to either database generation"
         );
     }
 

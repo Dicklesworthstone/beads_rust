@@ -679,10 +679,13 @@ Ordinary reads open a coherent private snapshot of the current database. If an
 automatic-import probe finds work, the command can still join the writer queue.
 It then reopens the canonical database and checks freshness and pending-merge
 state again under the same database-family authority. When startup finishes,
-the command captures a verified private read snapshot and closes the writable
-connection while the authority is still held. Only then does it release every
-retained authority token and execute the query. The result describes that
-snapshot; a later writer's changes appear in a later command.
+the command captures and verifies a private copy of the database family, then
+closes the writable connection while the authority is still held. It releases
+every retained authority token before opening that private copy, recovering
+its WAL index if necessary, and checking its integrity and runtime schema.
+Those final private checks must succeed before query execution. The result
+describes the captured snapshot; a later writer's changes appear in a later
+command.
 
 This handoff keeps normal writers serialized, preserves sole-opener checkpoint
 admission, and does not let database replacement change an in-flight query.
@@ -695,8 +698,10 @@ not an import rollback.
 `--lock-timeout` bounds acquisition waits, not the duration of an import,
 checkpoint, filesystem I/O, query, or output operation. A required startup
 write can still occupy the lock while it completes safely. Increasing the
-timeout does not fix an excessively long holder. To read the current database
-without automatic synchronization, use:
+timeout does not fix an excessively long holder. The protected import recheck
+also remains under authority because its decision permits a subsequent write;
+the final snapshot's private recovery and validation do not. To read the
+current database without automatic synchronization, use:
 
 ```bash
 br --no-auto-import --no-auto-flush search QUERY --all --json

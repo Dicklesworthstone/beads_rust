@@ -1693,6 +1693,35 @@ impl AuxiliaryHistorySnapshot {
     }
 }
 
+/// A fully copied and verified database family with no connection to the
+/// source. The private fields make successful capture the only way to obtain
+/// this capability. Opening or recovering the private copy can be expensive;
+/// callers may close their source connection and release its write authority
+/// before doing that work (GitHub #586).
+#[derive(Debug)]
+pub(crate) struct CapturedReadOnlySnapshot {
+    directory: tempfile::TempDir,
+}
+
+impl CapturedReadOnlySnapshot {
+    /// Open the captured family with the same strict read-only admission as
+    /// ordinary observational storage. WAL index recovery, when required,
+    /// operates only on another private copy and retains its own lifetime.
+    pub(crate) fn open(self) -> Result<Option<SqliteStorage>> {
+        let copy_path = self.directory.path().join("snapshot.db");
+        let mut storage = SqliteStorage::open_current_read_only(&copy_path)?;
+        if let Some(storage) = storage.as_mut()
+            && storage.read_snapshot_dir.is_none()
+        {
+            // Missing/stale WAL indexes can already have moved the reader
+            // into another private snapshot. Keep that directory when set;
+            // otherwise this copy owns the connection's entire lifetime.
+            storage.read_snapshot_dir = Some(self.directory);
+        }
+        Ok(storage)
+    }
+}
+
 /// SQLite-based storage backend.
 #[derive(Debug)]
 pub struct SqliteStorage {
@@ -2971,6 +3000,19 @@ impl SqliteStorage {
     /// must not repair the original on a fast-open miss, even when its
     /// current version stamp hides an incomplete schema.
     pub(crate) fn open_current_read_only_snapshot(path: &Path) -> Result<Option<Self>> {
+        match Self::capture_read_only_snapshot(path)? {
+            Some(snapshot) => snapshot.open(),
+            None => Ok(None),
+        }
+    }
+
+    /// Capture and verify every source-family member before opening any
+    /// engine connection. Once this returns, the copy is independent of
+    /// later source mutations or replacement, so source authority is no
+    /// longer needed for private recovery and validation.
+    pub(crate) fn capture_read_only_snapshot(
+        path: &Path,
+    ) -> Result<Option<CapturedReadOnlySnapshot>> {
         if checked_database_header_user_version(path)?.is_none()
             || namespace_sidecar_mode_repair_required(path)?
         {
@@ -2979,16 +3021,7 @@ impl SqliteStorage {
         let directory = tempfile::tempdir()?;
         let copy_path = directory.path().join("snapshot.db");
         copy_database_family_read_snapshot(path, &copy_path)?;
-        let mut storage = Self::open_current_read_only(&copy_path)?;
-        if let Some(storage) = storage.as_mut()
-            && storage.read_snapshot_dir.is_none()
-        {
-            // Missing/stale WAL indexes can already have moved the reader
-            // into another private snapshot. Keep that directory when set;
-            // otherwise this copy owns the connection's entire lifetime.
-            storage.read_snapshot_dir = Some(directory);
-        }
-        Ok(storage)
+        Ok(Some(CapturedReadOnlySnapshot { directory }))
     }
 
     fn open_current_read_only_inner(path: &Path, allow_snapshot: bool) -> Result<Option<Self>> {
@@ -36882,6 +36915,100 @@ required_fields:
                 verify_read_snapshot_family(&mut captured).is_err(),
                 "{change}"
             );
+        }
+    }
+
+    #[test]
+    fn captured_read_snapshot_opens_after_another_writer_changes_or_replaces_source() {
+        for replace_database in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("snapshot.db");
+            let mut source = SqliteStorage::open(&db_path).unwrap();
+            source
+                .set_metadata("snapshot_generation", "captured generation")
+                .unwrap();
+            drop(source);
+
+            let authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    temp.path(),
+                    &db_path,
+                    Some(100),
+                )
+                .unwrap(),
+            );
+            let mut source = SqliteStorage::open(&db_path).unwrap();
+            source.attach_write_authority(Arc::clone(&authority));
+            let captured = SqliteStorage::capture_read_only_snapshot(&db_path)
+                .unwrap()
+                .expect("verified family capture");
+            drop(source);
+            drop(authority);
+
+            // Delay every private engine open until a different writer owns
+            // the original family. The captured capability must retain neither
+            // workspace authority nor a live source-opener registration.
+            let next_authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    temp.path(),
+                    &db_path,
+                    Some(100),
+                )
+                .expect("capture must not pin the original writer authority"),
+            );
+            if replace_database {
+                let retained = temp.path().join("retained-original");
+                fs::create_dir(&retained).unwrap();
+                for suffix in
+                    std::iter::once("").chain(crate::config::db_sidecar_suffixes().copied())
+                {
+                    let member = database_sidecar_path(&db_path, suffix);
+                    if member.exists() {
+                        fs::rename(&member, retained.join(member.file_name().unwrap())).unwrap();
+                    }
+                }
+                next_authority
+                    .install_empty_database_replacement_and_bind()
+                    .unwrap();
+            }
+            let mut writer = SqliteStorage::open(&db_path).unwrap();
+            writer.attach_write_authority(Arc::clone(&next_authority));
+            writer
+                .set_metadata("snapshot_generation", "later writer generation")
+                .unwrap();
+            writer
+                .checkpoint_full()
+                .expect("capture must not retain a source opener lease");
+            assert_eq!(
+                writer
+                    .get_metadata("snapshot_generation")
+                    .unwrap()
+                    .as_deref(),
+                Some("later writer generation")
+            );
+            let mut live_family = capture_read_snapshot_family(&db_path).unwrap();
+
+            let mut reader = captured
+                .open()
+                .unwrap()
+                .expect("opening the private family must not revisit the source");
+            assert_eq!(
+                reader
+                    .get_metadata("snapshot_generation")
+                    .unwrap()
+                    .as_deref(),
+                Some("captured generation")
+            );
+            assert!(reader.read_snapshot_dir.is_some());
+            assert!(reader.attached_write_authority().is_none());
+            assert!(
+                reader
+                    .set_metadata("must_stay_read_only", "refused")
+                    .is_err()
+            );
+            drop(reader);
+            verify_read_snapshot_family(&mut live_family).unwrap();
+            next_authority.verify_database_authority().unwrap();
         }
     }
 

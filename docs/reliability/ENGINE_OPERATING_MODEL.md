@@ -100,19 +100,27 @@ the same workspace, canonical-path and database-inode authority through the
 protected freshness/pending-merge reprobe, the import, and writable teardown.
 
 Before command dispatch, `OpenStorageResult::finish_read_only_startup` verifies
-the routing and authority, obtains an actual private read-only snapshot, and
-closes the writable connection while its authority is still live. The existing
-sole-opener checkpoint gate remains in force during that close. The context,
-storage, CLI override markers, and top-level guard must all release their
-authority tokens before query execution or output can begin. A shared lock on
-`.write.lock` would still exclude writers and is not an appropriate downgrade.
+the routing and authority, captures and verifies a private database family,
+and closes the writable connection while its authority is still live. The
+existing sole-opener checkpoint gate remains in force during that close. The
+CLI override markers and top-level guard release their tokens before this
+consuming handoff; the context and storage retain authority through capture
+and teardown, then release it before the private copy is opened. Private WAL
+recovery, integrity checks, and runtime schema attestation must finish before
+query execution, but no longer retain authority over the original family.
+An existing protected read snapshot can be reused without another capture.
+A shared lock on `.write.lock` would still exclude writers and is not an
+appropriate downgrade.
 
 The snapshot retains the committed startup state independently of later writes
 or database-family replacement. An unfinished recovery or an unverifiable
 snapshot refuses the command; it never falls back to a long read under exclusive
 authority. The acquisition deadline is unchanged and is not a wall-clock bound
 on required imports, checkpoints, or filesystem calls. No authority is released
-in the middle of a write or recovery operation to satisfy a timeout.
+in the middle of a write or recovery operation to satisfy a timeout. The
+earlier protected freshness/pending-merge reprobe also retains authority
+because its verdict authorizes the subsequent import; the post-startup
+handoff does not change that decision protocol.
 
 ### Explicit trusted Unix group sharing (#533)
 
