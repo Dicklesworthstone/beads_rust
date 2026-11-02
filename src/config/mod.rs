@@ -4177,9 +4177,9 @@ impl OpenStorageResult {
 
     /// Finish writable startup before a read command begins executing.
     ///
-    /// Capture a verified private database snapshot while the original family
-    /// authority is still held, then close the writable connection and release
-    /// authority before opening or validating the private snapshot. A live read
+    /// Copy the database family and verify the source remained unchanged while
+    /// its authority is still held, then close the writable connection and
+    /// release authority before hashing or opening the private copy. A live read
     /// connection or a shared workspace lock would still tie the query to
     /// database replacement or exclude writers for its entire lifetime (#586).
     ///

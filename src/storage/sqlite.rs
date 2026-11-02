@@ -1693,22 +1693,28 @@ impl AuxiliaryHistorySnapshot {
     }
 }
 
-/// A fully copied and verified database family with no connection to the
-/// source. The private fields make successful capture the only way to obtain
-/// this capability. Opening or recovering the private copy can be expensive;
-/// callers may close their source connection and release its write authority
-/// before doing that work (GitHub #586).
+/// A copied database family whose source was verified before detaching it.
+/// The private fields make successful capture the only way to obtain this
+/// capability, which retains no source descriptors. Verifying, opening, or
+/// recovering the private copy can be expensive; callers may close their
+/// source connection and release its write authority before that work
+/// (GitHub #586).
 #[derive(Debug)]
 pub(crate) struct CapturedReadOnlySnapshot {
     directory: tempfile::TempDir,
+    copies: Vec<ReadSnapshotCopyWitness>,
 }
 
 impl CapturedReadOnlySnapshot {
-    /// Open the captured family with the same strict read-only admission as
-    /// ordinary observational storage. WAL index recovery, when required,
-    /// operates only on another private copy and retains its own lifetime.
+    /// Verify the private bytes before namespace admission or any engine open,
+    /// then apply the same strict read-only admission as ordinary observational
+    /// storage. WAL index recovery, when required, operates only on another
+    /// private copy and retains its own lifetime.
     pub(crate) fn open(self) -> Result<Option<SqliteStorage>> {
         let copy_path = self.directory.path().join("snapshot.db");
+        for copy in &self.copies {
+            copy.verify(&copy_path)?;
+        }
         #[cfg(any(unix, windows))]
         admit_private_snapshot_namespace(&self.directory)?;
         let mut storage = SqliteStorage::open_current_read_only(&copy_path)?;
@@ -3011,7 +3017,7 @@ impl SqliteStorage {
     /// Capture and verify every source-family member before opening any
     /// engine connection. Once this returns, the copy is independent of
     /// later source mutations or replacement, so source authority is no
-    /// longer needed for private recovery and validation.
+    /// longer needed to verify the private bytes, recover, or validate them.
     pub(crate) fn capture_read_only_snapshot(
         path: &Path,
     ) -> Result<Option<CapturedReadOnlySnapshot>> {
@@ -3022,8 +3028,32 @@ impl SqliteStorage {
         }
         let directory = tempfile::tempdir()?;
         let copy_path = directory.path().join("snapshot.db");
-        copy_database_family_read_snapshot(path, &copy_path)?;
-        Ok(Some(CapturedReadOnlySnapshot { directory }))
+        let mut family = capture_read_snapshot_family(path)?;
+        if family.first().is_none_or(|member| member.source.is_none()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Database snapshot source '{}' does not exist",
+                    path.display()
+                ),
+            )
+            .into());
+        }
+        for member in &mut family {
+            member.copy_to_unverified(&copy_path)?;
+        }
+        verify_read_snapshot_family(&mut family)?;
+        // Only detached content witnesses survive capture. The destination
+        // hash pass belongs to open(), after a handoff releases source writer
+        // authority; copying and all source checks remain protected.
+        let copies = family
+            .into_iter()
+            .map(|member| ReadSnapshotCopyWitness {
+                suffix: member.suffix,
+                digest: member.digest,
+            })
+            .collect();
+        Ok(Some(CapturedReadOnlySnapshot { directory, copies }))
     }
 
     fn open_current_read_only_inner(path: &Path, allow_snapshot: bool) -> Result<Option<Self>> {
@@ -18590,6 +18620,33 @@ struct ReadSnapshotMember {
     digest: Option<[u8; 32]>,
 }
 
+/// Detached content witness, including components absent from the source.
+#[derive(Debug)]
+struct ReadSnapshotCopyWitness {
+    suffix: &'static str,
+    digest: Option<[u8; 32]>,
+}
+
+impl ReadSnapshotCopyWitness {
+    fn verify(&self, db_path: &Path) -> Result<()> {
+        let path = database_sidecar_path(db_path, self.suffix);
+        let mut copy = StableSchemaSource::open_optional(&path, "private snapshot component")?;
+        let digest = copy
+            .as_mut()
+            .map(|source| snapshot_digest(&mut source.file))
+            .transpose()?;
+        if digest != self.digest {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Private recovery changed database payload {}",
+                    path.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 fn snapshot_digest(file: &mut std::fs::File) -> Result<[u8; 32]> {
     file.seek(SeekFrom::Start(0))?;
     let mut hash = Sha256::new();
@@ -18652,6 +18709,14 @@ impl ReadSnapshotMember {
     }
 
     fn copy_to(&mut self, db_path: &Path) -> Result<()> {
+        self.copy_to_unverified(db_path)?;
+        if self.source.is_some() {
+            self.verify_copy(db_path)?;
+        }
+        Ok(())
+    }
+
+    fn copy_to_unverified(&mut self, db_path: &Path) -> Result<()> {
         let Some(source) = self.source.as_mut() else {
             return Ok(());
         };
@@ -18667,25 +18732,15 @@ impl ReadSnapshotMember {
         source.file.seek(SeekFrom::Start(0))?;
         std::io::copy(&mut source.file, &mut file)?;
         drop(file);
-        self.verify_copy(db_path)
+        Ok(())
     }
 
     fn verify_copy(&self, db_path: &Path) -> Result<()> {
-        let path = database_sidecar_path(db_path, self.suffix);
-        let mut copy = StableSchemaSource::open_optional(&path, "private snapshot component")?;
-        let digest = copy
-            .as_mut()
-            .map(|source| snapshot_digest(&mut source.file))
-            .transpose()?;
-        if digest != self.digest {
-            return Err(BeadsError::SyncConflict {
-                message: format!(
-                    "Private recovery changed database payload {}",
-                    path.display()
-                ),
-            });
+        ReadSnapshotCopyWitness {
+            suffix: self.suffix,
+            digest: self.digest,
         }
-        Ok(())
+        .verify(db_path)
     }
 }
 
@@ -36980,6 +37035,78 @@ required_fields:
                 verify_read_snapshot_family(&mut captured).is_err(),
                 "{change}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_read_snapshot_refuses_private_changes_before_admission() {
+        for change in ["corrupted_main", "appeared_journal"] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("snapshot.db");
+            seed_closed_database(&db_path, "bd-private-copy");
+
+            let healthy = SqliteStorage::capture_read_only_snapshot(&db_path)
+                .unwrap()
+                .expect("healthy family capture")
+                .open()
+                .unwrap()
+                .expect("healthy family must pass private admission");
+            assert!(healthy.get_issue("bd-private-copy").unwrap().is_some());
+            drop(healthy);
+
+            let mut source_before = capture_read_snapshot_family(&db_path).unwrap();
+            let captured = SqliteStorage::capture_read_only_snapshot(&db_path)
+                .unwrap()
+                .expect("source verification must finish before private validation");
+            let copy_path = captured.directory.path().join("snapshot.db");
+            let changed_path = if change == "corrupted_main" {
+                // Leave the SQLite header intact: refusal must come from the
+                // deferred content witness, before engine or namespace work.
+                let mut bytes = fs::read(&copy_path).unwrap();
+                *bytes.last_mut().expect("nonempty database") ^= 0x80;
+                fs::write(&copy_path, bytes).unwrap();
+                copy_path.clone()
+            } else {
+                let journal = database_sidecar_path(&copy_path, "-journal");
+                assert!(!journal.exists(), "fixture must witness an absent journal");
+                fs::write(&journal, b"unexpected private rollback journal").unwrap();
+                journal
+            };
+
+            // Keep Unix descriptors so bytes remain observable after a refused
+            // open consumes the capability and cleans up its private directory.
+            // Namespace admission would rebind this copied ledger, so an
+            // unchanged ledger also proves verification precedes that mutation.
+            let mut private_before = capture_read_snapshot_family(&copy_path).unwrap();
+            assert!(
+                private_before.iter().any(|member| {
+                    member.suffix == "-fsqlite-ns-use" && member.source.is_some()
+                })
+            );
+            let error = captured
+                .open()
+                .expect_err("changed private bytes cannot reach namespace or engine admission");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Sync conflict: Private recovery changed database payload {}",
+                    changed_path.display()
+                ),
+                "{change}"
+            );
+            assert!(matches!(error, BeadsError::SyncConflict { .. }));
+            for member in &mut private_before {
+                if let Some(source) = member.source.as_mut() {
+                    assert_eq!(
+                        Some(snapshot_digest(&mut source.file).unwrap()),
+                        member.digest,
+                        "{change} mutated private component {} before refusal",
+                        member.suffix
+                    );
+                }
+            }
+            verify_read_snapshot_family(&mut source_before).unwrap();
         }
     }
 

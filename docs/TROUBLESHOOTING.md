@@ -679,10 +679,13 @@ Ordinary reads open a coherent private snapshot of the current database. If an
 automatic-import probe finds work, the command can still join the writer queue.
 It then reopens the canonical database and checks freshness and pending-merge
 state again under the same database-family authority. When startup finishes,
-the command captures and verifies a private copy of the database family, then
-closes the writable connection while the authority is still held. It releases
-every retained authority token before opening that private copy, recovering
-its WAL index if necessary, and checking its integrity and runtime schema.
+the command copies the database family and rechecks the original identities,
+metadata, and contents, then closes the writable connection while authority is
+still held. It releases every retained authority token before hashing the
+private copy against the captured source digests. That check rejects changed
+or unexpectedly appeared private components before namespace changes or engine
+access. Opening the private copy, recovering its WAL index if necessary, and
+checking its integrity and runtime schema also happen after authority ends.
 Those final private checks must succeed before query execution. The result
 describes the captured snapshot; a later writer's changes appear in a later
 command.
@@ -756,7 +759,7 @@ checkpoint, filesystem I/O, query, or output operation. A required startup
 write can still occupy the lock while it completes safely. Increasing the
 timeout does not fix an excessively long holder. The protected import recheck
 also remains under authority because its decision permits a subsequent write;
-the final snapshot's private recovery and validation do not. To read the
+the final snapshot's private hashing, recovery, and validation do not. To read the
 current database without automatic synchronization, use:
 
 ```bash

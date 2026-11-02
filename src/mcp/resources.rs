@@ -1095,7 +1095,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::{Duration, TimeZone, Utc};
-    use fastmcp_rust::{Cx, McpContext, Resource, ResourceContent, ResourceHandler};
+    use fastmcp_rust::{McpContext, Resource, ResourceContent, ResourceHandler};
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
@@ -1352,7 +1352,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_resource_state(&temp, false);
         insert_resource_issue(&state, "br-mcp-contract-ready", "contract ready issue");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
 
         let project_info = resource_text_json(
             &ProjectInfoResource::new(Arc::clone(&state))
@@ -1417,7 +1418,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_resource_state(&temp, true);
         insert_resource_issue(&state, "br-ready-resource-1", "ready resource first issue");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let resource = ReadyIssuesResource::new(Arc::clone(&state));
 
         let first_content = resource.read(&ctx).expect("read ready resource");
@@ -1456,7 +1458,8 @@ mod tests {
             .expect("add external dependency");
         drop(storage);
 
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let resource = ReadyIssuesResource::new(Arc::clone(&state));
         let content = resource.read(&ctx).expect("read ready resource");
         let ready = resource_text_json(&content);
@@ -1470,7 +1473,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_resource_state(&temp, true);
         insert_resource_issue(&state, "br-resource-issue", "resource issue details");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let resource = IssueResource::new(Arc::clone(&state));
         let params = HashMap::from([("id".to_string(), "br-resource-issue".to_string())]);
 
@@ -1530,7 +1534,8 @@ mod tests {
     fn coordination_status_resource_returns_empty_claim_set() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_resource_state(&temp, false);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let resource = CoordinationStatusResource::new(Arc::clone(&state));
 
         let content = resource.read(&ctx).expect("read coordination resource");

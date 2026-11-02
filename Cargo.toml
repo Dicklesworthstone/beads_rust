@@ -176,10 +176,6 @@ mimalloc = "0.1.52"
 vergen-gix = { version = "10.0", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
-# Re-enables `Cx::for_testing()` / `Cx::for_request()` for this crate's own
-# test builds; asupersync 0.4.8 gates those constructors behind
-# `test-internals` so production consumers cannot mint ambient authority.
-asupersync = { version = "=0.5.0", default-features = false, features = ["test-internals"] }
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 criterion = { version = "0.8.2", features = ["html_reports"] }

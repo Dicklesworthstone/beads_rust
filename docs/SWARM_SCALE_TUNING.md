@@ -112,11 +112,14 @@ Read intent remains observational even with this override: it does not grant
 permission to repair, migrate, or reconstruct the live database. A required
 automatic import still acquires exclusive database-family authority and repeats
 the freshness and pending-merge checks under that authority. Once that startup
-work finishes, the reader captures and verifies a private copy of the database
-family, closes the writable connection, and releases its writer authority.
-Opening, recovering, and validating that private copy then proceed without
-excluding writers on the original database. The private checks must succeed
-before query or output begins. A failed handoff refuses the read.
+work finishes, the reader copies the database family and verifies that the
+source identities, metadata, and contents remained unchanged. It then closes
+the writable connection and releases its writer authority. Hashing the private
+copy against the captured source digests happens after release, before any
+private namespace changes or engine access. Opening, recovery, and validation
+also proceed without excluding writers on the original database. Every private
+check must succeed before query or output begins. A failed handoff refuses the
+read; moving the private hash pass does not remove any consistency check.
 
 A first termination signal remains cooperative. During automatic-import lock
 polling, a canceled read withdraws its queue registration and releases any

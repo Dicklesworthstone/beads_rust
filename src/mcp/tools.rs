@@ -3549,7 +3549,7 @@ mod tests {
     use crate::model::{DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::{IssueUpdate, SqliteStorage};
     use chrono::{SecondsFormat, TimeZone, Utc};
-    use fastmcp_rust::{Content, Cx, McpContext, McpErrorCode, Tool, ToolHandler};
+    use fastmcp_rust::{Content, McpContext, McpErrorCode, Tool, ToolHandler};
     use serde_json::{Value, json};
     use std::{cell::Cell, fs, sync::Arc, time::Instant};
     use tempfile::TempDir;
@@ -3859,7 +3859,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state_with_read_snapshot(&temp, true);
         insert_test_issue(&state, "br-mcp-cache-1", "cached overview first issue");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ProjectOverviewTool::new(Arc::clone(&state));
 
         let first_content = tool
@@ -3904,7 +3905,8 @@ mod tests {
             .expect("add external dependency");
         drop(storage);
 
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ProjectOverviewTool::new(Arc::clone(&state));
         let content = tool.call(&ctx, json!({})).expect("project overview");
         let overview = content_json(&content);
@@ -3918,7 +3920,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state_with_read_snapshot(&temp, true);
         insert_test_issue(&state, "br-mcp-list-1", "cached list first issue");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ListIssuesTool::new(Arc::clone(&state));
         let args = json!({"limit": 10, "sort": "created"});
 
@@ -3948,7 +3951,8 @@ mod tests {
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-list-single-1", "legacy list single first");
         insert_test_issue(&state, "br-mcp-list-single-2", "legacy list single second");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ListIssuesTool::new(state);
 
         let content = tool
@@ -3982,7 +3986,8 @@ mod tests {
                 )
                 .expect("mark issue in progress");
         }
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ListIssuesTool::new(Arc::clone(&state));
         let queries = vec![
             json!({"limit": 10, "sort": "created"}),
@@ -4027,7 +4032,8 @@ mod tests {
     fn list_issues_batch_rejects_ambiguous_single_and_batch_args() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ListIssuesTool::new(state);
 
         let err = tool
@@ -4047,7 +4053,8 @@ mod tests {
             "br-mcp-list-batch-cache-1",
             "cached batch list first",
         );
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ListIssuesTool::new(Arc::clone(&state));
         let queries = vec![
             json!({"limit": 10, "sort": "created"}),
@@ -4084,7 +4091,8 @@ mod tests {
         let state = mcp_test_state_with_read_snapshot(&temp, true);
         let id = "br-mcp-show-1";
         insert_test_issue(&state, id, "cached show first title");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ShowIssueTool::new(Arc::clone(&state));
         let args = json!({"id": id});
 
@@ -4128,7 +4136,8 @@ mod tests {
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-batch-1", "batch first issue");
         insert_test_issue(&state, "br-mcp-batch-2", "batch second issue");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ShowIssueTool::new(Arc::clone(&state));
         let args = json!({"ids": ["br-mcp-batch-1", "missing-id", "YOUR_ID", "br-mcp-batch-2"]});
 
@@ -4166,7 +4175,8 @@ mod tests {
     fn show_issue_rejects_ambiguous_single_and_batch_args() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ShowIssueTool::new(state);
 
         let err = tool
@@ -4183,7 +4193,8 @@ mod tests {
         let state = mcp_test_state_with_read_snapshot(&temp, true);
         insert_test_issue(&state, "br-mcp-batch-cache-1", "cached batch first title");
         insert_test_issue(&state, "br-mcp-batch-cache-2", "cached batch second title");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ShowIssueTool::new(Arc::clone(&state));
         let ids = vec![
             "br-mcp-batch-cache-1".to_string(),
@@ -4225,7 +4236,8 @@ mod tests {
     fn create_issue_legacy_single_result_shape_is_unchanged() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = CreateIssueTool::new(Arc::clone(&state));
 
         let content = tool
@@ -4287,7 +4299,8 @@ mod tests {
             "workflow:\n  strict: true\n  statuses: [draft, in_planning, active, in_progress]\n  transitions:\n    initial: [draft, in_planning, active, in_progress]\n",
         )
         .expect("write workflow");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = CreateIssueTool::new(Arc::clone(&state));
 
         for (requested, expected, warning) in [
@@ -4333,7 +4346,8 @@ mod tests {
     fn create_issue_terminal_status_sets_matching_timestamp_and_export() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = CreateIssueTool::new(Arc::clone(&state));
 
         for (requested, expected) in [
@@ -4381,7 +4395,8 @@ mod tests {
     fn create_issue_rejects_non_string_status_without_creating_an_issue() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = CreateIssueTool::new(Arc::clone(&state));
 
         for status in [Value::Null, json!(4), json!(["draft"])] {
@@ -4401,7 +4416,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-create-parent", "batch parent issue");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = CreateIssueTool::new(Arc::clone(&state));
 
         let content = tool
@@ -4492,7 +4508,8 @@ mod tests {
     fn create_issue_batch_rejects_ambiguous_single_and_batch_args() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = CreateIssueTool::new(state);
 
         for args in [
@@ -4516,7 +4533,8 @@ mod tests {
     fn mcp_create_issue_batch_perf_probe() {
         let issue_count = 25_usize;
         let iterations = 5_usize;
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
 
         let single_temp = TempDir::new().expect("single tempdir");
         let single_state = mcp_test_state(&single_temp);
@@ -4580,7 +4598,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-update-single", "single update original");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = UpdateIssueTool::new(Arc::clone(&state));
 
         let content = tool
@@ -4605,7 +4624,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-acceptance", "acceptance checklist");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = UpdateIssueTool::new(Arc::clone(&state));
         let call = |args: Value| tool.call(&ctx, args).map(|content| content_json(&content));
 
@@ -4674,7 +4694,8 @@ mod tests {
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-update-batch-1", "batch first original");
         insert_test_issue(&state, "br-mcp-update-batch-2", "batch second original");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = UpdateIssueTool::new(Arc::clone(&state));
 
         let content = tool
@@ -4748,7 +4769,8 @@ mod tests {
     fn update_issue_batch_rejects_ambiguous_single_and_batch_args() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = UpdateIssueTool::new(state);
 
         let err = tool
@@ -4774,7 +4796,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-update-invalid-comment", "comment original");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = UpdateIssueTool::new(Arc::clone(&state));
 
         let content = tool
@@ -4819,7 +4842,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-close-single", "single close original");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = CloseIssueTool::new(Arc::clone(&state));
 
         let content = tool
@@ -4870,7 +4894,8 @@ mod tests {
                 .expect("add dependency");
         }
 
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = CloseIssueTool::new(Arc::clone(&state));
         let content = tool
             .call(
@@ -4933,7 +4958,8 @@ mod tests {
     fn close_issue_batch_rejects_ambiguous_single_and_batch_args() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = CloseIssueTool::new(state);
 
         let err = tool
@@ -4957,7 +4983,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-close-cas", "conditional close");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = CloseIssueTool::new(Arc::clone(&state));
         let read_issue = || {
             SqliteStorage::open(&state.db_path)
@@ -5146,7 +5173,8 @@ mod tests {
             );
         }
 
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let overview_tool = ProjectOverviewTool::new(Arc::clone(&state));
         let list_tool = ListIssuesTool::new(Arc::clone(&state));
         let show_tool = ShowIssueTool::new(Arc::clone(&state));
@@ -5299,7 +5327,8 @@ mod tests {
         for id in &ids {
             insert_test_issue(&repeated_state, id, &format!("Repeated update issue {id}"));
         }
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let repeated_tool = UpdateIssueTool::new(Arc::clone(&repeated_state));
         let repeated_started = Instant::now();
         for round in 0..iterations {
@@ -5387,7 +5416,8 @@ mod tests {
             }
         }
 
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let repeated_tool = CloseIssueTool::new(Arc::clone(&repeated_state));
         let repeated_started = Instant::now();
         for ids in &repeated_ids {
@@ -5464,7 +5494,8 @@ mod tests {
         let repeated_rounds = dependency_perf_rounds("single", issue_count, iterations);
         seed_dependency_perf_rounds(&repeated_state, &repeated_rounds);
 
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let repeated_tool = ManageDependenciesTool::new(Arc::clone(&repeated_state));
         let repeated_started = Instant::now();
         for (blocker, ids) in &repeated_rounds {
@@ -5722,7 +5753,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         let tool = CreateIssueTool::new(Arc::clone(&state));
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let description = "x".repeat(600_000);
 
         tool.call(
@@ -5753,7 +5785,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         let tool = CreateIssueTool::new(Arc::clone(&state));
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let title = "é".repeat(500);
 
         tool.call(&ctx, json!({ "title": title }))
@@ -5774,7 +5807,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         let tool = CreateIssueTool::new(Arc::clone(&state));
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
 
         tool.call(
             &ctx,
@@ -5805,7 +5839,8 @@ mod tests {
     fn manage_dependencies_allows_non_blocking_reverse_links() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let create_tool = CreateIssueTool::new(Arc::clone(&state));
 
         create_tool
@@ -5864,7 +5899,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-external-src", "external dependency source");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ManageDependenciesTool::new(Arc::clone(&state));
 
         let add = content_json(
@@ -5928,7 +5964,8 @@ mod tests {
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-dep-single-a", "single dependency source");
         insert_test_issue(&state, "br-mcp-dep-single-b", "single dependency target");
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ManageDependenciesTool::new(Arc::clone(&state));
 
         let add = content_json(
@@ -5990,7 +6027,8 @@ mod tests {
                 .expect("seed removable dependency");
         }
 
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ManageDependenciesTool::new(Arc::clone(&state));
         let content = tool
             .call(
@@ -6074,7 +6112,8 @@ mod tests {
     fn manage_dependencies_batch_rejects_ambiguous_single_and_batch_args() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let tool = ManageDependenciesTool::new(state);
 
         let err = tool
@@ -6097,7 +6136,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         let tool = CreateIssueTool::new(Arc::clone(&state));
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
 
         {
             let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
@@ -6155,7 +6195,8 @@ mod tests {
         // — still rejected by `reject_nul` for SQLite compatibility.
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
-        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
         let create_tool = CreateIssueTool::new(Arc::clone(&state));
 
         create_tool
