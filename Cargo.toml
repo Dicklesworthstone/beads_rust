@@ -72,11 +72,11 @@ fsqlite-error = { version = "=0.4.12" }
 fsqlite-core = { version = "=0.4.10" }
 fsqlite-func = { version = "=0.4.12" }
 fsqlite-vdbe = { version = "=0.4.10" }
-fsqlite-vfs = { version = "=0.4.11" }
+fsqlite-vfs = { version = "=0.4.12" }
 fsqlite-pager = { version = "=0.4.10" }
-fsqlite-parser = { version = "=0.4.10" }
-fsqlite-planner = { version = "=0.4.10" }
-fsqlite-wal = { version = "=0.4.10" }
+fsqlite-parser = { version = "=0.4.12" }
+fsqlite-planner = { version = "=0.4.12" }
+fsqlite-wal = { version = "=0.4.12" }
 fsqlite-btree = { version = "=0.4.10" }
 fsqlite-ast = { version = "=0.4.12" }
 fsqlite-mvcc = { version = "=0.4.10" }
