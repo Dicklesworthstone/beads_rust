@@ -98,15 +98,15 @@ impl Drop for ActiveDiagnosticOutput<'_> {
     }
 }
 
-/// Defer configured tracing stderr output until every read-startup owner has
-/// released its database authority. Nested/overlapping scopes share a bounded
-/// buffer, including records emitted by engine threads.
+/// Defer configured tracing stderr output and routed operator diagnostics until
+/// every read-startup owner has released its database authority. Nested/overlapping
+/// scopes share a bounded buffer, including records emitted by engine threads.
 ///
 /// Declare this guard before storage and authority owners, so error unwinding
 /// closes them before the guard flushes. Call [`Self::finish`] only after their
-/// successful read-only handoff. Direct stdout/stderr writes and the optional
-/// JSON file layer are outside this tracing-stderr contract; the CLI configures
-/// no file layer. Diagnostic I/O remains best-effort, like ordinary tracing.
+/// successful read-only handoff. Unrouted stdout/stderr writes and the optional
+/// JSON file layer are outside this stderr contract; the CLI configures no file
+/// layer. Diagnostic I/O remains best-effort, like ordinary tracing.
 #[must_use = "keep the diagnostic guard alive until read startup releases authority"]
 pub struct ReadStartupDiagnostics<'a, W: Write = io::Stderr> {
     state: &'a DiagnosticState,
@@ -235,7 +235,7 @@ impl<W: Write> Drop for ReadStartupDiagnostics<'_, W> {
     }
 }
 
-/// Start bounded tracing-stderr deferral for a read command's startup.
+/// Start bounded stderr-diagnostic deferral for a read command's startup.
 pub fn defer_read_startup_diagnostics() -> ReadStartupDiagnostics<'static> {
     ReadStartupDiagnostics::start(&READ_STARTUP_DIAGNOSTICS, io::stderr())
 }
@@ -281,6 +281,14 @@ fn startup_diagnostic_writer() -> StartupDiagnosticWriter<'static, io::Stderr> {
         state: &READ_STARTUP_DIAGNOSTICS,
         output: io::stderr(),
     }
+}
+
+/// Emit an operator-facing stderr diagnostic independently of tracing filters.
+/// Read startup defers these bytes through the same bounded buffer as tracing,
+/// so a reloaded policy warning cannot block while writer authority is held.
+/// Outside read startup, delivery is immediate and best-effort.
+pub(crate) fn emit_stderr_diagnostic(message: &str) {
+    let _ = startup_diagnostic_writer().write_all(message.as_bytes());
 }
 
 /// Initialize logging for the CLI.

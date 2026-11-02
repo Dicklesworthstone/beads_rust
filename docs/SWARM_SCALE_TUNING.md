@@ -138,8 +138,10 @@ records `snapshot_captured_ms` and `elapsed_ms` at capture and release, measured
 from the handoff's start before writing to stderr. Blocking on those diagnostics
 cannot extend the critical section.
 
-The CLI buffers tracing output to stderr throughout read startup, including
-lock admission, the protected recheck, automatic import, and connection teardown.
+The CLI buffers tracing output and warnings about unknown policy keys to stderr
+throughout read startup, including lock admission, the protected recheck,
+automatic import, and connection teardown. Policy warnings remain visible even
+when tracing is disabled, including when the policy changes while a read queues.
 It drains that buffer after startup authority has ended; an early error or
 interruption also closes storage and releases authority before draining. This
 keeps a stalled diagnostic consumer from indefinitely delaying writers while

@@ -1497,6 +1497,158 @@ fn e2e_586_auto_import_handoff_releases_authority_before_blocked_stderr() {
     }
 }
 
+/// A newly introduced policy typo is first seen by the protected reload after
+/// read admission. Its unfiltered warning must not strand writer authority
+/// when stderr is full, even with every tracing event disabled.
+#[test]
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
+fn e2e_586_policy_reload_warning_releases_authority_before_blocked_stderr() {
+    const IMPORTED_NOTES: &str = "import completed before the reloaded policy warning";
+    const RELOADED_POLICY: &str =
+        "workflow:\n  strict: false\nclose_policy:\n  gh586_unknown_after_queue: true\n";
+    let workspace = snapshot_search_workspace_with_description(String::new());
+    let root = &workspace.root;
+    let beads = root.join(".beads");
+    let db = beads.join("beads.db");
+    let policy = beads.join("policy.yaml");
+    fs::write(&policy, "workflow:\n  strict: false\n").unwrap();
+    let jsonl_before = update_snapshot_jsonl_for_import(root, IMPORTED_NOTES);
+    let owner = beads_rust::sync::blocking_write_lock(&beads).unwrap();
+    let results = root.join("logs/policy-warning-stdout.json");
+    let mut command = br_child_command_in_dir_with_env(
+        root,
+        [
+            "--lock-timeout",
+            "30000",
+            "--no-auto-flush",
+            "search",
+            "snapshot",
+            "--all",
+            "--json",
+        ],
+        [("RUST_LOG", "off")],
+    );
+    command.stdout(fs::File::create(&results).unwrap());
+    let mut reader = QueuedBrChildren(vec![command.spawn().unwrap()]);
+    wait_for_workspace_waiters(root, 1);
+    wait_for_child_owned_workspace_registration(root, &mut reader.0[0]);
+    fill_child_stderr_pipe(reader.0[0].id());
+    // The initial policy is valid. Only after the child's advisory probe and
+    // queue registration introduce an unseen key, so per-process warning
+    // deduplication cannot mask the warning in the protected policy reload.
+    fs::write(&policy, RELOADED_POLICY).unwrap();
+    drop(owner);
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let child = &mut reader.0[0];
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "read exited before its unfiltered policy warning blocked on stderr"
+        );
+        let channel = read_child_wait_channel(child.id());
+        if channel
+            .as_deref()
+            .is_some_and(|value| value.contains("pipe_write"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "policy warning never blocked on stderr; last wait channel: {channel:?}"
+        );
+        thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
+    }
+    // Stdout is a regular file and tracing is disabled: the only blocked
+    // pipe write is the operator warning emitted by the changed policy.
+    assert_eq!(fs::metadata(&results).unwrap().len(), 0);
+    assert_read_has_no_workspace_authority(root, &mut reader.0[0]);
+    let started = Instant::now();
+    let authority = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+        &beads,
+        &db,
+        Some(1_000),
+    )
+    .expect("the blocked policy warning must release every startup authority component");
+    let latency = started.elapsed();
+    authority.verify_database_authority().unwrap();
+    eprintln!(
+        "GH586 policy-warning full-family authority acquisition: {} ns",
+        latency.as_nanos()
+    );
+    assert!(latency < Duration::from_secs(1), "{latency:?}");
+    drop(authority);
+
+    let shown = run_br_in_dir(
+        root,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            "test-read",
+            "--json",
+        ],
+    );
+    assert!(
+        shown.success,
+        "completed import verification failed: {shown:?}"
+    );
+    assert_eq!(
+        extract_issues_array(&shown.stdout)[0]["notes"],
+        IMPORTED_NOTES
+    );
+    let writer = competing_snapshot_writer(root, "test-read");
+    assert!(
+        writer.status.success(),
+        "writer during blocked policy warning failed: {writer:?}"
+    );
+    assert_read_has_no_workspace_authority(root, &mut reader.0[0]);
+    assert_eq!(fs::metadata(&results).unwrap().len(), 0);
+
+    let output = reader.finish(Duration::from_secs(20)).remove(0);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "read failed: {stderr}");
+    let expected_warning = format!(
+        "warning: {} has 1 unknown key(s) that br ignores, so the rules they were meant to \
+         configure are NOT enforced: close_policy.gh586_unknown_after_queue. \
+         Check for typos (run `br doctor` for details).",
+        policy.display()
+    );
+    assert_eq!(
+        stderr.trim(),
+        expected_warning,
+        "the unfiltered policy warning must remain visible exactly once with RUST_LOG=off"
+    );
+    let issues = extract_issues_array(&fs::read_to_string(results).unwrap());
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["id"], "test-read");
+    assert_eq!(
+        issues[0]["notes"], IMPORTED_NOTES,
+        "the read must retain its imported snapshot from before the concurrent writer"
+    );
+    let shown = run_br_in_dir(
+        root,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            "test-read",
+            "--json",
+        ],
+    );
+    assert!(
+        shown.success,
+        "concurrent writer verification failed: {shown:?}"
+    );
+    assert_eq!(
+        extract_issues_array(&shown.stdout)[0]["notes"],
+        "after concurrent writer"
+    );
+    assert_eq!(fs::read(beads.join("issues.jsonl")).unwrap(), jsonl_before);
+    assert_eq!(fs::read_to_string(policy).unwrap(), RELOADED_POLICY);
+}
+
 /// An import parse failure must unwind writable storage and every authority
 /// owner before flushing the tracing that led to the error.
 #[test]

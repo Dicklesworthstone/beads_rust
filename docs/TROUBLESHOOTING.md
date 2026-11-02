@@ -705,11 +705,14 @@ other writers. If `.sync.lock` is already held, startup skips automatic import
 without opening the original database writable; it keeps the verified private
 snapshot already obtained by the recheck.
 
-Read-startup tracing to stderr is buffered until the startup authority is
-released, including diagnostics from an import or connection teardown. An error
-or interruption releases the retained storage and lock owners before the buffer
-is drained. A full stderr pipe can therefore leave the read waiting to deliver
-diagnostics after startup, while another writer proceeds. The buffer retains
+Tracing and warnings about unknown policy keys to stderr are buffered during
+read startup until its authority is released, including diagnostics from an
+import or connection teardown. Policy warnings remain visible even with logging
+disabled; a new unknown key discovered after queuing cannot make warning
+delivery retain writer authority. An error or interruption releases the retained
+storage and lock owners before the buffer is drained. A full stderr pipe can
+therefore leave the read waiting to deliver diagnostics after startup, while
+another writer proceeds. The buffer retains
 the first and most recent 128 KiB, up to 256 KiB total; if it fills, a notice
 reports omitted middle bytes while preserving the startup and completion details.
 Timestamps refer to when events occurred, so the delayed output can be used to

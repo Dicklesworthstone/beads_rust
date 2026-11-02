@@ -3025,6 +3025,8 @@ pub fn unknown_policy_fields_message(policy_path: &Path, unknown: &[String]) -> 
 /// once per distinct (policy file, unknown-key set) per process: commands
 /// load the policy several times per invocation, and a long-running MCP
 /// server should re-warn only when the set of unknown keys changes.
+/// Read startup defers delivery until its authority ends: the policy may
+/// change while a reader queues, causing a new warning on the protected reload.
 fn warn_unknown_policy_fields_once(policy_path: &Path, unknown: &[String]) {
     type Seen = std::collections::HashSet<(PathBuf, Vec<String>)>;
     static WARNED: std::sync::OnceLock<std::sync::Mutex<Seen>> = std::sync::OnceLock::new();
@@ -3040,10 +3042,10 @@ fn warn_unknown_policy_fields_once(policy_path: &Path, unknown: &[String]) {
         "policy.yaml contains unknown field(s) (beads_rust#302, #515)"
     );
     if first_time {
-        eprintln!(
-            "warning: {}",
+        crate::logging::emit_stderr_diagnostic(&format!(
+            "warning: {}\n",
             unknown_policy_fields_message(policy_path, unknown)
-        );
+        ));
     }
 }
 
