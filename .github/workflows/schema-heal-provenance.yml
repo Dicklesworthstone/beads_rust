@@ -51,4 +51,6 @@ jobs:
         run: cargo test --lib --locked schema_heal -- --test-threads=1
       - name: Run restoration and import regressions
         if: ${{ !cancelled() }}
-        run: cargo test --lib --locked sync:: -- --test-threads=1
+        # Quoted: a plain YAML scalar cannot contain ": ", which `sync:: --`
+        # does, so the unquoted form made the whole file fail to parse.
+        run: 'cargo test --lib --locked sync:: -- --test-threads=1'
