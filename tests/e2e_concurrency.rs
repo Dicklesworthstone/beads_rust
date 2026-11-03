@@ -876,6 +876,10 @@ fn competing_snapshot_writer(root: &Path, issue_id: &str) -> std::process::Outpu
             issue_id,
             "--notes",
             "after concurrent writer",
+            // Several fixtures import longer notes first. Without --force the
+            // shrink guard (#467, #481) refuses this replacement, and the
+            // writer fails for a reason unrelated to lock authority.
+            "--force",
             "--json",
         ],
     )])
@@ -2555,6 +2559,9 @@ fn e2e_586_cancelled_partial_import_releases_authority_before_blocked_stderr() {
     )
     .expect("the cancelled reader owns no authority while its diagnostics block");
     drop(authority);
+    // The engine refuses to open a database file with more than one hard
+    // link, so retire the fixture's alias before a real br writer opens it.
+    fs::remove_file(&alias).unwrap();
     let writer = competing_snapshot_writer(root, "test-read");
     assert!(
         writer.status.success(),
