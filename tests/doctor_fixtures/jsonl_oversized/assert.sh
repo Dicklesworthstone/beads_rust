@@ -11,16 +11,22 @@ stage="${2:?usage: assert.sh <target_dir> <stage>}"
 tool_bin="${TOOL_BIN:-br}"
 cd "$target_dir"
 
-threshold=$((100 * 1024 * 1024))
+# Must match JSONL_OVERSIZED_THRESHOLD_BYTES and JSONL_PUSH_REJECT_BYTES in
+# src/cli/commands/doctor.rs: doctor warns from 50 MiB (GitHub's push
+# warning) and reports the 100 MiB hard push limit alongside it.
+threshold=$((50 * 1024 * 1024))
+push_reject=$((100 * 1024 * 1024))
 
 assert_size_warn() {
   local out="$1"
-  echo "$out" | jq -e --argjson threshold "$threshold" '
+  echo "$out" | jq -e --argjson threshold "$threshold" --argjson push_reject "$push_reject" '
     .checks[] | select(.name == "jsonl_size")
     | select(.status == "warn")
     | select(.details.finding_id == "fm-state_files-jsonl-oversized")
     | select(.details.size_bytes > $threshold)
     | select(.details.threshold_bytes == $threshold)
+    | select(.details.push_reject_bytes == $push_reject)
+    | select(.details.over_push_limit == true)
   ' >/dev/null || {
     echo "ASSERT FAIL[$stage]: jsonl_size did not warn above threshold" >&2
     echo "$out" | jq '.checks[] | select(.name == "jsonl_size")' >&2
@@ -69,9 +75,10 @@ case "$stage" in
     # The padding also propagates into repair/undo artifacts: the
     # base_jsonl fixer regenerates beads.base.jsonl as a byte copy of the
     # padded export, and `doctor undo` preserves that copy in the run's
-    # backup slot. Sweep any padding-sized file (nothing legitimate in
-    # this fixture approaches 100MB). This invalidates redo for the
-    # retained workspace, which has already served its purpose.
+    # backup slot. Sweep any padding-sized file (the plant is ~104MB;
+    # nothing legitimate in this fixture approaches 100MB). This
+    # invalidates redo for the retained workspace, which has already
+    # served its purpose.
     while IFS= read -r artifact; do
       truncate -s 0 "$artifact"
     done < <(find . -type f -size +100M 2>/dev/null)

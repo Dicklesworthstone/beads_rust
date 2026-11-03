@@ -1,9 +1,11 @@
 # jsonl_oversized
 
 - **FM**: `fm-state_files-jsonl-oversized` (P3) — `.beads/issues.jsonl`
-  exceeds the 100MB `jsonl_size` threshold. At that scale the sync
+  reaches the 50 MiB `jsonl_size` threshold, where GitHub starts warning
+  on push (it rejects files over 100 MiB). At that scale the sync
   engine's full-file read on every flush is slow and the in-memory
-  parse pressures low-RAM hosts.
+  parse pressures low-RAM hosts. The fixture plants ~104 MiB, so the
+  finding also carries `over_push_limit: true`.
 - **Subsystem**: state_files
 - **Detect**: `jsonl_size` warns with `size_bytes` / `threshold_bytes`
   details. The padding is whitespace-only lines (skipped by every JSONL

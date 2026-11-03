@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Fixture: jsonl_oversized
 # FM: fm-state_files-jsonl-oversized (P3) — `.beads/issues.jsonl`
-# exceeds the 100MB `jsonl_size` threshold; flushes become slow and the
+# reaches the 50 MiB `jsonl_size` threshold (GitHub's push warning;
+# GitHub rejects files over 100 MiB); flushes become slow and the
 # full-file parse pressures low-RAM hosts.
 #
-# Plant: pad the JSONL past the threshold with whitespace-only lines.
+# Plant: pad the JSONL past both sizes with whitespace-only lines, so the
+# warning also reports the file as over the push limit.
 # Every JSONL scanner in br skips blank/whitespace lines, so the file
 # stays PARSE-VALID (jsonl.parse ok) while its size trips the
 # detect-only size check — isolating fm-state_files-jsonl-oversized
@@ -34,10 +36,11 @@ with open(".beads/issues.jsonl", "ab") as f:
         f.write(line)
 PY
 
-# Sanity: the padded file must exceed the 100MB threshold.
+# Sanity: the padded file must exceed the 100 MiB push limit (and so the
+# 50 MiB warning threshold).
 size=$(stat -c '%s' .beads/issues.jsonl)
 if [ "$size" -le $((100 * 1024 * 1024)) ]; then
-  echo "corrupt: padded JSONL is only $size bytes (<=100MB threshold)" >&2
+  echo "corrupt: padded JSONL is only $size bytes (<=100 MiB push limit)" >&2
   exit 1
 fi
 echo "$size" > .fixture_planted_size
