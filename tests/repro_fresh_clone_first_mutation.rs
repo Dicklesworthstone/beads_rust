@@ -200,27 +200,37 @@ fn fresh_clone_first_close_flushes_without_self_deadlock() {
     );
 }
 
-/// The control arm from the report: a read first builds the database and exits,
-/// so the following mutation opens an existing DB and never retains an
-/// authority. It must stay fast — this guards against a fix that "solves" the
-/// deadlock by making every flush slow.
+/// The control arm from the report: another command builds the database first
+/// and exits, so the following mutation opens an existing DB and never retains
+/// an authority. It must stay fast — this guards against a fix that "solves" the
+/// deadlock by making every flush slow. The report built the database with a
+/// read; reads no longer create a missing database (#585), so the control arm
+/// uses the explicit import instead.
 #[test]
-fn fresh_clone_read_first_then_mutation_still_flushes() {
+fn fresh_clone_import_first_then_mutation_still_flushes() {
     let donor = donor_workspace("fcr", &["seed"]);
     let clone = BrWorkspace::new();
     clone_tracked_beads(&donor, &clone);
 
-    let listed = run_br(&clone, ["list", "-q"], "clone-read-first");
+    let imported = run_br(
+        &clone,
+        ["sync", "--import-only", "-q"],
+        "clone-import-first",
+    );
     assert!(
-        listed.status.success(),
-        "read-first list failed: {}",
-        listed.stderr.trim()
+        imported.status.success(),
+        "import-first sync failed: {}",
+        imported.stderr.trim()
+    );
+    assert!(
+        clone.root.join(".beads/beads.db").is_file(),
+        "the explicit import must build the clone's database"
     );
 
     let created = run_br(
         &clone,
         ["create", "second", "-t", "task", "-p", "2", "--json"],
-        "clone-read-first-create",
+        "clone-import-first-create",
     );
     assert!(
         created.status.success(),

@@ -2840,6 +2840,32 @@ fn add_source_bypass_audit(row: &mut Value) {
     row["policy_gates_fired"] = json!(["acceptance_criteria", "security_review"]);
 }
 
+/// Close `id` the way a closure made before close attribution existed reaches
+/// a database: as an imported row without `closed_by`. Since #584 a native
+/// `br close` always records its actor in `close_metadata`, so it can no longer
+/// leave a closed issue with no close audit row at all. The audit-adoption
+/// tests below start from that state.
+fn close_through_unattributed_import(ws: &BrWorkspace, id: &str, label: &str) {
+    let mut rows = import_audit_rows(ws);
+    let row = rows.get_mut(id).expect("issue to close");
+    let closed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    row["status"] = json!("closed");
+    row["closed_at"] = json!(closed_at);
+    row["updated_at"] = json!(closed_at);
+    write_import_audit_rows(ws, &rows);
+    let receipt = ordinary_audit_import(ws, label);
+    assert_eq!(receipt["updated"], 1, "the closure must apply: {receipt}");
+    let storage = SqliteStorage::open(&db_path(ws)).unwrap();
+    assert_eq!(
+        storage.get_issue(id).unwrap().unwrap().status,
+        Status::Closed
+    );
+    assert!(
+        storage.get_close_metadata(id).unwrap().is_none(),
+        "an unattributed closure must not gain a close audit row"
+    );
+}
+
 #[test]
 fn ordinary_import_persists_new_close_audit_through_later_mutation_and_export() {
     let producer = BrWorkspace::new();
@@ -2936,8 +2962,7 @@ fn ordinary_import_adopts_matching_skipped_audit_without_churning_noops() {
         "audit_skip_comment",
     );
     assert!(comment.status.success(), "{comment:?}");
-    let closed = run_br(&ws, ["close", &id], "audit_skip_close");
-    assert!(closed.status.success(), "{closed:?}");
+    close_through_unattributed_import(&ws, &id, "audit_skip_close");
     let before = import_audit_issue(&ws, &id);
     assert!(
         SqliteStorage::open(&db_path(&ws))
@@ -3135,8 +3160,7 @@ fn ordinary_import_never_attaches_stale_close_audit_to_newer_local_state() {
         init_import_audit_workspace(&ws);
         let id = create_issue(&ws, "Closure before local changes", "audit_newer_create");
         let sibling = create_issue(&ws, "Publish preserved local state", "audit_newer_sibling");
-        let closed = run_br(&ws, ["close", &id], "audit_newer_close");
-        assert!(closed.status.success(), "{closed:?}");
+        close_through_unattributed_import(&ws, &id, "audit_newer_close");
         let mut restored = import_audit_rows(&ws);
         add_source_bypass_audit(restored.get_mut(&id).unwrap());
         let changed = match local_change {
@@ -4249,6 +4273,11 @@ fn restored_export_no_op_import_does_not_starve_concurrent_commands() {
         assert!(importer.0.try_wait().unwrap().is_none());
         assert!(held_lock(&workspace_lock));
         inode_blocker.verify_database_authority().unwrap();
+        // The engine refuses to open a database file with more than one hard
+        // link. Unlink the alias while its open descriptor still holds the
+        // inode lock, so every command that opens the database after the
+        // release sees a single link.
+        fs::remove_file(&alias).unwrap();
         drop(inode_blocker);
         let reader = reader.join().unwrap();
         let writer = writer.join().unwrap();

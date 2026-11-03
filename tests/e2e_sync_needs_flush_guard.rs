@@ -258,8 +258,9 @@ fn commit_jsonl(workspace: &BrWorkspace, message: &str) {
     git(workspace, &["commit", "-m", message]);
 }
 
-/// A real clone receives only tracked files and reconstructs its independent
-/// database through normal CLI startup.
+/// A real clone receives only tracked files and builds its independent
+/// database with an explicit import. Read commands are observational and never
+/// create a missing database (#585), so a read cannot do this step.
 fn clone_peer(workspace: &BrWorkspace) -> BrWorkspace {
     let mut peer = BrWorkspace::new();
     let checkout = peer.root.join("checkout");
@@ -268,7 +269,7 @@ fn clone_peer(workspace: &BrWorkspace) -> BrWorkspace {
         &["clone", "--no-hardlinks", ".", checkout.to_str().unwrap()],
     );
     peer.root = checkout;
-    checked_br(&peer, &["list", "--json"], "peer_rebuild_database");
+    checked_br(&peer, &["sync", "--import-only"], "peer_rebuild_database");
     peer
 }
 
