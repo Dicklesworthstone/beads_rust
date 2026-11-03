@@ -283,8 +283,8 @@ class RecoveryTests(unittest.TestCase):
 
     def test_source_change_before_publication_refused(self):
         witness = recovery.logical_witness
-        def changing(db, *, immutable):
-            result = witness(db, immutable=immutable)
+        def changing(db, *, immutable, max_bytes=recovery.DEFAULT_MAX_BYTES):
+            result = witness(db, immutable=immutable, max_bytes=max_bytes)
             if immutable:
                 recovery.component(self.db, '-shm').write_bytes(b'changed by noncooperating I/O')
             return result
@@ -392,8 +392,8 @@ if stage == 'replay':
     module.replay = crash
 elif stage == 'verify':
     witness = module.logical_witness
-    def crash(db, *, immutable):
-        result = witness(db, immutable=immutable)
+    def crash(db, *, immutable, max_bytes=module.DEFAULT_MAX_BYTES):
+        result = witness(db, immutable=immutable, max_bytes=max_bytes)
         if immutable:
             os._exit(73)
         return result
@@ -573,20 +573,23 @@ os._exit(0)
                 self.assertEqual(recovery.component(self.output / 'before' / 'beads.db', suffix).read_bytes(), data)
 
     def test_restore_rejects_private_index_header_and_page_hash_corruption(self):
-        witness = recovery.logical_witness
+        # Damage the oracle's SQLite-generated index after its last SQLite
+        # reader, the page-image check, and before validate_private_index
+        # inspects it. Injected any earlier, that reader rebuilds a damaged
+        # index header, so validation never sees the corruption.
+        verify = recovery.verify_page_image
         for offset in (12, 40, 96, 136, 16384):
             with self.subTest(offset=offset):
-                def corrupt(db, *, immutable):
-                    result = witness(db, immutable=immutable)
-                    if not immutable and db.parent.name == 'oracle':
-                        path = recovery.component(db, '-shm')
-                        with path.open('r+b') as file:
-                            file.seek(offset)
-                            old = file.read(1)
-                            file.seek(offset)
-                            file.write(bytes([old[0] ^ 1]))
+                def corrupt(oracle, *args, **kwargs):
+                    result = verify(oracle, *args, **kwargs)
+                    path = recovery.component(oracle, '-shm')
+                    with path.open('r+b') as file:
+                        file.seek(offset)
+                        old = file.read(1)
+                        file.seek(offset)
+                        file.write(bytes([old[0] ^ 1]))
                     return result
-                with mock.patch.object(recovery, 'logical_witness', side_effect=corrupt):
+                with mock.patch.object(recovery, 'verify_page_image', side_effect=corrupt):
                     self.assert_refused('private SHM', restore_shm=True)
 
     def test_transferred_index_rehearsal_cannot_silently_repair_invalid_headers(self):
@@ -602,14 +605,16 @@ os._exit(0)
             self.assert_refused('locked', restore_shm=True)
 
     def test_restore_rejects_private_reader_wal_rewrite(self):
-        witness = recovery.logical_witness
-        def change_wal(db, *, immutable):
-            result = witness(db, immutable=immutable)
-            if not immutable and db.parent.name == 'oracle':
-                with recovery.component(db, '-wal').open('ab') as file:
-                    file.write(b'private engine changed WAL')
+        # Rewrite the oracle WAL after the page-image check has re-verified it,
+        # so the refusal comes from validate_private_index itself. The earlier
+        # page-image refusal is covered in test_wal_page_image.py.
+        verify = recovery.verify_page_image
+        def change_wal(oracle, *args, **kwargs):
+            result = verify(oracle, *args, **kwargs)
+            with recovery.component(oracle, '-wal').open('ab') as file:
+                file.write(b'private engine changed WAL')
             return result
-        with mock.patch.object(recovery, 'logical_witness', side_effect=change_wal):
+        with mock.patch.object(recovery, 'verify_page_image', side_effect=change_wal):
             self.assert_refused('private SQLite reader changed protected component', restore_shm=True)
 
     def test_restore_large_real_wal_crosses_both_hash_segment_boundaries(self):
