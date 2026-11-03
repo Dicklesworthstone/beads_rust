@@ -2995,6 +2995,18 @@ pub const DEFAULT_WITNESS_PARALLELISM: usize = 64;
 #[derive(Args, Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SyncArgs {
+    /// Capture full portable issues and a database-bound token without mutation.
+    #[arg(long)]
+    pub snapshot: bool,
+
+    /// Apply a complete normalized JSONL snapshot under its original database token.
+    #[arg(long, value_name = "PATH", requires = "expect_database_sha256")]
+    pub apply_snapshot: Option<PathBuf>,
+
+    /// Original database token returned by --snapshot (not a fresh target plan).
+    #[arg(long, value_name = "SHA256", requires = "apply_snapshot")]
+    pub expect_database_sha256: Option<String>,
+
     /// Export database to JSONL (DB → .beads/issues.jsonl)
     ///
     /// Writes all issues from `SQLite` database to JSONL format.

@@ -668,6 +668,10 @@ pub fn execute(
 ) -> Result<()> {
     validate_sync_mode_args(args)?;
 
+    if args.snapshot || args.apply_snapshot.is_some() {
+        return execute_guarded_snapshot(args, cli, ctx);
+    }
+
     if args.witness {
         let (_, _, path_policy) = resolve_sync_startup_paths(args, cli)?;
         return execute_witness(&path_policy, args, ctx.is_json() || args.robot, ctx);
@@ -741,6 +745,239 @@ pub fn execute(
     finalize_sync_result(command_result, &mut startup.open_result)
 }
 
+/// Guarded commands bypass normal startup: a stale token never licenses repair.
+#[allow(clippy::too_many_lines)]
+fn execute_guarded_snapshot(
+    args: &SyncArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let requested_beads = config::discover_beads_dir_with_cli(cli)?;
+    let resolved =
+        crate::sync::resolve_reviewed_additive_workspace(&requested_beads, cli.db.as_ref())?;
+    let (beads_dir, db_path, jsonl_path, _) = &resolved;
+    let startup = config::load_startup_config_with_paths_uncached(beads_dir, cli.db.as_ref())?;
+    if cli
+        .no_db
+        .or_else(|| config::no_db_from_layer(&startup.merged_config))
+        .unwrap_or(false)
+    {
+        return Err(BeadsError::validation(
+            "no_db",
+            "Guarded snapshots require a persistent database",
+        ));
+    }
+    let path_policy = validate_sync_paths(beads_dir, jsonl_path, args.allow_external_jsonl)?;
+    let target_source = args
+        .apply_snapshot
+        .as_ref()
+        .map(|path| {
+            validate_sync_path_with_external(path, beads_dir, args.allow_external_jsonl)?;
+            crate::sync::capture_optional_jsonl_source(path)?.ok_or_else(|| {
+                BeadsError::validation("apply_snapshot", "Normalized JSONL snapshot does not exist")
+            })
+        })
+        .transpose()?;
+    let (snapshot, database_before) =
+        crate::sync::capture_guarded_snapshot(beads_dir, db_path, jsonl_path)?;
+    if crate::sync::resolve_reviewed_additive_workspace(&requested_beads, cli.db.as_ref())?
+        != resolved
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "Workspace or database authority changed during snapshot capture".to_string(),
+        });
+    }
+    if args.snapshot {
+        ctx.json_pretty(&snapshot);
+        return Ok(());
+    }
+    let expected = args.expect_database_sha256.as_deref().ok_or_else(|| {
+        BeadsError::validation("expect_database_sha256", "Missing original snapshot token")
+    })?;
+    if snapshot.database_sha256 != expected {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "Database changed since the original snapshot; refusing stale snapshot application"
+                    .to_string(),
+        });
+    }
+    let target_source = target_source.as_ref().ok_or_else(|| {
+        BeadsError::validation("apply_snapshot", "Missing normalized JSONL snapshot")
+    })?;
+    ensure_no_conflict_markers_snapshot(target_source)?;
+    let mut target = read_issues_from_jsonl_snapshot(target_source)?;
+    target.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    crate::sync::validate_guarded_snapshot_target(&snapshot.issues, &target)?;
+    drop(snapshot);
+
+    let write_authority = if let Some(authority) = cli.held_write_authority.as_ref() {
+        authority.verify_database_authority()?;
+        if authority.canonical_database_path() != db_path
+            || cli.held_write_lock_beads_dir.as_ref() != Some(beads_dir)
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Retained write authority does not protect the snapshot workspace"
+                    .to_string(),
+            });
+        }
+        Arc::clone(authority)
+    } else {
+        Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                beads_dir,
+                db_path,
+                cli.lock_timeout,
+            )?,
+        )
+    };
+    if crate::sync::resolve_reviewed_additive_workspace(&requested_beads, cli.db.as_ref())?
+        != resolved
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "Workspace or database authority changed while acquiring snapshot authority"
+                .to_string(),
+        });
+    }
+    let locked_storage = crate::storage::SqliteStorage::open_current_read_only_snapshot(db_path)?
+        .ok_or_else(|| {
+        BeadsError::Config(
+            "Guarded application requires an existing current-schema database".to_string(),
+        )
+    })?;
+    let locked_witness = locked_storage.with_read_transaction(capture_sync_database_witness)?;
+    if locked_witness != database_before {
+        return Err(BeadsError::SyncConflict {
+            message: "Database changed while waiting to apply the original snapshot".to_string(),
+        });
+    }
+    drop(locked_storage);
+    let _sync_authority =
+        crate::sync::try_sync_lock(beads_dir)?.ok_or_else(|| BeadsError::SyncConflict {
+            message: "Another sync owns .sync.lock".to_string(),
+        })?;
+    let jsonl_authority =
+        crate::sync::blocking_jsonl_family_write_lock_with_timeout(jsonl_path, cli.lock_timeout)?;
+    let base_authority = crate::sync::blocking_jsonl_family_write_lock_with_timeout(
+        &beads_dir.join("beads.base.jsonl"),
+        cli.lock_timeout,
+    )?;
+    let source = jsonl_authority.capture_optional_target()?;
+    if crate::sync::snapshot_database_sha256(
+        beads_dir,
+        db_path,
+        jsonl_path,
+        source.as_ref(),
+        &database_before,
+    )? != expected
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "Database or canonical JSONL changed since the original snapshot".to_string(),
+        });
+    }
+    if let Some(source) = source.as_ref() {
+        ensure_no_conflict_markers_snapshot(source)?;
+        let source_issues = read_issues_from_jsonl_snapshot(source)?;
+        crate::sync::validate_guarded_snapshot_target(&source_issues, &target)?;
+    }
+    let base_source = base_authority.capture_optional_target()?;
+    write_authority.verify_database_authority()?;
+    // No repairing opener or startup defaults: the original witness remains
+    // the transaction's required prestate.
+    let mut storage =
+        crate::storage::SqliteStorage::open_current_for_reconcile(db_path, cli.lock_timeout)?
+            .ok_or_else(|| {
+                BeadsError::Config(
+                    "Guarded application requires an existing current-schema database".to_string(),
+                )
+            })?;
+    storage.attach_write_authority(Arc::clone(&write_authority));
+    storage.set_workflow_policy(crate::close_policy::load_for_beads_dir(beads_dir)?.workflow);
+    write_authority.verify_database_authority()?;
+    if crate::sync::resolve_reviewed_additive_workspace(&requested_beads, cli.db.as_ref())?
+        != resolved
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "Original snapshot authority changed before application".to_string(),
+        });
+    }
+    let intent = SyncMergeIntent {
+        schema_version: 2,
+        database_authority_sha256: write_authority.authority_path_sha256().to_string(),
+        jsonl_authority_sha256: jsonl_authority.authority_path_sha256().to_string(),
+        jsonl_path_sha256: canonical_sync_path_sha256(jsonl_authority.canonical_jsonl_path()),
+        jsonl_before: source.as_ref().map_or(
+            JsonlSourceStateWitness::Missing,
+            JsonlSourceSnapshot::state_witness,
+        ),
+        jsonl_before_content_sha256: source
+            .as_ref()
+            .map(|source| source.content_sha256().to_string()),
+        base_authority_sha256: base_authority.authority_path_sha256().to_string(),
+        base_before: base_source.as_ref().map_or(
+            JsonlSourceStateWitness::Missing,
+            JsonlSourceSnapshot::state_witness,
+        ),
+        base_before_content_sha256: base_source
+            .as_ref()
+            .map(|source| source.content_sha256().to_string()),
+        resolution: "guarded-snapshot".to_string(),
+        actor: cli.actor.clone().unwrap_or_else(|| "br".to_string()),
+        event_attribution: storage.pending_event_attribution_for_review(),
+        capacity_policy: storage.workflow_capacity_policy_for_review(),
+        retention_days: None,
+        export_as_of: chrono::Utc::now(),
+        changed_kept_issue_ids: target.iter().map(|issue| issue.id.clone()).collect(),
+        kept_issue_witnesses: crate::sync::sync_merge_kept_issue_witnesses(&target)?,
+        deleted_issue_ids: Vec::new(),
+        note_witnesses: Vec::new(),
+        database_before,
+    };
+    let pending = storage.apply_sync_merge_atomically(&target, &[], &[], &intent)?;
+    drop(target);
+    let result = (|| -> Result<crate::sync::SyncSnapshotApplyReceipt> {
+        let reconciled = reconcile_pending_sync_merge_artifacts(
+            &mut storage,
+            db_path,
+            &path_policy,
+            args,
+            false,
+            config::resolved_history_config_from_layer(&startup.merged_config),
+            source.as_ref(),
+            &jsonl_authority,
+            base_source.as_ref(),
+            &base_authority,
+            pending,
+            false,
+        )?;
+        crate::sync::verify_jsonl_source_snapshot_current(
+            &reconciled.published_source,
+            &jsonl_authority,
+        )?;
+        let completion = PendingSyncMergeCompletion {
+            receipt: reconciled.terminal_receipt,
+            base_authority,
+        };
+        finalize_pending_sync_merge_after_adoption(
+            &mut storage,
+            db_path,
+            &reconciled.published_source,
+            &completion,
+            false,
+        )?;
+        Ok(crate::sync::SyncSnapshotApplyReceipt {
+            schema_version: 1,
+            status: "applied".to_string(),
+            receipt_id: completion.receipt.receipt_id,
+        })
+    })()
+    .map_err(|source| BeadsError::CommittedStateUnwitnessed {
+        operation: "guarded snapshot artifact reconciliation".to_string(),
+        source: Box::new(source),
+    })?;
+    ctx.json_pretty(&result);
+    Ok(())
+}
+
 /// Resolve path policy and open storage before dispatch. Keeping this separate
 /// from `execute` makes the command's startup phase distinct from the
 /// status/export/import/merge operation handlers below.
@@ -775,6 +1012,8 @@ fn prepare_sync_startup(
 #[must_use]
 pub const fn requires_read_only_storage(args: &SyncArgs) -> bool {
     args.status
+        || args.snapshot
+        || args.apply_snapshot.is_some()
         || (args.reconcile && args.dry_run)
         || (args.reconcile_additive && !args.apply)
         || (args.migrate_source_repo_path && !args.apply)
@@ -832,6 +1071,58 @@ fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
 /// `recover_database_from_jsonl` has already moved the existing DB aside.
 #[allow(clippy::too_many_lines)]
 pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
+    if args.snapshot || args.apply_snapshot.is_some() {
+        let incompatible = [
+            args.status,
+            args.flush_only,
+            args.import_only,
+            args.merge,
+            args.reconcile,
+            args.witness,
+            args.reconcile_additive,
+            args.migrate_source_repo_path,
+            args.apply,
+            args.dry_run,
+            args.force,
+            args.force_db,
+            args.force_jsonl,
+            args.rebuild,
+            args.rename_prefix,
+            args.skip_invalid_records,
+            args.manifest,
+            args.error_policy.is_some(),
+            args.orphans.is_some(),
+            args.expect_plan_sha256.is_some(),
+            !args.resolve_source_ids.is_empty(),
+            args.merge_base.is_some(),
+            args.witness_parallelism.is_some(),
+        ];
+        if incompatible.into_iter().any(|present| present)
+            || (args.snapshot && args.apply_snapshot.is_some())
+        {
+            return Err(BeadsError::validation(
+                "snapshot",
+                "--snapshot and --apply-snapshot are standalone guarded modes",
+            ));
+        }
+    }
+    if args.apply_snapshot.is_some() != args.expect_database_sha256.is_some() {
+        return Err(BeadsError::validation(
+            "expect_database_sha256",
+            "--apply-snapshot requires --expect-database-sha256, and vice versa",
+        ));
+    }
+    if let Some(token) = &args.expect_database_sha256
+        && (token.len() != 64
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err(BeadsError::validation(
+            "expect_database_sha256",
+            "--expect-database-sha256 must be exactly 64 lowercase hexadecimal characters",
+        ));
+    }
     if args.skip_invalid_records && !args.import_only {
         return Err(BeadsError::Validation {
             field: "skip_invalid_records".to_string(),
@@ -945,12 +1236,14 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         + u8::from(args.reconcile)
         + u8::from(args.witness)
         + u8::from(args.reconcile_additive)
-        + u8::from(args.migrate_source_repo_path);
+        + u8::from(args.migrate_source_repo_path)
+        + u8::from(args.snapshot)
+        + u8::from(args.apply_snapshot.is_some());
     if mode_count > 1 {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify exactly one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
+                "Must specify exactly one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --snapshot, --apply-snapshot, --status, or --witness"
                     .to_string(),
         });
     }
@@ -958,7 +1251,7 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
+                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --snapshot, --apply-snapshot, --status, or --witness"
                     .to_string(),
         });
     }

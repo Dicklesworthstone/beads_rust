@@ -259,7 +259,7 @@ fn commit_jsonl(workspace: &BrWorkspace, message: &str) {
 }
 
 /// A real clone receives only tracked files and reconstructs its independent
-/// database through normal CLI startup.
+/// database through an explicit import; observational commands never rebuild it.
 fn clone_peer(workspace: &BrWorkspace) -> BrWorkspace {
     let mut peer = BrWorkspace::new();
     let checkout = peer.root.join("checkout");
@@ -268,7 +268,7 @@ fn clone_peer(workspace: &BrWorkspace) -> BrWorkspace {
         &["clone", "--no-hardlinks", ".", checkout.to_str().unwrap()],
     );
     peer.root = checkout;
-    checked_br(&peer, &["list", "--json"], "peer_rebuild_database");
+    checked_br(&peer, &["sync", "--import-only"], "peer_rebuild_database");
     peer
 }
 
@@ -368,6 +368,598 @@ fn import_database_state(workspace: &BrWorkspace) -> BTreeMap<&'static str, Vec<
         (table, rows)
     })
     .collect()
+}
+
+fn guarded_database_state(
+    workspace: &BrWorkspace,
+) -> BTreeMap<&'static str, Vec<Vec<SqliteValue>>> {
+    let mut state = import_database_state(workspace);
+    let connection = database(workspace);
+    for table in ["config", "metadata", "export_hashes", "jsonl_row_receipts"] {
+        let rows = connection
+            .query(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .expect("read guarded snapshot bookkeeping")
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect();
+        state.insert(table, rows);
+    }
+    state
+}
+
+fn guarded_snapshot(workspace: &BrWorkspace, label: &str) -> Value {
+    let result = checked_br(workspace, &["sync", "--snapshot", "--json"], label);
+    let snapshot: Value =
+        serde_json::from_str(&extract_json_payload(&result.stdout)).expect("snapshot JSON");
+    assert_eq!(snapshot["schema_version"], 1);
+    let token = snapshot["database_sha256"]
+        .as_str()
+        .expect("database token");
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(snapshot["issues"].is_array());
+    snapshot
+}
+
+fn apply_guarded_snapshot(
+    workspace: &BrWorkspace,
+    target: &std::path::Path,
+    snapshot: &Value,
+    label: &str,
+) -> common::cli::BrRun {
+    run_br(
+        workspace,
+        [
+            "sync",
+            "--apply-snapshot",
+            target.to_str().expect("target path"),
+            "--expect-database-sha256",
+            snapshot["database_sha256"]
+                .as_str()
+                .expect("original token"),
+            "--json",
+        ],
+        label,
+    )
+}
+
+fn guarded_snapshot_workspace() -> BrWorkspace {
+    let workspace = import_authority_workspace();
+    for (id, text) in [
+        ("bd-shared", "Repeated payload"),
+        ("bd-shared", "Repeated payload"),
+        ("bd-control", "Other owner payload"),
+    ] {
+        checked_br(
+            &workspace,
+            &["comments", "add", id, text, "--actor", "snapshot-author"],
+            "snapshot_seed_comment",
+        );
+    }
+    // Native additions get independent clocks. Pin just their fixture clocks
+    // so two genuinely distinct persisted IDs have exactly the same payload.
+    database(&workspace)
+        .execute("UPDATE comments SET created_at = '2026-01-01T00:00:00Z'")
+        .expect("pin duplicate comment payload clocks");
+    checked_br(&workspace, &["close", "bd-control"], "snapshot_seed_close");
+    {
+        let mut storage =
+            beads_rust::storage::SqliteStorage::open(&workspace.root.join(".beads/beads.db"))
+                .expect("open local audit fixture");
+        storage
+            .set_config("snapshot.local.setting", "must survive")
+            .expect("seed local config");
+        storage
+            .record_close_metadata(
+                "bd-control",
+                &beads_rust::close_policy::AttributionValues::default(),
+                true,
+                Some("Original local audit"),
+                &["snapshot-audit".to_string()],
+            )
+            .expect("seed close audit");
+    }
+    checked_br(
+        &workspace,
+        &["sync", "--flush-only", "--force"],
+        "snapshot_seed_export",
+    );
+    workspace
+}
+
+#[test]
+fn guarded_snapshot_refuses_orphan_comments_without_erasing_their_payload() {
+    let workspace = guarded_snapshot_workspace();
+    {
+        let connection = database(&workspace);
+        connection.execute("PRAGMA foreign_keys = OFF").unwrap();
+        connection
+            .execute("UPDATE comments SET issue_id = 'bd-missing' WHERE issue_id = 'bd-control'")
+            .unwrap();
+    }
+    let before = guarded_database_state(&workspace);
+    let witness = sync_witness(&workspace);
+    let refused = run_br(
+        &workspace,
+        ["sync", "--snapshot", "--json"],
+        "snapshot_with_orphan_comment",
+    );
+    assert_eq!(refused.status.code(), Some(6), "{refused:?}");
+    assert_eq!(guarded_database_state(&workspace), before);
+    assert_eq!(sync_witness(&workspace), witness);
+}
+
+#[test]
+fn guarded_snapshot_rejects_unflushed_and_autoflushed_native_writes_without_mutation() {
+    for unflushed in [true, false] {
+        let workspace = guarded_snapshot_workspace();
+        let snapshot = guarded_snapshot(&workspace, "before_native_write");
+        let target = workspace.root.join(".beads/normalized.jsonl");
+        write_jsonl_records(&target, snapshot["issues"].as_array().unwrap());
+        let mut args = vec![
+            "comments",
+            "add",
+            "bd-shared",
+            "Accepted after the snapshot",
+        ];
+        if unflushed {
+            args.push("--no-auto-flush");
+        }
+        checked_br(&workspace, &args, "intervening_native_writer");
+        let published = jsonl_record(&workspace.root.join(".beads/issues.jsonl"), "bd-shared");
+        let published_new_comment = published["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|comment| comment["text"] == "Accepted after the snapshot");
+        assert_eq!(published_new_comment, !unflushed);
+        assert_eq!(dirty_ids(&workspace).is_empty(), !unflushed);
+        let before = guarded_database_state(&workspace);
+        let witness = sync_witness(&workspace);
+        let target_before = fs::read(&target).unwrap();
+        let refused =
+            apply_guarded_snapshot(&workspace, &target, &snapshot, "reject_stale_snapshot");
+        assert_sync_conflict(&refused);
+        assert_eq!(guarded_database_state(&workspace), before);
+        assert_eq!(sync_witness(&workspace), witness);
+        assert_eq!(fs::read(&target).unwrap(), target_before);
+        let current = guarded_snapshot(&workspace, "accepted_write_still_present");
+        let issue = current["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|issue| issue["id"] == "bd-shared")
+            .unwrap();
+        assert_eq!(issue["comments"].as_array().unwrap().len(), 3);
+        assert!(
+            issue["comments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|comment| { comment["text"] == "Accepted after the snapshot" })
+        );
+    }
+}
+
+#[test]
+fn guarded_snapshot_preserves_multiplicity_exact_swapped_ids_source_rows_and_local_audits() {
+    let workspace = guarded_snapshot_workspace();
+    let snapshot = guarded_snapshot(&workspace, "canonical_snapshot");
+    let mut target = snapshot["issues"].as_array().unwrap().clone();
+    let shared = target
+        .iter()
+        .position(|row| row["id"] == "bd-shared")
+        .unwrap();
+    let control = target
+        .iter()
+        .position(|row| row["id"] == "bd-control")
+        .unwrap();
+    assert_eq!(target[shared]["comments"].as_array().unwrap().len(), 2);
+    assert_ne!(
+        target[shared]["comments"][0]["id"],
+        target[shared]["comments"][1]["id"]
+    );
+    for field in ["author", "text", "created_at"] {
+        assert_eq!(
+            target[shared]["comments"][0][field],
+            target[shared]["comments"][1][field]
+        );
+    }
+    let first_id = target[shared]["comments"][0]["id"].clone();
+    let other_id = target[control]["comments"][0]["id"].clone();
+    assert_ne!(first_id, other_id);
+    target[shared]["comments"][0]["id"] = other_id;
+    target[shared]["comments"][1]["id"] = Value::from(9001);
+    target[control]["comments"][0]["id"] = first_id;
+    let mut peer = serde_json::json!({
+        "id": "bd-sourceonly", "title": "Source-only issue", "status": "open",
+        "priority": 2, "issue_type": "task",
+        "created_at": IMPORT_FIXTURE_TIME, "updated_at": IMPORT_FIXTURE_TIME,
+        "dependencies": [{
+            "issue_id": "bd-sourceonly", "depends_on_id": "bd-shared",
+            "type": "blocks", "created_at": IMPORT_FIXTURE_TIME, "created_by": "peer",
+            "metadata": "{\"reason\":\"preserve source dependency\"}",
+            "thread_id": "source-dependency-thread"
+        }]
+    });
+    peer["comments"] = serde_json::json!([{
+        "id": 9002, "issue_id": "bd-sourceonly", "author": "peer",
+        "text": "Unread source-only comment", "created_at": IMPORT_FIXTURE_TIME
+    }]);
+    let source_path = workspace.root.join(".beads/issues.jsonl");
+    let mut source = jsonl_records(&source_path);
+    source.push(peer.clone());
+    write_jsonl_records(&source_path, &source);
+    // The unread source is part of the original observation, not an
+    // intervening file-only write that should invalidate its token.
+    let snapshot = guarded_snapshot(&workspace, "snapshot_with_source_only_facts");
+    target.push(peer);
+    let target_path = workspace.root.join(".beads/normalized.jsonl");
+    write_jsonl_records(&target_path, &target);
+    let before = guarded_database_state(&workspace);
+    assert!(!before["events"].is_empty());
+    assert!(!before["close_metadata"].is_empty());
+    let applied =
+        apply_guarded_snapshot(&workspace, &target_path, &snapshot, "apply_canonical_ids");
+    assert!(applied.status.success(), "{applied:?}");
+    let receipt: Value = serde_json::from_str(&extract_json_payload(&applied.stdout)).unwrap();
+    assert_eq!(receipt["schema_version"], 1);
+    assert_eq!(receipt["status"], "applied");
+    let after = guarded_database_state(&workspace);
+    for table in ["events", "config", "close_metadata"] {
+        assert_eq!(after[table], before[table], "changed local {table}");
+    }
+    let observed = guarded_snapshot(&workspace, "canonical_result");
+    for expected in &target {
+        let actual = observed["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == expected["id"])
+            .unwrap();
+        // Compare typed facts, not JSON omission/default conventions.
+        let expected: Issue = serde_json::from_value(expected.clone()).unwrap();
+        let actual: Issue = serde_json::from_value(actual.clone()).unwrap();
+        assert_eq!(actual.comments, expected.comments);
+        assert_eq!(actual.dependencies, expected.dependencies);
+    }
+    assert_eq!(observed["issues"].as_array().unwrap().len(), target.len());
+    let published = jsonl_records(&source_path);
+    for expected in &target {
+        let actual = published
+            .iter()
+            .find(|row| row["id"] == expected["id"])
+            .unwrap();
+        assert_eq!(actual["comments"], expected["comments"]);
+    }
+    assert_eq!(
+        fs::read(&source_path).unwrap(),
+        fs::read(workspace.root.join(".beads/beads.base.jsonl")).unwrap()
+    );
+}
+
+#[test]
+fn guarded_snapshot_rejects_missing_facts_and_malformed_targets_without_mutation() {
+    let workspace = guarded_snapshot_workspace();
+    let snapshot = guarded_snapshot(&workspace, "preservation_snapshot");
+    let original = snapshot["issues"].as_array().unwrap();
+    let path = workspace.root.join(".beads/normalized.jsonl");
+    for case in [
+        "missing_issue",
+        "missing_comment",
+        "duplicate_id",
+        "changed_payload",
+        "malformed",
+    ] {
+        let mut target = original.clone();
+        match case {
+            "missing_issue" => {
+                target.retain(|row| row["id"] != "bd-reopen");
+            }
+            "missing_comment" => {
+                target
+                    .iter_mut()
+                    .find(|row| row["id"] == "bd-shared")
+                    .unwrap()["comments"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+            }
+            "duplicate_id" => {
+                let row = target
+                    .iter_mut()
+                    .find(|row| row["id"] == "bd-shared")
+                    .unwrap();
+                row["comments"][1]["id"] = row["comments"][0]["id"].clone();
+            }
+            "changed_payload" => {
+                target
+                    .iter_mut()
+                    .find(|row| row["id"] == "bd-shared")
+                    .unwrap()["comments"][0]["text"] = Value::from("Erased original fact");
+            }
+            "malformed" => {}
+            _ => unreachable!(),
+        }
+        write_jsonl_records(&path, &target);
+        if case == "malformed" {
+            fs::write(&path, "{not valid JSON\n").unwrap();
+        }
+        let before = guarded_database_state(&workspace);
+        let witness = sync_witness(&workspace);
+        let target_before = fs::read(&path).unwrap();
+        let refused = apply_guarded_snapshot(&workspace, &path, &snapshot, case);
+        assert!(!refused.status.success(), "{case}: {refused:?}");
+        assert_eq!(guarded_database_state(&workspace), before, "{case}");
+        assert_eq!(sync_witness(&workspace), witness, "{case}");
+        assert_eq!(fs::read(&path).unwrap(), target_before, "{case}");
+    }
+}
+
+#[test]
+fn guarded_snapshot_rejects_omitted_source_only_issue_and_comment_before_commit() {
+    for missing in ["issue", "comment"] {
+        let workspace = guarded_snapshot_workspace();
+        let snapshot = guarded_snapshot(&workspace, "before_unread_source");
+        let target = workspace.root.join(".beads/normalized.jsonl");
+        write_jsonl_records(&target, snapshot["issues"].as_array().unwrap());
+        let source_path = workspace.root.join(".beads/issues.jsonl");
+        let mut source = jsonl_records(&source_path);
+        if missing == "issue" {
+            source.push(serde_json::json!({
+                "id": "bd-unread", "title": "Unimported source fact", "status": "open",
+                "priority": 2, "issue_type": "task",
+                "created_at": IMPORT_FIXTURE_TIME, "updated_at": IMPORT_FIXTURE_TIME
+            }));
+        } else {
+            source
+                .iter_mut()
+                .find(|row| row["id"] == "bd-shared")
+                .unwrap()["comments"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "id": 9002, "issue_id": "bd-shared", "author": "peer",
+                    "text": "Unread peer fact", "created_at": IMPORT_FIXTURE_TIME
+                }));
+        }
+        write_jsonl_records(&source_path, &source);
+        let snapshot = guarded_snapshot(&workspace, "snapshot_with_unread_source");
+        let before = guarded_database_state(&workspace);
+        let witness = sync_witness(&workspace);
+        let refused = apply_guarded_snapshot(&workspace, &target, &snapshot, missing);
+        assert!(!refused.status.success(), "{missing}: {refused:?}");
+        assert_eq!(guarded_database_state(&workspace), before, "{missing}");
+        assert_eq!(sync_witness(&workspace), witness, "{missing}");
+    }
+}
+
+#[test]
+fn guarded_snapshot_rejects_file_only_scalar_write_without_mutation() {
+    let workspace = guarded_snapshot_workspace();
+    let snapshot = guarded_snapshot(&workspace, "before_file_only_write");
+    let target = workspace.root.join(".beads/normalized.jsonl");
+    write_jsonl_records(&target, snapshot["issues"].as_array().unwrap());
+    let source_path = workspace.root.join(".beads/issues.jsonl");
+    let database_before_edit = guarded_database_state(&workspace);
+    let mut source = jsonl_records(&source_path);
+    source
+        .iter_mut()
+        .find(|row| row["id"] == "bd-shared")
+        .unwrap()["title"] = Value::from("Accepted file-only correction after snapshot");
+    write_jsonl_records(&source_path, &source);
+    assert_eq!(guarded_database_state(&workspace), database_before_edit);
+    let before = guarded_database_state(&workspace);
+    let witness = sync_witness(&workspace);
+    let target_before = fs::read(&target).unwrap();
+    let refused = apply_guarded_snapshot(&workspace, &target, &snapshot, "reject_file_only_write");
+    assert_sync_conflict(&refused);
+    assert_eq!(guarded_database_state(&workspace), before);
+    assert_eq!(sync_witness(&workspace), witness);
+    assert_eq!(fs::read(&target).unwrap(), target_before);
+    assert_eq!(
+        jsonl_record(&source_path, "bd-shared")["title"],
+        "Accepted file-only correction after snapshot"
+    );
+}
+
+#[test]
+fn guarded_snapshot_rejects_invalid_source_scalar_and_dangling_dependency_without_mutation() {
+    for case in ["invalid_scalar", "dangling_dependency"] {
+        let workspace = guarded_snapshot_workspace();
+        let source_path = workspace.root.join(".beads/issues.jsonl");
+        let original = jsonl_records(&source_path);
+        let target = workspace.root.join(".beads/normalized.jsonl");
+        write_jsonl_records(&target, &original);
+        let mut source = original;
+        let shared = source
+            .iter_mut()
+            .find(|row| row["id"] == "bd-shared")
+            .unwrap();
+        if case == "invalid_scalar" {
+            shared["title"] = Value::from("");
+        } else {
+            shared["dependencies"] = serde_json::json!([{
+                "issue_id": "bd-shared",
+                "depends_on_id": "bd-missing",
+                "type": "blocks",
+                "created_at": IMPORT_FIXTURE_TIME,
+                "created_by": "peer"
+            }]);
+        }
+        write_jsonl_records(&source_path, &source);
+        // This is not a stale-source test: the token witnesses the malformed
+        // source, so application must reject its semantics, not erase it.
+        let snapshot = guarded_snapshot(&workspace, "snapshot_with_invalid_source");
+        let before = guarded_database_state(&workspace);
+        let witness = sync_witness(&workspace);
+        let target_before = fs::read(&target).unwrap();
+        let refused = apply_guarded_snapshot(&workspace, &target, &snapshot, case);
+        assert!(!refused.status.success(), "{case}: {refused:?}");
+        assert_eq!(guarded_database_state(&workspace), before, "{case}");
+        assert_eq!(sync_witness(&workspace), witness, "{case}");
+        assert_eq!(fs::read(&target).unwrap(), target_before, "{case}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn guarded_snapshot_publication_interruption_resumes_through_merge_without_replaying_facts() {
+    use std::process::{Command, Stdio};
+
+    let workspace = guarded_snapshot_workspace();
+    let snapshot = guarded_snapshot(&workspace, "before_publication_interruption");
+    let mut target = snapshot["issues"].as_array().unwrap().clone();
+    let shared = target
+        .iter_mut()
+        .find(|row| row["id"] == "bd-shared")
+        .unwrap();
+    shared["title"] = Value::from("Committed guarded correction");
+    shared["comments"][0]["id"] = Value::from(9001);
+    shared["comments"][1]["id"] = Value::from(9002);
+    let target_path = workspace.root.join(".beads/normalized.jsonl");
+    write_jsonl_records(&target_path, &target);
+    let beads_dir = workspace.root.join(".beads");
+    let source_path = beads_dir.join("issues.jsonl");
+    let before = guarded_database_state(&workspace);
+    let source_before = fs::read(&source_path).unwrap();
+    let anchor_before = fs::read(beads_dir.join("beads.base.jsonl")).unwrap();
+    // Existing native saga fault affordance: reserve every PID-scoped
+    // create-new publication candidate while its writer waits for authority.
+    // Unlike chmod or sleeps, this also works under privileged test runners.
+    let lock = beads_rust::sync::blocking_write_lock(&beads_dir).unwrap();
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("br"));
+    command.current_dir(&workspace.root).args([
+        "sync",
+        "--apply-snapshot",
+        target_path.to_str().unwrap(),
+        "--expect-database-sha256",
+        snapshot["database_sha256"].as_str().unwrap(),
+        "--json",
+    ]);
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("BD_")
+            || name.starts_with("BEADS_")
+            || name.starts_with("BR_")
+            || matches!(name.as_ref(), "TOON_DEFAULT_FORMAT" | "TOON_STATS")
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("HOME", &workspace.root)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().expect("spawn guarded publication");
+    let pid = child.id();
+    let collision_paths = (0..64_u32)
+        .map(|attempt| {
+            let suffix = if attempt == 0 {
+                u64::from(pid)
+            } else {
+                u64::from(pid) * 100 + u64::from(attempt)
+            };
+            source_path.with_extension(format!("jsonl.{suffix}.tmp"))
+        })
+        .collect::<Vec<_>>();
+    for path in &collision_paths {
+        fs::write(path, b"retained publication collision\n").unwrap();
+    }
+    drop(lock);
+    let interrupted = child.wait_with_output().expect("collect interrupted apply");
+    let stdout = String::from_utf8_lossy(&interrupted.stdout);
+    let stderr = String::from_utf8_lossy(&interrupted.stderr);
+    fs::write(
+        workspace
+            .log_dir
+            .join("guarded_publication_interrupted.log"),
+        format!(
+            "status: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            interrupted.status
+        ),
+    )
+    .unwrap();
+    assert!(!interrupted.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("Failed to allocate pinned temporary export file"),
+        "must reach postcommit publication failure: {stdout}\n{stderr}"
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), source_before);
+    assert_eq!(
+        fs::read(beads_dir.join("beads.base.jsonl")).unwrap(),
+        anchor_before
+    );
+    let committed = guarded_database_state(&workspace);
+    for table in ["events", "config", "close_metadata"] {
+        assert_eq!(committed[table], before[table]);
+    }
+    let rows = database(&workspace)
+        .query("SELECT value FROM metadata WHERE key = 'sync_merge_pending_v2'")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let pending: Value =
+        serde_json::from_str(rows[0].get(0).and_then(SqliteValue::as_text).unwrap()).unwrap();
+    assert_eq!(pending["phase"], "database_committed");
+    assert_eq!(pending["intent"]["resolution"], "guarded-snapshot");
+    // Neither a stale apply nor a malformed apply may run ordinary startup's
+    // pending-saga recovery. Only the explicit merge below may publish it.
+    let malformed_path = beads_dir.join("malformed-normalized.jsonl");
+    fs::write(&malformed_path, "{malformed\n").unwrap();
+    let pending_witness = sync_witness(&workspace);
+    for (path, label) in [
+        (&target_path, "pending_stale_apply"),
+        (&malformed_path, "pending_malformed_apply"),
+    ] {
+        let refused = apply_guarded_snapshot(&workspace, path, &snapshot, label);
+        assert!(!refused.status.success(), "{label}: {refused:?}");
+        assert_eq!(guarded_database_state(&workspace), committed, "{label}");
+        assert_eq!(sync_witness(&workspace), pending_witness, "{label}");
+    }
+    let quarantine = workspace.root.join("retained-publication-collisions");
+    fs::create_dir(&quarantine).unwrap();
+    for (index, path) in collision_paths.iter().enumerate() {
+        assert_eq!(fs::read(path).unwrap(), b"retained publication collision\n");
+        fs::rename(path, quarantine.join(index.to_string())).unwrap();
+    }
+    let resumed = checked_br(
+        &workspace,
+        &["sync", "--merge", "--json"],
+        "resume_guarded_saga",
+    );
+    let receipt: Value = serde_json::from_str(&extract_json_payload(&resumed.stdout)).unwrap();
+    assert_eq!(receipt["receipt_id"], pending["receipt_id"]);
+    assert_eq!(receipt["status"], "resumed");
+    assert_eq!(receipt["phase_before"], "database_committed");
+    let after = guarded_database_state(&workspace);
+    for table in [
+        "issues",
+        "comments",
+        "dependencies",
+        "events",
+        "config",
+        "close_metadata",
+    ] {
+        assert_eq!(after[table], committed[table], "resume replayed {table}");
+    }
+    assert!(
+        database(&workspace)
+            .query("SELECT value FROM metadata WHERE key = 'sync_merge_pending_v2'")
+            .unwrap()
+            .is_empty()
+    );
+    let published = jsonl_record(&source_path, "bd-shared");
+    assert_eq!(published["title"], "Committed guarded correction");
+    assert_eq!(published["comments"].as_array().unwrap().len(), 2);
+    assert_eq!(published["comments"][0]["id"], 9001);
+    assert_eq!(published["comments"][1]["id"], 9002);
+    assert_eq!(
+        fs::read(&source_path).unwrap(),
+        fs::read(beads_dir.join("beads.base.jsonl")).unwrap()
+    );
 }
 
 fn assert_sync_conflict(result: &common::cli::BrRun) {

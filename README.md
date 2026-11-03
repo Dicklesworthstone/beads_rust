@@ -648,6 +648,8 @@ See the [migration reference](docs/CLI_REFERENCE.md#doctor) for eligibility and 
 | `sync` | Explicit DB ↔ JSONL modes | `br sync --flush-only` |
 | `sync --witness` | Read-only deterministic JSONL witness | `br sync --witness --robot` |
 | `sync --reconcile-additive` | Lossless exact-ID recovery plan/apply | `br sync --reconcile-additive --robot` |
+| `sync --snapshot` | Observational database snapshot and original-generation token | `br sync --snapshot --json` |
+| `sync --apply-snapshot` | Guarded in-place application of a complete derived JSONL | `br sync --apply-snapshot target.jsonl --expect-database-sha256 "$token" --json` |
 | `sync --migrate-source-repo-path` | Reconcile rows and normalize machine-specific source paths | `br sync --migrate-source-repo-path --robot` |
 | `doctor` | Run diagnostics | `br doctor` |
 | `doctor migrate-schema` | Plan/apply/undo an explicit receipt-bound schema upgrade | `br doctor migrate-schema plan --json` |
@@ -1099,6 +1101,34 @@ the JSONL hash is unchanged since the last import, and a following
 `br sync --flush-only` needs `--force` to write the renamed ids back out.
 
 If you want to preserve imported IDs exactly as-is, omit `--rename-prefix`.
+
+### Applying a derived snapshot without losing concurrent writes
+
+Integrations that must correct comment identities can use `br sync --snapshot
+--json` and derive a complete JSONL target from its `issues` array. Retain the
+original `database_sha256` and pass it to `br sync --apply-snapshot <target>
+--expect-database-sha256 <token> --json`. Targets outside `.beads` additionally
+require `--allow-external-jsonl`.
+
+The token binds the observed database and canonical JSONL generation. Do not
+take another snapshot merely to authorize an older target. Any intervening
+native write, including one already auto-exported, or source-file change makes
+the old token stale. On refusal, derive a new target from a fresh observation
+and reconcile it with the desired edits.
+
+Application preserves every existing issue and comment payload, including
+repeated identical comments, plus local audit events, close metadata and
+configuration. It permits deliberate scalar, label and dependency corrections
+and preserves the exact positive, globally unique comment IDs supplied in the
+target. Ordinary imports retain their database-local comment identity rules.
+Missing issue/comment facts, malformed records, dangling dependencies and
+tombstone resurrection are refused before commit. Neither operation rebuilds
+or migrates a missing, corrupt or old-schema database.
+
+Successful application publishes through the native recoverable sync transaction
+and returns a `SyncSnapshotApplyReceipt`. If publication is interrupted, resume
+with `br sync --merge`; do not replay a stale apply request. A snapshot is refused
+while this recovery is pending.
 
 ### Error: "Stale database"
 

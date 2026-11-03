@@ -27,7 +27,7 @@ use crate::format::{
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
-use crate::sync::AdditiveReconcileReceipt;
+use crate::sync::{AdditiveReconcileReceipt, SyncSnapshot, SyncSnapshotApplyReceipt};
 use crate::{config, output};
 use chrono::{DateTime, Utc};
 use schemars::{JsonSchema, Schema, generate::SchemaSettings};
@@ -218,6 +218,11 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
                 "AdditiveReconcileReceipt",
                 schema_for_output::<AdditiveReconcileReceipt>(),
             );
+            schemas.insert("SyncSnapshot", schema_for_output::<SyncSnapshot>());
+            schemas.insert(
+                "SyncSnapshotApplyReceipt",
+                schema_for_output::<SyncSnapshotApplyReceipt>(),
+            );
             schemas.insert(
                 "SourceRepoPathMigrationReceipt",
                 schema_for_output::<crate::cli::commands::sync::SourceRepoPathMigrationReceipt>(),
@@ -307,6 +312,7 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
     insert_dependency_command_shapes(&mut commands);
     insert_aggregate_command_shapes(&mut commands);
     insert_label_command_shapes(&mut commands);
+    insert_sync_command_shapes(&mut commands);
     commands.insert(
         "init",
         CommandShape {
@@ -319,36 +325,6 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
                 "Successful initialization receipt with resolved paths, stored prefix, and file outcomes. \
                  --force reuses existing issues and rewrites metadata; it does not reset the database. \
                  Structured errors are emitted on stdout.",
-            ),
-        },
-    );
-    commands.insert(
-        "sync --reconcile-additive",
-        CommandShape {
-            shape: "object",
-            jq_filter: ".",
-            items_at: None,
-            item_schema: Some("AdditiveReconcileReceipt"),
-            error_envelope_on_stderr: false,
-            notes: Some(
-                "Dry-run by default. Apply requires the exact plan_sha256 from an \
-                 identically configured reviewed dry-run via --expect-plan-sha256. \
-                 Structured machine-mode errors are currently emitted on stdout.",
-            ),
-        },
-    );
-    commands.insert(
-        "sync --migrate-source-repo-path",
-        CommandShape {
-            shape: "object",
-            jq_filter: ".",
-            items_at: None,
-            item_schema: Some("SourceRepoPathMigrationReceipt"),
-            error_envelope_on_stderr: false,
-            notes: Some(
-                "Read-only plan by default. Apply requires the exact plan_sha256 from an \
-                 identically configured reviewed dry-run via --expect-plan-sha256. Uses the \
-                 crash-recoverable sync publication saga and never probes Git.",
             ),
         },
     );
@@ -388,6 +364,68 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
     );
 
     commands
+}
+
+fn insert_sync_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
+    commands.insert(
+        "sync --reconcile-additive",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("AdditiveReconcileReceipt"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Dry-run by default. Apply requires the exact plan_sha256 from an \
+                 identically configured reviewed dry-run via --expect-plan-sha256. \
+                 Structured machine-mode errors are currently emitted on stdout.",
+            ),
+        },
+    );
+    commands.insert(
+        "sync --snapshot",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("SyncSnapshot"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Read-only current-schema database snapshot. Derive the target from issues \
+                 and retain this original database_sha256 for guarded application.",
+            ),
+        },
+    );
+    commands.insert(
+        "sync --apply-snapshot",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("SyncSnapshotApplyReceipt"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Requires the original --expect-database-sha256. Preserves existing issue \
+                 and comment facts and local audit; publishes through the existing sync \
+                 saga. Recover interrupted publication with sync --merge.",
+            ),
+        },
+    );
+    commands.insert(
+        "sync --migrate-source-repo-path",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("SourceRepoPathMigrationReceipt"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Read-only plan by default. Apply requires the exact plan_sha256 from an \
+                 identically configured reviewed dry-run via --expect-plan-sha256. Uses the \
+                 crash-recoverable sync publication saga and never probes Git.",
+            ),
+        },
+    );
 }
 
 fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {

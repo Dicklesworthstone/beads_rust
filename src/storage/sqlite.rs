@@ -22629,6 +22629,22 @@ impl SqliteStorage {
                             .to_string(),
                 });
             }
+            let guarded_snapshot = intent.resolution == "guarded-snapshot";
+            if guarded_snapshot {
+                if !deleted_ids.is_empty() || !notes.is_empty() {
+                    return Err(BeadsError::validation(
+                        "snapshot", "Guarded snapshots cannot delete issues or append merge notes",
+                    ));
+                }
+                let ids = storage.get_all_issues_metadata()?
+                    .into_iter().map(|issue| issue.id).collect::<Vec<_>>();
+                let mut existing = storage.get_issues_by_ids(&ids)?;
+                let mut comments = storage.get_all_comments()?;
+                for issue in &mut existing {
+                    issue.comments = comments.remove(&issue.id).unwrap_or_default();
+                }
+                crate::sync::validate_guarded_snapshot_target(&existing, kept)?;
+            }
 
             let mut changed_ids = kept
                 .iter()
@@ -22756,13 +22772,53 @@ impl SqliteStorage {
                 ImportSourceRepoPath::KeepLocal
             };
             for issue in kept {
-                storage
-                    .upsert_issue_for_import_with_source_repo_path_in_tx(issue, source_repo_path)?;
+                if guarded_snapshot && existing_by_id.contains_key(&issue.id) {
+                    // Snapshot normalization never replaces local closure
+                    // audit with portable defaults or caller-supplied audit.
+                    storage.update_issue_scalars_for_additive_reconcile_in_tx(issue)?;
+                } else if guarded_snapshot {
+                    let timestamps = ImportIssueTimestampStrings::from_issue(issue);
+                    storage.insert_issue_row_for_import(issue, &timestamps)?;
+                    // An orphaned local audit is still durable evidence, not
+                    // permission to overwrite it when its issue reappears.
+                    if storage.get_close_metadata(&issue.id)?.is_none() {
+                        storage.persist_imported_close_bypass_audit_in_tx(issue)?;
+                    }
+                } else {
+                    storage.upsert_issue_for_import_with_source_repo_path_in_tx(issue, source_repo_path)?;
+                }
+            }
+            if guarded_snapshot {
+                // All owners are cleared before insertion: a rowid swap is
+                // independent of issue order, unlike ordinary local-ID sync.
+                storage.delete_comments_for_import_issue_ids_in_tx(&actual_kept_ids)?;
             }
             for issue in kept {
                 storage.sync_labels_for_import_in_tx(&issue.id, &issue.labels)?;
                 storage.sync_dependencies_for_import_in_tx(&issue.id, &issue.dependencies)?;
-                storage.sync_comments_for_import_in_tx(&issue.id, &issue.comments)?;
+                if guarded_snapshot {
+                    for comment in &issue.comments {
+                        storage.insert_import_comment_with_id(
+                            &issue.id, comment, &comment.created_at.to_rfc3339(),
+                        )?;
+                    }
+                } else {
+                    storage.sync_comments_for_import_in_tx(&issue.id, &issue.comments)?;
+                }
+            }
+            if guarded_snapshot {
+                let comments = storage.get_comments_for_issues(&actual_kept_ids)?;
+                for issue in kept {
+                    let expected = issue.comments.iter().map(|comment| (comment.id, comment))
+                        .collect::<BTreeMap<_, _>>();
+                    let actual = comments.get(&issue.id).into_iter().flatten()
+                        .map(|comment| (comment.id, comment)).collect::<BTreeMap<_, _>>();
+                    if actual != expected {
+                        return Err(BeadsError::SyncConflict {
+                            message: format!("Exact snapshot comment IDs or payloads were not preserved for {}", issue.id),
+                        });
+                    }
+                }
             }
 
             for (issue_id, note) in notes {

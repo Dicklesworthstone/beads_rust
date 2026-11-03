@@ -1714,6 +1714,125 @@ fn dry_run_mutates_no_files_and_is_deterministic() {
 }
 
 #[test]
+fn guarded_snapshot_is_observational_with_unimported_source_and_dirty_database() {
+    let ws = BrWorkspace::new();
+    let (_, shared_id) = build_false_equal_workspace(&ws, "snapshot_observe");
+    let local = run_br(
+        &ws,
+        [
+            "comments",
+            "add",
+            &shared_id,
+            "Unflushed snapshot fact",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "snapshot_dirty_comment",
+    );
+    assert!(local.status.success(), "{local:?}");
+    let before = hash_files_under(&beads_dir(&ws));
+    let first = run_br(
+        &ws,
+        ["sync", "--snapshot", "--json"],
+        "snapshot_observe_first",
+    );
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(hash_files_under(&beads_dir(&ws)), before);
+    let snapshot = parse_json_value(&first.stdout);
+    assert_eq!(snapshot["schema_version"], 1);
+    let issues = snapshot["issues"].as_array().expect("snapshot issues");
+    assert_eq!(
+        issues.len(),
+        3,
+        "snapshot must not import the two source-only rows"
+    );
+    let shared = issues
+        .iter()
+        .find(|issue| issue["id"] == shared_id)
+        .unwrap();
+    assert!(
+        shared["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|comment| { comment["text"] == "Unflushed snapshot fact" })
+    );
+    let second = run_br(
+        &ws,
+        ["sync", "--snapshot", "--json"],
+        "snapshot_observe_second",
+    );
+    assert!(second.status.success(), "{second:?}");
+    assert_eq!(parse_json_value(&second.stdout), snapshot);
+    assert_eq!(hash_files_under(&beads_dir(&ws)), before);
+}
+
+#[test]
+fn guarded_snapshot_modes_never_rebuild_missing_or_corrupt_database() {
+    for corrupt in [false, true] {
+        let ws = BrWorkspace::new();
+        init_workspace(&ws, "snapshot_no_recovery");
+        create_issue(
+            &ws,
+            "Recoverable JSONL must remain untouched",
+            "snapshot_recovery_seed",
+        );
+        let snapshot = run_br(
+            &ws,
+            ["sync", "--snapshot", "--json"],
+            "snapshot_before_damage",
+        );
+        assert!(snapshot.status.success(), "{snapshot:?}");
+        let snapshot = parse_json_value(&snapshot.stdout);
+        let target = beads_dir(&ws).join("normalized.jsonl");
+        let bytes = snapshot["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&target, bytes).unwrap();
+        let retained = ws.root.join("retained-database-family");
+        fs::create_dir(&retained).unwrap();
+        for entry in fs::read_dir(beads_dir(&ws)).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with("beads.db") {
+                fs::rename(entry.path(), retained.join(entry.file_name())).unwrap();
+            }
+        }
+        if corrupt {
+            fs::write(db_path(&ws), b"not a SQLite database\n").unwrap();
+        }
+        let before = hash_files_under(&beads_dir(&ws));
+        let retained_before = hash_files_under(&retained);
+        for (label, args) in [
+            (
+                "snapshot_refuses_recovery",
+                vec!["sync", "--snapshot", "--json"],
+            ),
+            (
+                "apply_refuses_recovery",
+                vec![
+                    "sync",
+                    "--apply-snapshot",
+                    target.to_str().unwrap(),
+                    "--expect-database-sha256",
+                    snapshot["database_sha256"].as_str().unwrap(),
+                    "--json",
+                ],
+            ),
+        ] {
+            let result = run_br(&ws, args, label);
+            assert!(!result.status.success(), "{label}: {result:?}");
+            assert_eq!(hash_files_under(&beads_dir(&ws)), before, "{label}");
+            assert_eq!(hash_files_under(&retained), retained_before, "{label}");
+        }
+    }
+}
+
+#[test]
 fn apply_recovers_false_equal_state_without_touching_jsonl_or_events() {
     let ws = BrWorkspace::new();
     let (_, newer_shared_id) = build_false_equal_workspace(&ws, "recover");
@@ -2824,6 +2943,31 @@ fn ordinary_audit_import(ws: &BrWorkspace, label: &str) -> Value {
     parse_json_value(&import.stdout)
 }
 
+fn import_historical_unaudited_close(ws: &BrWorkspace, id: &str, label: &str) {
+    // Since #584, a real local close always records its actor in close_metadata.
+    // Import a historical closure instead: neither the import actor nor a later
+    // storage open may invent the audit evidence these tests deliberately lack.
+    let mut rows = import_audit_rows(ws);
+    let row = rows.get_mut(id).expect("historical closure source");
+    assert_eq!(row["status"], json!("open"));
+    let closed_at = json!(chrono::Utc::now());
+    row["status"] = json!("closed");
+    row["updated_at"] = closed_at.clone();
+    row["closed_at"] = closed_at;
+    write_import_audit_rows(ws, &rows);
+    let receipt = ordinary_audit_import(ws, label);
+    assert_eq!(receipt["created"], 0);
+    assert_eq!(receipt["updated"], 1);
+    assert!(
+        SqliteStorage::open(&db_path(ws))
+            .expect("open historical closure database")
+            .get_close_metadata(id)
+            .expect("read historical closure audit")
+            .is_none(),
+        "importing a historical closure must not invent local close audit"
+    );
+}
+
 fn assert_import_audit_export(ws: &BrWorkspace, expected: &Issue) {
     let mut expected = expected.clone();
     expected.source_repo_path = None;
@@ -2936,8 +3080,7 @@ fn ordinary_import_adopts_matching_skipped_audit_without_churning_noops() {
         "audit_skip_comment",
     );
     assert!(comment.status.success(), "{comment:?}");
-    let closed = run_br(&ws, ["close", &id], "audit_skip_close");
-    assert!(closed.status.success(), "{closed:?}");
+    import_historical_unaudited_close(&ws, &id, "audit_skip_close");
     let before = import_audit_issue(&ws, &id);
     assert!(
         SqliteStorage::open(&db_path(&ws))
@@ -3135,8 +3278,7 @@ fn ordinary_import_never_attaches_stale_close_audit_to_newer_local_state() {
         init_import_audit_workspace(&ws);
         let id = create_issue(&ws, "Closure before local changes", "audit_newer_create");
         let sibling = create_issue(&ws, "Publish preserved local state", "audit_newer_sibling");
-        let closed = run_br(&ws, ["close", &id], "audit_newer_close");
-        assert!(closed.status.success(), "{closed:?}");
+        import_historical_unaudited_close(&ws, &id, "audit_newer_close");
         let mut restored = import_audit_rows(&ws);
         add_source_bypass_audit(restored.get_mut(&id).unwrap());
         let changed = match local_change {
@@ -3155,6 +3297,14 @@ fn ordinary_import_never_attaches_stale_close_audit_to_newer_local_state() {
         };
         assert!(changed.status.success(), "{changed:?}");
         let local = import_audit_issue(&ws, &id);
+        assert!(
+            SqliteStorage::open(&db_path(&ws))
+                .unwrap()
+                .get_close_metadata(&id)
+                .unwrap()
+                .is_none(),
+            "{local_change} must leave the historical closure without local audit"
+        );
         let events = all_events_dump(&ws);
         write_import_audit_rows(&ws, &restored);
         let source = fs::read(jsonl_path(&ws)).unwrap();
@@ -4249,6 +4399,33 @@ fn restored_export_no_op_import_does_not_starve_concurrent_commands() {
         assert!(importer.0.try_wait().unwrap().is_none());
         assert!(held_lock(&workspace_lock));
         inode_blocker.verify_database_authority().unwrap();
+        // The alias exists only to acquire inode authority independently of
+        // this workspace. FrankenSQLite rejects a main database with multiple
+        // hard links during namespace admission, so remove the fixture alias
+        // before any queued command can open the live database. Unlinking it
+        // leaves the blocker's descriptor and inode lock held until drop.
+        #[cfg(unix)]
+        let database_before_unlink = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(db_path(&ws)).unwrap();
+            assert_eq!(metadata.nlink(), 2, "only the fixture alias is extra");
+            metadata
+        };
+        fs::remove_file(&alias).unwrap();
+        assert!(!alias.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(db_path(&ws)).unwrap();
+            assert_eq!(metadata.nlink(), 1, "engine admission requires one link");
+            assert_eq!(
+                (metadata.dev(), metadata.ino()),
+                (database_before_unlink.dev(), database_before_unlink.ino()),
+                "removing the fixture alias must preserve the database inode"
+            );
+        }
+        assert!(importer.0.try_wait().unwrap().is_none());
+        assert!(held_lock(&workspace_lock));
         drop(inode_blocker);
         let reader = reader.join().unwrap();
         let writer = writer.join().unwrap();

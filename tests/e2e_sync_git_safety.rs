@@ -405,6 +405,10 @@ fn e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation() {
             strings(&["sync", "--status", "--json"]),
         ),
         ("matrix_witness", strings(&["sync", "--witness", "--json"])),
+        (
+            "matrix_snapshot",
+            strings(&["sync", "--snapshot", "--json"]),
+        ),
     ] {
         let result = guarded_sync(&workspace, &sentinel_path, &sentinel_dir, &args, &[], label);
         assert!(
@@ -425,6 +429,85 @@ fn e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation() {
                 result.stdout
             );
         }
+    }
+
+    for external in [false, true] {
+        let snapshot = guarded_sync(
+            &workspace,
+            &sentinel_path,
+            &sentinel_dir,
+            &strings(&["sync", "--snapshot", "--json"]),
+            &[],
+            "matrix_original_snapshot",
+        );
+        assert!(snapshot.status.success(), "{snapshot:?}");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&extract_json_payload(&snapshot.stdout)).unwrap();
+        let target = if external {
+            workspace.root.join("external-normalized.jsonl")
+        } else {
+            workspace.root.join(".beads/normalized.jsonl")
+        };
+        let bytes = snapshot["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&target, bytes).unwrap();
+        let mut args = strings(&[
+            "sync",
+            "--apply-snapshot",
+            target.to_str().unwrap(),
+            "--expect-database-sha256",
+            snapshot["database_sha256"].as_str().unwrap(),
+            "--json",
+        ]);
+        if external {
+            let refused = guarded_sync(
+                &workspace,
+                &sentinel_path,
+                &sentinel_dir,
+                &args,
+                &[],
+                "matrix_snapshot_external_refused",
+            );
+            assert!(!refused.status.success(), "{refused:?}");
+            args.push("--allow-external-jsonl".to_string());
+        }
+        let mut no_db_apply = args.clone();
+        no_db_apply.push("--no-db".to_string());
+        for (label, no_db_args) in [
+            (
+                "matrix_no_db_snapshot_refused",
+                strings(&["sync", "--snapshot", "--json", "--no-db"]),
+            ),
+            ("matrix_no_db_snapshot_apply_refused", no_db_apply),
+        ] {
+            let refused = guarded_sync(
+                &workspace,
+                &sentinel_path,
+                &sentinel_dir,
+                &no_db_args,
+                &[],
+                label,
+            );
+            assert!(!refused.status.success(), "{label}: {refused:?}");
+        }
+        let applied = guarded_sync(
+            &workspace,
+            &sentinel_path,
+            &sentinel_dir,
+            &args,
+            &[],
+            "matrix_snapshot_apply",
+        );
+        assert!(applied.status.success(), "{applied:?}");
+        let receipt: serde_json::Value =
+            serde_json::from_str(&extract_json_payload(&applied.stdout)).unwrap();
+        assert_eq!(receipt["status"], "applied");
     }
 
     // These modes have distinct, supported JSONL-only implementations. A

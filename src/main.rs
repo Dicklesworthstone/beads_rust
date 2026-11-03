@@ -129,7 +129,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     // optimization and of automatic-sync flags (GH #585).
     let observational_startup = ctx.overrides.read_only_storage
         || matches!(cli.command, Commands::Doctor(_))
-        || matches!(&cli.command, Commands::Sync(args) if args.status || (args.reconcile && args.dry_run));
+        || matches!(&cli.command, Commands::Sync(args) if args.snapshot || args.apply_snapshot.is_some() || args.status || (args.reconcile && args.dry_run));
     let mut startup_recovery_lock = if storage_enabled
         && !observational_startup
         && (command_needs_write_lock

@@ -83,7 +83,7 @@ pub(crate) use path::{
 };
 
 use crate::error::{BeadsError, Result};
-use crate::model::{Comment, Dependency, DependencyType, Issue};
+use crate::model::{Comment, Dependency, DependencyType, Issue, Status};
 use crate::storage::sqlite::{ExportCloseBypassAudit, ImportCloseBypassAudit, ImportIssueLookup};
 use crate::storage::{EventAttribution, SqliteStorage};
 use crate::sync::history::HistoryConfig;
@@ -4658,7 +4658,12 @@ impl SyncMergePendingReceipt {
         }
         if !matches!(
             self.intent.resolution.as_str(),
-            "manual" | "force-db" | "force-jsonl" | "force-newer" | "source-repo-path-migration"
+            "manual"
+                | "force-db"
+                | "force-jsonl"
+                | "force-newer"
+                | "source-repo-path-migration"
+                | "guarded-snapshot"
         ) {
             return Err(BeadsError::SyncConflict {
                 message: format!(
@@ -5213,7 +5218,7 @@ fn additive_file_identity(path: &Path) -> Result<(u64, u64)> {
     )))
 }
 
-fn resolve_reviewed_additive_workspace(
+pub(crate) fn resolve_reviewed_additive_workspace(
     beads_dir: &Path,
     db_override: Option<&PathBuf>,
 ) -> Result<(PathBuf, PathBuf, PathBuf, (u64, u64))> {
@@ -5302,6 +5307,217 @@ fn resolve_reviewed_additive_workspace(
     }
     let identity = additive_file_identity(&canonical_database)?;
     Ok((canonical_beads, canonical_database, jsonl_path, identity))
+}
+
+/// Portable payload and token captured from one non-mutating database observation.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SyncSnapshot {
+    /// Snapshot response version, currently 1.
+    pub schema_version: u32,
+    /// Lowercase SHA-256 binding the complete logical database and its authority.
+    pub database_sha256: String,
+    /// Every issue, including tombstones, with portable comments and relations.
+    pub issues: Vec<Issue>,
+}
+
+/// Successful guarded application, emitted only after saga finalization.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SyncSnapshotApplyReceipt {
+    /// Application response version, currently 1.
+    pub schema_version: u32,
+    /// `applied`: database and canonical JSONL publication have both finalized.
+    pub status: String,
+    /// Identifier of the completed native merge publication saga.
+    pub receipt_id: String,
+}
+
+/// Bind the complete logical database and canonical JSONL generation to their
+/// original authority. A target-derived plan is never an authorization token.
+pub(crate) fn snapshot_database_sha256(
+    beads_dir: &Path,
+    database_path: &Path,
+    jsonl_path: &Path,
+    source: Option<&JsonlSourceSnapshot>,
+    witness: &AdditiveDatabaseWitness,
+) -> Result<String> {
+    sync_merge_domain_separated_sha256(
+        "beads-rust.guarded-snapshot.v1",
+        &(
+            canonical_sync_path_sha256(beads_dir),
+            additive_path_identity_sha256(beads_dir, "workspace")?,
+            canonical_sync_path_sha256(database_path),
+            additive_file_identity(database_path)?,
+            database_write_authority_sha256(database_path)?,
+            canonical_sync_path_sha256(jsonl_path),
+            source.map_or(
+                JsonlSourceStateWitness::Missing,
+                JsonlSourceSnapshot::state_witness,
+            ),
+            source.map(JsonlSourceSnapshot::content_sha256),
+            witness,
+        ),
+        "guarded database snapshot",
+    )
+}
+
+/// The immutable current-schema opener must never fall back to repair/migration.
+pub(crate) fn capture_guarded_snapshot(
+    beads_dir: &Path,
+    database_path: &Path,
+    jsonl_path: &Path,
+) -> Result<(SyncSnapshot, AdditiveDatabaseWitness)> {
+    let source = capture_optional_jsonl_source(jsonl_path)?;
+    let identity_before = additive_file_identity(database_path)?;
+    let storage =
+        SqliteStorage::open_current_read_only_snapshot(database_path)?.ok_or_else(|| {
+            BeadsError::Config(
+                "Guarded snapshots require an existing current-schema database".to_string(),
+            )
+        })?;
+    // This storage is a private immutable copy. Inspecting its pending receipt
+    // before the payload transaction is coherent and avoids a nested BEGIN.
+    if storage.pending_sync_merge_receipt()?.is_some() {
+        return Err(BeadsError::SyncConflict {
+            message: "Resume the pending sync merge before taking or applying a snapshot"
+                .to_string(),
+        });
+    }
+    let result = storage.with_read_transaction(|storage| {
+        refuse_import_with_existing_orphans(storage)?;
+        let database = hydrate_additive_database_issues(storage)?;
+        let witness = additive_database_witness(storage, &database)?;
+        let mut issues = database.into_values().collect::<Vec<_>>();
+        storage.attach_close_bypass_audit_for_export(&mut issues)?;
+        for issue in &mut issues {
+            normalize_issue_for_export(issue);
+        }
+        let database_sha256 = snapshot_database_sha256(
+            beads_dir,
+            database_path,
+            jsonl_path,
+            source.as_ref(),
+            &witness,
+        )?;
+        Ok((
+            SyncSnapshot {
+                schema_version: 1,
+                database_sha256,
+                issues,
+            },
+            witness,
+        ))
+    })?;
+    if additive_file_identity(database_path)? != identity_before {
+        return Err(BeadsError::SyncConflict {
+            message: "Database identity changed during snapshot capture".to_string(),
+        });
+    }
+    Ok(result)
+}
+
+/// Guarded snapshots preserve every existing issue and comment fact, including
+/// multiplicity. Row IDs may change only in this explicit operation.
+pub(crate) fn validate_guarded_snapshot_target(existing: &[Issue], target: &[Issue]) -> Result<()> {
+    let targets = target
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue))
+        .collect::<BTreeMap<_, _>>();
+    if targets.len() != target.len() {
+        return Err(BeadsError::validation(
+            "snapshot",
+            "Duplicate target issue IDs",
+        ));
+    }
+    let mut comment_ids = BTreeSet::new();
+    for issue in target {
+        validate_guarded_snapshot_issue(issue, &targets)?;
+        for comment in &issue.comments {
+            if comment.id <= 0 || !comment_ids.insert(comment.id) {
+                return Err(BeadsError::validation(
+                    "comments",
+                    "Target comment IDs must be positive, globally unique, and owned by their enclosing issue",
+                ));
+            }
+        }
+    }
+    for issue in existing {
+        validate_guarded_snapshot_issue(issue, &targets)?;
+        let replacement = targets.get(issue.id.as_str()).ok_or_else(|| {
+            BeadsError::validation(
+                "snapshot",
+                format!("Target omits existing issue {}", issue.id),
+            )
+        })?;
+        if issue.status == Status::Tombstone && replacement.status != Status::Tombstone {
+            return Err(BeadsError::validation(
+                "snapshot",
+                "Target cannot resurrect an existing tombstone",
+            ));
+        }
+        let mut payload_counts = BTreeMap::new();
+        for comment in &replacement.comments {
+            *payload_counts
+                .entry((&comment.author, &comment.body, comment.created_at))
+                .or_insert(0usize) += 1;
+        }
+        for comment in &issue.comments {
+            let count =
+                payload_counts.get_mut(&(&comment.author, &comment.body, comment.created_at));
+            match count {
+                Some(count) if *count > 0 => *count -= 1,
+                _ => {
+                    return Err(BeadsError::validation(
+                        "comments",
+                        format!("Target omits an existing comment payload for {}", issue.id),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_guarded_snapshot_issue(issue: &Issue, targets: &BTreeMap<&str, &Issue>) -> Result<()> {
+    if let Err(errors) = IssueValidator::validate(issue) {
+        return Err(BeadsError::validation(
+            "snapshot",
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    for comment in &issue.comments {
+        if comment.issue_id != issue.id {
+            return Err(BeadsError::validation(
+                "comments",
+                "Comment has a mismatched issue owner",
+            ));
+        }
+        if let Err(errors) = CommentValidator::validate(comment) {
+            return Err(BeadsError::validation(
+                "comments",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+    }
+    for dependency in &issue.dependencies {
+        if dependency.issue_id != issue.id
+            || (!dependency.depends_on_id.starts_with("external:")
+                && !targets.contains_key(dependency.depends_on_id.as_str()))
+        {
+            return Err(BeadsError::validation(
+                "dependencies",
+                "Dependency has a mismatched owner or dangling reference",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build a reviewed additive plan without creating, migrating, repairing, or
@@ -15925,7 +16141,7 @@ fn import_orphan_predicate(table: &str, column: &str) -> String {
 /// them later through relation replacement or the global orphan-cleanup pass.
 /// Run inside the import transaction before its first mutation so concurrent
 /// changes cannot introduce an unreviewed cleanup between this check and apply.
-fn refuse_automatic_import_with_existing_orphans(storage: &SqliteStorage) -> Result<()> {
+fn refuse_import_with_existing_orphans(storage: &SqliteStorage) -> Result<()> {
     let mut retained = Vec::new();
     for &(table, column) in IMPORT_ORPHAN_REFERENCES {
         let predicate = import_orphan_predicate(table, column);
@@ -15955,7 +16171,7 @@ fn refuse_automatic_import_with_existing_orphans(storage: &SqliteStorage) -> Res
     }
     Err(BeadsError::SyncConflict {
         message: format!(
-            "Automatic import refused: existing database records reference missing issues ({}); \
+            "Import refused: existing database records reference missing issues ({}); \
              no import was applied and these records were retained. Preserve the database and \
              inspect it with `br doctor --json` before deciding how to reconcile the missing \
              issues. Explicit cleanup can permanently delete these records, including event \
@@ -17060,7 +17276,7 @@ fn import_from_jsonl_snapshot_impl(
     let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
         if mode == ImportMode::Automatic {
             refuse_automatic_import_with_displaced_issue_ids(&collision_plan)?;
-            refuse_automatic_import_with_existing_orphans(storage)?;
+            refuse_import_with_existing_orphans(storage)?;
         }
         // One query proves that no owned relation rows (labels, dependencies,
         // comments) exist anywhere yet. When it holds, every inserted issue
@@ -31951,13 +32167,7 @@ mod tests {
                 None,
             )
             .unwrap_err();
-            let message = error.to_string();
-            assert!(message.contains("Automatic import refused:"), "{message}");
-            assert!(message.contains(diagnostic), "{message}");
-            assert!(
-                message.contains("Explicit cleanup can permanently delete"),
-                "{message}"
-            );
+            assert!(matches!(&error, BeadsError::SyncConflict { .. }), "{error}");
             assert_eq!(raw_import_refusal_state(&storage), before, "{diagnostic}");
             assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
             assert_eq!(
