@@ -21,6 +21,10 @@ import tempfile
 import unittest
 from unittest import mock
 
+# Restoring a missing SHM refuses a group-writable database by design, so a host
+# default of umask 002 would fail these fixtures for a reason they do not test.
+os.umask(0o022)
+
 from test_wal_recovery_resume import make_orphan, family, identity, evidence_bytes, EXPECTED, QUERY
 from test_wal_recovery_resume import recovery, interrupt_restore
 

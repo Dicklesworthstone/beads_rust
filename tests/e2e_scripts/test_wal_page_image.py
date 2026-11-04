@@ -21,6 +21,10 @@ import tempfile
 import unittest
 from unittest import mock
 
+# Restoring a missing SHM refuses a group-writable database by design, so a host
+# default of umask 002 would fail these fixtures for a reason they do not test.
+os.umask(0o022)
+
 SCRIPT = Path(__file__).resolve().parents[2] / 'scripts' / 'recover_orphaned_wal.py'
 SPEC = importlib.util.spec_from_file_location('pager_image_recovery', SCRIPT)
 recovery = importlib.util.module_from_spec(SPEC)
