@@ -3664,7 +3664,9 @@ fn e2e_simultaneous_claim_processes_have_one_winner() {
         if !output.status.success() {
             assert_eq!(output.status.code(), Some(4), "{output:?}");
             let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(error["error"]["code"], "VALIDATION_FAILED");
+            assert_eq!(error["error"]["code"], "CLAIM_CONFLICT");
+            assert_eq!(error["error"]["retryable"], false);
+            assert_eq!(error["error"]["context"]["actual_assignee"], winner);
             assert!(
                 error["error"]["message"]
                     .as_str()

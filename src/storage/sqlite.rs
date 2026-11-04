@@ -1,5 +1,9 @@
 //! `SQLite` storage implementation.
 
+use crate::coordination::{
+    ClaimAssessment, ClaimAssessmentInput, ClaimReclaimGuard, assess_claim,
+    reclaim_allowed_by_policy, reclaim_audit_message,
+};
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
@@ -329,6 +333,10 @@ struct CapacityBatchTransition {
     /// Assignee after this mutation commits. Only assignee-scope counting
     /// reads this.
     prospective_assignee: Option<String>,
+    /// A guarded reclaim transfers existing occupancy to a new owner even
+    /// when its status stays the same. Ordinary updates keep their existing
+    /// status-transition admission semantics.
+    ownership_handoff: bool,
 }
 
 /// The acting attribution one CLI mutation carries into capacity-scope
@@ -6131,6 +6139,7 @@ impl SqliteStorage {
             issue_type: issue_type.map(ToString::to_string),
             current_assignee: assignee.current.map(ToString::to_string),
             prospective_assignee: assignee.prospective.map(ToString::to_string),
+            ownership_handoff: false,
         }];
         Self::evaluate_workflow_capacity_batch_in_tx(conn, policy, &transitions, acting)
     }
@@ -6616,6 +6625,28 @@ impl SqliteStorage {
             }
         };
 
+        let changes_partition = |transition: &CapacityBatchTransition| {
+            transition.ownership_handoff && enter_key(transition) != drain_key(transition)
+        };
+        let enters_scope = |transition: &CapacityBatchTransition| {
+            Self::transition_enters_capacity(transition, check.members)
+                || (changes_partition(transition)
+                    && check
+                        .members
+                        .iter()
+                        .any(|status| status.eq_ignore_ascii_case(&transition.to)))
+        };
+        let drains_scope = |transition: &CapacityBatchTransition| {
+            Self::transition_drains_capacity(transition, check.members)
+                || (changes_partition(transition)
+                    && transition.from.as_deref().is_some_and(|from| {
+                        check
+                            .members
+                            .iter()
+                            .any(|status| status.eq_ignore_ascii_case(from))
+                    }))
+        };
+
         // Partition keys that gain occupancy from this batch. For the acting
         // scopes this is at most the single acting key; for assignee/subtree
         // it is the distinct keys of entering transitions.
@@ -6624,7 +6655,7 @@ impl SqliteStorage {
             if is_exempt(&transition.issue_id) {
                 continue;
             }
-            if Self::transition_enters_capacity(transition, check.members)
+            if enters_scope(transition)
                 && let Some(key) = enter_key(transition)
                 && !candidate_keys.contains(&key)
             {
@@ -6654,14 +6685,14 @@ impl SqliteStorage {
                 if is_exempt(&transition.issue_id) {
                     continue;
                 }
-                if Self::transition_enters_capacity(transition, check.members)
+                if enters_scope(transition)
                     && enter_key(transition).as_deref() == Some(key.as_str())
                 {
                     prospective += 1;
                     if blamed.is_none() {
                         blamed = Some(transition);
                     }
-                } else if Self::transition_drains_capacity(transition, check.members)
+                } else if drains_scope(transition)
                     && drain_key(transition).as_deref() == Some(key.as_str())
                     && population.contains(&transition.issue_id)
                 {
@@ -7974,6 +8005,11 @@ impl SqliteStorage {
             let capacity_policy = self.workflow_capacity_policy.clone();
             let workflow_policy = self.workflow_transition_policy.clone();
             self.mutate("update_issues_atomically", actor, |conn, ctx| {
+                // Reclaims bind ownership and the issue revision before any
+                // workflow check, so a competing claim keeps its meaningful
+                // contention diagnostic. Derive the audit again on each retry.
+                let reclaim_updates = Self::prepare_reclaim_updates_in_tx(conn, updates, actor)?;
+                let updates = reclaim_updates.as_deref().unwrap_or(updates);
                 let mut transitions = Vec::new();
                 for (id, update) in updates {
                     let issue = Self::get_issue_from_conn(conn, id)?
@@ -7985,7 +8021,7 @@ impl SqliteStorage {
                         });
                     }
                     if let Some(status) = &update.status
-                        && issue.status != *status
+                        && (issue.status != *status || update.reclaim.is_some())
                     {
                         transitions.push(CapacityBatchTransition {
                             issue_id: id.clone(),
@@ -8000,6 +8036,7 @@ impl SqliteStorage {
                                 Some(prospective) => prospective.clone(),
                                 None => issue.assignee.clone(),
                             },
+                            ownership_handoff: update.reclaim.is_some(),
                         });
                     }
                 }
@@ -8118,6 +8155,109 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Prepare the audit that also satisfies a reclaim's workflow transition.
+    /// Ordinary updates borrow their existing batch without cloning it.
+    fn prepare_reclaim_updates_in_tx(
+        conn: &Connection,
+        updates: &[(String, IssueUpdate)],
+        actor: &str,
+    ) -> Result<Option<Vec<(String, IssueUpdate)>>> {
+        if !updates.iter().any(|(_, update)| update.reclaim.is_some()) {
+            return Ok(None);
+        }
+
+        let mut prepared = updates.to_vec();
+        for (id, update) in &mut prepared {
+            if update.reclaim.is_none() {
+                continue;
+            }
+            let issue = Self::get_issue_from_conn(conn, id)?
+                .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
+            if let Some(assessment) = Self::validate_reclaim_guard(&issue, update, actor)? {
+                update.transition_comment = (issue.status != Status::InProgress)
+                    .then(|| reclaim_audit_message(&assessment));
+            }
+        }
+        Ok(Some(prepared))
+    }
+
+    /// Verify the complete ownership authorization inside the write transaction.
+    /// A `ClaimReclaimGuard` never disables normal claim-target or policy gates.
+    fn validate_reclaim_guard(
+        issue: &Issue,
+        updates: &IssueUpdate,
+        actor: &str,
+    ) -> Result<Option<ClaimAssessment>> {
+        let Some(guard) = updates.reclaim.as_ref() else {
+            return Ok(None);
+        };
+        if actor.trim().is_empty()
+            || guard.expected_assignee.trim().is_empty()
+            || !updates.expect_unassigned
+            || updates.claim_actor.as_deref() != Some(actor)
+            || updates.assignee.as_ref().and_then(Option::as_deref) != Some(actor)
+            || updates.status != Some(Status::InProgress)
+            || updates.expect_updated_at != Some(guard.expected_updated_at)
+            || updates.workflow_policy_bypass_reason.is_some()
+        {
+            return Err(BeadsError::validation(
+                "reclaim",
+                "a reclaim requires a named new actor, guarded old ownership and revision, \
+                 an in_progress assignment to that actor, and no workflow-policy bypass",
+            ));
+        }
+
+        let current_owner = issue.assignee.as_deref().map(str::trim);
+        if current_owner != Some(guard.expected_assignee.trim())
+            || issue.updated_at != guard.expected_updated_at
+        {
+            return Err(BeadsError::claim_conflict(
+                &issue.id,
+                Some(&guard.expected_assignee),
+                current_owner,
+                Some(guard.expected_updated_at),
+                Some(issue.updated_at),
+            ));
+        }
+        if guard
+            .expected_assignee
+            .trim()
+            .eq_ignore_ascii_case(actor.trim())
+        {
+            return Err(BeadsError::validation(
+                "reclaim",
+                "the reclaiming actor must differ from the previous owner",
+            ));
+        }
+
+        let now = Utc::now();
+        Self::validate_claim_target(issue, now)?;
+        if issue.status == Status::Pinned {
+            return Err(BeadsError::validation(
+                "reclaim",
+                format!("cannot reclaim pinned issue {}", issue.id),
+            ));
+        }
+        let assessment = assess_claim(ClaimAssessmentInput {
+            assignee: issue.assignee.clone(),
+            updated_at: issue.updated_at,
+            now,
+            owner_kind: guard.owner_kind,
+            reservation: guard.reservation.clone(),
+        });
+        if !reclaim_allowed_by_policy(&assessment) {
+            return Err(BeadsError::validation_with_hint(
+                "reclaim",
+                format!(
+                    "issue {} is not eligible for reclaim: {:?} ({:?})",
+                    issue.id, assessment.classification, assessment.owner_kind
+                ),
+                "Refresh coordination snapshots and inspect the current owner before generating new reclaim advice.",
+            ));
+        }
+        Ok(Some(assessment))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn update_issue_in_tx(
         conn: &Connection,
@@ -8138,6 +8278,8 @@ impl SqliteStorage {
             );
             BeadsError::IssueNotFound { id: id.to_string() }
         })?;
+
+        let reclaim_assessment = Self::validate_reclaim_guard(&issue, updates, actor)?;
 
         if issue.status == Status::Tombstone {
             return Err(BeadsError::Validation {
@@ -8168,30 +8310,63 @@ impl SqliteStorage {
         if updates.expect_unassigned {
             Self::validate_claim_target(&issue, Utc::now())?;
             let row = conn.query_row_with_params(
-                "SELECT assignee, status, defer_until FROM issues WHERE id = ?",
+                "SELECT assignee, status, defer_until, updated_at FROM issues WHERE id = ?",
                 &[SqliteValue::from(id)],
             )?;
             let current_assignee = row.get(0).and_then(SqliteValue::as_text);
+            let trimmed = current_assignee.map(str::trim).filter(|s| !s.is_empty());
+            if let Some(guard) = updates.reclaim.as_ref() {
+                let observed_updated_at = parse_datetime_value(row.get(3))?;
+                // Retain the validated original tuple, never a silently
+                // refreshed owner/revision from the predicate-building read.
+                if trimmed != Some(guard.expected_assignee.trim())
+                    || observed_updated_at != guard.expected_updated_at
+                    || row.get(1).and_then(SqliteValue::as_text) != Some(issue.status.as_str())
+                    || parse_opt_datetime_value(row.get(2))? != issue.defer_until
+                {
+                    return Err(BeadsError::claim_conflict(
+                        id,
+                        Some(&guard.expected_assignee),
+                        trimmed,
+                        Some(guard.expected_updated_at),
+                        Some(observed_updated_at),
+                    ));
+                }
+            }
             claim_state = Some((
                 row.get(0).cloned().unwrap_or(SqliteValue::Null),
                 row.get(1).cloned().unwrap_or(SqliteValue::Null),
                 row.get(2).cloned().unwrap_or(SqliteValue::Null),
+                row.get(3).cloned().unwrap_or(SqliteValue::Null),
             ));
-            let trimmed = current_assignee.map(str::trim).filter(|s| !s.is_empty());
             let claim_actor = updates.claim_actor.as_deref().unwrap_or("");
 
             match trimmed {
+                Some(_) if reclaim_assessment.is_some() => {
+                    // The exact previous owner and revision passed the guarded
+                    // handoff check above; no unassigned interval is needed.
+                }
                 None => { /* unassigned, proceed with claim */ }
                 Some(current) if !updates.claim_exclusive && current == claim_actor => {
                     /* same actor re-claim, idempotent */
                 }
                 Some(current) => {
-                    return Err(BeadsError::validation(
-                        "claim",
-                        format!("issue {id} already assigned to {current}"),
+                    return Err(BeadsError::claim_conflict(
+                        id,
+                        None,
+                        Some(current),
+                        updates.expect_updated_at,
+                        Some(issue.updated_at),
                     ));
                 }
             }
+        }
+
+        if let Some(assessment) = reclaim_assessment.as_ref() {
+            let audit = reclaim_audit_message(assessment);
+            validate_new_comment(id, actor, &audit)?;
+            insert_comment_row(conn, id, actor, &audit)?;
+            ctx.record_event(EventType::Commented, id, Some(audit));
         }
 
         let mut set_clauses: Vec<String> = vec![];
@@ -8265,7 +8440,9 @@ impl SqliteStorage {
                     None,
                 );
 
-                if let Some(comment) = updates.transition_comment.as_deref() {
+                if updates.reclaim.is_none()
+                    && let Some(comment) = updates.transition_comment.as_deref()
+                {
                     let comment = comment.trim();
                     validate_new_comment(id, actor, comment)?;
                     insert_comment_row(conn, id, actor, comment)?;
@@ -8583,14 +8760,17 @@ impl SqliteStorage {
         // if two writers both observed the row as unassigned earlier.
         let mut where_clause = "id = ?".to_string();
         params.push(SqliteValue::from(id));
-        if let Some((assignee, status, defer_until)) = claim_state {
+        if let Some((assignee, status, defer_until, observed_updated_at)) = claim_state {
             // Compare exactly what passed the Rust eligibility/assignment
             // checks. This preserves whitespace handling and RFC3339 offsets
             // without a second, subtly different SQL interpretation.
-            where_clause.push_str(" AND assignee IS ? AND status = ? AND defer_until IS ?");
+            where_clause.push_str(
+                " AND assignee IS ? AND status = ? AND defer_until IS ? AND updated_at = ?",
+            );
             params.push(assignee);
             params.push(status);
             params.push(defer_until);
+            params.push(observed_updated_at);
         }
 
         let sql = format!(
@@ -8600,34 +8780,16 @@ impl SqliteStorage {
         let updated_rows = conn.execute_with_params(&sql, &params)?;
         if updated_rows == 0 {
             if updates.expect_unassigned {
-                if let Some(current) = Self::get_issue_from_conn(conn, id)? {
-                    Self::validate_claim_target(&current, Utc::now())?;
-                }
-                let current_assignee = match conn.query_row_with_params(
-                    "SELECT assignee FROM issues WHERE id = ?",
-                    &[SqliteValue::from(id)],
-                ) {
-                    Ok(row) => row
-                        .get(0)
-                        .and_then(SqliteValue::as_text)
-                        .map(String::from)
-                        .and_then(|assignee| {
-                            let trimmed = assignee.trim().to_string();
-                            (!trimmed.is_empty()).then_some(trimmed)
-                        })
-                        .unwrap_or_else(|| "<unknown>".to_string()),
-                    Err(FrankenError::QueryReturnedNoRows) => "<unknown>".to_string(),
-                    Err(error) => return Err(error.into()),
-                };
-                return Err(BeadsError::validation(
-                    "claim",
-                    if current_assignee == "<unknown>" {
-                        format!(
-                            "claim preconditions changed for issue {id}; reload it before claiming"
-                        )
-                    } else {
-                        format!("issue {id} already assigned to {current_assignee}")
-                    },
+                let current = Self::get_issue_from_conn(conn, id)?;
+                return Err(BeadsError::claim_conflict(
+                    id,
+                    updates
+                        .reclaim
+                        .as_ref()
+                        .map(|guard| guard.expected_assignee.as_str()),
+                    current.as_ref().and_then(|issue| issue.assignee.as_deref()),
+                    updates.expect_updated_at,
+                    current.as_ref().map(|issue| issue.updated_at),
                 ));
             }
 
@@ -20148,6 +20310,10 @@ pub struct IssueUpdate {
     pub claim_exclusive: bool,
     /// The actor performing the claim (used for idempotent same-actor check).
     pub claim_actor: Option<String>,
+    /// Guarded abandoned-claim transfer, bound to the previous owner and
+    /// revision. Storage reevaluates its policy evidence and writes its audit
+    /// atomically with assignment; this never authorizes an unguarded claim.
+    pub reclaim: Option<ClaimReclaimGuard>,
     /// Optimistic-concurrency precondition: the `updated_at` the caller read
     /// before composing this update (GitHub #500).
     ///
@@ -20195,6 +20361,7 @@ impl IssueUpdate {
             && self.transition_comment.is_none()
             && self.workflow_policy_bypass_reason.is_none()
             && !self.expect_unassigned
+            && self.reclaim.is_none()
             // A precondition is not a field change, but it must still be
             // *checked*, and the only place that happens is inside the write
             // transaction this flag gates (GitHub #500). Reporting such an
@@ -22671,6 +22838,7 @@ impl SqliteStorage {
                             .get(&issue.id)
                             .and_then(|existing| existing.assignee.clone()),
                         prospective_assignee: issue.assignee.clone(),
+                        ownership_handoff: false,
                     });
                 }
             }
@@ -22687,6 +22855,7 @@ impl SqliteStorage {
                         issue_type: None,
                         current_assignee: tombstone.assignee.clone(),
                         prospective_assignee: tombstone.assignee.clone(),
+                        ownership_handoff: false,
                     });
                 }
             }
@@ -31177,6 +31346,319 @@ required_fields:
                     .unwrap()
             )
         })
+    }
+
+    fn reclaim_update(issue: &Issue, actor: &str) -> IssueUpdate {
+        IssueUpdate {
+            status: Some(Status::InProgress),
+            assignee: Some(Some(actor.to_string())),
+            expect_unassigned: true,
+            claim_actor: Some(actor.to_string()),
+            expect_updated_at: Some(issue.updated_at),
+            reclaim: Some(ClaimReclaimGuard {
+                expected_assignee: issue.assignee.clone().expect("assigned reclaim fixture"),
+                expected_updated_at: issue.updated_at,
+                owner_kind: crate::coordination::ClaimOwnerKind::SwarmAgent,
+                reservation: crate::coordination::ReservationEvidence::NoReservation,
+            }),
+            ..IssueUpdate::default()
+        }
+    }
+
+    fn abandoned_issue(id: &str, status: Status) -> Issue {
+        make_issue(
+            id,
+            "Abandoned work",
+            status,
+            2,
+            Some("OldAgent"),
+            Utc::now() - chrono::Duration::hours(10),
+            None,
+        )
+    }
+
+    #[test]
+    fn reclaim_records_one_audit_before_ownership_and_replay_is_a_conflict() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = abandoned_issue("bd-reclaim-audit", Status::InProgress);
+        storage.create_issue(&issue, "OldAgent").unwrap();
+        let update = reclaim_update(&issue, "NewAgent");
+        let transferred = storage
+            .update_issue(&issue.id, &update, "NewAgent")
+            .unwrap();
+        assert_eq!(transferred.assignee.as_deref(), Some("NewAgent"));
+        assert_eq!(transferred.status, Status::InProgress);
+        assert!(transferred.updated_at > issue.updated_at);
+        let comments = storage.get_comments(&issue.id).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].author, "NewAgent");
+        assert!(comments[0].body.starts_with("reclaim:"));
+        assert!(comments[0].body.contains("assignee=OldAgent"));
+        assert!(
+            comments[0]
+                .body
+                .contains("reservation_status=no_reservation")
+        );
+        let events = storage
+            .conn
+            .query_with_params(
+                "SELECT event_type, actor FROM events WHERE issue_id = ? ORDER BY id",
+                &[SqliteValue::from(issue.id.as_str())],
+            )
+            .unwrap();
+        let event_types = events
+            .iter()
+            .map(|row| row.get(0).and_then(SqliteValue::as_text).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(event_types, ["created", "commented", "assignee_changed"]);
+        for row in &events[1..] {
+            assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some("NewAgent"));
+        }
+        let before_replay = label_update_rows(&storage);
+        let error = storage
+            .update_issue(&issue.id, &update, "NewAgent")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::ClaimConflict { .. }));
+        assert!(!crate::error::StructuredError::from_error(&error).retryable);
+        assert_eq!(label_update_rows(&storage), before_replay);
+    }
+
+    #[test]
+    fn reclaim_audit_is_rolled_back_when_a_later_field_validation_fails() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = abandoned_issue("bd-reclaim-rollback", Status::InProgress);
+        storage.create_issue(&issue, "OldAgent").unwrap();
+        let before = label_update_rows(&storage);
+        let mut update = reclaim_update(&issue, "NewAgent");
+        update.title = Some(String::new());
+        assert!(
+            storage
+                .update_issue(&issue.id, &update, "NewAgent")
+                .is_err()
+        );
+        assert_eq!(label_update_rows(&storage), before);
+    }
+
+    #[test]
+    fn reclaim_rechecks_owner_and_revision_including_aba_changes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = abandoned_issue("bd-reclaim-changed", Status::InProgress);
+        storage.create_issue(&issue, "OldAgent").unwrap();
+        let stale_update = reclaim_update(&issue, "NewAgent");
+        for owner in ["WinningAgent", "OldAgent"] {
+            storage
+                .update_issue(
+                    &issue.id,
+                    &IssueUpdate {
+                        assignee: Some(Some(owner.to_string())),
+                        ..IssueUpdate::default()
+                    },
+                    owner,
+                )
+                .unwrap();
+            let before = label_update_rows(&storage);
+            let error = storage
+                .update_issue(&issue.id, &stale_update, "NewAgent")
+                .unwrap_err();
+            match error {
+                BeadsError::ClaimConflict {
+                    expected_assignee,
+                    actual_assignee,
+                    expected_updated_at,
+                    actual_updated_at,
+                    ..
+                } => {
+                    assert_eq!(expected_assignee.as_deref(), Some("OldAgent"));
+                    assert_eq!(actual_assignee.as_deref(), Some(owner));
+                    assert_ne!(expected_updated_at, actual_updated_at);
+                }
+                error => panic!("expected ownership conflict, got {error:?}"),
+            }
+            assert_eq!(label_update_rows(&storage), before);
+        }
+    }
+
+    #[test]
+    fn reclaim_rejects_ineligible_evidence_and_malformed_internal_updates() {
+        use crate::coordination::{ClaimOwnerKind, ReservationEvidence};
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = abandoned_issue("bd-reclaim-inputs", Status::InProgress);
+        storage.create_issue(&issue, "OldAgent").unwrap();
+        let before = label_update_rows(&storage);
+        let base = reclaim_update(&issue, "NewAgent");
+        let mut rejected = Vec::new();
+        for owner_kind in [ClaimOwnerKind::Human, ClaimOwnerKind::Unknown] {
+            let mut update = base.clone();
+            update.reclaim.as_mut().unwrap().owner_kind = owner_kind;
+            rejected.push(update);
+        }
+        for reservation in [
+            ReservationEvidence::NoSnapshot,
+            ReservationEvidence::InvalidSnapshot {
+                reason: "untrusted".to_string(),
+            },
+            ReservationEvidence::Active {
+                holder: "OldAgent".to_string(),
+                expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                provenance: None,
+            },
+        ] {
+            let mut update = base.clone();
+            update.reclaim.as_mut().unwrap().reservation = reservation;
+            rejected.push(update);
+        }
+        let mut update = base.clone();
+        update.expect_unassigned = false;
+        rejected.push(update);
+        let mut update = base.clone();
+        update.expect_updated_at = None;
+        rejected.push(update);
+        let mut update = base.clone();
+        update.status = Some(Status::Open);
+        rejected.push(update);
+        let mut update = base.clone();
+        update.assignee = Some(Some("DifferentAgent".to_string()));
+        rejected.push(update);
+        let mut update = base.clone();
+        update.claim_actor = None;
+        rejected.push(update);
+        let mut update = base.clone();
+        update.workflow_policy_bypass_reason = Some("not allowed".to_string());
+        rejected.push(update);
+        let mut update = base.clone();
+        update.reclaim.as_mut().unwrap().expected_assignee.clear();
+        rejected.push(update);
+        for update in rejected {
+            assert!(
+                storage
+                    .update_issue(&issue.id, &update, "NewAgent")
+                    .is_err()
+            );
+            assert_eq!(label_update_rows(&storage), before);
+        }
+        assert!(
+            storage
+                .update_issue(&issue.id, &base, "OtherActor")
+                .is_err()
+        );
+        for same_actor in ["OldAgent", "oldagent", " OldAgent ", ""] {
+            let update = reclaim_update(&issue, same_actor);
+            assert!(
+                storage
+                    .update_issue(&issue.id, &update, same_actor)
+                    .is_err()
+            );
+            assert_eq!(label_update_rows(&storage), before);
+        }
+    }
+
+    #[test]
+    fn reclaim_rejects_fresh_and_non_work_targets_without_mutation() {
+        for status in [
+            Status::InProgress,
+            Status::Closed,
+            Status::Deferred,
+            Status::Pinned,
+        ] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let mut issue = abandoned_issue("bd-reclaim-ineligible", status.clone());
+            if status == Status::InProgress {
+                issue.updated_at = Utc::now();
+            }
+            if status == Status::Closed {
+                issue.closed_at = Some(issue.updated_at);
+            }
+            storage.create_issue(&issue, "OldAgent").unwrap();
+            let before = label_update_rows(&storage);
+            let update = reclaim_update(&issue, "NewAgent");
+            assert!(
+                storage
+                    .update_issue(&issue.id, &update, "NewAgent")
+                    .is_err()
+            );
+            assert_eq!(label_update_rows(&storage), before);
+        }
+    }
+
+    #[test]
+    fn reclaim_audit_satisfies_required_transition_comment_exactly_once() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = abandoned_issue("bd-reclaim-rework", Status::Custom("rework".to_string()));
+        storage.create_issue(&issue, "OldAgent").unwrap();
+        storage.set_workflow_policy(
+            serde_yml::from_str(
+                "statuses: [open, rework, in_progress, closed]\n\
+                 transitions:\n  rework: [in_progress]\n\
+                 required_fields:\n  'rework -> in_progress': [transition_comment]\n",
+            )
+            .unwrap(),
+        );
+        let mut update = reclaim_update(&issue, "NewAgent");
+        update.transition_comment = Some("untrusted caller text".to_string());
+        let result = storage
+            .update_issue(&issue.id, &update, "NewAgent")
+            .unwrap();
+        assert_eq!(result.status, Status::InProgress);
+        let comments = storage.get_comments(&issue.id).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].author, "NewAgent");
+        assert!(comments[0].body.starts_with("reclaim:"));
+        assert!(!comments[0].body.contains("untrusted caller text"));
+    }
+
+    #[test]
+    fn reclaim_handoff_checks_scoped_capacity_without_changing_repository_occupancy() {
+        for scope in ["assignee", "actor"] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let issue = abandoned_issue("bd-reclaim-capacity", Status::InProgress);
+            storage.create_issue(&issue, "OldAgent").unwrap();
+            let occupied = make_issue(
+                "bd-reclaim-busy",
+                "New owner's active work",
+                Status::InProgress,
+                2,
+                Some("NewAgent"),
+                Utc::now(),
+                None,
+            );
+            storage.create_issue(&occupied, "NewAgent").unwrap();
+            storage.set_workflow_capacity_policy(scoped_status_capacity(
+                scope,
+                "in_progress",
+                None,
+                Some(1),
+            ));
+            let before = label_update_rows(&storage);
+            let update = reclaim_update(&issue, "NewAgent");
+            let error = storage
+                .update_issue(&issue.id, &update, "NewAgent")
+                .unwrap_err();
+            let violation = expect_capacity_violation(&error);
+            assert_eq!(violation.scope, scope);
+            assert_eq!(violation.scope_key.as_deref(), Some("NewAgent"));
+            assert_eq!(label_update_rows(&storage), before);
+
+            let mut policy = scoped_status_capacity(scope, "in_progress", None, Some(2));
+            policy.statuses.insert(
+                "in_progress".to_string(),
+                crate::close_policy::CapacityLimit {
+                    soft: None,
+                    hard: Some(2),
+                },
+            );
+            storage.set_workflow_capacity_policy(policy);
+            storage
+                .update_issue(&issue.id, &update, "NewAgent")
+                .unwrap();
+            assert_eq!(storage.get_comments(&issue.id).unwrap().len(), 1);
+            let occupancy = storage.capacity_snapshot().unwrap();
+            let new_owner = occupancy
+                .iter()
+                .find(|row| row.scope == scope && row.scope_key.as_deref() == Some("NewAgent"))
+                .expect("new owner's occupancy");
+            assert_eq!(new_owner.counted, 2);
+        }
     }
 
     #[test]

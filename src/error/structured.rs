@@ -78,6 +78,8 @@ pub enum ErrorCode {
     InvalidPriority,
     /// Required field missing
     RequiredField,
+    /// Claim ownership changed or another actor already owns the issue
+    ClaimConflict,
 
     // === Dependency Errors (exit code 5) ===
     /// Dependency cycle detected
@@ -165,6 +167,7 @@ impl ErrorCode {
             Self::InvalidType => "INVALID_TYPE",
             Self::InvalidPriority => "INVALID_PRIORITY",
             Self::RequiredField => "REQUIRED_FIELD",
+            Self::ClaimConflict => "CLAIM_CONFLICT",
             // Dependency
             Self::CycleDetected => "CYCLE_DETECTED",
             Self::DependencyNotFound => "DEPENDENCY_NOT_FOUND",
@@ -258,6 +261,7 @@ impl ErrorCode {
             | Self::InvalidType
             | Self::InvalidPriority
             | Self::RequiredField
+            | Self::ClaimConflict
             | Self::PolicyViolation
             | Self::WorkflowCapacityExceeded => 4,
             // Dependency (5)
@@ -777,6 +781,23 @@ impl StructuredError {
                     "written": false,
                 })),
             ),
+            BeadsError::ClaimConflict {
+                id,
+                expected_assignee,
+                actual_assignee,
+                expected_updated_at,
+                actual_updated_at,
+            } => (
+                ErrorCode::ClaimConflict,
+                Some(json!({
+                    "issue_id": id,
+                    "expected_assignee": expected_assignee,
+                    "actual_assignee": actual_assignee,
+                    "expected_updated_at": expected_updated_at,
+                    "actual_updated_at": actual_updated_at,
+                    "written": false,
+                })),
+            ),
             BeadsError::CommittedStateUnwitnessed { operation, source } => {
                 let source_context = source.downcast_ref::<BeadsError>().and_then(|error| {
                     let (_, context) = Self::extract_code_and_context(error);
@@ -1042,6 +1063,11 @@ impl StructuredError {
             BeadsError::UpdatePreconditionFailed { id, .. } => Some(format!(
                 "Re-read it (`br show {id} --json`), reapply your edit to the current value, and \
                  retry with the new --if-unchanged token."
+            )),
+            BeadsError::ClaimConflict { id, .. } => Some(format!(
+                "Inspect the current owner with `br show {id} --json`. Do not replay this claim \
+                 or clear the assignee. Refresh coordination snapshots and regenerate \
+                 `br coordination status` advice before attempting an abandoned-claim handoff."
             )),
             BeadsError::NothingToDo { reason } => Some(skip_reason_hint(reason)),
             BeadsError::CloseIncomplete { summary, .. } => Some(skip_reason_hint(summary)),
@@ -1372,6 +1398,7 @@ mod tests {
         assert!(!ErrorCode::CycleDetected.is_retryable());
         assert!(ErrorCode::DatabaseLocked.is_retryable());
         assert!(ErrorCode::ValidationFailed.is_retryable());
+        assert!(!ErrorCode::ClaimConflict.is_retryable());
         assert!(ErrorCode::InvalidPriority.is_retryable());
         assert!(ErrorCode::ShuttingDown.is_retryable());
     }
@@ -1402,6 +1429,43 @@ mod tests {
         assert_eq!(json["error"]["code"], "ISSUE_NOT_FOUND");
         assert_eq!(json["error"]["hint"], "Did you mean 'bd-abd'?");
         assert!(!json["error"]["retryable"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn claim_conflict_preserves_ownership_evidence_without_retrying() {
+        let expected = "2026-11-04T01:00:00Z".parse().unwrap();
+        let actual = "2026-11-04T10:00:00Z".parse().unwrap();
+        let error = BeadsError::claim_conflict(
+            "bd-handoff",
+            Some("OldAgent"),
+            Some("WinningAgent"),
+            Some(expected),
+            Some(actual),
+        );
+        let structured = StructuredError::from_error(&error);
+        assert_eq!(structured.code, ErrorCode::ClaimConflict);
+        assert_eq!(structured.code.exit_code(), 4);
+        assert!(!structured.retryable);
+        assert!(
+            structured
+                .message
+                .contains("already assigned to WinningAgent")
+        );
+        assert!(structured.hint.as_deref().unwrap().contains("regenerate"));
+        let context = structured.context.unwrap();
+        assert_eq!(context["issue_id"], "bd-handoff");
+        assert_eq!(context["expected_assignee"], "OldAgent");
+        assert_eq!(context["actual_assignee"], "WinningAgent");
+        assert_eq!(context["expected_updated_at"], "2026-11-04T01:00:00Z");
+        assert_eq!(context["actual_updated_at"], "2026-11-04T10:00:00Z");
+        assert_eq!(context["written"], false);
+
+        let ordinary = BeadsError::claim_conflict("bd-owned", None, Some("bob"), None, None);
+        let ordinary = StructuredError::from_error(&ordinary);
+        assert_eq!(ordinary.code, ErrorCode::ClaimConflict);
+        assert!(!ordinary.retryable);
+        assert!(ordinary.message.contains("already assigned to bob"));
+        assert!(ordinary.context.unwrap()["expected_assignee"].is_null());
     }
 
     #[test]

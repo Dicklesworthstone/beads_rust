@@ -983,6 +983,14 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                     commands::coordination::execute_status(&args, &overrides, &output_ctx)
                 }
             }
+            beads_rust::cli::CoordinationCommands::Reclaim(args) => {
+                commands::coordination::execute_reclaim_with_storage(
+                    &args,
+                    &overrides,
+                    &output_ctx,
+                    &mut storage_result,
+                )
+            }
         },
         Commands::Count(args) => {
             if let Some(res) = storage_result.as_ref() {
@@ -1509,6 +1517,9 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
         ),
         Commands::Orphans(args) => args.fix,
+        Commands::Coordination { command } => {
+            matches!(command, beads_rust::cli::CoordinationCommands::Reclaim(_))
+        }
         _ => false,
     }
 }
@@ -2096,7 +2107,9 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         Commands::Sync(args) => args.status || (args.reconcile && args.dry_run),
         Commands::Stats(_)
         | Commands::Status(_)
-        | Commands::Coordination { .. }
+        | Commands::Coordination {
+            command: beads_rust::cli::CoordinationCommands::Status(_),
+        }
         | Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
@@ -2146,7 +2159,9 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
-        | Commands::Coordination { .. }
+        | Commands::Coordination {
+            command: beads_rust::cli::CoordinationCommands::Status(_),
+        }
         | Commands::Ready(_)
         | Commands::Scheduler(_)
         | Commands::Blocked(_)
@@ -2210,6 +2225,7 @@ fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
         Commands::Show(args) => args.format.map(Into::into),
         Commands::Coordination { command } => match command {
             beads_rust::cli::CoordinationCommands::Status(args) => args.format.map(Into::into),
+            beads_rust::cli::CoordinationCommands::Reclaim(_) => None,
         },
         Commands::Capabilities(args) => args.format.map(Into::into),
         Commands::RobotDocs { command } => match command {
@@ -4243,6 +4259,36 @@ mod tests {
         let sync_cmd = Cli::parse_from(["br", "sync"]).command;
         assert!(!is_mutating_command(&sync_cmd));
         assert!(!should_auto_import(&sync_cmd));
+    }
+
+    #[test]
+    fn coordination_reclaim_uses_mutation_authority_not_read_only_fallbacks() {
+        let status = Cli::parse_from(["br", "coordination", "status"]).command;
+        let reclaim = Cli::parse_from([
+            "br",
+            "coordination",
+            "reclaim",
+            "bd-123",
+            "--expected-assignee",
+            "OldAgent",
+            "--if-unchanged",
+            "2026-11-04T01:00:00Z",
+            "--reservations",
+            "reservations.json",
+            "--actor",
+            "NewAgent",
+        ])
+        .command;
+        assert!(!is_mutating_command(&status));
+        assert!(supports_read_only_fast_open(&status));
+        assert!(is_mutating_command(&reclaim));
+        assert!(needs_write_lock(&reclaim));
+        assert!(should_auto_import(&reclaim));
+        assert!(command_must_refuse_during_pending_merge(&reclaim));
+        assert!(!requires_read_only_storage(&reclaim));
+        assert!(!supports_read_only_fast_open(&reclaim));
+        assert!(!supports_stale_jsonl_fallback(&reclaim));
+        assert!(!supports_auto_import_read_only_probe(&reclaim));
     }
 
     #[test]

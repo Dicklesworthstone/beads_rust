@@ -453,7 +453,18 @@ pub fn execute_with_storage(
         ));
     }
 
-    let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
+    let routed_batches = if args.reclaim.is_some() {
+        // Coordination evidence was read from this workspace. Do not reroute
+        // the already-resolved ID to another tracker with a colliding claim.
+        vec![config::routing::RoutedIssueBatch {
+            beads_dir: beads_dir.clone(),
+            is_external: false,
+            project_path: None,
+            issue_inputs: target_inputs.clone(),
+        }]
+    } else {
+        config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?
+    };
 
     let (updated_issues, render_items, ordered_resolved_ids, mut capacity_warnings) =
         if routed_batches.iter().any(|batch| batch.is_external) {
@@ -1269,7 +1280,7 @@ fn validate_route_runtime_guards(
     resolved_ids: &[String],
     update: &IssueUpdate,
 ) -> Result<()> {
-    if update.expect_unassigned {
+    if update.expect_unassigned && update.reclaim.is_none() {
         let claim_actor = update.claim_actor.as_deref().unwrap_or("");
         for id in resolved_ids {
             let issue = storage
@@ -1285,9 +1296,12 @@ fn validate_route_runtime_guards(
                 None => {}
                 Some(current) if !update.claim_exclusive && current == claim_actor => {}
                 Some(current) => {
-                    return Err(BeadsError::validation(
-                        "claim",
-                        format!("issue {id} already assigned to {current}"),
+                    return Err(BeadsError::claim_conflict(
+                        id,
+                        None,
+                        Some(current),
+                        update.expect_updated_at,
+                        Some(issue.updated_at),
                     ));
                 }
             }
@@ -1943,6 +1957,7 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         labels: None,
         skip_cache_rebuild: false,
         expect_unassigned: args.claim,
+        reclaim: args.reclaim.clone(),
         claim_exclusive: args.claim && claim_exclusive,
         claim_actor: if args.claim {
             Some(actor.to_string())

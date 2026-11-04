@@ -839,7 +839,7 @@ schemas:
           Do nothing except continue normal observation.,string,observe
           Ask the assignee or human operator before touching the claim.,string,ask_owner
           Inspect Agent Mail reservations or capture a fresh snapshot.,string,inspect_mail
-          "The issue is a candidate for the documented audit-comment plus claim\nsequence. This is still advisory, not an automatic mutation.",string,reclaim_candidate
+          "The issue is a candidate for the documented atomic audit-and-handoff\ncommand. This is still advisory, not an automatic mutation.",string,reclaim_candidate
           Leave the claim alone because evidence says work may still be active.,string,leave_active
       CoordinationEvidenceSource:
         description: Evidence categories present in a claim assessment.
@@ -858,9 +858,10 @@ schemas:
         required[2]: purpose,command
       CoordinationSuggestedCommandPurpose:
         description: Role for a suggested coordination command.
-        oneOf[2]{description,type,const}:
-          Record the reclaim evidence before touching ownership.,string,add_reclaim_audit_comment
-          Claim the issue after the audit comment is recorded.,string,claim_issue
+        oneOf[3]{description,type,const}:
+          "Historical separate audit command, retained for older v1 snapshots.\nNew advice never emits this purpose.",string,add_reclaim_audit_comment
+          "Historical ordinary claim command, retained for older v1 snapshots.\nNew advice never emits this purpose.",string,claim_issue
+          Atomically record reclaim evidence and transfer the unchanged claim.,string,reclaim_issue
   CoordinationStatusOutput:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: CoordinationStatusOutput
@@ -1175,7 +1176,7 @@ schemas:
           Do nothing except continue normal observation.,string,observe
           Ask the assignee or human operator before touching the claim.,string,ask_owner
           Inspect Agent Mail reservations or capture a fresh snapshot.,string,inspect_mail
-          "The issue is a candidate for the documented audit-comment plus claim\nsequence. This is still advisory, not an automatic mutation.",string,reclaim_candidate
+          "The issue is a candidate for the documented atomic audit-and-handoff\ncommand. This is still advisory, not an automatic mutation.",string,reclaim_candidate
           Leave the claim alone because evidence says work may still be active.,string,leave_active
       CoordinationEvidenceSource:
         description: Evidence categories present in a claim assessment.
@@ -1194,9 +1195,10 @@ schemas:
         required[2]: purpose,command
       CoordinationSuggestedCommandPurpose:
         description: Role for a suggested coordination command.
-        oneOf[2]{description,type,const}:
-          Record the reclaim evidence before touching ownership.,string,add_reclaim_audit_comment
-          Claim the issue after the audit comment is recorded.,string,claim_issue
+        oneOf[3]{description,type,const}:
+          "Historical separate audit command, retained for older v1 snapshots.\nNew advice never emits this purpose.",string,add_reclaim_audit_comment
+          "Historical ordinary claim command, retained for older v1 snapshots.\nNew advice never emits this purpose.",string,claim_issue
+          Atomically record reclaim evidence and transfer the unchanged claim.,string,reclaim_issue
       CapacityStat:
         description: "Observed occupancy of one workflow capacity (GitHub #384 phase 6).\n\nOne row per repository capacity plus one row per occupied partition of\neach scoped capacity, mirroring the enforcement engine's counting\n(exemptions and hierarchy modes included)."
         type: object
@@ -2861,6 +2863,11 @@ commands:
     items_at: .
     error_envelope_on_stderr: false
     notes: Empty array if no comments. ErrorEnvelope on stdout if the issue id cannot be resolved.
+  "coordination reclaim":
+    shape: array|object
+    jq_filter: "if type == \"array\" then .[] else .updated[] end"
+    error_envelope_on_stderr: false
+    notes: "Updated issue array, or {updated, warnings} when capacity warnings apply. The audit and ownership handoff commit together; CLAIM_CONFLICT refuses stale ownership evidence without writing."
   "coordination status":
     shape: object
     jq_filter: ".claims[]"

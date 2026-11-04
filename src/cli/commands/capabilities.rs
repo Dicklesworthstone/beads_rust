@@ -556,7 +556,17 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
         "update" => &[
             "Pass explicit IDs in automation; without IDs, update uses the last-touched issue.",
             "`--claim` refuses blocked issues unless `--force` is supplied.",
+            "An existing different assignee produces CLAIM_CONFLICT, which must not be blindly retried or cleared. Inspect coordination status for guarded abandoned-claim recovery.",
             "Use `--assignee \"\"`, `--owner \"\"`, `--due \"\"`, `--defer \"\"`, or `--parent \"\"` to clear those fields.",
+        ],
+        "coordination" | "coordination status" => &[
+            "`status` is read-only; its advice uses supplied offline snapshots and never checks live Agent Mail or panes.",
+            "Review current owner activity and fresh snapshots before invoking the separately mutating `reclaim` subcommand.",
+        ],
+        "coordination reclaim" => &[
+            "Requires an explicit non-empty --actor and the previous assignee plus original updated_at from coordination advice.",
+            "Reloads snapshots and atomically writes an audit comment before transferring unchanged ownership in the current workspace.",
+            "CLAIM_CONFLICT writes nothing and is not retryable without inspecting current ownership and regenerating advice.",
         ],
         "close" => &[
             "Pass explicit IDs in automation; without IDs, close uses the last-touched issue.",
@@ -1002,7 +1012,21 @@ fn command_contract(name: &str) -> CommandContract {
                 "br scheduler --limit 5 --candidate-limit 100 --format json",
             ],
         },
+        "coordination reclaim" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &[
+                "br coordination reclaim br-abc --expected-assignee OldAgent --if-unchanged 2026-11-04T01:00:00Z --reservations reservations.json --agents agents.jsonl --actor NewAgent --json",
+            ],
+        },
         "coordination" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br coordination status --json"],
+        },
+        "coordination status" => CommandContract {
             operation: "read",
             workspace: "required",
             machine_output: &["json", "toon", "text"],

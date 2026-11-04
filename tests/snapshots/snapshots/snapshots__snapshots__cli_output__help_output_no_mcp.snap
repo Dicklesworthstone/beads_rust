@@ -17,7 +17,7 @@ Commands:
   comments      Manage comments
   completions   Generate shell completions
   config        Configuration management
-  coordination  Diagnose swarm coordination state without mutating claims
+  coordination  Diagnose swarm claims and explicitly reclaim abandoned ownership
   count         Count issues with optional grouping
   create        Create a new issue
   defer         Defer issues (schedule for later)

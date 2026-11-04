@@ -787,7 +787,7 @@ pub enum Commands {
         command: ConfigCommands,
     },
 
-    /// Diagnose swarm coordination state without mutating claims
+    /// Diagnose swarm claims and explicitly reclaim abandoned ownership
     #[command(alias = "coord")]
     Coordination {
         #[command(subcommand)]
@@ -1326,6 +1326,11 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub claim: bool,
 
+    /// Internal guarded handoff supplied by `coordination reclaim`.
+    /// This is not an `update` CLI flag; ordinary claims cannot take ownership.
+    #[arg(skip)]
+    pub reclaim: Option<crate::coordination::ClaimReclaimGuard>,
+
     /// Only apply this update if the issue has not changed since you read it
     /// (GitHub #500).
     ///
@@ -1531,11 +1536,45 @@ pub struct SchemaArgs {
     pub stats: bool,
 }
 
-/// Subcommands for coordination diagnosis.
+/// Subcommands for coordination diagnosis and explicit guarded handoff.
 #[derive(Subcommand, Debug)]
 pub enum CoordinationCommands {
     /// Show hidden in-progress claims with stale-claim evidence
     Status(CoordinationStatusArgs),
+    /// Audit and reclaim an unchanged abandoned claim in one transaction
+    Reclaim(CoordinationReclaimArgs),
+}
+
+/// Arguments for `br coordination reclaim`.
+#[derive(Args, Debug, Clone)]
+pub struct CoordinationReclaimArgs {
+    /// Issue whose observed claim should be transferred
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+
+    /// Previous assignee from the coordination advice (never the new actor)
+    #[arg(long, value_name = "ASSIGNEE")]
+    pub expected_assignee: String,
+
+    /// Original updated_at from the advice; any intervening activity refuses the handoff
+    #[arg(long, value_name = "UPDATED_AT")]
+    pub if_unchanged: String,
+
+    /// Fresh offline Agent Mail reservation snapshot, reloaded before handoff
+    #[arg(long, value_name = "PATH")]
+    pub reservations: PathBuf,
+
+    /// Offline Agent Mail agent snapshot used to identify swarm ownership
+    #[arg(long, value_name = "PATH")]
+    pub agents: Option<PathBuf>,
+
+    /// Owner policy from the advice; human ownership is never reclaimed
+    #[arg(long, value_enum, default_value = "unknown")]
+    pub owner_kind: CoordinationOwnerKindArg,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
 }
 
 /// Arguments for `br coordination status`.
@@ -1776,6 +1815,7 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
 const fn coordination_command_requests_robot_json(command: &CoordinationCommands) -> bool {
     match command {
         CoordinationCommands::Status(args) => args.robot,
+        CoordinationCommands::Reclaim(args) => args.robot,
     }
 }
 

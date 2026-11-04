@@ -1730,7 +1730,7 @@
               "const": "inspect_mail"
             },
             {
-              "description": "The issue is a candidate for the documented audit-comment plus claim\nsequence. This is still advisory, not an automatic mutation.",
+              "description": "The issue is a candidate for the documented atomic audit-and-handoff\ncommand. This is still advisory, not an automatic mutation.",
               "type": "string",
               "const": "reclaim_candidate"
             },
@@ -1783,14 +1783,19 @@
           "description": "Role for a suggested coordination command.",
           "oneOf": [
             {
-              "description": "Record the reclaim evidence before touching ownership.",
+              "description": "Historical separate audit command, retained for older v1 snapshots.\nNew advice never emits this purpose.",
               "type": "string",
               "const": "add_reclaim_audit_comment"
             },
             {
-              "description": "Claim the issue after the audit comment is recorded.",
+              "description": "Historical ordinary claim command, retained for older v1 snapshots.\nNew advice never emits this purpose.",
               "type": "string",
               "const": "claim_issue"
+            },
+            {
+              "description": "Atomically record reclaim evidence and transfer the unchanged claim.",
+              "type": "string",
+              "const": "reclaim_issue"
             }
           ]
         }
@@ -2400,7 +2405,7 @@
               "const": "inspect_mail"
             },
             {
-              "description": "The issue is a candidate for the documented audit-comment plus claim\nsequence. This is still advisory, not an automatic mutation.",
+              "description": "The issue is a candidate for the documented atomic audit-and-handoff\ncommand. This is still advisory, not an automatic mutation.",
               "type": "string",
               "const": "reclaim_candidate"
             },
@@ -2453,14 +2458,19 @@
           "description": "Role for a suggested coordination command.",
           "oneOf": [
             {
-              "description": "Record the reclaim evidence before touching ownership.",
+              "description": "Historical separate audit command, retained for older v1 snapshots.\nNew advice never emits this purpose.",
               "type": "string",
               "const": "add_reclaim_audit_comment"
             },
             {
-              "description": "Claim the issue after the audit comment is recorded.",
+              "description": "Historical ordinary claim command, retained for older v1 snapshots.\nNew advice never emits this purpose.",
               "type": "string",
               "const": "claim_issue"
+            },
+            {
+              "description": "Atomically record reclaim evidence and transfer the unchanged claim.",
+              "type": "string",
+              "const": "reclaim_issue"
             }
           ]
         },
@@ -5130,6 +5140,12 @@
       "items_at": ".",
       "error_envelope_on_stderr": false,
       "notes": "Empty array if no comments. ErrorEnvelope on stdout if the issue id cannot be resolved."
+    },
+    "coordination reclaim": {
+      "shape": "array|object",
+      "jq_filter": "if type == \"array\" then .[] else .updated[] end",
+      "error_envelope_on_stderr": false,
+      "notes": "Updated issue array, or {updated, warnings} when capacity warnings apply. The audit and ownership handoff commit together; CLAIM_CONFLICT refuses stale ownership evidence without writing."
     },
     "coordination status": {
       "shape": "object",

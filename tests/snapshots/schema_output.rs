@@ -622,12 +622,18 @@ fn assert_live_output_shape(command_name: &str, shape: &Value, output: &Value) {
         .and_then(Value::as_str)
         .unwrap_or("<missing>");
 
-    let matched = match expected_shape {
-        "array" => output.is_array(),
-        "object" => output.is_object(),
-        "scalar" => !(output.is_array() || output.is_object()),
-        _ => false,
-    };
+    let mut matched = false;
+    for alternative in expected_shape.split('|') {
+        matched |= match alternative {
+            "array" => output.is_array(),
+            "object" => output.is_object(),
+            "scalar" => !(output.is_array() || output.is_object()),
+            _ => panic!(
+                "command {command_name:?} declares unknown top-level shape alternative \
+                 {alternative:?} in {expected_shape:?}"
+            ),
+        };
+    }
 
     assert!(
         matched,

@@ -105,7 +105,8 @@ struct SchemaOutput {
 /// hard-coding per-command knowledge.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 struct CommandShape {
-    /// Top-level JSON shape: "array" | "object" | "scalar".
+    /// Top-level JSON shape ("array", "object", "scalar"), with pipe-separated
+    /// alternatives when a command can also return a warning envelope.
     shape: &'static str,
     /// jq filter that extracts the useful payload from the command's
     /// `--json` output. For iterable commands this yields one item per
@@ -613,6 +614,21 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             ),
         },
     );
+    commands.insert(
+        "coordination reclaim",
+        CommandShape {
+            shape: "array|object",
+            jq_filter: "if type == \"array\" then .[] else .updated[] end",
+            items_at: None,
+            item_schema: None,
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Updated issue array, or {updated, warnings} when capacity warnings apply. \
+                 The audit and ownership handoff commit together; CLAIM_CONFLICT refuses \
+                 stale ownership evidence without writing.",
+            ),
+        },
+    );
 }
 
 fn insert_label_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
@@ -790,12 +806,15 @@ mod tests {
         // Build schemas once, not per-iteration — schema_for! does real work.
         let known_schemas = build_schemas(SchemaTarget::All);
         for (name, shape) in &commands {
-            // shape must be one of the documented values.
-            assert!(
-                matches!(shape.shape, "array" | "object" | "scalar"),
-                "{name}: shape={:?} is not one of array|object|scalar",
-                shape.shape
-            );
+            // Each declared alternative must be a documented JSON shape.
+            // Warning envelopes may add an object alternative to an array.
+            for alternative in shape.shape.split('|') {
+                assert!(
+                    matches!(alternative, "array" | "object" | "scalar"),
+                    "{name}: shape={:?} contains unsupported alternative {alternative:?}",
+                    shape.shape
+                );
+            }
             // jq_filter must be non-empty.
             assert!(!shape.jq_filter.is_empty(), "{name}: jq_filter is empty");
             // If shape is array, items_at must be Some(".") (jq identity — the

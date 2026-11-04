@@ -92,6 +92,23 @@ pub enum BeadsError {
     #[error("Invalid issue ID format: {id}")]
     InvalidId { id: String },
 
+    /// A claim's observed ownership no longer matches the current issue.
+    /// Replaying the same claim cannot resolve this conflict.
+    #[error(
+        "Claim conflict for {id}: {owner}; expected assignee {expected_owner} at {expected_version}, found updated_at {actual_version}. This issue's ownership was not changed.",
+        owner = claim_owner_description(actual_assignee.as_deref()),
+        expected_owner = expected_assignee.as_deref().unwrap_or("(unassigned)"),
+        expected_version = expected_updated_at.as_deref().unwrap_or("(not constrained)"),
+        actual_version = actual_updated_at.as_deref().unwrap_or("(unknown)")
+    )]
+    ClaimConflict {
+        id: String,
+        expected_assignee: Option<String>,
+        actual_assignee: Option<String>,
+        expected_updated_at: Option<String>,
+        actual_updated_at: Option<String>,
+    },
+
     // === Validation Errors ===
     /// Field validation failed.
     #[error("Validation failed: {field}: {reason}")]
@@ -456,6 +473,7 @@ impl BeadsError {
                 | Self::InvalidPriority { .. }
                 | Self::PrefixMismatch { .. }
                 | Self::AmbiguousId { .. }
+                | Self::ClaimConflict { .. }
                 | Self::PolicyViolation { .. }
                 | Self::WorkflowCapacityExceeded { .. }
         )
@@ -584,6 +602,27 @@ impl BeadsError {
         }
     }
 
+    /// Describe an ownership conflict consistently at CLI and storage boundaries.
+    #[must_use]
+    pub fn claim_conflict(
+        id: &str,
+        expected_assignee: Option<&str>,
+        actual_assignee: Option<&str>,
+        expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+        actual_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        let timestamp = |value: chrono::DateTime<chrono::Utc>| {
+            value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+        };
+        Self::ClaimConflict {
+            id: id.to_string(),
+            expected_assignee: expected_assignee.map(str::to_string),
+            actual_assignee: actual_assignee.map(str::to_string),
+            expected_updated_at: expected_updated_at.map(timestamp),
+            actual_updated_at: actual_updated_at.map(timestamp),
+        }
+    }
+
     /// Create a validation error that carries an actionable hint.
     #[must_use]
     pub fn validation_with_hint(
@@ -638,6 +677,13 @@ impl BeadsError {
             Self::ValidationErrors { errors }
         }
     }
+}
+
+fn claim_owner_description(assignee: Option<&str>) -> String {
+    assignee.map_or_else(
+        || "issue is no longer assigned".to_string(),
+        |owner| format!("already assigned to {owner}"),
+    )
 }
 
 /// Result type using `BeadsError`.

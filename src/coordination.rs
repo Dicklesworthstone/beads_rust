@@ -193,8 +193,8 @@ pub enum RecommendedAction {
     AskOwner,
     /// Inspect Agent Mail reservations or capture a fresh snapshot.
     InspectMail,
-    /// The issue is a candidate for the documented audit-comment plus claim
-    /// sequence. This is still advisory, not an automatic mutation.
+    /// The issue is a candidate for the documented atomic audit-and-handoff
+    /// command. This is still advisory, not an automatic mutation.
     ReclaimCandidate,
     /// Leave the claim alone because evidence says work may still be active.
     LeaveActive,
@@ -218,10 +218,14 @@ impl RecommendedAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CoordinationSuggestedCommandPurpose {
-    /// Record the reclaim evidence before touching ownership.
+    /// Historical separate audit command, retained for older v1 snapshots.
+    /// New advice never emits this purpose.
     AddReclaimAuditComment,
-    /// Claim the issue after the audit comment is recorded.
+    /// Historical ordinary claim command, retained for older v1 snapshots.
+    /// New advice never emits this purpose.
     ClaimIssue,
+    /// Atomically record reclaim evidence and transfer the unchanged claim.
+    ReclaimIssue,
 }
 
 /// A command suggestion emitted for an operator to review and run manually.
@@ -238,6 +242,27 @@ pub struct CoordinationClaimAdvisory {
     pub required_human_confirmation: bool,
     pub evidence_summary: String,
     pub suggested_commands: Vec<CoordinationSuggestedCommand>,
+}
+
+/// Inputs that a reclaim command must reload before trusting offline evidence.
+/// Paths are absolute so a suggestion does not silently read different files
+/// when the operator invokes it from another working directory.
+#[derive(Debug, Clone)]
+pub struct ReclaimCommandContext {
+    pub reservations: String,
+    pub agents: Option<String>,
+    pub owner_kind: ClaimOwnerKind,
+}
+
+/// An observed ownership revision plus freshly supplied coordination evidence.
+/// Storage checks this inside the same transaction as the audit and handoff;
+/// it is never permission to clear whichever assignment happens to exist.
+#[derive(Debug, Clone)]
+pub struct ClaimReclaimGuard {
+    pub expected_assignee: String,
+    pub expected_updated_at: DateTime<Utc>,
+    pub owner_kind: ClaimOwnerKind,
+    pub reservation: ReservationEvidence,
 }
 
 /// Evidence categories present in a claim assessment.
@@ -567,16 +592,17 @@ fn evidence_sources_for(reservation: &ReservationEvidence) -> Vec<CoordinationEv
 pub fn advisory_for_claim(
     issue_id: &str,
     assessment: &ClaimAssessment,
+    command_context: Option<&ReclaimCommandContext>,
 ) -> CoordinationClaimAdvisory {
     let reclaim_allowed_by_policy = reclaim_allowed_by_policy(assessment);
     let required_human_confirmation =
         matches!(assessment.recommended_action, RecommendedAction::AskOwner);
     let evidence_summary = evidence_summary_for(assessment);
-    let suggested_commands = if reclaim_allowed_by_policy {
-        reclaim_suggested_commands(issue_id, &evidence_summary)
-    } else {
-        Vec::new()
-    };
+    let suggested_commands = command_context
+        .filter(|_| reclaim_allowed_by_policy)
+        .map_or_else(Vec::new, |context| {
+            reclaim_suggested_commands(issue_id, assessment, context)
+        });
 
     CoordinationClaimAdvisory {
         reclaim_allowed_by_policy,
@@ -586,7 +612,7 @@ pub fn advisory_for_claim(
     }
 }
 
-fn reclaim_allowed_by_policy(assessment: &ClaimAssessment) -> bool {
+pub(crate) fn reclaim_allowed_by_policy(assessment: &ClaimAssessment) -> bool {
     matches!(assessment.owner_kind, ClaimOwnerKind::SwarmAgent)
         && matches!(
             assessment.classification,
@@ -656,25 +682,41 @@ fn optional_timestamp(timestamp: Option<&DateTime<Utc>>) -> String {
 
 fn reclaim_suggested_commands(
     issue_id: &str,
-    evidence_summary: &str,
+    assessment: &ClaimAssessment,
+    context: &ReclaimCommandContext,
 ) -> Vec<CoordinationSuggestedCommand> {
-    let audit_message = format!(
-        "reclaim: previous in_progress claim appears abandoned; evidence: {evidence_summary}; no active reservation found in supplied snapshot; pane_status=not_checked_by_br"
+    let mut command = format!(
+        "br coordination reclaim {} --expected-assignee={} --if-unchanged {} --reservations {}",
+        shell_quote(issue_id),
+        shell_quote(assessment.assignee.as_deref().unwrap_or_default()),
+        shell_quote(&assessment.updated_at.to_rfc3339()),
+        shell_quote(&context.reservations),
     );
-    vec![
-        CoordinationSuggestedCommand {
-            purpose: CoordinationSuggestedCommandPurpose::AddReclaimAuditComment,
-            command: format!(
-                "br comments add {} --author \"$AGENT_NAME\" --message {} --json",
-                shell_quote(issue_id),
-                shell_quote(&audit_message)
-            ),
-        },
-        CoordinationSuggestedCommand {
-            purpose: CoordinationSuggestedCommandPurpose::ClaimIssue,
-            command: format!("br update {} --claim --json", shell_quote(issue_id)),
-        },
-    ]
+    if let Some(agents) = &context.agents {
+        command.push_str(&format!(" --agents {}", shell_quote(agents)));
+    }
+    let owner_kind = match context.owner_kind {
+        ClaimOwnerKind::SwarmAgent => "swarm-agent",
+        ClaimOwnerKind::Human => "human",
+        ClaimOwnerKind::Unknown => "unknown",
+    };
+    command.push_str(&format!(
+        " --owner-kind {owner_kind} --actor=\"${{AGENT_NAME:?Set AGENT_NAME to the reclaiming agent}}\" --json"
+    ));
+    vec![CoordinationSuggestedCommand {
+        purpose: CoordinationSuggestedCommandPurpose::ReclaimIssue,
+        command,
+    }]
+}
+
+/// The audit body is derived from the evidence actually checked at handoff,
+/// rather than copied from a stale shell command. Storage inserts it before
+/// recording the ownership change, within the same transaction.
+pub(crate) fn reclaim_audit_message(assessment: &ClaimAssessment) -> String {
+    format!(
+        "reclaim: previous claim appears abandoned; evidence: {}; no active reservation found in supplied snapshot; pane_status=not_checked_by_br",
+        evidence_summary_for(assessment)
+    )
 }
 
 fn shell_quote(value: &str) -> String {
@@ -786,8 +828,9 @@ mod tests {
         AgentMailReservationSnapshot, COORDINATION_SCHEMA_VERSION, ClaimAssessmentInput,
         ClaimClassification, ClaimOwnerKind, CoordinationClaimRow, CoordinationComment,
         CoordinationEvidenceSource, CoordinationIssueRow, CoordinationStatusOutput,
-        CoordinationSuggestedCommandPurpose, CoordinationWorkspaceCounts, RecommendedAction,
-        ReservationEvidence, advisory_for_claim, assess_claim, reservation_evidence_from_snapshots,
+        CoordinationSuggestedCommandPurpose, CoordinationWorkspaceCounts, ReclaimCommandContext,
+        RecommendedAction, ReservationEvidence, advisory_for_claim, assess_claim,
+        reservation_evidence_from_snapshots,
     };
     use crate::model::{Comment, IssueType, Priority, Status};
     use chrono::{Duration, TimeZone, Utc};
@@ -813,7 +856,7 @@ mod tests {
     }
 
     fn claim_row(id: &str, assessment: super::ClaimAssessment) -> CoordinationClaimRow {
-        let advisory = advisory_for_claim(id, &assessment);
+        let advisory = advisory_for_claim(id, &assessment, None);
         CoordinationClaimRow {
             issue: CoordinationIssueRow {
                 id: id.to_string(),
@@ -1061,6 +1104,87 @@ mod tests {
     }
 
     #[test]
+    fn historical_status_envelope_round_trips_both_legacy_command_purposes() {
+        // Keep the historical wire values literal: constructing this fixture
+        // through current Rust types would hide a renamed or removed variant.
+        let historical = serde_json::json!({
+            "schema_version": "br.coordination.v1",
+            "generated_at": "2026-05-08T09:00:00Z",
+            "summary": {
+                "total_claims": 1,
+                "workspace": {
+                    "open": 0, "ready": 0, "blocked": 0,
+                    "in_progress": 1, "deferred": 0, "closed": 0
+                },
+                "unassigned": 0, "fresh": 0, "blocked_by_active_reservation": 0,
+                "stale_candidate": 1, "abandoned_likely": 0,
+                "no_mail_snapshot": 0, "ambiguous": 0
+            },
+            "claims": [{
+                "issue": {
+                    "id": "bd-stale",
+                    "title": "Historical abandoned claim",
+                    "status": "in_progress",
+                    "priority": 1,
+                    "issue_type": "task",
+                    "labels": ["coordination"],
+                    "dependency_count": 1,
+                    "dependent_count": 2,
+                    "latest_comments": [{
+                        "author": "TopazFox",
+                        "text": "historical evidence",
+                        "created_at": "2026-05-08T07:00:00Z"
+                    }]
+                },
+                "assessment": {
+                    "assignee": "TopazFox",
+                    "owner_kind": "swarm_agent",
+                    "updated_at": "2026-05-08T07:00:00Z",
+                    "updated_age_minutes": 120,
+                    "stale_threshold_minutes": 120,
+                    "abandoned_threshold_minutes": 480,
+                    "reservation": {"state": "no_reservation"},
+                    "classification": "stale_candidate",
+                    "recommended_action": "reclaim_candidate",
+                    "evidence_sources": [
+                        "issue_metadata", "policy_threshold", "agent_mail_snapshot"
+                    ]
+                },
+                "reclaim_allowed_by_policy": true,
+                "required_human_confirmation": false,
+                "evidence_summary": "historical reclaim evidence",
+                "suggested_commands": [{
+                    "purpose": "add_reclaim_audit_comment",
+                    "command": "br comments add 'bd-stale' --author \"$AGENT_NAME\" --message 'reclaim: historical evidence' --json"
+                }, {
+                    "purpose": "claim_issue",
+                    "command": "br update 'bd-stale' --claim --json"
+                }]
+            }]
+        });
+        let decoded: CoordinationStatusOutput = serde_json::from_value(historical.clone())
+            .expect("historical v1 status envelope must remain readable");
+        assert_eq!(decoded.schema_version, COORDINATION_SCHEMA_VERSION);
+        assert_eq!(decoded.claims.len(), 1);
+        assert!(decoded.capacity.is_empty());
+        let commands = &decoded.claims[0].suggested_commands;
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[0].purpose,
+            CoordinationSuggestedCommandPurpose::AddReclaimAuditComment
+        );
+        assert_eq!(
+            commands[1].purpose,
+            CoordinationSuggestedCommandPurpose::ClaimIssue
+        );
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("historical envelope serializes"),
+            historical,
+            "reading historical advice must preserve its purpose and command semantics"
+        );
+    }
+
+    #[test]
     fn reservation_snapshot_active_match_blocks_reclaim_with_provenance() {
         let reservations = vec![AgentMailReservationSnapshot {
             holder: "TopazFox".to_string(),
@@ -1163,44 +1287,59 @@ mod tests {
             ClaimOwnerKind::SwarmAgent,
             ReservationEvidence::NoReservation,
         ));
-        let advisory = advisory_for_claim("bd-stale", &stale);
+        let command_context = ReclaimCommandContext {
+            reservations: "/tmp/reservations.json".to_string(),
+            agents: Some("/tmp/agents.jsonl".to_string()),
+            owner_kind: ClaimOwnerKind::SwarmAgent,
+        };
+        let advisory = advisory_for_claim("bd-stale", &stale, Some(&command_context));
 
         assert!(advisory.reclaim_allowed_by_policy);
         assert!(!advisory.required_human_confirmation);
-        assert_eq!(advisory.suggested_commands.len(), 2);
+        assert_eq!(advisory.suggested_commands.len(), 1);
         assert_eq!(
             advisory.suggested_commands[0].purpose,
-            CoordinationSuggestedCommandPurpose::AddReclaimAuditComment
-        );
-        assert_eq!(
-            advisory.suggested_commands[1].purpose,
-            CoordinationSuggestedCommandPurpose::ClaimIssue
+            CoordinationSuggestedCommandPurpose::ReclaimIssue
         );
         assert!(
             advisory.suggested_commands[0]
                 .command
-                .contains("br comments add")
-        );
-        assert!(advisory.suggested_commands[1].command.contains("br update"));
-        assert!(
-            advisory.suggested_commands[0]
-                .command
-                .contains("updated_at=2026-05-08")
+                .contains("br coordination reclaim 'bd-stale'")
         );
         assert!(
             advisory.suggested_commands[0]
                 .command
-                .contains("assignee=TopazFox")
+                .contains("--if-unchanged '2026-05-08T07:00:00+00:00'")
         );
         assert!(
             advisory.suggested_commands[0]
                 .command
+                .contains("--expected-assignee='TopazFox'")
+        );
+        assert!(
+            advisory.suggested_commands[0]
+                .command
+                .contains("--reservations '/tmp/reservations.json'")
+        );
+        assert!(
+            advisory.suggested_commands[0]
+                .command
+                .contains("--actor=\"${AGENT_NAME:?Set AGENT_NAME to the reclaiming agent}\"")
+        );
+        assert!(
+            advisory
+                .evidence_summary
                 .contains("stale_threshold_minutes=120")
         );
         assert!(
-            advisory.suggested_commands[0]
-                .command
+            advisory
+                .evidence_summary
                 .contains("reservation_status=no_reservation")
+        );
+        assert!(
+            advisory_for_claim("bd-stale", &stale, None)
+                .suggested_commands
+                .is_empty()
         );
 
         let missing_snapshot = assess_claim(input(
@@ -1208,7 +1347,7 @@ mod tests {
             ClaimOwnerKind::SwarmAgent,
             ReservationEvidence::NoSnapshot,
         ));
-        let advisory = advisory_for_claim("bd-stale", &missing_snapshot);
+        let advisory = advisory_for_claim("bd-stale", &missing_snapshot, Some(&command_context));
 
         assert!(!advisory.reclaim_allowed_by_policy);
         assert!(advisory.suggested_commands.is_empty());
@@ -1228,7 +1367,7 @@ mod tests {
         ));
 
         for assessment in [human, unknown] {
-            let advisory = advisory_for_claim("bd-stale", &assessment);
+            let advisory = advisory_for_claim("bd-stale", &assessment, None);
             assert!(!advisory.reclaim_allowed_by_policy);
             assert!(advisory.required_human_confirmation);
             assert!(advisory.suggested_commands.is_empty());
@@ -1253,7 +1392,7 @@ mod tests {
         ));
 
         for assessment in [fresh, active] {
-            let advisory = advisory_for_claim("bd-stale", &assessment);
+            let advisory = advisory_for_claim("bd-stale", &assessment, None);
             assert!(!advisory.reclaim_allowed_by_policy);
             assert!(!advisory.required_human_confirmation);
             assert!(advisory.suggested_commands.is_empty());

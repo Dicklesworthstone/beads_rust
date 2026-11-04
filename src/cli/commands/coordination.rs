@@ -1,27 +1,162 @@
-//! Read-only swarm coordination diagnostics.
+//! Swarm coordination diagnostics and explicit, guarded ownership handoff.
 
 use crate::cli::{
-    CoordinationOwnerKindArg, CoordinationStatusArgs, OutputFormat,
-    resolve_output_format_basic_with_outer_mode,
+    CoordinationOwnerKindArg, CoordinationReclaimArgs, CoordinationStatusArgs, OutputFormat,
+    UpdateArgs, resolve_output_format_basic_with_outer_mode,
 };
 use crate::config;
 use crate::coordination::{
     AgentMailAgentSnapshot, AgentMailReservationSnapshot, ClaimAssessmentInput, ClaimOwnerKind,
-    CoordinationClaimRow, CoordinationComment, CoordinationIssueRow, CoordinationStatusOutput,
-    CoordinationWorkspaceCounts, ReservationEvidence, ReservationEvidenceProvenance,
-    advisory_for_claim, assess_claim, reservation_evidence_from_snapshots,
+    ClaimReclaimGuard, CoordinationClaimRow, CoordinationComment, CoordinationIssueRow,
+    CoordinationStatusOutput, CoordinationWorkspaceCounts, ReclaimCommandContext,
+    ReservationEvidence, ReservationEvidenceProvenance, advisory_for_claim, assess_claim,
+    reclaim_allowed_by_policy, reclaim_audit_message, reservation_evidence_from_snapshots,
 };
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, truncate_title};
 use crate::model::{Comment, Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::util::id::{IdResolver, ResolverConfig};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+
+/// Execute an explicit reclaim under the normal update/write/export machinery.
+/// The supplied snapshots are reloaded, and storage repeats the ownership and
+/// eligibility guards inside the audit-and-transfer transaction.
+///
+/// # Errors
+///
+/// Refuses missing actors, stale ownership revisions, unsafe evidence, and any
+/// ordinary claim/workflow rejection without partially transferring ownership.
+pub fn execute_reclaim_with_storage(
+    args: &CoordinationReclaimArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    pre_opened: &mut Option<config::OpenStorageResult>,
+) -> Result<()> {
+    let actor = cli
+        .actor
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            BeadsError::validation_with_hint(
+                "actor",
+                "coordination reclaim requires an explicit non-empty --actor",
+                "Set AGENT_NAME to the reclaiming agent and pass --actor \"$AGENT_NAME\".",
+            )
+        })?;
+    let expected_assignee = args.expected_assignee.trim();
+    if expected_assignee.is_empty() || actor.eq_ignore_ascii_case(expected_assignee) {
+        return Err(BeadsError::validation(
+            "expected-assignee",
+            "reclaim requires a non-empty previous assignee different from the new actor",
+        ));
+    }
+    let expected_updated_at = super::update::parse_if_unchanged_surface(
+        Some(&args.if_unchanged),
+        "--if-unchanged",
+        "`br coordination status --json` (assessment.updated_at)",
+    )?
+    .ok_or_else(|| BeadsError::internal("reclaim missing required ownership revision"))?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    if pre_opened.is_none() {
+        *pre_opened = Some(config::open_storage_with_cli(&beads_dir, cli)?);
+    }
+    let storage_ctx = pre_opened
+        .as_mut()
+        .ok_or_else(|| BeadsError::internal("reclaim missing open storage handle"))?;
+    super::auto_import_storage_ctx_if_stale(storage_ctx, cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(
+        config::id_config_from_layer(&config_layer).prefix,
+    ));
+    let id = super::resolve_issue_id(&storage_ctx.storage, &resolver, &args.id)?;
+    let issue = storage_ctx
+        .storage
+        .get_issue(&id)?
+        .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
+    if issue.assignee.as_deref().map(str::trim) != Some(expected_assignee)
+        || issue.updated_at != expected_updated_at
+    {
+        return Err(BeadsError::claim_conflict(
+            &id,
+            Some(expected_assignee),
+            issue.assignee.as_deref(),
+            Some(expected_updated_at),
+            Some(issue.updated_at),
+        ));
+    }
+    SqliteStorage::validate_claim_target(&issue, Utc::now())?;
+    if !is_coordination_claim(&issue) {
+        return Err(BeadsError::validation(
+            "reclaim",
+            "issue is not a live assigned claim",
+        ));
+    }
+
+    let assessment = load_reclaim_assessment(args, &issue, &storage_ctx.storage)?;
+    let update = UpdateArgs {
+        ids: vec![id],
+        claim: true,
+        reclaim: Some(ClaimReclaimGuard {
+            expected_assignee: expected_assignee.to_string(),
+            expected_updated_at,
+            owner_kind: assessment.owner_kind,
+            reservation: assessment.reservation.clone(),
+        }),
+        if_unchanged: Some(args.if_unchanged.clone()),
+        transition_comment: (issue.status != Status::InProgress)
+            .then(|| reclaim_audit_message(&assessment)),
+        ..UpdateArgs::default()
+    };
+    let mut explicit_actor_cli = cli.clone();
+    explicit_actor_cli.actor = Some(actor.to_string());
+    super::update::execute_with_storage(&update, &explicit_actor_cli, ctx, pre_opened)
+}
+
+fn load_reclaim_assessment(
+    args: &CoordinationReclaimArgs,
+    issue: &Issue,
+    storage: &SqliteStorage,
+) -> Result<crate::coordination::ClaimAssessment> {
+    let snapshots = SnapshotContext::from_args(&CoordinationStatusArgs {
+        owner_kind: args.owner_kind,
+        reservations: Some(args.reservations.clone()),
+        agents: args.agents.clone(),
+        ..CoordinationStatusArgs::default()
+    })?;
+    // A display limit must never conceal a path reservation at mutation time.
+    let comments = storage.get_comments(&issue.id)?;
+    let now = Utc::now();
+    let owner_kind = snapshots.owner_kind_for(issue.assignee.as_deref(), args.owner_kind);
+    let reservation =
+        snapshots.reservation_for(&issue.id, issue.assignee.as_deref(), &comments, now);
+    let assessment = assess_claim(ClaimAssessmentInput {
+        assignee: issue.assignee.clone(),
+        updated_at: issue.updated_at,
+        now,
+        owner_kind,
+        reservation,
+    });
+    if !reclaim_allowed_by_policy(&assessment) {
+        return Err(BeadsError::validation_with_hint(
+            "reclaim",
+            format!(
+                "issue {} is not eligible for reclaim: {} (owner_kind={owner_kind:?})",
+                issue.id,
+                assessment.classification.as_str()
+            ),
+            "Inspect the owner and current reservations, then regenerate coordination advice. Human and unknown owners require human coordination.",
+        ));
+    }
+    Ok(assessment)
+}
 
 /// Execute `br coordination status`.
 ///
@@ -181,7 +316,7 @@ fn build_coordination_status_output(
                 comments,
                 generated_at,
             );
-            let owner_kind = if agent.is_some() {
+            let owner_kind = if owner_kind != ClaimOwnerKind::Human && agent.is_some() {
                 ClaimOwnerKind::SwarmAgent
             } else {
                 owner_kind
@@ -198,6 +333,7 @@ fn build_coordination_status_output(
                     dependent_count: dependent_counts.get(&issue_id).copied().unwrap_or(0),
                     comments,
                     comment_limit,
+                    command_context: snapshots.command_context.as_ref(),
                 },
             )
         })
@@ -224,6 +360,7 @@ struct ClaimRowContext<'a> {
     dependent_count: usize,
     comments: &'a [Comment],
     comment_limit: usize,
+    command_context: Option<&'a ReclaimCommandContext>,
 }
 
 fn build_claim_row(issue: Issue, context: ClaimRowContext<'_>) -> CoordinationClaimRow {
@@ -236,7 +373,7 @@ fn build_claim_row(issue: Issue, context: ClaimRowContext<'_>) -> CoordinationCl
         owner_kind: context.owner_kind,
         reservation: context.reservation,
     });
-    let advisory = advisory_for_claim(&issue_id, &assessment);
+    let advisory = advisory_for_claim(&issue_id, &assessment, context.command_context);
     let issue = CoordinationIssueRow {
         id: issue_id,
         title: issue.title,
@@ -264,6 +401,7 @@ fn build_claim_row(issue: Issue, context: ClaimRowContext<'_>) -> CoordinationCl
 struct SnapshotContext {
     reservations: Option<Vec<AgentMailReservationSnapshot>>,
     agents_by_name: HashMap<String, AgentMailAgentSnapshot>,
+    command_context: Option<ReclaimCommandContext>,
 }
 
 impl SnapshotContext {
@@ -284,9 +422,25 @@ impl SnapshotContext {
             .map(|agent: AgentMailAgentSnapshot| (agent_key(&agent.name), agent))
             .collect();
 
+        let command_context = args
+            .reservations
+            .as_deref()
+            .map(|reservations| -> Result<ReclaimCommandContext> {
+                Ok(ReclaimCommandContext {
+                    reservations: snapshot_command_path(reservations)?,
+                    agents: args
+                        .agents
+                        .as_deref()
+                        .map(snapshot_command_path)
+                        .transpose()?,
+                    owner_kind: owner_kind_from_arg(args.owner_kind),
+                })
+            })
+            .transpose()?;
         Ok(Self {
             reservations,
             agents_by_name,
+            command_context,
         })
     }
 
@@ -294,6 +448,19 @@ impl SnapshotContext {
         assignee
             .map(agent_key)
             .and_then(|key| self.agents_by_name.get(&key).cloned())
+    }
+
+    fn owner_kind_for(
+        &self,
+        assignee: Option<&str>,
+        assumed: CoordinationOwnerKindArg,
+    ) -> ClaimOwnerKind {
+        let assumed = owner_kind_from_arg(assumed);
+        if assumed != ClaimOwnerKind::Human && self.agent_for(assignee).is_some() {
+            ClaimOwnerKind::SwarmAgent
+        } else {
+            assumed
+        }
     }
 
     const fn has_reservation_snapshot(&self) -> bool {
@@ -319,6 +486,23 @@ impl SnapshotContext {
             now,
         )
     }
+}
+
+fn snapshot_command_path(path: &Path) -> Result<String> {
+    // Keep the logical filename: exporters may refresh a symlink to a new
+    // snapshot generation. Canonicalizing would pin advice to the old target.
+    let absolute = std::path::absolute(path).map_err(|err| {
+        BeadsError::validation(
+            "coordination_snapshot",
+            format!("failed to resolve snapshot {}: {err}", path.display()),
+        )
+    })?;
+    absolute.to_str().map(str::to_string).ok_or_else(|| {
+        BeadsError::validation(
+            "coordination_snapshot",
+            "snapshot path must be valid UTF-8 for executable advice",
+        )
+    })
 }
 
 fn agent_key(name: &str) -> String {
@@ -664,6 +848,7 @@ mod tests {
                 dependent_count: 3,
                 comments: &[],
                 comment_limit: 2,
+                command_context: None,
             },
         );
 
