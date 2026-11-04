@@ -1,8 +1,9 @@
 # Coordination Evidence Contract
 
 Status: implemented helper contract shared by coordination CLI, MCP, scheduler,
-and audit work. The primary user-facing surface is the read-only
-`br coordination status` command.
+and audit work. The read-only `br coordination status` command diagnoses claims;
+the explicit `br coordination reclaim` command performs a guarded, audited
+handoff.
 
 ## Purpose
 
@@ -20,7 +21,7 @@ classification helpers in `src/coordination.rs`.
 - No live Agent Mail calls from `br`.
 - No git operations.
 - No background daemon.
-- No command that mutates issue status or assignee.
+- No ownership mutation from `coordination status` or the shared classifier.
 
 ## Evidence Inputs
 
@@ -31,6 +32,8 @@ The classifier uses only caller-provided evidence:
 - Optional Agent Mail snapshot evidence supplied by a caller or fixture.
 
 Missing Agent Mail data is explicit evidence, not proof of abandonment.
+An explicit human owner policy takes precedence over matching agent snapshot
+metadata, so a human name in an agent export cannot enable reclamation.
 
 ## Policy Matrix
 
@@ -85,16 +88,22 @@ Each claim assessment includes:
 Each claim row also includes advisory-only reclaim guidance:
 
 - `reclaim_allowed_by_policy`: true only when the shared policy has enough
-  evidence to suggest the audit-comment plus claim sequence for a swarm-agent
-  claim.
+  evidence to suggest a guarded reclaim attempt for a swarm-agent claim.
 - `required_human_confirmation`: true for human or unknown owners that are old
   enough to inspect but must not be reclaimed automatically.
 - `evidence_summary`: compact evidence values suitable for an audit comment,
   including `updated_at`, assignee, owner kind, age, thresholds, and
   reservation/snapshot status.
-- `suggested_commands`: reviewed-by-human shell commands. These are empty for
-  fresh claims, active reservations, missing/invalid snapshots, and human or
-  unknown ownership.
+- `suggested_commands`: shell commands for review before execution. An eligible
+  claim has one `br coordination reclaim` command carrying its observed
+  assignee, `updated_at`, snapshot paths, owner policy, and explicit new actor.
+  Commands are empty for fresh claims, active reservations, missing/invalid
+  snapshots, and human or unknown ownership.
+
+The v1 schema retains the historical `add_reclaim_audit_comment` and
+`claim_issue` purposes so older saved snapshots remain readable. New advice
+emits only `reclaim_issue`. Regenerate advice before a handoff instead of
+executing the obsolete two-command sequence from a saved snapshot.
 
 Future CLI and MCP surfaces should expose this shape directly in JSON mode and
 may convert it to TOON using the normal output layer. Human text output should be
@@ -187,10 +196,11 @@ Reviews, follow-up labels, and issue audit views continue to use the ordinary
 ## Agent Mail Boundary
 
 Agent Mail remains the collision-avoidance layer. `br` must not depend on a live
-MCP service. Future commands may accept explicit snapshot files or stdin payloads
-that describe reservations and agent liveness, but absence of that snapshot must
-be reported as `no_mail_snapshot` or `ambiguous`, never as proof that reclaiming
-is safe.
+MCP service. Coordination commands accept explicit snapshot files describing
+reservations and agent liveness. Absence of a usable snapshot is reported as
+`no_mail_snapshot` or `ambiguous`, never as proof that reclaiming is safe.
+Refresh snapshot files and inspect pane/process activity before a handoff;
+`br` cannot detect live activity omitted from an offline snapshot.
 
 ## Scheduler Boundary
 
@@ -205,21 +215,36 @@ coordination status surface for deeper diagnosis.
 
 ## Reclaim Boundary
 
-`reclaim_candidate` is advisory. The documented safe sequence still requires an
-audit comment before any claim update:
+`reclaim_candidate` is advisory. `coordination status` never executes the
+suggested command. After reviewing the evidence and checking external
+pane/process activity, an operator or agent can run the emitted guarded handoff.
+For a claim observed as owned by `OldAgent` at the timestamp below:
 
 ```bash
-br comments add <id> --author "$AGENT_NAME" \
-  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
-  --json
-br update <id> --claim --json
+br coordination reclaim bd-abc123 \
+  --expected-assignee=OldAgent \
+  --if-unchanged '2026-11-04T00:00:00Z' \
+  --reservations reservations.json --agents agents.jsonl \
+  --owner-kind swarm-agent \
+  --actor="${AGENT_NAME:?Set AGENT_NAME to the reclaiming agent}" --json
 ```
 
-Human or unknown ownership keeps the safer `ask_owner` recommendation even after
-the stale threshold.
+The command re-reads the supplied snapshot files and applies the same policy to
+the current issue. Under the ownership transaction, it requires eligible claim
+status and the same assignee and `updated_at` as the observation. It inserts the
+reclaim audit comment first, using the new actor as author, then assigns the
+issue directly to that actor with status `in_progress`. Audit and ownership commit
+together. A failed guard or policy check leaves both unchanged, and concurrent
+claimers cannot both succeed.
 
-`br coordination status` can emit the same sequence in `suggested_commands`, but
-only as an advisory. It never executes either command. The first suggested
-command is always the audit comment; only then does the second command show
-`br update <id> --claim --json`. Operators should still review the evidence and
-confirm any external pane/process state that `br` cannot observe.
+There is no separate `comments add`, unconditional requeue, or ordinary
+`update --claim` step. Adding a comment beforehand changes `updated_at` and
+invalidates the guard. `update --claim` retains its refusal of another actor's
+work. On a contention refusal, diagnostics expose the current claim and mark
+the error `retryable: false`; refresh the evidence rather than replaying the
+old command. Repeated use of a successful command is also refused.
+
+Human or unknown ownership keeps the safer `ask_owner` recommendation even after
+the stale threshold. Active reservations, fresh claims, and missing or invalid
+snapshots remain ineligible. Snapshot evidence is local and advisory; an old
+status output cannot authorize overwriting a newer database assignment.

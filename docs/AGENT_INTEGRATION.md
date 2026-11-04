@@ -288,6 +288,11 @@ future, including with `--force`. Use `br reopen` or `br undefer` explicitly
 before claiming that work. An expired timestamp on an otherwise open issue
 does not prevent a claim.
 
+An existing different assignee produces `CLAIM_CONFLICT` (exit `4`, `retryable: false`).
+Inspect that owner rather than retrying or clearing the assignment. The guarded
+abandoned-claim workflow below is the explicit handoff path when its evidence
+and policy checks pass.
+
 ### Stale Claims and Abandoned Work
 
 `br ready` intentionally hides `in_progress` issues. That keeps agents from
@@ -314,19 +319,32 @@ an Agent Mail name in comments, use that evidence when deciding whether the work
 is abandoned. Do not reclaim when the old claim is fresh, the owner is actively
 editing the same files, or the dirty tree contains unclear overlapping changes.
 
-When reclaiming abandoned work, leave an audit comment before touching files:
+When reclaiming abandoned work, refresh the Agent Mail snapshots and review the
+guarded handoff offered by coordination status:
 
 ```bash
-br comments add <id> --author "$BD_ACTOR" \
-  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
-  --json
-br update <id> --claim --json
+br coordination status --reservations reservations.json --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
 ```
 
-If Agent Mail is down, include the intended file scope in the same comment or a
-follow-up degraded-coordination comment. The newest assignee owns the claim, but
-the old owner can still return; in that case, coordinate in the bead thread and
-split or hand off the work instead of silently overwriting each other.
+Set `AGENT_NAME` to your agent identity and run the emitted
+`br coordination reclaim` command only after checking the old owner's session
+and file activity. The command inserts its audit comment before transferring
+ownership, with both writes in one transaction. It uses the same actor for the
+comment author and new assignee, and checks eligible claim status plus the exact
+previous assignee and observed `updated_at`. A newer assignment or intervening
+update makes the command fail without changing ownership or adding a reclaim
+comment.
+
+Do not add a separate audit comment first: a comment changes `updated_at` and
+invalidates the observed claim. Do not unconditionally requeue or clear the old
+assignee. Ordinary `update --claim` correctly refuses another actor's work.
+
+Missing coordination evidence remains a reason to inspect or ask the owner.
+If Mail is unavailable, do not infer abandonment from that failure. After a
+successful handoff, record the intended file scope under the degraded protocol
+when needed. If the old owner returns, coordinate in the bead thread and split
+or hand off the work instead of silently overwriting each other.
 
 `br scheduler --json` uses the same coordination age policy for its
 `evidence.stale_claim` object, but it deliberately assumes
@@ -375,30 +393,44 @@ br coordination status \
   --json
 ```
 
-Safe reclaim is still a manual, auditable sequence. Review
+Safe reclaim is an explicit, auditable action. Review
 `required_human_confirmation`, `reclaim_allowed_by_policy`, and
 `suggested_commands` first:
 
 ```bash
 br coordination status --reservations reservations.jsonl --agents agents.jsonl --json \
   | jq '.claims[] | {id: .issue.id, action: .assessment.recommended_action, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
-
-br comments add <id> --author "$BD_ACTOR" \
-  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
-  --json
-br update <id> --claim --json
 ```
 
-Only run the final two commands when the advisory output and human policy allow
-it. `br coordination status` never auto-reclaims, never runs git, and never
-creates or releases Agent Mail reservations.
+Each eligible claim has a single suggested command. Copy it after reviewing
+the evidence; it includes `--expected-assignee`, `--if-unchanged`, the snapshot
+paths, the owner policy, and an explicit `--actor` using the required
+`AGENT_NAME` environment variable. This guard prevents an unset or empty
+`AGENT_NAME` from silently falling back to a different identity.
+`coordination reclaim` re-reads the snapshot files and checks the current issue
+before writing its audit comment and transferring ownership atomically.
+
+Concurrent claimers can have at most one successful handoff. Changed ownership,
+renewed activity, and repeating a completed handoff produce a contention refusal
+with `retryable: false`. Inspect the reported current owner and refresh
+`coordination status`; do not retry stale commands or clear another owner's
+assignment. Refresh snapshots before each attempt, since `br` cannot observe
+live panes or Agent Mail changes that are absent from those files.
+
+`br coordination status` never auto-reclaims, never runs git, and never creates
+or releases Agent Mail reservations.
 
 The output is advisory only. `reclaim_allowed_by_policy=true` means the local
-policy and supplied snapshot evidence allow the documented audit-comment plus
-claim sequence. `suggested_commands` is empty for fresh claims, active
-reservations, missing or malformed snapshots, and human or unknown owners.
+policy and supplied snapshot evidence allow a guarded `coordination reclaim`
+attempt. The mutating command rechecks eligibility; the advisory itself does
+not authorize overwriting a newer assignment. `suggested_commands` is empty for
+fresh claims, active reservations, missing or malformed snapshots, and human or
+unknown owners.
 `required_human_confirmation=true` means ask the owner or operator instead of
 copying a claim command.
+An explicit `--owner-kind human` remains authoritative even when an agent
+snapshot happens to contain the same name. Do not override known human
+ownership with `--owner-kind swarm-agent`.
 
 When a coordination snapshot matters for a handoff or review, record it through
 the audit log before taking follow-up action:

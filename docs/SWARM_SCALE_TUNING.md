@@ -229,14 +229,22 @@ RUST_LOG=error br coordination status \
   --json
 ```
 
-Safe reclaim remains a two-step manual sequence. Review advisory output first,
-then copy the suggested audit comment and claim command only when policy allows
-it:
+Safe reclaim uses an explicit guarded handoff. Review advisory output first,
+then copy the single suggested `br coordination reclaim` command only when
+policy allows it:
 
 ```bash
 RUST_LOG=error br coordination status --reservations reservations.jsonl --agents agents.jsonl --json \
   | jq '.claims[] | select(.reclaim_allowed_by_policy == true) | {id: .issue.id, suggested_commands}'
 ```
+
+Set `AGENT_NAME` to the new owner. The emitted command includes that actor, the
+observed previous assignee and `updated_at`, and the snapshot paths. It re-reads
+the snapshots, rechecks the current claim, then inserts the audit comment and
+transfers ownership in one transaction. Refresh the snapshots and inspect the
+old owner's pane before running it. A changed assignment or a repeated attempt
+is a contention refusal (`retryable: false`); inspect fresh evidence instead of
+clearing the assignee or blindly retrying.
 
 `br coordination status` is read-only. It does not call Agent Mail, run git,
 create reservations, release reservations, or auto-reclaim work.

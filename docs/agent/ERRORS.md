@@ -55,6 +55,38 @@ envelope's `retryable` flag and `hint`, rather than inferring retry safety from
 reconciliation or artifact-repair guidance; repeating the primary mutation could
 duplicate work.
 
+## Claim contention
+
+`CLAIM_CONFLICT` (exit `4`) means an ordinary `br update --claim` encountered
+another assignee, or a guarded `br coordination reclaim` no longer matches the
+observed owner or revision. It is `retryable: false`: replaying the same command
+does not grant permission to take the current owner's work.
+
+Its structured context preserves the contention evidence:
+
+| Field | Meaning |
+| --- | --- |
+| `issue_id` | Issue whose claim was refused |
+| `expected_assignee` | Owner recorded in the reclaim advice; null for an ordinary claim |
+| `actual_assignee` | Current database assignee, or null when unassigned |
+| `expected_updated_at` | Revision from the reclaim advice, when supplied |
+| `actual_updated_at` | Current database revision, when available |
+| `written` | `false`: this refused handoff did not write its audit comment or change ownership |
+
+Read `hint` and inspect the current issue. For abandoned work, refresh the
+reservation/agent snapshots and obtain new coordination advice before deciding
+whether a new handoff is appropriate:
+
+```bash
+br show bd-abc123 --json
+br coordination status --reservations reservations.json --agents agents.jsonl --json
+```
+
+Do not clear the assignee or unconditionally requeue the issue to force a claim
+through. The generated `coordination reclaim` command records the audit comment
+and transfers the unchanged claim atomically. A repeated attempt after a
+successful handoff is a conflict, not a second ownership transfer.
+
 ## Partial-batch failures: two documents on stdout
 
 Since [#336], a command that partially applies a batch (e.g. `br close <blocked> <closeable> --json`) exits non-zero and writes **two** JSON documents to stdout: first the payload document describing what *did* happen, then the error envelope describing what failed:

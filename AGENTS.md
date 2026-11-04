@@ -698,18 +698,32 @@ reservations. Use `updated_at`, `assignee`, any session/pane/agent identity in
 comments, and named file scopes as evidence. If the previous owner may still be
 working, choose another ready bead or ask the human operator.
 
-When reclaiming, leave an audit comment first, then claim:
+When reclaiming, refresh the Agent Mail snapshots and review the guarded handoff
+command:
 
 ```bash
-br comments add <id> --author "$AGENT_NAME" \
-  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
-  --json
-br update <id> --claim --json
+br coordination status --reservations reservations.json --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
 ```
 
-If Agent Mail is unavailable, add or include the degraded-coordination intended
-file scope before editing. The newest assignee owns the claim, but if the old
-owner returns, coordinate in the bead thread instead of overwriting their work.
+Set `AGENT_NAME` to your agent identity, check the previous owner's pane and file
+activity, and run the emitted `br coordination reclaim` command when policy
+allows it. It carries the observed assignee and `updated_at` plus the snapshot
+paths. The command rechecks those guards and eligibility, inserts an audit
+comment authored by the new actor, then transfers ownership in the same
+transaction. There is no intermediate unassigned state.
+
+Do not add a separate audit comment before the generated command: doing so
+changes `updated_at` and invalidates its evidence. Do not requeue or clear the
+assignee to force `update --claim` through. On a contention refusal
+(`retryable: false`), inspect the current owner and refresh coordination status;
+never blindly retry the stale handoff. Missing/invalid snapshots, active
+reservations, and human/unknown ownership remain ineligible.
+
+If Agent Mail is unavailable, absence of evidence does not authorize reclaim.
+After a successful handoff, add the degraded-coordination intended file scope
+before editing when needed. If the old owner returns, coordinate in the bead
+thread instead of overwriting their work.
 
 ### Mapping Cheat Sheet
 

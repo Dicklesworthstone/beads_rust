@@ -442,7 +442,7 @@ br update [OPTIONS] [IDS]...
 | `-t, --type <TYPE>` | Change issue type |
 | `--assignee <NAME>` | Assign (empty string clears) |
 | `--owner <EMAIL>` | Set owner (empty string clears) |
-| `--claim` | Atomic claim (assignee=actor + status=in_progress) |
+| `--claim` | Atomic claim of unassigned work (assignee=actor + status=in_progress) |
 | `--if-unchanged <UPDATED_AT>` | Apply only if the issue still carries this `updated_at` (see [lost updates](#if-unchanged-lost-updates) below); one issue at a time |
 | `--force` | Force update even if issue is blocked; also required for a destructive rewrite of a non-empty description/design/acceptance-criteria/prerequisites/notes/agent-context value (see the overwrite guard below); never bypasses workflow requirements or capacity |
 | `--due <DATE>` | Set due date (empty string clears) |
@@ -472,6 +472,11 @@ br update bd-abc123 --add-label "urgent,reviewed"
 # Append to notes without rewriting the field (never needs --force)
 br update bd-abc123 --append-notes "decision: keep the WAL until the migration is verified"
 ```
+
+`--claim` refuses work assigned to another actor with `CLAIM_CONFLICT` (exit `4`,
+`retryable: false`). For an eligible abandoned owner, use the guarded
+[`coordination reclaim`](#coordination-reclaim) handoff instead of clearing the
+assignee. Normal claims retain their protection against another owner's work.
 
 **Combined field and label updates.** When `update` combines fields with labels,
 it applies both in one transaction across the selected issues in each workspace.
@@ -1057,12 +1062,18 @@ issue status or assignee.
 | `--stats` | Show token savings stats when using TOON output |
 | `--robot` | Machine-readable output |
 
+The status command defaults to `--owner-kind swarm-agent`. An explicit
+`--owner-kind human` takes precedence over a matching name in the agent
+snapshot; known human ownership is never converted into a swarm reclaim.
+
 JSON/TOON claim rows include advisory fields:
 `reclaim_allowed_by_policy`, `required_human_confirmation`,
 `evidence_summary`, and `suggested_commands`. Suggested commands are emitted
-only when the policy has enough evidence to propose the documented audit-comment
-plus `br update --claim` sequence. Fresh claims, active reservations, missing or
-invalid snapshots, and human/unknown ownership do not emit reclaim commands.
+only when the policy has enough evidence to propose the documented audit comment
+and ownership transfer through `br coordination reclaim`. The single suggested
+command records its audit comment before transferring the claim in the same
+transaction. Fresh claims, active reservations, missing or invalid snapshots,
+and human/unknown ownership do not emit reclaim commands.
 
 **Examples:**
 ```bash
@@ -1082,6 +1093,59 @@ br coordination status --reservations reservations.json --agents agents.jsonl --
 br coordination status --reservations reservations.json --agents agents.jsonl --json \
   | jq '.claims[] | {id: .issue.id, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
 ```
+
+### coordination reclaim
+
+Transfer an eligible abandoned swarm-agent claim to an explicit new actor,
+recording the evidence and ownership change atomically.
+
+```text
+br coordination reclaim <ID> --expected-assignee <NAME> --if-unchanged <TIMESTAMP> --reservations <PATH> [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--expected-assignee <NAME>` | Exact previous assignee observed by `coordination status` |
+| `--if-unchanged <TIMESTAMP>` | Observed `assessment.updated_at` value in RFC3339 format |
+| `--reservations <PATH>` | Required local reservation snapshot; read again when reclaiming |
+| `--agents <PATH>` | Optional local agent snapshot; read again when reclaiming |
+| `--owner-kind <KIND>` | Ownership policy from the advice: swarm-agent, human, or unknown (reclaim defaults to unknown) |
+| `--actor <NAME>` | Explicit new owner and author of the reclaim audit comment |
+| `--json` | Machine-readable result or structured refusal |
+
+Use the command emitted by `coordination status` after reviewing its evidence.
+It carries the observed assignee and timestamp, the snapshot paths and owner
+policy, and an explicit actor. For example, an advisory for `bd-abc123` owned by
+`OldAgent` at the timestamp below has this shape:
+
+```bash
+br coordination reclaim bd-abc123 \
+  --expected-assignee=OldAgent \
+  --if-unchanged '2026-11-04T00:00:00Z' \
+  --reservations reservations.json --agents agents.jsonl \
+  --owner-kind swarm-agent \
+  --actor="${AGENT_NAME:?Set AGENT_NAME to the reclaiming agent}" --json
+```
+
+The command rechecks the current claim and the supplied snapshots against the
+same conservative eligibility rules. It requires an eligible claim status and
+the same assignee and `updated_at` as the observation. On success it inserts the
+reclaim audit comment first, then changes the assignee directly to the actor and
+sets the issue `in_progress`. Both writes commit together; there is no unassigned
+interval and no separate `comments add` or `update --claim` step.
+
+Changed ownership, renewed activity, active reservations, invalid evidence,
+human/unknown ownership, and repeated use of an old command are refusals. A
+contention refusal identifies the current state and is not blindly retryable
+(`retryable: false`): refresh the coordination evidence before deciding what to
+do next. Normal `br update --claim` continues to refuse another actor's work.
+
+`br` does not fetch live Agent Mail state or inspect panes. Refresh the snapshot
+files and check the previous owner's session before running the handoff. An old
+snapshot is not proof that a worker is inactive, and `--owner-kind swarm-agent`
+must not be used to relabel known human-owned work.
 
 ---
 
@@ -1230,17 +1294,19 @@ comments or Agent Mail reservations do not show live work. Default thresholds
 are two hours for automated swarm claims and one business day for human or
 unclear claims.
 
-Before reclaiming, add an audit comment with the evidence, then claim:
+Use fresh Agent Mail snapshots to obtain a guarded handoff command:
 
 ```bash
-br comments add <id> --author "$BD_ACTOR" \
-  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
-  --json
-br update <id> --claim --json
+br coordination status --reservations reservations.json --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
 ```
 
-There is not a separate reclaim command; the audit comment plus `update --claim`
-is the documented recovery workflow.
+Review the output, set `AGENT_NAME` to the new owner's identity, and run the
+emitted [`coordination reclaim`](#coordination-reclaim) command. That command
+records the audit comment and transfers the matching claim in one transaction.
+Do not clear the assignee or requeue the issue to make `update --claim` succeed:
+that would discard the ownership guard. Human or unclear claims still require
+the owner or operator to resolve ownership explicitly.
 
 ---
 
