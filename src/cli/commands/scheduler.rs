@@ -527,6 +527,7 @@ fn scheduler_stale_claim_evidence(
             updated_at: issue.updated_at,
             now: *now,
             owner_kind: ClaimOwnerKind::SwarmAgent,
+            owner_last_active_at: None,
             reservation: ReservationEvidence::NoSnapshot,
         },
         scheduler_claim_policy(stale_threshold_minutes),

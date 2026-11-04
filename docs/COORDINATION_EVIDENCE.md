@@ -30,6 +30,7 @@ The classifier uses only caller-provided evidence:
 - Issue metadata: status, assignee, and `updated_at`.
 - Owner kind: `swarm_agent`, `human`, or `unknown`.
 - Optional Agent Mail snapshot evidence supplied by a caller or fixture.
+- The matching owner's `last_active_ts`, when an agent snapshot supplies it.
 
 Missing Agent Mail data is explicit evidence, not proof of abandonment.
 An explicit human owner policy takes precedence over matching agent snapshot
@@ -44,6 +45,7 @@ metadata, so a human name in an agent export cannot enable reclamation.
 | Active matching reservation after stale threshold | `blocked_by_active_reservation` | `leave_active` |
 | Stale age but no Agent Mail snapshot | `no_mail_snapshot` | `inspect_mail` |
 | Stale age with invalid snapshot | `ambiguous` | `inspect_mail` |
+| Stale issue with recent owner activity and valid reservation evidence | `fresh` | `observe` |
 | Stale swarm-agent age with no active reservation | `stale_candidate` | `reclaim_candidate` |
 | Abandoned-likely swarm-agent age with no active reservation | `abandoned_likely` | `reclaim_candidate` |
 | Stale human or unknown owner with no active reservation | `stale_candidate` | `ask_owner` |
@@ -60,6 +62,12 @@ These thresholds match the existing AGENTS.md guidance that swarm-agent claims
 are stale candidates after two quiet hours, while human or unclear claims use a
 one-business-day rule of thumb. The abandoned-likely marker is deliberately more
 conservative and remains advisory.
+
+Quiet time is measured from the newer of the issue's `updated_at` and the
+matching owner's `last_active_ts`. A recent or future-dated heartbeat cannot
+authorize reclamation. Duplicate agent names are matched case-insensitively
+after trimming and retain the newest heartbeat regardless of row order. The
+original issue timestamp remains the ownership revision checked by the handoff.
 
 ## Output Shape
 
@@ -79,6 +87,8 @@ Each claim assessment includes:
 - assignee after trimming whitespace,
 - owner kind,
 - updated timestamp and computed age in minutes,
+- optional `owner_last_active_at` and `last_activity_age_minutes`, distinguishing
+  owner liveness from the unchanged issue revision,
 - stale and abandoned thresholds,
 - reservation evidence,
 - classification,
@@ -97,6 +107,9 @@ Each claim row also includes advisory-only reclaim guidance:
 - `suggested_commands`: shell commands for review before execution. An eligible
   claim has one `br coordination reclaim` command carrying its observed
   assignee, `updated_at`, snapshot paths, owner policy, and explicit new actor.
+  It also binds the observed workspace, database, JSONL, and cache paths, including
+  databases stored outside the workspace. Legacy database environment aliases
+  are cleared so they cannot redirect workspace discovery.
   Commands are empty for fresh claims, active reservations, missing/invalid
   snapshots, and human or unknown ownership.
 
@@ -154,13 +167,20 @@ Agent snapshots use the same JSON/JSONL wrapping rules with an `agents` array:
 ```
 
 Reservations correlate to claims by assignee/holder, bead id in
-`reason`/`thread_id`, or path patterns named in recent comments. A matching
+`reason`/`thread_id`, or path patterns named in any issue comment. Both status
+and reclaim inspect the full comment history for reservation evidence;
+`--comments` limits only the displayed excerpts. A matching
 active reservation changes stale-looking work to
 `blocked_by_active_reservation` with `leave_active`. Missing snapshots remain
 `no_mail_snapshot`; supplied snapshots with no matching reservation become
 `no_reservation` evidence and allow the normal stale/reclaim policy to apply.
-Malformed or unreadable snapshot files fail with structured validation errors
-instead of silently weakening evidence.
+Malformed, unreadable, zero-byte, or whitespace-only snapshot files fail with
+structured validation errors. A verified empty export must contain an explicit
+JSON `[]` (or an empty `reservations`/`agents` array). Blank reservation holders
+or paths and release timestamps in the future produce `invalid_snapshot`
+evidence, even when that row would otherwise be unrelated to the issue.
+Blank agent names are rejected. Refresh exports atomically so a reader cannot
+mistake an interrupted export for evidence of inactivity.
 
 ## Audit Flight Recorder
 
@@ -221,16 +241,28 @@ pane/process activity, an operator or agent can run the emitted guarded handoff.
 For a claim observed as owned by `OldAgent` at the timestamp below:
 
 ```bash
+BEADS_DIR='/work/project/.beads' \
+BEADS_DB='/work/project/.beads/beads.db' \
+BEADS_JSONL='/work/project/.beads/issues.jsonl' \
+BEADS_CACHE_DIR='/work/project/.beads' BD_DB= BD_DATABASE= \
 br coordination reclaim bd-abc123 \
   --expected-assignee=OldAgent \
+  --expected-workspace '/work/project/.beads' \
   --if-unchanged '2026-11-04T00:00:00Z' \
-  --reservations reservations.json --agents agents.jsonl \
+  --reservations '/work/project/reservations.json' \
+  --agents '/work/project/agents.jsonl' \
+  --db '/work/project/.beads/beads.db' \
   --owner-kind swarm-agent \
   --actor="${AGENT_NAME:?Set AGENT_NAME to the reclaiming agent}" --json
 ```
 
-The command re-reads the supplied snapshot files and applies the same policy to
-the current issue. Under the ownership transaction, it requires eligible claim
+The command keeps the inspected workspace, database, JSONL export, and cache even when
+run from a different directory or with different inherited database settings.
+It rejects workspace authority changes before startup repair or automatic
+import, including metadata that resolves a pinned database under a different
+workspace's policy. It re-reads the supplied snapshot files and applies the same policy to the current issue,
+including the owner's latest supplied heartbeat. Under the ownership
+transaction, it requires eligible claim
 status and the same assignee and `updated_at` as the observation. It inserts the
 reclaim audit comment first, using the new actor as author, then assigns the
 issue directly to that actor with status `in_progress`. Audit and ownership commit

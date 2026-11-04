@@ -8243,6 +8243,7 @@ impl SqliteStorage {
             updated_at: issue.updated_at,
             now,
             owner_kind: guard.owner_kind,
+            owner_last_active_at: guard.owner_last_active_at,
             reservation: guard.reservation.clone(),
         });
         if !reclaim_allowed_by_policy(&assessment) {
@@ -31359,6 +31360,7 @@ required_fields:
                 expected_assignee: issue.assignee.clone().expect("assigned reclaim fixture"),
                 expected_updated_at: issue.updated_at,
                 owner_kind: crate::coordination::ClaimOwnerKind::SwarmAgent,
+                owner_last_active_at: None,
                 reservation: crate::coordination::ReservationEvidence::NoReservation,
             }),
             ..IssueUpdate::default()
@@ -31437,6 +31439,37 @@ required_fields:
                 .is_err()
         );
         assert_eq!(label_update_rows(&storage), before);
+    }
+
+    #[test]
+    fn reclaim_rechecks_owner_liveness_before_audit_and_assignment() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = abandoned_issue("bd-reclaim-active-owner", Status::InProgress);
+        storage.create_issue(&issue, "OldAgent").unwrap();
+        let before = label_update_rows(&storage);
+        for last_active_at in [
+            Utc::now() - chrono::Duration::minutes(30),
+            Utc::now() + chrono::Duration::hours(1),
+        ] {
+            let mut update = reclaim_update(&issue, "NewAgent");
+            update.reclaim.as_mut().unwrap().owner_last_active_at = Some(last_active_at);
+            let error = storage
+                .update_issue(&issue.id, &update, "NewAgent")
+                .unwrap_err();
+            assert!(matches!(error, BeadsError::ValidationWithHint { .. }));
+            assert_eq!(label_update_rows(&storage), before);
+        }
+
+        let mut update = reclaim_update(&issue, "NewAgent");
+        update.reclaim.as_mut().unwrap().owner_last_active_at = Some(issue.updated_at);
+        let reclaimed = storage
+            .update_issue(&issue.id, &update, "NewAgent")
+            .unwrap();
+        assert_eq!(reclaimed.assignee.as_deref(), Some("NewAgent"));
+        let comments = storage.get_comments(&issue.id).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].body.contains("owner_last_active_at="));
+        assert!(comments[0].body.contains("last_activity_age_minutes="));
     }
 
     #[test]

@@ -301,7 +301,8 @@ ready issue. Treat an `in_progress` issue as an abandoned-claim candidate only
 after checking `updated_at`, the assignee, and the coordination trail.
 
 A claim is normally fresh if it was updated recently or the assignee is still
-reachable. In swarm sessions, wait at least two hours since `updated_at` unless
+reachable. In swarm sessions, wait at least two quiet hours since the newer of
+`updated_at` and the matching agent snapshot's `last_active_ts`, unless
 the human operator explicitly says the pane is dead. For human-owned or unclear
 claims, use one business day as the default threshold.
 
@@ -335,6 +336,15 @@ comment author and new assignee, and checks eligible claim status plus the exact
 previous assignee and observed `updated_at`. A newer assignment or intervening
 update makes the command fail without changing ownership or adding a reclaim
 comment.
+
+Generated commands bind the inspected workspace, database, JSONL, and cache paths and
+clear historical database environment aliases; running one from another
+directory does not retarget it. A workspace guard refuses changed authority
+before startup repair or import. Fresh owner heartbeats, including the newest of
+duplicate agent rows, block reclaim. Both status and reclaim inspect every issue comment for
+active path reservations, independently of the displayed comment limit.
+Refresh the supplied snapshots before execution. A zero-byte or whitespace-only
+file is rejected; use an explicit JSON `[]` for a verified empty export.
 
 Do not add a separate audit comment first: a comment changes `updated_at` and
 invalidates the observed claim. Do not unconditionally requeue or clear the old

@@ -249,6 +249,10 @@ pub struct CoordinationClaimAdvisory {
 /// when the operator invokes it from another working directory.
 #[derive(Debug, Clone)]
 pub struct ReclaimCommandContext {
+    pub beads_dir: String,
+    pub db_path: String,
+    pub jsonl_path: String,
+    pub cache_dir: String,
     pub reservations: String,
     pub agents: Option<String>,
     pub owner_kind: ClaimOwnerKind,
@@ -262,6 +266,7 @@ pub struct ClaimReclaimGuard {
     pub expected_assignee: String,
     pub expected_updated_at: DateTime<Utc>,
     pub owner_kind: ClaimOwnerKind,
+    pub owner_last_active_at: Option<DateTime<Utc>>,
     pub reservation: ReservationEvidence,
 }
 
@@ -275,7 +280,7 @@ pub enum CoordinationEvidenceSource {
     PolicyThreshold,
     /// A caller-supplied Agent Mail snapshot.
     AgentMailSnapshot,
-    /// Explicit absence of an Agent Mail snapshot.
+    /// Explicit absence of an Agent Mail reservation snapshot.
     NoAgentMailSnapshot,
 }
 
@@ -304,6 +309,8 @@ pub struct ClaimAssessmentInput {
     pub updated_at: DateTime<Utc>,
     pub now: DateTime<Utc>,
     pub owner_kind: ClaimOwnerKind,
+    /// Most recent heartbeat of the matching owner in a supplied agent snapshot.
+    pub owner_last_active_at: Option<DateTime<Utc>>,
     pub reservation: ReservationEvidence,
 }
 
@@ -333,6 +340,13 @@ pub struct ClaimAssessment {
     pub owner_kind: ClaimOwnerKind,
     pub updated_at: DateTime<Utc>,
     pub updated_age_minutes: i64,
+    /// Supplied owner liveness never replaces the issue revision used by CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_last_active_at: Option<DateTime<Utc>>,
+    /// Quiet time since the newer of the issue revision and owner heartbeat.
+    /// Present when an agent snapshot supplied matching owner liveness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_age_minutes: Option<i64>,
     pub stale_threshold_minutes: i64,
     pub abandoned_threshold_minutes: i64,
     pub reservation: ReservationEvidence,
@@ -487,6 +501,13 @@ pub fn assess_claim_with_policy(
         .signed_duration_since(input.updated_at)
         .num_minutes()
         .max(0);
+    let last_activity_age_minutes = input.owner_last_active_at.map(|last_active_at| {
+        input
+            .now
+            .signed_duration_since(input.updated_at.max(last_active_at))
+            .num_minutes()
+            .max(0)
+    });
     let stale_threshold_minutes = policy.stale_candidate_after_minutes.max(0);
     let abandoned_threshold_minutes = policy
         .abandoned_likely_after_minutes
@@ -497,16 +518,24 @@ pub fn assess_claim_with_policy(
         input.owner_kind,
         &input.reservation,
         updated_age_minutes,
+        last_activity_age_minutes.unwrap_or(updated_age_minutes),
         stale_threshold_minutes,
         abandoned_threshold_minutes,
     );
-    let evidence_sources = evidence_sources_for(&input.reservation);
+    let mut evidence_sources = evidence_sources_for(&input.reservation);
+    if input.owner_last_active_at.is_some()
+        && !evidence_sources.contains(&CoordinationEvidenceSource::AgentMailSnapshot)
+    {
+        evidence_sources.push(CoordinationEvidenceSource::AgentMailSnapshot);
+    }
 
     ClaimAssessment {
         assignee,
         owner_kind: input.owner_kind,
         updated_at: input.updated_at,
         updated_age_minutes,
+        owner_last_active_at: input.owner_last_active_at,
+        last_activity_age_minutes,
         stale_threshold_minutes,
         abandoned_threshold_minutes,
         reservation: input.reservation,
@@ -521,6 +550,7 @@ fn classify_claim(
     owner_kind: ClaimOwnerKind,
     reservation: &ReservationEvidence,
     updated_age_minutes: i64,
+    activity_age_minutes: i64,
     stale_threshold_minutes: i64,
     abandoned_threshold_minutes: i64,
 ) -> (ClaimClassification, RecommendedAction) {
@@ -546,7 +576,9 @@ fn classify_claim(
             RecommendedAction::InspectMail,
         ),
         ReservationEvidence::NoReservation | ReservationEvidence::Expired { .. } => {
-            if updated_age_minutes >= abandoned_threshold_minutes {
+            if activity_age_minutes < stale_threshold_minutes {
+                (ClaimClassification::Fresh, RecommendedAction::Observe)
+            } else if activity_age_minutes >= abandoned_threshold_minutes {
                 (
                     ClaimClassification::AbandonedLikely,
                     recommended_reclaim_action(owner_kind),
@@ -630,7 +662,7 @@ pub(crate) fn reclaim_allowed_by_policy(assessment: &ClaimAssessment) -> bool {
 
 fn evidence_summary_for(assessment: &ClaimAssessment) -> String {
     let assignee = assessment.assignee.as_deref().unwrap_or("(unassigned)");
-    format!(
+    let mut summary = format!(
         "updated_at={}, assignee={}, owner_kind={}, age_minutes={}, stale_threshold_minutes={}, abandoned_threshold_minutes={}, reservation_status={}",
         assessment.updated_at,
         assignee,
@@ -639,7 +671,17 @@ fn evidence_summary_for(assessment: &ClaimAssessment) -> String {
         assessment.stale_threshold_minutes,
         assessment.abandoned_threshold_minutes,
         reservation_summary(&assessment.reservation)
-    )
+    );
+    if let Some(last_active_at) = assessment.owner_last_active_at {
+        summary.push_str(&format!(
+            ", owner_last_active_at={}, last_activity_age_minutes={}",
+            last_active_at,
+            assessment
+                .last_activity_age_minutes
+                .unwrap_or(assessment.updated_age_minutes)
+        ));
+    }
+    summary
 }
 
 const fn owner_kind_summary(owner_kind: ClaimOwnerKind) -> &'static str {
@@ -686,7 +728,11 @@ fn reclaim_suggested_commands(
     context: &ReclaimCommandContext,
 ) -> Vec<CoordinationSuggestedCommand> {
     let mut command = format!(
-        "br coordination reclaim {} --expected-assignee={} --if-unchanged {} --reservations {}",
+        "BEADS_DIR={} BEADS_DB={} BEADS_JSONL={} BEADS_CACHE_DIR={} BD_DB= BD_DATABASE= br coordination reclaim {} --expected-assignee={} --if-unchanged {} --reservations {}",
+        shell_quote(&context.beads_dir),
+        shell_quote(&context.db_path),
+        shell_quote(&context.jsonl_path),
+        shell_quote(&context.cache_dir),
         shell_quote(issue_id),
         shell_quote(assessment.assignee.as_deref().unwrap_or_default()),
         shell_quote(&assessment.updated_at.to_rfc3339()),
@@ -701,7 +747,9 @@ fn reclaim_suggested_commands(
         ClaimOwnerKind::Unknown => "unknown",
     };
     command.push_str(&format!(
-        " --owner-kind {owner_kind} --actor=\"${{AGENT_NAME:?Set AGENT_NAME to the reclaiming agent}}\" --json"
+        " --owner-kind {owner_kind} --expected-workspace {} --db {} --actor=\"${{AGENT_NAME:?Set AGENT_NAME to the reclaiming agent}}\" --json",
+        shell_quote(&context.beads_dir),
+        shell_quote(&context.db_path)
     ));
     vec![CoordinationSuggestedCommand {
         purpose: CoordinationSuggestedCommandPurpose::ReclaimIssue,
@@ -738,6 +786,29 @@ pub fn reservation_evidence_from_snapshots(
     let Some(reservations) = reservations else {
         return ReservationEvidence::NoSnapshot;
     };
+
+    // Validate the complete export before matching. An incomplete identity or
+    // impossible release time must not disappear into "no matching reservation"
+    // merely because the malformed row could not be associated with this issue.
+    for (index, reservation) in reservations.iter().enumerate() {
+        let invalid = if reservation.holder.trim().is_empty() {
+            Some("has an empty holder")
+        } else if reservation.path_pattern.trim().is_empty() {
+            Some("has an empty path_pattern")
+        } else if reservation
+            .released_ts
+            .is_some_and(|released| released > now)
+        {
+            Some("has a release timestamp in the future")
+        } else {
+            None
+        };
+        if let Some(reason) = invalid {
+            return ReservationEvidence::InvalidSnapshot {
+                reason: format!("reservation snapshot row {} {reason}", index + 1),
+            };
+        }
+    }
 
     let mut expired_match = None;
     for reservation in reservations {
@@ -830,7 +901,7 @@ mod tests {
         CoordinationEvidenceSource, CoordinationIssueRow, CoordinationStatusOutput,
         CoordinationSuggestedCommandPurpose, CoordinationWorkspaceCounts, ReclaimCommandContext,
         RecommendedAction, ReservationEvidence, advisory_for_claim, assess_claim,
-        reservation_evidence_from_snapshots,
+        reclaim_allowed_by_policy, reservation_evidence_from_snapshots,
     };
     use crate::model::{Comment, IssueType, Priority, Status};
     use chrono::{Duration, TimeZone, Utc};
@@ -851,6 +922,7 @@ mod tests {
             updated_at: now() - Duration::minutes(minutes_old),
             now: now(),
             owner_kind,
+            owner_last_active_at: None,
             reservation,
         }
     }
@@ -894,6 +966,109 @@ mod tests {
         assert_eq!(assessment.stale_threshold_minutes, 120);
         assert_eq!(assessment.classification, ClaimClassification::Fresh);
         assert_eq!(assessment.recommended_action, RecommendedAction::Observe);
+    }
+
+    #[test]
+    fn recent_owner_liveness_prevents_reclaim_without_replacing_issue_revision() {
+        for (last_active_at, expected_age) in [
+            (now() - Duration::minutes(119), 119),
+            (now(), 0),
+            (now() + Duration::minutes(5), 0),
+        ] {
+            let mut evidence = input(
+                12 * 60,
+                ClaimOwnerKind::SwarmAgent,
+                ReservationEvidence::NoReservation,
+            );
+            let original_revision = evidence.updated_at;
+            evidence.owner_last_active_at = Some(last_active_at);
+            let assessment = assess_claim(evidence);
+
+            assert_eq!(assessment.updated_at, original_revision);
+            assert_eq!(assessment.updated_age_minutes, 12 * 60);
+            assert_eq!(assessment.owner_last_active_at, Some(last_active_at));
+            assert_eq!(assessment.last_activity_age_minutes, Some(expected_age));
+            assert_eq!(assessment.classification, ClaimClassification::Fresh);
+            assert!(!reclaim_allowed_by_policy(&assessment));
+            let advisory = advisory_for_claim("bd-active-owner", &assessment, None);
+            assert!(advisory.evidence_summary.contains("owner_last_active_at="));
+            assert!(
+                advisory
+                    .evidence_summary
+                    .contains(&format!("last_activity_age_minutes={expected_age}"))
+            );
+        }
+    }
+
+    #[test]
+    fn owner_liveness_uses_the_existing_stale_and_abandoned_thresholds() {
+        for (quiet_minutes, classification) in [
+            (120, ClaimClassification::StaleCandidate),
+            (479, ClaimClassification::StaleCandidate),
+            (480, ClaimClassification::AbandonedLikely),
+        ] {
+            let mut evidence = input(
+                12 * 60,
+                ClaimOwnerKind::SwarmAgent,
+                ReservationEvidence::NoReservation,
+            );
+            evidence.owner_last_active_at = Some(now() - Duration::minutes(quiet_minutes));
+            let assessment = assess_claim(evidence);
+
+            assert_eq!(assessment.classification, classification);
+            assert_eq!(assessment.last_activity_age_minutes, Some(quiet_minutes));
+            assert!(reclaim_allowed_by_policy(&assessment));
+        }
+
+        let mut fresh_issue = input(
+            30,
+            ClaimOwnerKind::SwarmAgent,
+            ReservationEvidence::NoReservation,
+        );
+        fresh_issue.owner_last_active_at = Some(now() - Duration::hours(48));
+        let assessment = assess_claim(fresh_issue);
+        assert_eq!(assessment.classification, ClaimClassification::Fresh);
+        assert_eq!(assessment.last_activity_age_minutes, Some(30));
+        assert!(!reclaim_allowed_by_policy(&assessment));
+    }
+
+    #[test]
+    fn owner_liveness_never_overrides_reservation_or_human_guards() {
+        for (reservation, classification) in [
+            (
+                ReservationEvidence::Active {
+                    holder: "TopazFox".to_string(),
+                    expires_at: Some(now() + Duration::hours(1)),
+                    provenance: None,
+                },
+                ClaimClassification::BlockedByActiveReservation,
+            ),
+            (
+                ReservationEvidence::NoSnapshot,
+                ClaimClassification::NoMailSnapshot,
+            ),
+            (
+                ReservationEvidence::InvalidSnapshot {
+                    reason: "incomplete export".to_string(),
+                },
+                ClaimClassification::Ambiguous,
+            ),
+        ] {
+            let mut evidence = input(12 * 60, ClaimOwnerKind::SwarmAgent, reservation);
+            evidence.owner_last_active_at = Some(now());
+            let assessment = assess_claim(evidence);
+            assert_eq!(assessment.classification, classification);
+            assert!(!reclaim_allowed_by_policy(&assessment));
+        }
+
+        for owner_kind in [ClaimOwnerKind::Human, ClaimOwnerKind::Unknown] {
+            let mut evidence = input(96 * 60, owner_kind, ReservationEvidence::NoReservation);
+            evidence.owner_last_active_at = Some(now() - Duration::hours(80));
+            let assessment = assess_claim(evidence);
+            assert_eq!(assessment.owner_kind, owner_kind);
+            assert_eq!(assessment.recommended_action, RecommendedAction::AskOwner);
+            assert!(!reclaim_allowed_by_policy(&assessment));
+        }
     }
 
     #[test]
@@ -1014,6 +1189,7 @@ mod tests {
             updated_at: now() + Duration::minutes(5),
             now: now(),
             owner_kind: ClaimOwnerKind::SwarmAgent,
+            owner_last_active_at: None,
             reservation: ReservationEvidence::NoReservation,
         });
 
@@ -1028,6 +1204,7 @@ mod tests {
             updated_at: now() - Duration::hours(12),
             now: now(),
             owner_kind: ClaimOwnerKind::SwarmAgent,
+            owner_last_active_at: None,
             reservation: ReservationEvidence::NoReservation,
         });
 
@@ -1207,6 +1384,7 @@ mod tests {
             updated_at: now() - Duration::hours(12),
             now: now(),
             owner_kind: ClaimOwnerKind::SwarmAgent,
+            owner_last_active_at: None,
             reservation: evidence,
         });
 
@@ -1220,6 +1398,74 @@ mod tests {
                 provenance: Some(_),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn invalid_reservation_rows_cannot_authorize_reclaim_as_absent_or_expired() {
+        let base = AgentMailReservationSnapshot {
+            holder: "OtherAgent".to_string(),
+            path_pattern: "unrelated/**".to_string(),
+            exclusive: true,
+            reason: None,
+            expires_ts: now() + Duration::hours(1),
+            released_ts: None,
+            thread_id: None,
+        };
+        for (reservation, expected_reason) in [
+            (
+                AgentMailReservationSnapshot {
+                    holder: "   ".to_string(),
+                    ..base.clone()
+                },
+                "empty holder",
+            ),
+            (
+                AgentMailReservationSnapshot {
+                    path_pattern: "\t ".to_string(),
+                    ..base.clone()
+                },
+                "empty path_pattern",
+            ),
+            (
+                AgentMailReservationSnapshot {
+                    released_ts: Some(now() + Duration::minutes(5)),
+                    ..base.clone()
+                },
+                "release timestamp in the future",
+            ),
+        ] {
+            for owner in ["TopazFox", "OtherAgent"] {
+                let evidence = reservation_evidence_from_snapshots(
+                    "bd-claim",
+                    Some(owner),
+                    &[],
+                    Some(std::slice::from_ref(&reservation)),
+                    now(),
+                );
+                let ReservationEvidence::InvalidSnapshot { reason } = &evidence else {
+                    panic!("invalid snapshot became usable evidence: {evidence:?}");
+                };
+                assert!(reason.contains(expected_reason), "{reason}");
+                let assessment = assess_claim(input(12 * 60, ClaimOwnerKind::SwarmAgent, evidence));
+                assert_eq!(assessment.classification, ClaimClassification::Ambiguous);
+                assert!(!reclaim_allowed_by_policy(&assessment));
+            }
+        }
+
+        let released = AgentMailReservationSnapshot {
+            released_ts: Some(now() - Duration::minutes(1)),
+            ..base
+        };
+        assert!(matches!(
+            reservation_evidence_from_snapshots(
+                "bd-claim",
+                Some("OtherAgent"),
+                &[],
+                Some(&[released]),
+                now(),
+            ),
+            ReservationEvidence::Expired { .. }
         ));
     }
 
@@ -1288,6 +1534,10 @@ mod tests {
             ReservationEvidence::NoReservation,
         ));
         let command_context = ReclaimCommandContext {
+            beads_dir: "/tmp/source 'workspace'/.beads".to_string(),
+            db_path: "/tmp/source 'workspace'/tracker.db".to_string(),
+            jsonl_path: "/tmp/source 'workspace'/.beads/issues.jsonl".to_string(),
+            cache_dir: "/tmp/cache 'workspace'".to_string(),
             reservations: "/tmp/reservations.json".to_string(),
             agents: Some("/tmp/agents.jsonl".to_string()),
             owner_kind: ClaimOwnerKind::SwarmAgent,
@@ -1297,6 +1547,24 @@ mod tests {
         assert!(advisory.reclaim_allowed_by_policy);
         assert!(!advisory.required_human_confirmation);
         assert_eq!(advisory.suggested_commands.len(), 1);
+        let words = shell_words::split(&advisory.suggested_commands[0].command)
+            .expect("suggested shell command parses");
+        assert_eq!(words[0], "BEADS_DIR=/tmp/source 'workspace'/.beads");
+        assert_eq!(words[1], "BEADS_DB=/tmp/source 'workspace'/tracker.db");
+        assert_eq!(
+            words[2],
+            "BEADS_JSONL=/tmp/source 'workspace'/.beads/issues.jsonl"
+        );
+        assert_eq!(words[3], "BEADS_CACHE_DIR=/tmp/cache 'workspace'");
+        assert_eq!(words[4], "BD_DB=");
+        assert_eq!(words[5], "BD_DATABASE=");
+        let workspace_flag = words
+            .iter()
+            .position(|word| word == "--expected-workspace")
+            .unwrap();
+        assert_eq!(words[workspace_flag + 1], "/tmp/source 'workspace'/.beads");
+        let db_flag = words.iter().position(|word| word == "--db").unwrap();
+        assert_eq!(words[db_flag + 1], "/tmp/source 'workspace'/tracker.db");
         assert_eq!(
             advisory.suggested_commands[0].purpose,
             CoordinationSuggestedCommandPurpose::ReclaimIssue

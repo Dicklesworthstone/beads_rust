@@ -1447,6 +1447,16 @@
               "type": "integer",
               "format": "int64"
             },
+            "owner_last_active_at": {
+              "description": "Supplied owner liveness never replaces the issue revision used by CAS.",
+              "type": ["string", "null"],
+              "format": "date-time"
+            },
+            "last_activity_age_minutes": {
+              "description": "Quiet time since the newer of the issue revision and owner heartbeat.\nPresent when an agent snapshot supplied matching owner liveness.",
+              "type": ["integer", "null"],
+              "format": "int64"
+            },
             "stale_threshold_minutes": {
               "type": "integer",
               "format": "int64"
@@ -1760,7 +1770,7 @@
               "const": "agent_mail_snapshot"
             },
             {
-              "description": "Explicit absence of an Agent Mail snapshot.",
+              "description": "Explicit absence of an Agent Mail reservation snapshot.",
               "type": "string",
               "const": "no_agent_mail_snapshot"
             }
@@ -2122,6 +2132,16 @@
               "type": "integer",
               "format": "int64"
             },
+            "owner_last_active_at": {
+              "description": "Supplied owner liveness never replaces the issue revision used by CAS.",
+              "type": ["string", "null"],
+              "format": "date-time"
+            },
+            "last_activity_age_minutes": {
+              "description": "Quiet time since the newer of the issue revision and owner heartbeat.\nPresent when an agent snapshot supplied matching owner liveness.",
+              "type": ["integer", "null"],
+              "format": "int64"
+            },
             "stale_threshold_minutes": {
               "type": "integer",
               "format": "int64"
@@ -2435,7 +2455,7 @@
               "const": "agent_mail_snapshot"
             },
             {
-              "description": "Explicit absence of an Agent Mail snapshot.",
+              "description": "Explicit absence of an Agent Mail reservation snapshot.",
               "type": "string",
               "const": "no_agent_mail_snapshot"
             }

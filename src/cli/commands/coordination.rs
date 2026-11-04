@@ -65,12 +65,17 @@ pub fn execute_reclaim_with_storage(
     )?
     .ok_or_else(|| BeadsError::internal("reclaim missing required ownership revision"))?;
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    validate_reclaim_workspace(args.expected_workspace.as_deref(), &beads_dir)?;
     if pre_opened.is_none() {
         *pre_opened = Some(config::open_storage_with_cli(&beads_dir, cli)?);
     }
     let storage_ctx = pre_opened
         .as_mut()
         .ok_or_else(|| BeadsError::internal("reclaim missing open storage handle"))?;
+    validate_reclaim_workspace(
+        args.expected_workspace.as_deref(),
+        &storage_ctx.paths.beads_dir,
+    )?;
     super::auto_import_storage_ctx_if_stale(storage_ctx, cli)?;
     let config_layer = storage_ctx.load_config(cli)?;
     let resolver = IdResolver::new(ResolverConfig::with_prefix(
@@ -108,6 +113,7 @@ pub fn execute_reclaim_with_storage(
             expected_assignee: expected_assignee.to_string(),
             expected_updated_at,
             owner_kind: assessment.owner_kind,
+            owner_last_active_at: assessment.owner_last_active_at,
             reservation: assessment.reservation.clone(),
         }),
         if_unchanged: Some(args.if_unchanged.clone()),
@@ -118,6 +124,40 @@ pub fn execute_reclaim_with_storage(
     let mut explicit_actor_cli = cli.clone();
     explicit_actor_cli.actor = Some(actor.to_string());
     super::update::execute_with_storage(&update, &explicit_actor_cli, ctx, pre_opened)
+}
+
+/// Refuse a changed workspace authority before inspecting or transferring a claim.
+///
+/// # Errors
+///
+/// Returns a validation error if the captured workspace cannot be resolved or
+/// differs from the workspace selected for the handoff.
+pub fn validate_reclaim_workspace(expected: Option<&Path>, actual: &Path) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let resolve = |path: &Path| {
+        fs::canonicalize(path).map_err(|err| {
+            BeadsError::validation(
+                "expected-workspace",
+                format!("cannot resolve reclaim workspace {}: {err}", path.display()),
+            )
+        })
+    };
+    let expected = resolve(expected)?;
+    let actual = resolve(actual)?;
+    if actual != expected {
+        return Err(BeadsError::validation_with_hint(
+            "expected-workspace",
+            format!(
+                "coordination workspace changed: expected {}, resolved {}",
+                expected.display(),
+                actual.display(),
+            ),
+            "Inspect the database path and workspace redirects, then regenerate advice from the intended workspace. Do not remove the workspace guard to force a handoff.",
+        ));
+    }
+    Ok(())
 }
 
 fn load_reclaim_assessment(
@@ -142,6 +182,9 @@ fn load_reclaim_assessment(
         updated_at: issue.updated_at,
         now,
         owner_kind,
+        owner_last_active_at: snapshots
+            .agent_for(issue.assignee.as_deref())
+            .map(|agent| agent.last_active_ts),
         reservation,
     });
     if !reclaim_allowed_by_policy(&assessment) {
@@ -169,7 +212,7 @@ pub fn execute_status(
     outer_ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    execute_status_inner(args, cli, outer_ctx, &beads_dir, None, None)
+    execute_status_inner(args, cli, outer_ctx, &beads_dir, None)
 }
 
 /// Execute `br coordination status` using the caller's pre-opened storage.
@@ -184,7 +227,7 @@ pub fn execute_status_with_storage_ctx(
     beads_dir: &Path,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<()> {
-    execute_status_inner(args, cli, outer_ctx, beads_dir, None, Some(storage_ctx))
+    execute_status_inner(args, cli, outer_ctx, beads_dir, Some(storage_ctx))
 }
 
 fn execute_status_inner(
@@ -192,25 +235,25 @@ fn execute_status_inner(
     cli: &config::CliOverrides,
     outer_ctx: &OutputContext,
     beads_dir: &Path,
-    preloaded_storage: Option<&SqliteStorage>,
     preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<()> {
-    let owned_storage_ctx = if preloaded_storage.is_some() || preloaded_storage_ctx.is_some() {
+    let owned_storage_ctx = if preloaded_storage_ctx.is_some() {
         None
     } else {
         Some(config::open_storage_with_cli(beads_dir, cli)?)
     };
-    let storage = preloaded_storage
-        .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
-        .or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage))
+    let storage_ctx = preloaded_storage_ctx
+        .or(owned_storage_ctx.as_ref())
         .ok_or_else(|| BeadsError::internal("coordination status missing open storage handle"))?;
+    let storage = &storage_ctx.storage;
 
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
         outer_ctx.inherited_output_mode(),
         args.robot,
     );
-    let snapshots = SnapshotContext::from_args(args)?;
+    let mut snapshots = SnapshotContext::from_args(args)?;
+    snapshots.bind_command_context(args, &storage_ctx.paths)?;
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, true);
     if matches!(ctx.mode(), OutputMode::Quiet) {
@@ -293,13 +336,18 @@ fn build_coordination_status_output(
     let labels_by_issue = storage.get_labels_for_issues(&issue_ids)?;
     let (dependency_counts, dependent_counts) =
         storage.count_relation_counts_for_issues(&issue_ids)?;
-    let comment_scan_limit = if snapshots.has_reservation_snapshot() {
-        comment_limit.max(1)
+    let comments_by_issue = if snapshots
+        .reservations
+        .as_ref()
+        .is_some_and(|reservations| !reservations.is_empty())
+    {
+        // Display limits must not change the ownership decision. Old comments
+        // can still name paths covered by a current reservation. Keep this a
+        // batched read, and bound only the excerpts included in the output.
+        storage.get_comments_for_issues(&issue_ids)?
     } else {
-        comment_limit
+        storage.get_latest_comments_for_issues(&issue_ids, comment_limit)?
     };
-    let comments_by_issue =
-        storage.get_latest_comments_for_issues(&issue_ids, comment_scan_limit)?;
 
     let claims: Vec<CoordinationClaimRow> = issues
         .into_iter()
@@ -371,6 +419,7 @@ fn build_claim_row(issue: Issue, context: ClaimRowContext<'_>) -> CoordinationCl
         updated_at: issue.updated_at,
         now: context.generated_at,
         owner_kind: context.owner_kind,
+        owner_last_active_at: context.agent.as_ref().map(|agent| agent.last_active_ts),
         reservation: context.reservation,
     });
     let advisory = advisory_for_claim(&issue_id, &assessment, context.command_context);
@@ -411,37 +460,69 @@ impl SnapshotContext {
             .as_deref()
             .map(|path| read_snapshot_rows(path, "reservation", "reservations"))
             .transpose()?;
-        let agents = args
+        let agents: Vec<AgentMailAgentSnapshot> = args
             .agents
             .as_deref()
             .map(|path| read_snapshot_rows(path, "agent", "agents"))
             .transpose()?
             .unwrap_or_default();
-        let agents_by_name = agents
-            .into_iter()
-            .map(|agent: AgentMailAgentSnapshot| (agent_key(&agent.name), agent))
-            .collect();
+        let mut agents_by_name = HashMap::<String, AgentMailAgentSnapshot>::new();
+        for agent in agents {
+            let name = agent_key(&agent.name);
+            if name.is_empty() {
+                return Err(BeadsError::validation(
+                    "coordination_snapshot",
+                    "agent snapshot contains an empty owner name",
+                ));
+            }
+            // Merged exports can contain multiple sightings of the same owner.
+            // Input order must never let an older row hide positive liveness.
+            match agents_by_name.entry(name) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if agent.last_active_ts > entry.get().last_active_ts {
+                        entry.insert(agent);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(agent);
+                }
+            }
+        }
 
-        let command_context = args
+        Ok(Self {
+            reservations,
+            agents_by_name,
+            command_context: None,
+        })
+    }
+
+    fn bind_command_context(
+        &mut self,
+        args: &CoordinationStatusArgs,
+        paths: &config::ConfigPaths,
+    ) -> Result<()> {
+        self.command_context = args
             .reservations
             .as_deref()
             .map(|reservations| -> Result<ReclaimCommandContext> {
                 Ok(ReclaimCommandContext {
-                    reservations: snapshot_command_path(reservations)?,
+                    beads_dir: absolute_command_path(&paths.beads_dir)?,
+                    db_path: absolute_command_path(&paths.db_path)?,
+                    jsonl_path: absolute_command_path(&paths.jsonl_path)?,
+                    cache_dir: absolute_command_path(&crate::util::resolve_cache_dir(
+                        &paths.beads_dir,
+                    ))?,
+                    reservations: absolute_command_path(reservations)?,
                     agents: args
                         .agents
                         .as_deref()
-                        .map(snapshot_command_path)
+                        .map(absolute_command_path)
                         .transpose()?,
                     owner_kind: owner_kind_from_arg(args.owner_kind),
                 })
             })
             .transpose()?;
-        Ok(Self {
-            reservations,
-            agents_by_name,
-            command_context,
-        })
+        Ok(())
     }
 
     fn agent_for(&self, assignee: Option<&str>) -> Option<AgentMailAgentSnapshot> {
@@ -468,7 +549,7 @@ impl SnapshotContext {
     }
 
     fn has_snapshots(&self) -> bool {
-        self.reservations.is_some() || !self.agents_by_name.is_empty()
+        self.has_reservation_snapshot() || !self.agents_by_name.is_empty()
     }
 
     fn reservation_for(
@@ -488,19 +569,19 @@ impl SnapshotContext {
     }
 }
 
-fn snapshot_command_path(path: &Path) -> Result<String> {
+fn absolute_command_path(path: &Path) -> Result<String> {
     // Keep the logical filename: exporters may refresh a symlink to a new
     // snapshot generation. Canonicalizing would pin advice to the old target.
     let absolute = std::path::absolute(path).map_err(|err| {
         BeadsError::validation(
-            "coordination_snapshot",
-            format!("failed to resolve snapshot {}: {err}", path.display()),
+            "coordination_command",
+            format!("failed to resolve command path {}: {err}", path.display()),
         )
     })?;
     absolute.to_str().map(str::to_string).ok_or_else(|| {
         BeadsError::validation(
-            "coordination_snapshot",
-            "snapshot path must be valid UTF-8 for executable advice",
+            "coordination_command",
+            "command paths must be valid UTF-8 for executable advice",
         )
     })
 }
@@ -521,7 +602,11 @@ where
     })?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Err(BeadsError::validation_with_hint(
+            "coordination_snapshot",
+            format!("{kind} snapshot {} is empty or incomplete", path.display()),
+            "Refresh the snapshot. Use an explicit JSON [] for a verified empty export; an empty file does not prove absence of activity.",
+        ));
     }
 
     match serde_json::from_str::<Value>(trimmed) {

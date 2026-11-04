@@ -246,6 +246,13 @@ old owner's pane before running it. A changed assignment or a repeated attempt
 is a contention refusal (`retryable: false`); inspect fresh evidence instead of
 clearing the assignee or blindly retrying.
 
+The command also pins the inspected workspace, database, JSONL, and cache paths,
+and refuses changed workspace authority before startup repair or import.
+Quiet time includes the newest matching owner heartbeat, so active owners are
+protected even when their issue timestamp is old. All issue comments contribute
+reservation evidence regardless of the displayed comment limit. Empty files
+are not valid snapshots; represent a verified empty export as JSON `[]`.
+
 `br coordination status` is read-only. It does not call Agent Mail, run git,
 create reservations, release reservations, or auto-reclaim work.
 

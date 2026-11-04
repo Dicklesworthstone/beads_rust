@@ -1556,6 +1556,10 @@ pub struct CoordinationReclaimArgs {
     #[arg(long, value_name = "ASSIGNEE")]
     pub expected_assignee: String,
 
+    /// Refuse if workspace discovery differs from the directory inspected by status
+    #[arg(long, value_name = "PATH")]
+    pub expected_workspace: Option<PathBuf>,
+
     /// Original updated_at from the advice; any intervening activity refuses the handoff
     #[arg(long, value_name = "UPDATED_AT")]
     pub if_unchanged: String,

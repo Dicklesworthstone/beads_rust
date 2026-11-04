@@ -73,6 +73,20 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     let command_supports_auto_import = should_auto_import(&cli.command);
     let mut overrides = build_cli_overrides(&cli);
 
+    // Validate the captured workspace before startup repair or automatic import
+    // can mutate a database under a different workspace's policy/authority.
+    if let Commands::Coordination {
+        command: beads_rust::cli::CoordinationCommands::Reclaim(args),
+    } = &cli.command
+        && args.expected_workspace.is_some()
+    {
+        let beads_dir = config::discover_beads_dir_with_cli(&overrides)?;
+        commands::coordination::validate_reclaim_workspace(
+            args.expected_workspace.as_deref(),
+            &beads_dir,
+        )?;
+    }
+
     // Phase 1: Startup & Discovery (One-time)
     let mut ctx = match StartupContext::init(&overrides) {
         Ok(ctx) => ctx,

@@ -713,6 +713,14 @@ schemas:
           updated_age_minutes:
             type: integer
             format: int64
+          owner_last_active_at:
+            description: Supplied owner liveness never replaces the issue revision used by CAS.
+            type[2]: string,"null"
+            format: date-time
+          last_activity_age_minutes:
+            description: "Quiet time since the newer of the issue revision and owner heartbeat.\nPresent when an agent snapshot supplied matching owner liveness."
+            type[2]: integer,"null"
+            format: int64
           stale_threshold_minutes:
             type: integer
             format: int64
@@ -847,7 +855,7 @@ schemas:
           "Issue status, assignee, and updated timestamp.",string,issue_metadata
           Owner-specific stale and abandoned thresholds.,string,policy_threshold
           A caller-supplied Agent Mail snapshot.,string,agent_mail_snapshot
-          Explicit absence of an Agent Mail snapshot.,string,no_agent_mail_snapshot
+          Explicit absence of an Agent Mail reservation snapshot.,string,no_agent_mail_snapshot
       CoordinationSuggestedCommand:
         description: A command suggestion emitted for an operator to review and run manually.
         type: object
@@ -1050,6 +1058,14 @@ schemas:
           updated_age_minutes:
             type: integer
             format: int64
+          owner_last_active_at:
+            description: Supplied owner liveness never replaces the issue revision used by CAS.
+            type[2]: string,"null"
+            format: date-time
+          last_activity_age_minutes:
+            description: "Quiet time since the newer of the issue revision and owner heartbeat.\nPresent when an agent snapshot supplied matching owner liveness."
+            type[2]: integer,"null"
+            format: int64
           stale_threshold_minutes:
             type: integer
             format: int64
@@ -1184,7 +1200,7 @@ schemas:
           "Issue status, assignee, and updated timestamp.",string,issue_metadata
           Owner-specific stale and abandoned thresholds.,string,policy_threshold
           A caller-supplied Agent Mail snapshot.,string,agent_mail_snapshot
-          Explicit absence of an Agent Mail snapshot.,string,no_agent_mail_snapshot
+          Explicit absence of an Agent Mail reservation snapshot.,string,no_agent_mail_snapshot
       CoordinationSuggestedCommand:
         description: A command suggestion emitted for an operator to review and run manually.
         type: object

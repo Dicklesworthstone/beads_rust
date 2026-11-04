@@ -678,8 +678,9 @@ after you have evidence from the bead metadata and coordination trail.
 
 Use this rule of thumb:
 
-- Agent swarm claim: stale candidate after two hours without an `updated_at`
-  change, unless the human operator explicitly says the pane/session is dead.
+- Agent swarm claim: stale candidate after two quiet hours since the newer of
+  `updated_at` and the matching agent snapshot's `last_active_ts`, unless the
+  human operator explicitly says the pane/session is dead.
 - Human or unclear claim: stale candidate after one business day.
 - Any claim with live Agent Mail reservations, recent comments, or visible dirty
   work in the same files is not abandoned.
@@ -712,6 +713,12 @@ allows it. It carries the observed assignee and `updated_at` plus the snapshot
 paths. The command rechecks those guards and eligibility, inserts an audit
 comment authored by the new actor, then transfers ownership in the same
 transaction. There is no intermediate unassigned state.
+
+Generated commands also bind the inspected workspace, database, JSONL, and cache
+paths. Recent owner heartbeats and active reservations found through any issue
+comment block reclamation, even when comment excerpts are hidden. A zero-byte
+or whitespace-only snapshot is invalid; use explicit JSON `[]` for a verified
+empty export.
 
 Do not add a separate audit comment before the generated command: doing so
 changes `updated_at` and invalidates its evidence. Do not requeue or clear the

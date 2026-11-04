@@ -128,7 +128,7 @@ fn write_snapshot_files(workspace: &BrWorkspace) -> (String, String) {
     let agents = json!({
         "name": "AmberLion",
         "task_description": "working stale fixture",
-        "last_active_ts": "2099-01-01T00:30:00Z",
+        "last_active_ts": "2020-01-01T00:30:00Z",
         "contact_policy": "auto"
     });
     fs::write(&reservations_path, reservations.to_string()).expect("write reservations snapshot");
@@ -779,6 +779,69 @@ mod reclaim {
         output
     }
 
+    fn run_suggestion_from(
+        fixture: &ReclaimFixture,
+        other: &BrWorkspace,
+        actor: &str,
+        label: &str,
+    ) -> Output {
+        let last_touched = other.root.join(".beads/last-touched");
+        let marker: &[u8] = b"bd-fresh\nOtherAgent\n";
+        fs::write(&last_touched, marker).expect("other clone's last-touched marker");
+        let output = shell_command(fixture, actor)
+            .current_dir(&other.root)
+            .env("HOME", &other.root)
+            .env("BEADS_DIR", other.root.join(".beads"))
+            .env("BEADS_DB", other.root.join(".beads/beads.db"))
+            .env("BD_DB", other.root.join(".beads/beads.db"))
+            .env("BD_DATABASE", other.root.join(".beads/beads.db"))
+            .env("BEADS_JSONL", other.root.join(".beads/issues.jsonl"))
+            .env("BEADS_CACHE_DIR", other.root.join(".beads"))
+            .output()
+            .expect("run suggestion from a different clone");
+        eprintln!(
+            "{}",
+            json!({"kind": "reclaim_invocation_directory", "cwd": other.root})
+        );
+        record_output(fixture, actor, label, &output);
+        assert_eq!(
+            fs::read(last_touched).expect("preserved last-touched marker"),
+            marker,
+            "handoff must not redirect another clone's subsequent implicit-ID update"
+        );
+        output
+    }
+
+    fn refreshed_advice(fixture: &ReclaimFixture, label: &str) -> Value {
+        coordination_json(
+            &fixture.workspace,
+            &[
+                "coordination",
+                "status",
+                "--reservations",
+                &fixture.reservations,
+                "--agents",
+                &fixture.agents,
+                "--json",
+            ],
+            label,
+        )
+    }
+
+    fn write_owner_heartbeat(fixture: &ReclaimFixture, last_active: &str) {
+        fs::write(
+            &fixture.agents,
+            json!({
+                "name": PREVIOUS_OWNER,
+                "task_description": ISSUE_ID,
+                "last_active_ts": last_active,
+                "contact_policy": "auto",
+            })
+            .to_string(),
+        )
+        .expect("owner heartbeat snapshot");
+    }
+
     fn assert_success(output: &Output) {
         assert!(
             output.status.success(),
@@ -797,8 +860,12 @@ mod reclaim {
     }
 
     fn state(workspace: &BrWorkspace, id: &str) -> Value {
+        state_at_database(workspace, id, &workspace.root.join(".beads/beads.db"))
+    }
+
+    fn state_at_database(workspace: &BrWorkspace, id: &str, database: &Path) -> Value {
         let connection = beads_rust::franken_sync::compat::open_with_flags(
-            &workspace.root.join(".beads/beads.db").to_string_lossy(),
+            &database.to_string_lossy(),
             beads_rust::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .expect("read-only state observer");
@@ -848,6 +915,26 @@ mod reclaim {
             json!({"kind": "reclaim_state", "workspace": workspace.root, "id": id, "state": state})
         );
         state
+    }
+
+    fn workspace_database_bytes(workspace: &BrWorkspace) -> Vec<Option<Vec<u8>>> {
+        [
+            "beads.db",
+            "beads.db-wal",
+            "beads.db-shm",
+            "beads.db-journal",
+            "issues.jsonl",
+            "metadata.json",
+        ]
+        .into_iter()
+        .map(
+            |name| match fs::read(workspace.root.join(".beads").join(name)) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("cannot observe {name}: {error}"),
+            },
+        )
+        .collect()
     }
 
     fn assert_conflict(output: &Output, actual_owner: &str) {
@@ -1197,6 +1284,192 @@ mod reclaim {
     }
 
     #[test]
+    fn blank_snapshot_files_refuse_status_and_handoff_but_explicit_empty_arrays_work() {
+        let _log = common::test_log(
+            "blank_snapshot_files_refuse_status_and_handoff_but_explicit_empty_arrays_work",
+        );
+        for (index, (kind, payload)) in [
+            ("reservations", ""),
+            ("reservations", " \t\r\n "),
+            ("agents", ""),
+            ("agents", " \t\r\n "),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = fixture();
+            let path = if kind == "reservations" {
+                &fixture.reservations
+            } else {
+                &fixture.agents
+            };
+            fs::write(path, payload).expect("blank snapshot");
+            let before = state(&fixture.workspace, ISSUE_ID);
+            let result = run_br(
+                &fixture.workspace,
+                [
+                    "coordination",
+                    "status",
+                    "--reservations",
+                    &fixture.reservations,
+                    "--agents",
+                    &fixture.agents,
+                    "--json",
+                ],
+                &format!("blank_{kind}_{index}_status"),
+            );
+            assert_eq!(result.status.code(), Some(4), "{result:?}");
+            let error: Value = serde_json::from_str(&result.stdout).expect("snapshot refusal");
+            assert_eq!(error["error"]["code"], "VALIDATION_FAILED", "{error}");
+            assert_eq!(error["error"]["context"]["field"], "coordination_snapshot");
+            assert_eq!(state(&fixture.workspace, ISSUE_ID), before);
+            let output = run_suggestion(
+                &fixture,
+                "NewAgent",
+                &format!("blank_{kind}_{index}_handoff"),
+            );
+            assert_eq!(output.status.code(), Some(4), "{output:?}");
+            let error: Value = serde_json::from_slice(&output.stdout).expect("snapshot refusal");
+            assert_eq!(error["error"]["context"]["field"], "coordination_snapshot");
+            assert_eq!(
+                state(&fixture.workspace, ISSUE_ID),
+                before,
+                "blank {kind} must not authorize a handoff or append an audit"
+            );
+        }
+
+        let mut fixture = fixture();
+        fs::write(&fixture.reservations, "[]\n").expect("explicit empty reservations");
+        fs::write(&fixture.agents, "[]\n").expect("explicit empty agents");
+        let advice = refreshed_advice(&fixture, "explicit_empty_collections");
+        let claim = claim_by_id(&advice, ISSUE_ID);
+        assert_eq!(claim["reclaim_allowed_by_policy"], true);
+        claim["suggested_commands"][0]["command"]
+            .as_str()
+            .expect("empty collection suggestion")
+            .clone_into(&mut fixture.command);
+        assert_success(&run_suggestion(
+            &fixture,
+            "NewAgent",
+            "explicit_empty_collection_handoff",
+        ));
+        assert_handoff_audit(&fixture, "NewAgent");
+    }
+
+    #[test]
+    fn fresh_and_future_owner_heartbeats_block_old_advice_without_audit() {
+        let _log =
+            common::test_log("fresh_and_future_owner_heartbeats_block_old_advice_without_audit");
+        for (label, heartbeat) in [
+            ("fresh", chrono::Utc::now()),
+            ("future", chrono::Utc::now() + chrono::Duration::hours(1)),
+        ] {
+            let fixture = fixture();
+            let timestamp = heartbeat.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+            write_owner_heartbeat(&fixture, &timestamp);
+            let before = state(&fixture.workspace, ISSUE_ID);
+            let advice = refreshed_advice(&fixture, &format!("{label}_heartbeat_advice"));
+            let claim = claim_by_id(&advice, ISSUE_ID);
+            assert_eq!(claim["assessment"]["classification"], "fresh");
+            assert_eq!(claim["assessment"]["owner_last_active_at"], timestamp);
+            assert!(
+                claim["assessment"]["last_activity_age_minutes"]
+                    .as_u64()
+                    .is_some_and(|minutes| minutes < 120),
+                "{claim}"
+            );
+            assert_eq!(claim["reclaim_allowed_by_policy"], false);
+            assert_eq!(claim["suggested_commands"], json!([]));
+            assert_eq!(state(&fixture.workspace, ISSUE_ID), before);
+
+            let output = run_suggestion(&fixture, "NewAgent", &format!("{label}_heartbeat"));
+            assert_eq!(output.status.code(), Some(4), "{output:?}");
+            let error: Value = serde_json::from_slice(&output.stdout).expect("heartbeat refusal");
+            assert_eq!(error["error"]["context"]["field"], "reclaim", "{error}");
+            assert_eq!(
+                state(&fixture.workspace, ISSUE_ID),
+                before,
+                "{label} heartbeat refusal changed ownership or audit state"
+            );
+        }
+    }
+
+    #[test]
+    fn old_owner_heartbeat_still_allows_an_audited_handoff() {
+        let _log = common::test_log("old_owner_heartbeat_still_allows_an_audited_handoff");
+        let fixture = fixture();
+        let heartbeat = chrono::Utc::now() - chrono::Duration::hours(9);
+        let timestamp = heartbeat.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+        write_owner_heartbeat(&fixture, &timestamp);
+        let advice = refreshed_advice(&fixture, "old_heartbeat_advice");
+        let claim = claim_by_id(&advice, ISSUE_ID);
+        assert_eq!(claim["assessment"]["owner_last_active_at"], timestamp);
+        assert_eq!(claim["assessment"]["classification"], "abandoned_likely");
+        assert_eq!(claim["reclaim_allowed_by_policy"], true);
+        assert_success(&run_suggestion(
+            &fixture,
+            "NewAgent",
+            "old_heartbeat_handoff",
+        ));
+        assert_eq!(
+            show(&fixture.workspace, ISSUE_ID, "old_heartbeat_owner")["assignee"],
+            "NewAgent"
+        );
+        assert_handoff_audit(&fixture, "NewAgent");
+    }
+
+    #[test]
+    fn duplicate_agent_names_cannot_hide_the_latest_owner_heartbeat() {
+        let _log = common::test_log("duplicate_agent_names_cannot_hide_the_latest_owner_heartbeat");
+        for (label, json_array, fresh_first) in [
+            ("json_fresh_first", true, true),
+            ("json_stale_first", true, false),
+            ("jsonl_fresh_first", false, true),
+            ("jsonl_stale_first", false, false),
+        ] {
+            let fixture = fixture();
+            let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+            let fresh = json!({
+                "name": " amberlion ",
+                "task_description": ISSUE_ID,
+                "last_active_ts": timestamp,
+                "contact_policy": "auto",
+            });
+            let stale = json!({
+                "name": PREVIOUS_OWNER,
+                "task_description": ISSUE_ID,
+                "last_active_ts": ORIGINAL_TIMESTAMP,
+                "contact_policy": "auto",
+            });
+            let rows = if fresh_first {
+                [fresh, stale]
+            } else {
+                [stale, fresh]
+            };
+            let payload = if json_array {
+                serde_json::to_string(&rows).expect("agent array")
+            } else {
+                format!("{}\n{}\n", rows[0], rows[1])
+            };
+            fs::write(&fixture.agents, payload).expect("duplicate agent snapshot");
+            let before = state(&fixture.workspace, ISSUE_ID);
+            let advice = refreshed_advice(&fixture, &format!("{label}_advice"));
+            let claim = claim_by_id(&advice, ISSUE_ID);
+            assert_eq!(claim["agent"]["last_active_ts"], timestamp);
+            assert_eq!(claim["assessment"]["owner_last_active_at"], timestamp);
+            assert_eq!(claim["assessment"]["classification"], "fresh");
+            assert_eq!(claim["reclaim_allowed_by_policy"], false);
+            assert_eq!(claim["suggested_commands"], json!([]));
+
+            let output = run_suggestion(&fixture, "NewAgent", label);
+            assert_eq!(output.status.code(), Some(4), "{output:?}");
+            let error: Value = serde_json::from_slice(&output.stdout).expect("heartbeat refusal");
+            assert_eq!(error["error"]["context"]["field"], "reclaim", "{error}");
+            assert_eq!(state(&fixture.workspace, ISSUE_ID), before, "{label}");
+        }
+    }
+
+    #[test]
     fn refreshed_active_reservations_block_old_advice_without_audit() {
         let _log = common::test_log("refreshed_active_reservations_block_old_advice_without_audit");
         for matching in ["owner", "issue", "comment_path"] {
@@ -1231,6 +1504,152 @@ mod reclaim {
                 before,
                 "{matching} reservation refusal changed state"
             );
+        }
+    }
+
+    #[test]
+    fn status_matches_reservations_in_comments_hidden_by_the_display_limit() {
+        let _log =
+            common::test_log("status_matches_reservations_in_comments_hidden_by_the_display_limit");
+        let fixture = fixture();
+        let jsonl_path = fixture.workspace.root.join(".beads/issues.jsonl");
+        let jsonl = fs::read_to_string(&jsonl_path).expect("seeded JSONL");
+        let mut issues: Vec<Value> = jsonl
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("issue row"))
+            .collect();
+        let issue = issues
+            .iter_mut()
+            .find(|issue| issue["id"] == ISSUE_ID)
+            .expect("stale issue");
+        issue["comments"]
+            .as_array_mut()
+            .expect("seeded comments")
+            .push(json!({
+                "id": 3,
+                "issue_id": ISSUE_ID,
+                "author": PREVIOUS_OWNER,
+                "text": "A newer comment without any file scope",
+                "created_at": "2020-01-01T01:00:00Z",
+            }));
+        fs::write(
+            &jsonl_path,
+            issues
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("incoming comments");
+        let imported = run_br(
+            &fixture.workspace,
+            ["sync", "--import-only", "--json"],
+            "import_old_comment_history",
+        );
+        assert!(imported.status.success(), "{imported:?}");
+        assert_eq!(
+            show(&fixture.workspace, ISSUE_ID, "hidden_comment_claim")["updated_at"],
+            ORIGINAL_TIMESTAMP,
+            "the claim must remain old enough for reservation evidence to decide"
+        );
+        fs::write(
+            &fixture.reservations,
+            json!({"reservations": [{
+                "holder": "OtherAgent",
+                "path_pattern": "tests/e2e_coordination.rs",
+                "exclusive": true,
+                "reason": "unrelated work",
+                "thread_id": "unrelated-thread",
+                "expires_ts": "2099-01-01T00:00:00Z",
+            }]})
+            .to_string(),
+        )
+        .expect("reservation matching only the older comment");
+        let before = state(&fixture.workspace, ISSUE_ID);
+        for limit in ["0", "1"] {
+            let advice = coordination_json(
+                &fixture.workspace,
+                &[
+                    "coordination",
+                    "status",
+                    "--reservations",
+                    &fixture.reservations,
+                    "--agents",
+                    &fixture.agents,
+                    "--comments",
+                    limit,
+                    "--json",
+                ],
+                &format!("hidden_comment_limit_{limit}"),
+            );
+            let claim = claim_by_id(&advice, ISSUE_ID);
+            let displayed = claim["issue"]["latest_comments"]
+                .as_array()
+                .expect("comments");
+            assert_eq!(displayed.len(), limit.parse::<usize>().unwrap());
+            assert!(displayed.iter().all(|comment| {
+                !comment["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("degraded-coordination")
+            }));
+            assert_eq!(
+                claim["assessment"]["classification"],
+                "blocked_by_active_reservation"
+            );
+            assert_eq!(
+                claim["assessment"]["reservation"]["detail"]["provenance"]["matched_on"],
+                json!(["comment_path"])
+            );
+            assert_eq!(claim["reclaim_allowed_by_policy"], false);
+            assert_eq!(claim["suggested_commands"], json!([]));
+            assert_eq!(state(&fixture.workspace, ISSUE_ID), before);
+        }
+    }
+
+    #[test]
+    fn invalid_reservation_records_cannot_authorize_a_handoff() {
+        let _log = common::test_log("invalid_reservation_records_cannot_authorize_a_handoff");
+        for (label, holder, path_pattern, released_ts) in [
+            ("blank_holder", " \t ", "unrelated.rs", None),
+            ("blank_path", "OtherAgent", " \t ", None),
+            (
+                "future_release",
+                "OtherAgent",
+                "unrelated.rs",
+                Some("2099-01-01T00:00:00Z"),
+            ),
+        ] {
+            let fixture = fixture();
+            fs::write(
+                &fixture.reservations,
+                json!({"reservations": [{
+                    "holder": holder,
+                    "path_pattern": path_pattern,
+                    "exclusive": true,
+                    "reason": "unrelated work",
+                    "expires_ts": "2099-02-01T00:00:00Z",
+                    "released_ts": released_ts,
+                }]})
+                .to_string(),
+            )
+            .expect("semantically invalid reservation");
+            let before = state(&fixture.workspace, ISSUE_ID);
+            let advice = refreshed_advice(&fixture, &format!("{label}_advice"));
+            let claim = claim_by_id(&advice, ISSUE_ID);
+            assert_eq!(
+                claim["assessment"]["reservation"]["state"],
+                "invalid_snapshot"
+            );
+            assert_eq!(claim["assessment"]["classification"], "ambiguous");
+            assert_eq!(claim["reclaim_allowed_by_policy"], false);
+            assert_eq!(claim["suggested_commands"], json!([]));
+            let output = run_suggestion(&fixture, "NewAgent", label);
+            assert_eq!(output.status.code(), Some(4), "{output:?}");
+            let error: Value = serde_json::from_slice(&output.stdout).expect("evidence refusal");
+            assert_eq!(error["error"]["context"]["field"], "reclaim", "{error}");
+            assert_eq!(state(&fixture.workspace, ISSUE_ID), before, "{label}");
         }
     }
 
@@ -1356,6 +1775,223 @@ mod reclaim {
             state(&external, ISSUE_ID),
             external_before,
             "local coordination evidence must never mutate an external clone"
+        );
+    }
+
+    #[test]
+    fn suggested_handoff_stays_bound_to_its_workspace_from_another_clone() {
+        let _log =
+            common::test_log("suggested_handoff_stays_bound_to_its_workspace_from_another_clone");
+        let fixture = fixture();
+        let other = fixture_with_status("in_progress");
+        let other_before = state(&other.workspace, ISSUE_ID);
+        let fresh_before = state(&fixture.workspace, "bd-fresh");
+        let output = run_suggestion_from(
+            &fixture,
+            &other.workspace,
+            "NewAgent",
+            "handoff_from_another_clone",
+        );
+        assert_success(&output);
+        assert_eq!(
+            show(&fixture.workspace, ISSUE_ID, "original_workspace_owner")["assignee"],
+            "NewAgent"
+        );
+        assert_handoff_audit(&fixture, "NewAgent");
+        assert_eq!(state(&fixture.workspace, "bd-fresh"), fresh_before);
+        assert_eq!(
+            state(&other.workspace, ISSUE_ID),
+            other_before,
+            "same ID, owner and revision in another clone must not receive the handoff"
+        );
+    }
+
+    fn fixture_with_database_in_cache(
+        seed: &ReclaimFixture,
+    ) -> (ReclaimFixture, std::path::PathBuf) {
+        let workspace = BrWorkspace::new();
+        let cache = workspace.root.join("database cache 'quoted'");
+        let initialized = run_br_with_env(
+            &workspace,
+            ["init", "--prefix", "bd", "--json"],
+            [("BEADS_CACHE_DIR", &cache)],
+            "initialize_external_database",
+        );
+        assert!(initialized.status.success(), "{initialized:?}");
+        let receipt: Value = serde_json::from_str(&initialized.stdout).expect("init receipt");
+        let database = std::path::PathBuf::from(
+            receipt["database_path"]
+                .as_str()
+                .expect("actual database path"),
+        );
+        assert!(
+            database.starts_with(dunce::canonicalize(&cache).expect("resolved database cache")),
+            "{database:?}"
+        );
+        assert!(!workspace.root.join(".beads/beads.db").exists());
+        let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+        fs::copy(seed.workspace.root.join(".beads/issues.jsonl"), &jsonl_path)
+            .expect("seed external database from the same shared issue state");
+        let database_arg = database.to_str().expect("database path");
+        let imported = run_br_with_env(
+            &workspace,
+            ["sync", "--import-only", "--db", database_arg, "--json"],
+            [("BEADS_JSONL", &jsonl_path)],
+            "import_external_database",
+        );
+        assert!(imported.status.success(), "{imported:?}");
+        let mut fixture = ReclaimFixture {
+            workspace,
+            reservations: seed.reservations.clone(),
+            agents: seed.agents.clone(),
+            command: String::new(),
+        };
+        let advice = run_br_with_env(
+            &fixture.workspace,
+            [
+                "coordination",
+                "status",
+                "--db",
+                database_arg,
+                "--reservations",
+                &fixture.reservations,
+                "--agents",
+                &fixture.agents,
+                "--json",
+            ],
+            [("BEADS_JSONL", &jsonl_path)],
+            "external_database_advice",
+        );
+        assert!(advice.status.success(), "{advice:?}");
+        let advice: Value = serde_json::from_str(&advice.stdout).expect("coordination advice");
+        assert!(!cache.join("issues.jsonl").exists());
+        let claim = claim_by_id(&advice, ISSUE_ID);
+        assert_eq!(claim["reclaim_allowed_by_policy"], true);
+        claim["suggested_commands"][0]["command"]
+            .as_str()
+            .expect("external database suggestion")
+            .clone_into(&mut fixture.command);
+        (fixture, database)
+    }
+
+    #[test]
+    fn suggested_handoff_binds_the_actual_database_outside_the_metadata_directory() {
+        let _log = common::test_log(
+            "suggested_handoff_binds_the_actual_database_outside_the_metadata_directory",
+        );
+        let other = fixture();
+        let (fixture, database) = fixture_with_database_in_cache(&other);
+        let other_before = state(&other.workspace, ISSUE_ID);
+        let output = run_suggestion_from(
+            &fixture,
+            &other.workspace,
+            "NewAgent",
+            "external_database_handoff_from_another_clone",
+        );
+        assert_success(&output);
+        let jsonl_path = fixture.workspace.root.join(".beads/issues.jsonl");
+        let shown = run_br_with_env(
+            &fixture.workspace,
+            [
+                "show",
+                ISSUE_ID,
+                "--db",
+                database.to_str().expect("database path"),
+                "--json",
+            ],
+            [("BEADS_JSONL", &jsonl_path)],
+            "external_database_owner",
+        );
+        assert!(shown.status.success(), "{shown:?}");
+        let shown: Value = serde_json::from_str(&shown.stdout).expect("external database issue");
+        assert_eq!(shown[0]["assignee"], "NewAgent");
+        let after = state_at_database(&fixture.workspace, ISSUE_ID, &database);
+        let exported: Value = serde_json::from_str(after["jsonl_row"].as_str().unwrap()).unwrap();
+        assert_eq!(exported["assignee"], "NewAgent");
+        let comments = exported["comments"]
+            .as_array()
+            .expect("exported audit trail");
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[1]["author"], "NewAgent");
+        assert!(!fixture.workspace.root.join(".beads/beads.db").exists());
+        assert!(!database.with_file_name("issues.jsonl").exists());
+        assert_eq!(
+            state(&other.workspace, ISSUE_ID),
+            other_before,
+            "inherited workspace/database/export overrides must not redirect the handoff"
+        );
+    }
+
+    #[test]
+    fn wrong_expected_workspace_refuses_before_database_startup() {
+        let _log = common::test_log("wrong_expected_workspace_refuses_before_database_startup");
+        let fixture = fixture();
+        let other = fixture_with_status("in_progress");
+        let original_before = workspace_database_bytes(&fixture.workspace);
+        let other_before = workspace_database_bytes(&other.workspace);
+        let mut args = direct_args(&fixture);
+        args.extend(["--owner-kind", "swarm-agent", "--actor", "NewAgent"].map(str::to_owned));
+        args.extend([
+            "--expected-workspace".to_owned(),
+            other
+                .workspace
+                .root
+                .join(".beads")
+                .to_string_lossy()
+                .into_owned(),
+        ]);
+        let result = run_br(&fixture.workspace, args, "wrong_expected_workspace");
+        assert_eq!(result.status.code(), Some(4), "{result:?}");
+        let error: Value = serde_json::from_str(&result.stdout).expect("workspace refusal");
+        assert_eq!(error["error"]["code"], "VALIDATION_FAILED", "{error}");
+        assert_eq!(error["error"]["context"]["field"], "expected-workspace");
+        assert_eq!(
+            workspace_database_bytes(&fixture.workspace),
+            original_before
+        );
+        assert_eq!(workspace_database_bytes(&other.workspace), other_before);
+    }
+
+    #[test]
+    fn metadata_database_alias_cannot_redirect_a_suggested_handoff() {
+        let _log = common::test_log("metadata_database_alias_cannot_redirect_a_suggested_handoff");
+        let mut fixture = fixture();
+        let other = fixture_with_status("in_progress");
+        let metadata_path = fixture.workspace.root.join(".beads/metadata.json");
+        let mut metadata: Value =
+            serde_json::from_slice(&fs::read(&metadata_path).expect("workspace metadata"))
+                .expect("metadata JSON");
+        metadata["database"] = json!(other.workspace.root.join(".beads/beads.db"));
+        metadata["jsonl_export"] = json!(fixture.workspace.root.join(".beads/issues.jsonl"));
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap())
+            .expect("metadata database alias into another tracker");
+
+        // Status observes the database named by A's metadata under A's policy.
+        // An explicit --db inside B/.beads would normally rediscover B instead.
+        let advice = refreshed_advice(&fixture, "metadata_alias_advice");
+        let claim = claim_by_id(&advice, ISSUE_ID);
+        assert_eq!(claim["reclaim_allowed_by_policy"], true);
+        claim["suggested_commands"][0]["command"]
+            .as_str()
+            .expect("metadata alias suggestion")
+            .clone_into(&mut fixture.command);
+        assert!(fixture.command.contains("--expected-workspace"));
+        let original_before = workspace_database_bytes(&fixture.workspace);
+        let other_before = workspace_database_bytes(&other.workspace);
+        let output = run_suggestion(&fixture, "NewAgent", "refuse_metadata_alias_handoff");
+        assert_eq!(output.status.code(), Some(4), "{output:?}");
+        let error: Value = serde_json::from_slice(&output.stdout).expect("workspace refusal");
+        assert_eq!(error["error"]["code"], "VALIDATION_FAILED", "{error}");
+        assert_eq!(error["error"]["context"]["field"], "expected-workspace");
+        assert_eq!(
+            workspace_database_bytes(&fixture.workspace),
+            original_before,
+            "workspace refusal must preserve the originating database family and export"
+        );
+        assert_eq!(
+            workspace_database_bytes(&other.workspace),
+            other_before,
+            "workspace refusal must precede startup imports, audits and ownership writes"
         );
     }
 

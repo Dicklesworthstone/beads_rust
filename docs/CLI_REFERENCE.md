@@ -1055,7 +1055,7 @@ issue status or assignee.
 | Option | Description |
 |--------|-------------|
 | `--owner-kind <KIND>` | Fallback ownership policy: swarm-agent, human, or unknown |
-| `--comments <N>` | Latest comments to include per claim (default: 2) |
+| `--comments <N>` | Latest comments to display per claim (default: 2); reservation checks inspect all comments |
 | `--reservations <PATH>` | Offline Agent Mail reservation snapshot (JSON array, wrapper object, or JSONL) |
 | `--agents <PATH>` | Offline Agent Mail agent snapshot (JSON array, wrapper object, or JSONL) |
 | `--format <FMT>` | Output format: text, json, toon |
@@ -1074,6 +1074,17 @@ and ownership transfer through `br coordination reclaim`. The single suggested
 command records its audit comment before transferring the claim in the same
 transaction. Fresh claims, active reservations, missing or invalid snapshots,
 and human/unknown ownership do not emit reclaim commands.
+
+When an agent snapshot matches the previous owner, quiet time starts at the
+newer of its `last_active_ts` and the issue's `updated_at`. Recent owner activity
+therefore blocks reclamation even if the issue itself has not changed. Duplicate
+agent names retain the newest heartbeat regardless of snapshot row order.
+Assessments expose optional `owner_last_active_at` and
+`last_activity_age_minutes`; `updated_at` remains the original issue revision.
+
+Empty or whitespace-only snapshot files are invalid. Use an explicit JSON `[]`
+for a verified empty export. Blank agent names, blank reservation holders or
+paths, and future reservation release timestamps cannot authorize reclamation.
 
 **Examples:**
 ```bash
@@ -1108,6 +1119,7 @@ br coordination reclaim <ID> --expected-assignee <NAME> --if-unchanged <TIMESTAM
 | Option | Description |
 |--------|-------------|
 | `--expected-assignee <NAME>` | Exact previous assignee observed by `coordination status` |
+| `--expected-workspace <PATH>` | Refuse before startup mutation if workspace discovery differs from the inspected directory; included in generated commands |
 | `--if-unchanged <TIMESTAMP>` | Observed `assessment.updated_at` value in RFC3339 format |
 | `--reservations <PATH>` | Required local reservation snapshot; read again when reclaiming |
 | `--agents <PATH>` | Optional local agent snapshot; read again when reclaiming |
@@ -1117,14 +1129,26 @@ br coordination reclaim <ID> --expected-assignee <NAME> --if-unchanged <TIMESTAM
 
 Use the command emitted by `coordination status` after reviewing its evidence.
 It carries the observed assignee and timestamp, the snapshot paths and owner
-policy, and an explicit actor. For example, an advisory for `bd-abc123` owned by
-`OldAgent` at the timestamp below has this shape:
+policy, and an explicit actor. It binds the inspected workspace, database, JSONL,
+and cache paths through `BEADS_DIR`, `BEADS_DB`, `BEADS_JSONL`, `BEADS_CACHE_DIR`,
+and `--db`, and clears the historical `BD_DB`/`BD_DATABASE` overrides. The
+`--expected-workspace` guard refuses changed or mixed workspace authority before
+startup repair or import. Another working directory or inherited database setting
+cannot redirect the handoff. For example, an advisory
+for `bd-abc123` owned by `OldAgent` at the timestamp below has this shape:
 
 ```bash
+BEADS_DIR='/work/project/.beads' \
+BEADS_DB='/work/project/.beads/beads.db' \
+BEADS_JSONL='/work/project/.beads/issues.jsonl' \
+BEADS_CACHE_DIR='/work/project/.beads' BD_DB= BD_DATABASE= \
 br coordination reclaim bd-abc123 \
   --expected-assignee=OldAgent \
+  --expected-workspace '/work/project/.beads' \
   --if-unchanged '2026-11-04T00:00:00Z' \
-  --reservations reservations.json --agents agents.jsonl \
+  --reservations '/work/project/reservations.json' \
+  --agents '/work/project/agents.jsonl' \
+  --db '/work/project/.beads/beads.db' \
   --owner-kind swarm-agent \
   --actor="${AGENT_NAME:?Set AGENT_NAME to the reclaiming agent}" --json
 ```
