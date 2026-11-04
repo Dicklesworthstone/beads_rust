@@ -147,7 +147,10 @@ reading a duplicate never removes the other records. Deliberately requested
 `sync --import-only --rebuild` remains a separate, best-effort operation. It
 retains the original family for rollback, but JSONL alone cannot restore every
 database-only record. A missing database can still be initialized from JSONL
-when no retained WAL or journal data makes that unsafe.
+when no retained WAL or journal data makes that unsafe: `br sync --import-only`
+or the first mutation does it, as in a fresh clone. A read refuses instead of
+creating the database, and `br --no-db <command>` reads the JSONL without
+creating one.
 
 ### Export Guards
 

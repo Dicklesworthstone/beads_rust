@@ -200,6 +200,72 @@ fn fresh_clone_first_close_flushes_without_self_deadlock() {
     );
 }
 
+/// A read never creates the database (#585), so the first read in a fresh clone
+/// is refused. The refusal and the doctor report it points at must name the
+/// routes out, and those routes must work.
+#[test]
+fn fresh_clone_first_read_refusal_names_routes_that_work() {
+    let donor = donor_workspace("fcp", &["seed"]);
+    let clone = BrWorkspace::new();
+    clone_tracked_beads(&donor, &clone);
+    let db = clone.root.join(".beads/beads.db");
+
+    let refused = run_br(&clone, ["list", "--json"], "clone-first-read");
+    assert!(
+        !refused.status.success(),
+        "a read must not build the database: {}",
+        refused.stdout
+    );
+    for route in ["br sync --import-only", "br --no-db"] {
+        assert!(
+            refused.stdout.contains(route),
+            "the refusal does not name `{route}`: {}",
+            refused.stdout
+        );
+    }
+
+    let doctor = run_br(&clone, ["doctor", "--json"], "clone-first-doctor");
+    assert!(
+        doctor.stdout.contains("br sync --import-only"),
+        "doctor does not name the import: {}",
+        doctor.stdout
+    );
+    assert!(
+        !doctor
+            .stdout
+            .contains("Mutating commands must remain disabled"),
+        "a fresh clone's first mutation is allowed: {}",
+        doctor.stdout
+    );
+    assert!(!db.exists(), "observing must not create the database");
+
+    let private_view = run_br(&clone, ["--no-db", "list", "--json"], "clone-no-db-read");
+    assert!(
+        private_view.status.success(),
+        "--no-db read failed: {}",
+        private_view.stderr
+    );
+    assert_eq!(
+        common::cli::extract_issues_array(&private_view.stdout).len(),
+        1
+    );
+    assert!(!db.exists(), "--no-db must not create the database");
+
+    let imported = run_br(&clone, ["sync", "--import-only", "-q"], "clone-import");
+    assert!(
+        imported.status.success(),
+        "import failed: {}",
+        imported.stderr
+    );
+    let listed = run_br(&clone, ["list", "--json"], "clone-read-after-import");
+    assert!(
+        listed.status.success(),
+        "read after import failed: {}",
+        listed.stderr
+    );
+    assert_eq!(common::cli::extract_issues_array(&listed.stdout).len(), 1);
+}
+
 /// The control arm from the report: another command builds the database first
 /// and exits, so the following mutation opens an existing DB and never retains
 /// an authority. It must stay fast — this guards against a fix that "solves" the

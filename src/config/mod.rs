@@ -5425,13 +5425,24 @@ pub(crate) fn open_sqlite_storage_read_only(db_path: &Path) -> Result<SqliteStor
     )
 }
 
+/// What to do about a database file that does not exist, which is how every
+/// fresh clone starts: `.beads/.gitignore` keeps `beads.db` out of Git.
+pub(crate) const MISSING_DATABASE_GUIDANCE: &str = "No database file exists at that path. In a \
+     fresh clone, `br sync --import-only` builds it from the tracked JSONL and `br --no-db \
+     <command>` reads the JSONL without creating it. Otherwise, restore the missing database first";
+
 fn read_only_storage_refusal_context(db_path: &Path) -> String {
-    format!(
+    let refusal = format!(
         "Read-only storage open refused for {}: writable recovery and schema changes \
              are disabled. Run `br doctor --json` to inspect the original tracker and \
              select an explicit, lossless recovery or migration",
         db_path.display(),
-    )
+    );
+    if matches!(db_path.try_exists(), Ok(false)) {
+        format!("{refusal}. {MISSING_DATABASE_GUIDANCE}")
+    } else {
+        refusal
+    }
 }
 
 fn validate_sqlite_storage_read_only(

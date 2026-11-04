@@ -1453,7 +1453,11 @@ fn check_pending_sync_merge(db_path: &Path, checks: &mut Vec<CheckResult>) {
             let mut details = serde_json::json!({
                 "pending": "unknown",
                 "database_path": db_path.display().to_string(),
-                "remediation": hint.remediation().unwrap_or_else(|| "Restore read-only access to the database family, then rerun `br doctor`. Mutating commands must remain disabled until pending merge state can be inspected.".to_string()),
+                "remediation": hint.remediation().unwrap_or_else(|| if matches!(db_path.try_exists(), Ok(false)) {
+                    config::MISSING_DATABASE_GUIDANCE.to_string()
+                } else {
+                    "Restore read-only access to the database family, then rerun `br doctor`. Mutating commands must remain disabled until pending merge state can be inspected.".to_string()
+                }),
             });
             merge_json_object(&mut details, hint.json_details());
             let message = if hint.is_poisoned_wal_index() {
@@ -14333,7 +14337,10 @@ fn inspect_doctor_database(
             "db.exists",
             CheckStatus::Error,
             Some(format!("Missing database file at {}", db_path.display())),
-            Some(serde_json::json!({ "path": db_path.display().to_string() })),
+            Some(serde_json::json!({
+                "path": db_path.display().to_string(),
+                "recommended_fix": config::MISSING_DATABASE_GUIDANCE,
+            })),
         );
     }
 }
