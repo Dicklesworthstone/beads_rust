@@ -9,6 +9,13 @@ on:
       - '.github/tests/compaction-retention-imports.py'
       - 'src/config/compaction_retention.rs'
       - 'src/config/mod.rs'
+      - 'src/cli/commands/sync.rs'
+      - 'src/sync/mod.rs'
+      - 'src/storage/sqlite.rs'
+      - 'tests/e2e_sync_artifacts.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
   workflow_dispatch:
 
 permissions:
@@ -18,24 +25,42 @@ concurrency:
   group: compaction-retention-validation
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTUP_TOOLCHAIN: nightly-2026-08-31
+  CARGO_BUILD_JOBS: '1'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: '1'
+  # Bind both staged files to their reviewed input and qualified output. Only
+  # the complete original pair or complete activated pair is accepted.
+  REVIEWED_CONFIG_BLOB: 69850c39bdb5ee89090bca7ad4f3191eed2b5bf2
+  QUALIFIED_CONFIG_BLOB: b8d61a25e4e4c6134458a9dc5f1709a6cf3e2478
+  REVIEWED_E2E_BLOB: 448886e2b548c7edee462644ebf0482b97072837
+  QUALIFIED_E2E_BLOB: f6291e686dfa18791064ca59e0d1a37f6160a015
+
 jobs:
-  validate-and-activate:
+  qualify:
+    name: Qualify (${{ matrix.os }}, umask ${{ matrix.umask }})
     if: github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    permissions:
-      contents: write
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+        umask: ['002', '022']
     env:
-      RUSTUP_TOOLCHAIN: nightly-2026-08-31
-      CARGO_BUILD_JOBS: '1'
-      CARGO_INCREMENTAL: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
+      TEST_UMASK: ${{ matrix.umask }}
     steps:
-      # No external Actions or persisted checkout credentials. The write token
-      # is supplied only to the final, post-validation publication step.
+      # No external Actions, persisted credentials, or write token in any
+      # qualification job. Each matrix entry tests the same exact candidate.
       - name: Fetch the exact public source revision
-        shell: bash
         run: |
           set -euo pipefail
           git init .
@@ -43,51 +68,115 @@ jobs:
           git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-      - name: Apply the hand-authored hook to its exact reviewed source
-        shell: bash
+      - name: Prepare the exact candidate without formatting source
         run: |
           set -euo pipefail
-          if ! grep -q '^mod compaction_retention;$' src/config/mod.rs; then
-            test "$(git hash-object src/config/mod.rs)" = ac56e3a7c592f32110006e856ba51f3cb7fb7093
-            git apply --check --recount .github/patches/compaction-retention.patch
-            git apply --recount .github/patches/compaction-retention.patch
+          config_blob=$(git hash-object src/config/mod.rs)
+          e2e_blob=$(git hash-object tests/e2e_sync_artifacts.rs)
+          if [ "$config_blob" = "$REVIEWED_CONFIG_BLOB" ] && [ "$e2e_blob" = "$REVIEWED_E2E_BLOB" ]; then
+            git apply --check .github/patches/compaction-retention.patch
+            git apply .github/patches/compaction-retention.patch
+          elif [ "$config_blob" != "$QUALIFIED_CONFIG_BLOB" ] || [ "$e2e_blob" != "$QUALIFIED_E2E_BLOB" ]; then
+            echo 'Refusing mixed or unreviewed compaction source and integration-test blobs' >&2
+            exit 1
           fi
+          test "$(git hash-object src/config/mod.rs)" = "$QUALIFIED_CONFIG_BLOB"
+          test "$(git hash-object tests/e2e_sync_artifacts.rs)" = "$QUALIFIED_E2E_BLOB"
+          test "$(grep -c '^mod compaction_retention;$' src/config/mod.rs)" = 1
           test "$(grep -c 'compaction_retention::complete_and_prune(' src/config/mod.rs)" = 1
-          python3 -m py_compile .github/tests/compaction-retention-imports.py
+          git diff --exit-code -- . ':(exclude)src/config/mod.rs' ':(exclude)tests/e2e_sync_artifacts.rs'
+          printf 'RETENTION_CANDIDATE_BLOB=%s\n' "$(git hash-object src/config/mod.rs)" >> "$GITHUB_ENV"
+          printf 'RETENTION_CANDIDATE_E2E_BLOB=%s\n' "$(git hash-object tests/e2e_sync_artifacts.rs)" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/tests/compaction-retention-imports.py')
+          compile(path.read_text(), str(path), 'exec')
+          PY
       - name: Install the repository's pinned Rust toolchain
-        shell: bash
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
-      - name: Format only the implementation and its hook
-        shell: bash
         run: |
           set -euo pipefail
-          rustfmt --edition 2024 --config skip_children=true src/config/mod.rs src/config/compaction_retention.rs
+          grep -Fx "channel = \"$RUSTUP_TOOLCHAIN\"" rust-toolchain.toml
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustc --version
+          cargo --version
+          command -v sqlite3
+      - name: Check formatting without changing the candidate
+        run: |
+          set -euo pipefail
           cargo fmt --all -- --check
           git diff --check
-      - name: Run all retention regressions against real storage
-        shell: bash
+      - name: Run all retention and recovery-directory regressions
         run: |
           set -euo pipefail
+          umask "$TEST_UMASK"
           cargo test --locked --lib config::compaction_retention::tests:: -- --list | tee "$RUNNER_TEMP/retention-tests.txt"
-          test "$(grep -c '^config::compaction_retention::tests::.*: test$' "$RUNNER_TEMP/retention-tests.txt")" = 24
-          cargo test --locked --lib config::compaction_retention::tests:: -- --test-threads=1 --nocapture
+          test "$(grep -c '^config::compaction_retention::tests::.*: test$' "$RUNNER_TEMP/retention-tests.txt")" = 44
+          cargo test --locked --lib config::compaction_retention::tests:: -- --test-threads=1 --nocapture | tee "$RUNNER_TEMP/retention-results.txt"
+          grep -F 'test result: ok. 44 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/retention-results.txt"
+          cargo test --locked --lib config::tests::recovery_directory_ -- --test-threads=1 --nocapture | tee "$RUNNER_TEMP/recovery-directory-results.txt"
+          grep -F 'test result: ok. 6 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/recovery-directory-results.txt"
       - name: Check and lint all targets
-        shell: bash
         run: |
           set -euo pipefail
+          umask "$TEST_UMASK"
           cargo check --locked --all-targets
           cargo clippy --locked --all-targets -- -D warnings
-      - name: Validate repeated CLI imports
-        shell: bash
+      - name: Validate real repeated compactions and clean CLI imports
         run: |
           set -euo pipefail
+          umask "$TEST_UMASK"
+          cargo test --locked --test e2e_sync_artifacts e2e_sync_import_compacts_when_the_freelist_passes_the_threshold -- --exact --test-threads=1 --nocapture | tee "$RUNNER_TEMP/compaction-import-results.txt"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/compaction-import-results.txt"
           cargo build --locked --bin br
           python3 .github/tests/compaction-retention-imports.py target/debug/br
       - name: Run the complete test suite
-        shell: bash
-        run: cargo test --locked
+        run: |
+          set -euo pipefail
+          umask "$TEST_UMASK"
+          cargo test --locked --no-fail-fast
+      - name: Confirm all gates exercised unchanged candidate bytes
+        run: |
+          set -euo pipefail
+          test "$(git hash-object src/config/mod.rs)" = "$RETENTION_CANDIDATE_BLOB"
+          test "$(git hash-object tests/e2e_sync_artifacts.rs)" = "$RETENTION_CANDIDATE_E2E_BLOB"
+          git diff --cached --exit-code
+          git diff --exit-code -- . ':(exclude)src/config/mod.rs' ':(exclude)tests/e2e_sync_artifacts.rs'
+          git diff --check
+          printf 'Qualified %s on %s with umask %s; config blob %s; integration-test blob %s.\n' \
+            "$GITHUB_SHA" "$RUNNER_OS" "$TEST_UMASK" "$RETENTION_CANDIDATE_BLOB" "$RETENTION_CANDIDATE_E2E_BLOB" >> "$GITHUB_STEP_SUMMARY"
+
+  activate:
+    needs: qualify
+    if: needs.qualify.result == 'success' && github.repository == 'Dicklesworthstone/beads_rust' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Reconstruct the same candidate after every matrix job passes
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          config_blob=$(git hash-object src/config/mod.rs)
+          e2e_blob=$(git hash-object tests/e2e_sync_artifacts.rs)
+          if [ "$config_blob" = "$REVIEWED_CONFIG_BLOB" ] && [ "$e2e_blob" = "$REVIEWED_E2E_BLOB" ]; then
+            git apply --check .github/patches/compaction-retention.patch
+            git apply .github/patches/compaction-retention.patch
+          elif [ "$config_blob" != "$QUALIFIED_CONFIG_BLOB" ] || [ "$e2e_blob" != "$QUALIFIED_E2E_BLOB" ]; then
+            echo 'Refusing mixed or unreviewed compaction source and integration-test blobs' >&2
+            exit 1
+          fi
+          test "$(git hash-object src/config/mod.rs)" = "$QUALIFIED_CONFIG_BLOB"
+          test "$(git hash-object tests/e2e_sync_artifacts.rs)" = "$QUALIFIED_E2E_BLOB"
+          test "$(grep -c '^mod compaction_retention;$' src/config/mod.rs)" = 1
+          test "$(grep -c 'compaction_retention::complete_and_prune(' src/config/mod.rs)" = 1
+          git diff --exit-code -- . ':(exclude)src/config/mod.rs' ':(exclude)tests/e2e_sync_artifacts.rs'
+          git diff --check
       - name: Publish only the exact validated implementation directly to main
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -107,14 +196,27 @@ jobs:
                   args += ['--method', 'POST', '--input', '-']
               return json.loads(run(*args, data=json.dumps(payload) if payload is not None else None))
 
-          allowed = {'src/config/mod.rs', 'src/config/compaction_retention.rs'}
-          changed = set(run('git', 'diff', '--name-only').splitlines())
-          if not changed <= allowed:
-              raise SystemExit(f'Refusing unexpected publication paths: {changed - allowed}')
-          if not changed:
-              print('Validated source is already committed; no publication needed.')
-              raise SystemExit(0)
           expected = os.environ['GITHUB_SHA']
+          if run('git', 'rev-parse', 'HEAD') != expected:
+              raise SystemExit('Refusing a checkout different from the qualified revision')
+          run('git', 'diff', '--cached', '--exit-code')
+          pins = {
+              'src/config/mod.rs': ('REVIEWED_CONFIG_BLOB', 'QUALIFIED_CONFIG_BLOB'),
+              'tests/e2e_sync_artifacts.rs': ('REVIEWED_E2E_BLOB', 'QUALIFIED_E2E_BLOB'),
+          }
+          allowed = set(pins)
+          changed = set(run('git', 'diff', '--name-only').splitlines())
+          if changed and changed != allowed:
+              raise SystemExit(f'Refusing incomplete or unexpected publication paths: {changed}')
+          for path, (_, qualified_pin) in pins.items():
+              if run('git', 'hash-object', path) != os.environ[qualified_pin]:
+                  raise SystemExit(f'Reconstructed candidate differs from the matrix-qualified blob: {path}')
+          if not changed:
+              print(f'Validated source {expected} is already activated; no publication needed.')
+              raise SystemExit(0)
+          for path, (reviewed_pin, _) in pins.items():
+              if run('git', 'rev-parse', f'HEAD:{path}') != os.environ[reviewed_pin]:
+                  raise SystemExit(f'Staged activation no longer has the reviewed input blob: {path}')
           if api('git/ref/heads/main')['object']['sha'] != expected:
               raise SystemExit('main advanced; do not publish or rebase untested changes')
           base_tree = api(f'git/commits/{expected}')['tree']['sha']
@@ -127,7 +229,7 @@ jobs:
               entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob})
           tree = api('git/trees', {'base_tree': base_tree, 'tree': entries})['sha']
           commit = api('git/commits', {
-              'message': 'fix(config): activate validated completed-compaction retention (#554)\n\nPublish the exact source that passed retention, repeated-import, format, check, clippy, and complete test-suite gates.',
+              'message': 'fix(config): activate validated completed-compaction retention (#554)\n\nPublish the exact candidate that passed Linux and macOS qualification under umasks 002 and 022: retention and private-directory regressions, eight real CLI compactions, clean repeated imports, formatting, all-target check/Clippy, and the complete test suite.',
               'tree': tree, 'parents': [expected],
           })['sha']
           # This non-forced update also rejects a concurrent divergent advance.

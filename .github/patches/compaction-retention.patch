@@ -1,15 +1,49 @@
 diff --git a/src/config/mod.rs b/src/config/mod.rs
+index 69850c39bdb5ee89090bca7ad4f3191eed2b5bf2..b8d61a25e4e4c6134458a9dc5f1709a6cf3e2478 100644
 --- a/src/config/mod.rs
 +++ b/src/config/mod.rs
-@@ -10,5 +10,7 @@
+@@ -9,6 +9,8 @@
+ //! 6. DB config table
  //! 7. Defaults
- 
+
 +#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 +mod compaction_retention;
  pub mod routing;
- 
+
  use crate::error::{BeadsError, Result, ResultExt};
-@@ -3343,4 +3345,22 @@
+@@ -3039,7 +3041,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
+     let temp_path = db_path.with_file_name(format!(".{stem}.vacuum.{nonce}.tmp"));
+     let recovery_parent =
+         recovery_dir_for_db_path(db_path, db_path.parent().unwrap_or_else(|| Path::new(".")));
+-    fs::create_dir_all(&recovery_parent)?;
++    ensure_recovery_directory(&recovery_parent)?;
+     let private_source_dir = tempfile::Builder::new()
+         .prefix(".vacuum-source-")
+         .tempdir_in(&recovery_parent)
+@@ -3065,6 +3067,20 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
+     crate::util::sync_parent_directory(&private_source_path).map_err(BeadsError::Io)?;
+
+     let mut private_storage = SqliteStorage::open(&private_source_path)?;
++    // The retained family must itself be trustworthy before it can displace
++    // older recovery history. A repaired candidate passing integrity_check
++    // does not prove that its pre-compaction source was healthy.
++    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
++    let source_integrity = match compaction_retention::capture_source_integrity(
++        &mut private_storage,
++        &private_source_path,
++    ) {
++        Ok(proof) => Some(proof),
++        Err(error) => {
++            warn!(%error, "Compaction source is unverified; recovery history will be preserved");
++            None
++        }
++    };
+     if let Err(err) = private_storage.execute_raw("VACUUM") {
+         tracing::warn!(
+             error = %err,
+@@ -3226,7 +3242,25 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
+         });
+
      match post_install_result {
 -        Ok(reopened) => Ok(reopened),
 +        Ok(reopened) => {
@@ -21,6 +55,7 @@ diff --git a/src/config/mod.rs b/src/config/mod.rs
 +                &retained_family,
 +                write_authority,
 +                &reopened,
++                source_integrity.as_ref(),
 +                Utc::now(),
 +            ) {
 +                warn!(
@@ -32,3 +67,618 @@ diff --git a/src/config/mod.rs b/src/config/mod.rs
 +        }
          Err(install_error) => {
              if let Err(rollback_error) =
+                 rollback_compacted_database_install(&retained_family, write_authority)
+@@ -3601,7 +3635,7 @@ fn prepare_missing_database_cleanup_for_recovery(
+     reject_symlinked_database_path_for_recovery(db_path)?;
+     let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
+     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
+-    fs::create_dir_all(&recovery_dir)?;
++    ensure_recovery_directory(&recovery_dir)?;
+     Ok(RecoveryBackupSet {
+         db_path: db_path.to_path_buf(),
+         recovery_dir,
+@@ -3641,7 +3675,7 @@ fn move_database_family_to_recovery(
+ ) -> Result<RecoveryBackupSet> {
+     reject_symlinked_database_path_for_recovery(db_path)?;
+     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
+-    fs::create_dir_all(&recovery_dir)?;
++    ensure_recovery_directory(&recovery_dir)?;
+     let (files, verified_files) = rename_existing_paths_with_backup_verification(
+         database_family_paths(db_path).into_iter().map(|original| {
+             let backup = recovery_dir.join(recovery_backup_filename(&original, stamp, "bak"));
+@@ -3944,6 +3978,118 @@ pub(crate) fn recovery_dir_for_db_path(db_path: &Path, beads_dir: &Path) -> Path
+         .join(RECOVERY_DIR_NAME)
+ }
+
++/// Open every directory component without following links, retaining the final
++/// descriptor so permission changes cannot be redirected through a pathname.
++#[cfg(unix)]
++fn open_recovery_directory_nofollow(path: &Path) -> Result<fs::File> {
++    use rustix::fs::{CWD, Mode, OFlags, openat};
++    use std::path::Component;
++
++    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
++    let anchor = if path.is_absolute() { "/" } else { "." };
++    let mut directory =
++        fs::File::from(openat(CWD, anchor, flags, Mode::empty()).map_err(std::io::Error::from)?);
++    for component in path.components() {
++        match component {
++            Component::Normal(name) => {
++                directory = fs::File::from(
++                    openat(&directory, name, flags, Mode::empty()).map_err(std::io::Error::from)?,
++                );
++            }
++            Component::RootDir | Component::CurDir => {}
++            _ => {
++                return Err(BeadsError::Config(format!(
++                    "Refusing ambiguous recovery directory route '{}'",
++                    path.display()
++                )));
++            }
++        }
++    }
++    Ok(directory)
++}
++
++/// Create private recovery storage independently of the process umask. Older
++/// versions created 0775 directories under umask 002; tighten only directories
++/// owned by this effective user and never a world-writable or redirected path.
++#[cfg(unix)]
++fn ensure_recovery_directory(path: &Path) -> Result<()> {
++    use rustix::fs::{AtFlags, Mode, fstat, mkdirat, statat};
++    use rustix::io::Errno;
++    use std::os::unix::fs::{MetadataExt, PermissionsExt};
++
++    crate::sync::reject_symlinked_database_route_components(&path.join(".recovery"))?;
++    let parent_path = path
++        .parent()
++        .ok_or_else(|| BeadsError::Config("Recovery directory has no parent".to_string()))?;
++    let name = path
++        .file_name()
++        .ok_or_else(|| BeadsError::Config("Recovery directory has no filename".to_string()))?;
++    let parent = open_recovery_directory_nofollow(parent_path)?;
++    match mkdirat(&parent, name, Mode::RWXU) {
++        Ok(()) | Err(Errno::EXIST) => {}
++        Err(error) => return Err(BeadsError::Io(error.into())),
++    }
++    let before = statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)?;
++    let directory = open_recovery_directory_nofollow(path)?;
++    let opened = fstat(&directory).map_err(std::io::Error::from)?;
++    let metadata = directory.metadata()?;
++    if before.st_dev != opened.st_dev
++        || before.st_ino != opened.st_ino
++        || metadata.uid() != rustix::process::geteuid().as_raw()
++        || metadata.mode() & 0o002 != 0
++    {
++        return Err(BeadsError::Config(format!(
++            "Refusing recovery directory '{}': changed identity, foreign owner, or world-writable permissions",
++            path.display()
++        )));
++    }
++
++    // Use the descriptor, never chmod(path), and only REMOVE permission bits.
++    // Do not change member files: old or unsafe evidence is still ineligible
++    // for receipt-based pruning, even after its directory becomes private.
++    let private_mode = metadata.mode() & 0o700;
++    if metadata.mode() & 0o7777 != private_mode {
++        directory.set_permissions(fs::Permissions::from_mode(private_mode))?;
++    }
++    directory.sync_all()?;
++    parent.sync_all()?;
++    let current = open_recovery_directory_nofollow(path)?.metadata()?;
++    let held = directory.metadata()?;
++    if current.dev() != metadata.dev()
++        || current.ino() != metadata.ino()
++        || held.uid() != metadata.uid()
++        || held.mode() & 0o7777 != private_mode
++        || current.uid() != held.uid()
++        || current.mode() != held.mode()
++    {
++        return Err(BeadsError::Config(format!(
++            "Recovery directory '{}' changed while securing it",
++            path.display()
++        )));
++    }
++    Ok(())
++}
++
++#[cfg(not(unix))]
++fn ensure_recovery_directory(path: &Path) -> Result<()> {
++    crate::sync::reject_symlinked_database_route_components(&path.join(".recovery"))?;
++    match fs::create_dir(path) {
++        Ok(()) => Ok(()),
++        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
++            let metadata = fs::symlink_metadata(path)?;
++            if metadata.is_dir() && !metadata.file_type().is_symlink() {
++                Ok(())
++            } else {
++                Err(BeadsError::Config(format!(
++                    "Refusing non-directory recovery path '{}'",
++                    path.display()
++                )))
++            }
++        }
++        Err(error) => Err(BeadsError::Io(error)),
++    }
++}
++
+ fn database_family_paths(db_path: &Path) -> Vec<PathBuf> {
+     std::iter::once(db_path.to_path_buf())
+         .chain(db_sidecar_suffixes().map(|suffix| {
+@@ -4048,7 +4194,7 @@ where
+ {
+     let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
+     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
+-    fs::create_dir_all(&recovery_dir)?;
++    ensure_recovery_directory(&recovery_dir)?;
+
+     let (renamed_paths, verified_files) = rename_existing_paths_with_backup_verification(
+         artifact_paths.into_iter().map(|original| {
+@@ -14569,6 +14715,151 @@ routing:
+         );
+     }
+
++    #[cfg(unix)]
++    #[test]
++    fn recovery_directory_creation_is_private_under_the_process_umask() {
++        use std::os::unix::fs::MetadataExt;
++
++        let temp = TempDir::new().expect("tempdir");
++        let parent = fs::canonicalize(temp.path()).expect("canonical fixture root");
++        let recovery = parent.join(RECOVERY_DIR_NAME);
++        ensure_recovery_directory(&recovery).expect("create private recovery directory");
++        let metadata = fs::symlink_metadata(&recovery).expect("directory metadata");
++        assert!(metadata.is_dir());
++        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
++        assert_eq!(metadata.mode() & 0o7777, 0o700);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn recovery_directory_tightening_preserves_identity_children_and_owner_permissions() {
++        use std::os::unix::fs::{MetadataExt, PermissionsExt};
++
++        let temp = TempDir::new().expect("tempdir");
++        let parent = fs::canonicalize(temp.path()).expect("canonical fixture root");
++        for mode in [0o775, 0o2775, 0o755, 0o500] {
++            let recovery = parent.join(format!("recovery-{mode:o}"));
++            fs::create_dir(&recovery).expect("create legacy recovery directory");
++            let child = recovery.join("unreceipted.vacuum-backup.bak");
++            fs::write(&child, b"untrusted legacy recovery evidence").expect("seed evidence");
++            fs::set_permissions(&child, fs::Permissions::from_mode(0o664))
++                .expect("set legacy member mode");
++            fs::set_permissions(&recovery, fs::Permissions::from_mode(mode))
++                .expect("set legacy directory mode");
++            let before = fs::symlink_metadata(&recovery).expect("original identity");
++
++            ensure_recovery_directory(&recovery).expect("tighten owned recovery directory");
++
++            let after = fs::symlink_metadata(&recovery).expect("secured identity");
++            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
++            assert_eq!(after.mode() & 0o7777, mode & 0o700);
++            assert_eq!(fs::metadata(&child).unwrap().mode() & 0o777, 0o664);
++            assert_eq!(
++                fs::read(&child).unwrap(),
++                b"untrusted legacy recovery evidence"
++            );
++        }
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn recovery_directory_refuses_world_write_without_mutation() {
++        use std::os::unix::fs::{MetadataExt, PermissionsExt};
++
++        let temp = TempDir::new().expect("tempdir");
++        let parent = fs::canonicalize(temp.path()).expect("canonical fixture root");
++        for mode in [0o777, 0o702] {
++            let recovery = parent.join(format!("recovery-{mode:o}"));
++            fs::create_dir(&recovery).unwrap();
++            let child = recovery.join("evidence");
++            fs::write(&child, b"preserve").unwrap();
++            fs::set_permissions(&recovery, fs::Permissions::from_mode(mode)).unwrap();
++            let before = fs::metadata(&recovery).unwrap();
++            let error = ensure_recovery_directory(&recovery).expect_err("unsafe root must fail");
++            assert!(error.to_string().contains("world-writable"), "{error}");
++            let after = fs::metadata(&recovery).unwrap();
++            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
++            assert_eq!(after.mode(), before.mode());
++            assert_eq!(fs::read(&child).unwrap(), b"preserve");
++        }
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn recovery_directory_refuses_symlink_root_and_parent_without_touching_target() {
++        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
++
++        let temp = TempDir::new().expect("tempdir");
++        let parent = fs::canonicalize(temp.path()).expect("canonical fixture root");
++        let target = parent.join("outside");
++        fs::create_dir(&target).unwrap();
++        fs::set_permissions(&target, fs::Permissions::from_mode(0o775)).unwrap();
++        fs::write(target.join("evidence"), b"preserve").unwrap();
++        let before = fs::metadata(&target).unwrap();
++        let link = parent.join(RECOVERY_DIR_NAME);
++        symlink(&target, &link).unwrap();
++        assert!(ensure_recovery_directory(&link).is_err());
++        assert!(ensure_recovery_directory(&link.join(RECOVERY_DIR_NAME)).is_err());
++        assert!(
++            fs::symlink_metadata(&link)
++                .unwrap()
++                .file_type()
++                .is_symlink()
++        );
++        assert!(!target.join(RECOVERY_DIR_NAME).exists());
++        assert_eq!(fs::metadata(&target).unwrap().mode(), before.mode());
++        assert_eq!(fs::read(target.join("evidence")).unwrap(), b"preserve");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn recovery_directory_refuses_regular_file_without_mutation() {
++        use std::os::unix::fs::MetadataExt;
++
++        let temp = TempDir::new().expect("tempdir");
++        let parent = fs::canonicalize(temp.path()).expect("canonical fixture root");
++        let recovery = parent.join(RECOVERY_DIR_NAME);
++        fs::write(&recovery, b"preserve special recovery evidence").unwrap();
++        let before = fs::metadata(&recovery).unwrap();
++        assert!(ensure_recovery_directory(&recovery).is_err());
++        let after = fs::metadata(&recovery).unwrap();
++        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
++        assert_eq!(after.mode(), before.mode());
++        assert_eq!(
++            fs::read(&recovery).unwrap(),
++            b"preserve special recovery evidence"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn recovery_directory_refuses_foreign_owner_without_chmod() {
++        use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
++
++        let temp = TempDir::new().expect("tempdir");
++        let parent = fs::canonicalize(temp.path()).expect("canonical fixture root");
++        let recovery = if rustix::process::geteuid().is_root() {
++            let path = parent.join(RECOVERY_DIR_NAME);
++            fs::create_dir(&path).unwrap();
++            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
++            chown(&path, Some(65_534), None).expect("assign foreign fixture owner");
++            path
++        } else {
++            // An unprivileged test cannot chown a fixture. This existing
++            // root-owned directory gives the same negative ownership control;
++            // the kernel also prevents the test user from changing its mode.
++            PathBuf::from("/usr")
++        };
++        let before = fs::metadata(&recovery).unwrap();
++        assert_ne!(before.uid(), rustix::process::geteuid().as_raw());
++        let error = ensure_recovery_directory(&recovery).expect_err("foreign owner must fail");
++        assert!(error.to_string().contains("foreign owner"), "{error}");
++        let after = fs::metadata(&recovery).unwrap();
++        assert_eq!(after.mode(), before.mode());
++        assert_eq!(after.uid(), before.uid());
++        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
++    }
++
+     #[test]
+     fn verify_recovery_backup_artifact_rejects_digest_mismatch() {
+         let temp = TempDir::new().expect("tempdir");
+diff --git a/tests/e2e_sync_artifacts.rs b/tests/e2e_sync_artifacts.rs
+index 448886e2b548c7edee462644ebf0482b97072837..f6291e686dfa18791064ca59e0d1a37f6160a015 100644
+--- a/tests/e2e_sync_artifacts.rs
++++ b/tests/e2e_sync_artifacts.rs
+@@ -1591,7 +1591,11 @@ fn import_json(workspace: &BrWorkspace, label: &str) -> serde_json::Value {
+ }
+
+ fn init_flushed_workspace(prefix: &str, issue_count: usize) -> (BrWorkspace, Vec<String>) {
+-    let workspace = BrWorkspace::new();
++    let mut workspace = BrWorkspace::new();
++    // macOS temp paths may start at /var, a symlink to /private/var. Direct
++    // engine/authority calls must use the same canonical route as the CLI.
++    workspace.root = fs::canonicalize(&workspace.root).expect("canonical workspace");
++    workspace.log_dir = workspace.root.join("logs");
+     let init = run_br(&workspace, ["init", "--prefix", prefix], "init");
+     assert!(init.status.success(), "init failed: {}", init.stderr);
+     let mut ids = Vec::new();
+@@ -1657,65 +1661,251 @@ fn e2e_sync_import_one_row_change_skips_compaction() {
+     );
+ }
+
+-/// GitHub #577: an import still compacts when free pages pass the reclaim
+-/// threshold, so skipping routine compactions does not leave a large
+-/// freelist in place indefinitely.
++fn populate_compaction_freelist(db_path: &Path) {
++    // Free well over 1024 pages, and over a quarter of the file, by filling
++    // and dropping a scratch table through the real engine. Close the direct
++    // connection before a CLI subprocess acquires database-family authority.
++    let conn = beads_rust::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
++        .expect("open database");
++    conn.execute("CREATE TABLE compaction_filler (payload TEXT)")
++        .expect("create filler");
++    let payload = "x".repeat(4000);
++    conn.execute("BEGIN").expect("begin filler");
++    for _ in 0..2000 {
++        conn.execute_with_params(
++            "INSERT INTO compaction_filler (payload) VALUES (?)",
++            &[fsqlite_types::SqliteValue::from(payload.as_str())],
++        )
++        .expect("insert filler");
++    }
++    conn.execute("COMMIT").expect("commit filler");
++    conn.execute("DROP TABLE compaction_filler")
++        .expect("drop filler");
++}
++
++#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
++fn completed_compaction_receipts(beads_dir: &Path) -> BTreeMap<String, Vec<u8>> {
++    let recovery_dir = beads_dir.join(".br_recovery");
++    let entries = match fs::read_dir(&recovery_dir) {
++        Ok(entries) => entries,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
++        Err(error) => panic!("read recovery directory: {error}"),
++    };
++    entries
++        .map(|entry| entry.expect("recovery entry"))
++        .filter_map(|entry| {
++            let name = entry.file_name().into_string().expect("fixture filename");
++            if name.starts_with("beads.db.vacuum-") && name.ends_with(".complete.json") {
++                Some((name, fs::read(entry.path()).expect("completion receipt")))
++            } else {
++                None
++            }
++        })
++        .collect()
++}
++
++#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
++fn assert_completed_compaction_family(
++    db_path: &Path,
++    marker: &str,
++    contents: &[u8],
++    started: chrono::DateTime<chrono::Utc>,
++) {
++    use std::collections::BTreeSet;
++    use std::os::unix::fs::MetadataExt;
++
++    let receipt: serde_json::Value = serde_json::from_slice(contents).expect("receipt JSON");
++    assert_eq!(receipt["schema_version"], "br.compaction.complete.v3");
++    assert_eq!(receipt["integrity_check"], "ok");
++    assert_eq!(receipt["source_integrity_check"], "ok");
++    assert_eq!(receipt["database_path"].as_str(), db_path.to_str());
++    let completed = chrono::DateTime::parse_from_rfc3339(
++        receipt["completed_at"]
++            .as_str()
++            .expect("completion timestamp"),
++    )
++    .expect("valid completion timestamp")
++    .with_timezone(&chrono::Utc);
++    assert!(
++        (started..=chrono::Utc::now()).contains(&completed),
++        "this run must produce fresh completion evidence: {receipt}"
++    );
++    let stamp = receipt["stamp"].as_str().expect("compaction stamp");
++    assert_eq!(marker, format!("beads.db.{stamp}.complete.json"));
++    let members = receipt["members"].as_array().expect("family members");
++    let suffixes: BTreeSet<_> = members
++        .iter()
++        .map(|member| member["suffix"].as_str().expect("member suffix"))
++        .collect();
++    assert_eq!(suffixes.len(), members.len(), "no duplicate member");
++    assert!(suffixes.contains(""), "main database must be retained");
++    let recovery_dir = db_path.parent().unwrap().join(".br_recovery");
++    let mut expected_names = BTreeSet::from([marker.to_string()]);
++    for member in members {
++        let suffix = member["suffix"].as_str().unwrap();
++        let name = format!("beads.db{suffix}.{stamp}.bak");
++        let backup = recovery_dir.join(&name);
++        let metadata = fs::symlink_metadata(&backup).expect("retained member metadata");
++        assert!(metadata.is_file(), "retained member must be a regular file");
++        let witness = &member["witness"];
++        assert_eq!(witness["length"].as_u64(), Some(metadata.len()));
++        assert_eq!(witness["device"].as_u64(), Some(metadata.dev()));
++        assert_eq!(witness["inode"].as_u64(), Some(metadata.ino()));
++        let digest = Sha256::digest(fs::read(&backup).expect("retained member bytes"));
++        assert_eq!(witness["sha256"], beads_rust::util::hex_encode(&digest));
++        expected_names.insert(name);
++    }
++    for suffix in receipt["family_suffixes"]
++        .as_array()
++        .expect("sidecar catalog")
++    {
++        let suffix = suffix.as_str().expect("catalog suffix");
++        assert_eq!(
++            recovery_dir
++                .join(format!("beads.db{suffix}.{stamp}.bak"))
++                .exists(),
++            suffixes.contains(suffix),
++            "recorded sidecar absences must match the retained family"
++        );
++    }
++    let generation = format!(".{stamp}.");
++    let actual_names: BTreeSet<_> = fs::read_dir(&recovery_dir)
++        .expect("recovery inventory")
++        .map(|entry| {
++            entry
++                .expect("recovery entry")
++                .file_name()
++                .into_string()
++                .expect("fixture filename")
++        })
++        .filter(|name| name.starts_with("beads.db") && name.contains(&generation))
++        .collect();
++    assert_eq!(actual_names, expected_names, "complete retained generation");
++}
++
++fn assert_compaction_import_refuses_competing_authority(workspace: &BrWorkspace, db_path: &Path) {
++    let beads_dir = db_path.parent().unwrap();
++    let recovery_dir = beads_dir.join(".br_recovery");
++    let recovery_before = DirectorySnapshot::capture(&recovery_dir);
++    let jsonl_path = beads_dir.join("issues.jsonl");
++    let jsonl_before = fs::read(&jsonl_path).expect("pending import");
++    // A different workspace keeps the actual database-family authority busy;
++    // the import must not merely collide on its own workspace's .write.lock.
++    let other_workspace = tempfile::tempdir_in(&workspace.root).expect("competing workspace");
++    let authority = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
++        other_workspace.path(),
++        db_path,
++        Some(1_000),
++    )
++    .expect("competing database authority");
++    let blocked = run_br(
++        workspace,
++        ["--lock-timeout", "100", "sync", "--import-only", "--json"],
++        "compaction_import_blocked",
++    );
++    assert_eq!(blocked.status.code(), Some(2), "{}", blocked.stderr);
++    let error: serde_json::Value = serde_json::from_str(&blocked.stdout).expect("refusal JSON");
++    assert_eq!(error["error"]["code"], "DATABASE_LOCKED", "{error}");
++    assert_eq!(
++        error["error"]["context"]["lock_role"], "database-family write lock",
++        "{error}"
++    );
++    authority
++        .verify_database_authority()
++        .expect("authority remains held");
++    assert_eq!(
++        DirectorySnapshot::capture(&recovery_dir).files,
++        recovery_before.files,
++        "a refused compaction must preserve every recovery copy and receipt"
++    );
++    assert_eq!(
++        fs::read(jsonl_path).expect("pending import remains"),
++        jsonl_before,
++        "refusal must preserve the pending JSONL import"
++    );
++    // No main-database descriptor is opened while this process owns its POSIX
++    // lock. Release authority before the successful retry or any engine open.
++    drop(authority);
++}
++
++/// GitHub #577/#554: imports still reclaim a substantial freelist, seal the
++/// installed family, and retain every recent generation even beyond five.
+ #[test]
+ fn e2e_sync_import_compacts_when_the_freelist_passes_the_threshold() {
+     let _log = common::test_log("e2e_sync_import_compacts_when_the_freelist_passes_the_threshold");
++    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
++    let started = chrono::Utc::now();
+     let (workspace, ids) = init_flushed_workspace("cmf", 10);
+     let beads_dir = workspace.root.join(".beads");
+     let db_path = beads_dir.join("beads.db");
+     let jsonl_path = beads_dir.join("issues.jsonl");
+     let backups_before = compaction_backup_count(&beads_dir);
++    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
++    let mut prior_receipts = completed_compaction_receipts(&beads_dir);
+
+-    // Free well over 1024 pages, and over a quarter of the file, by filling
+-    // and dropping a scratch table.
+-    {
++    for round in 0..8 {
++        populate_compaction_freelist(&db_path);
++        let title = format!("after the drop {round}");
++        edit_one_jsonl_row(
++            &jsonl_path,
++            &ids[3],
++            &title,
++            &format!("2030-01-0{}T00:00:00Z", round + 1),
++        );
++        if round == 7 {
++            assert_compaction_import_refuses_competing_authority(&workspace, &db_path);
++        }
++        let import = import_json(&workspace, &format!("import_after_drop_{round}"));
++        assert_eq!(import["updated"], 1, "one row changed: {import}");
++        assert_eq!(
++            compaction_backup_count(&beads_dir),
++            backups_before + round + 1,
++            "every necessary compaction must keep its recent backup (round {round})"
++        );
++        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
++        {
++            let receipts = completed_compaction_receipts(&beads_dir);
++            assert_eq!(receipts.len(), prior_receipts.len() + 1, "one new receipt");
++            for (name, contents) in &prior_receipts {
++                assert_eq!(receipts.get(name), Some(contents), "recent receipt changed");
++            }
++            for (name, contents) in &receipts {
++                assert_completed_compaction_family(&db_path, name, contents, started);
++            }
++            prior_receipts = receipts;
++        }
++        let show = run_br(
++            &workspace,
++            ["show", &ids[3], "--json"],
++            &format!("show_after_compaction_{round}"),
++        );
++        assert!(show.status.success(), "show failed: {}", show.stderr);
++        let issues: serde_json::Value = serde_json::from_str(&show.stdout).expect("issue JSON");
++        assert_eq!(issues[0]["title"], title, "live imported issue survived");
+         let conn =
+             beads_rust::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+-                .expect("open database");
+-        conn.execute("CREATE TABLE compaction_filler (payload TEXT)")
+-            .expect("create filler");
+-        let payload = "x".repeat(4000);
+-        conn.execute("BEGIN").expect("begin filler");
+-        for _ in 0..2000 {
+-            conn.execute_with_params(
+-                "INSERT INTO compaction_filler (payload) VALUES (?)",
+-                &[fsqlite_types::SqliteValue::from(payload.as_str())],
+-            )
+-            .expect("insert filler");
+-        }
+-        conn.execute("COMMIT").expect("commit filler");
+-        conn.execute("DROP TABLE compaction_filler")
+-            .expect("drop filler");
++                .expect("reopen database");
++        let freelist = conn
++            .query_row("PRAGMA freelist_count")
++            .expect("freelist_count");
++        assert_eq!(
++            freelist
++                .get(0)
++                .and_then(fsqlite_types::SqliteValue::as_integer),
++            Some(0),
++            "compaction must reclaim free pages (round {round})"
++        );
++        let integrity = conn
++            .query_row("PRAGMA integrity_check")
++            .expect("live integrity");
++        assert_eq!(
++            integrity
++                .get(0)
++                .and_then(fsqlite_types::SqliteValue::as_text),
++            Some("ok"),
++            "installed database must remain intact (round {round})"
++        );
+     }
+-
+-    edit_one_jsonl_row(
+-        &jsonl_path,
+-        &ids[3],
+-        "after the drop",
+-        "2030-01-01T00:00:00Z",
+-    );
+-    let import = import_json(&workspace, "import_after_drop");
+-    assert_eq!(import["updated"], 1, "one row changed: {import}");
+-    assert_eq!(
+-        compaction_backup_count(&beads_dir),
+-        backups_before + 1,
+-        "a freelist past the threshold must trigger post-import compaction"
+-    );
+-    let conn = beads_rust::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+-        .expect("reopen database");
+-    let freelist = conn
+-        .query_row("PRAGMA freelist_count")
+-        .expect("freelist_count");
+-    assert_eq!(
+-        freelist
+-            .get(0)
+-            .and_then(fsqlite_types::SqliteValue::as_integer),
+-        Some(0),
+-        "compaction must reclaim the free pages"
+-    );
+ }
+
+ /// Invoke the C `sqlite3` CLI to run `PRAGMA integrity_check` against the
