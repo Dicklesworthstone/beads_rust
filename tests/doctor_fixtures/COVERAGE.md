@@ -36,6 +36,7 @@ invocation (env override or flag) to pin the finding/check contract;
 | fm-configs-policy-unknown-keys | policy_unknown_keys | detect |
 | fm-configs-startup-cache-poisoned | startup_cache_poisoned | detect |
 | fm-configs-unknown-keys | config_unknown_keys | detect |
+| fm-configs-vcs-tracked-runtime-files | — | exception: `git.tracked_runtime_files` runs only under `br doctor --git-runtime-files` and always reports status ok (an inventory, never a non-ok finding), so no planted state can fire it. `tests/e2e_vcs_status.rs` pins its tracked and unavailable inventories. |
 | fm-configs-yaml-malformed | config_yaml_malformed | detect |
 | fm-dependencies-dead-closed-blocking-edges | dep_dead_closed_blocking_edges | detect |
 | fm-dependencies-fully-unblocked-open-issues | dep_dead_closed_blocking_edges | detect |
