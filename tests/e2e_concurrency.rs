@@ -6947,3 +6947,143 @@ fn e2e_routed_access_remains_bounded_while_remote_workspace_mutates() {
         main_status.stdout, main_status.stderr
     );
 }
+
+#[cfg(unix)]
+mod dependency_unblock_races {
+    use super::*;
+    use common::cli::BrWorkspace;
+    use serde_json::Value;
+
+    fn seed() -> (BrWorkspace, String, String, String) {
+        let workspace = BrWorkspace::new();
+        let root = &workspace.root;
+        let init = run_br_in_dir(root, ["init"]);
+        assert!(init.success, "{init:?}");
+        let mut ids = Vec::new();
+        for title in ["completed prerequisite", "dependent awaiting review", "competing prerequisite"] {
+            let created = run_br_in_dir(root, ["--actor", "seed", "create", title, "--json"]);
+            assert!(created.success, "{created:?}");
+            let created: Value = serde_json::from_str(&created.stdout).unwrap();
+            ids.push(created["id"].as_str().unwrap().to_string());
+        }
+        for args in [
+            vec!["dep", "add", &ids[1], &ids[0]],
+            vec!["update", &ids[1], "--status", "blocked"],
+            vec!["close", &ids[0], "--reason", "completed"],
+        ] {
+            let result = run_br_in_dir(root, args);
+            assert!(result.success, "{result:?}");
+        }
+        let preview = run_br_in_dir(
+            root,
+            ["--actor", "repairer", "doctor", "unblock", "--authorize", &ids[1], "--json"],
+        );
+        assert!(preview.success, "{preview:?}");
+        let preview: Value = serde_json::from_str(&preview.stdout).unwrap();
+        assert_eq!(preview["planned_ids"], serde_json::json!([ids[1]]));
+        let token = preview["plan_token"].as_str().unwrap().to_string();
+        (workspace, ids[1].clone(), ids[2].clone(), token)
+    }
+
+    fn start_repair(root: &Path, id: &str, token: &str) -> std::process::Child {
+        spawn_br_child_in_dir(
+            root,
+            [
+                "--actor", "repairer", "--lock-timeout", "30000", "doctor", "unblock",
+                "--authorize", id, "--apply", "--expect", token, "--json",
+            ],
+        )
+    }
+
+    #[test]
+    fn unblock_595_queued_repair_rechecks_competing_ownership_and_edges() {
+        for change in ["ownership", "dependency"] {
+            let (workspace, id, competing, token) = seed();
+            let root = &workspace.root;
+            let authority = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+            let mutation = if change == "ownership" {
+                vec!["update", id.as_str(), "--assignee", "alice", "--notes", "concurrent ownership"]
+            } else {
+                vec!["dep", "add", id.as_str(), competing.as_str()]
+            };
+            let mut children = QueuedBrChildren(vec![spawn_br_child_in_dir(root, mutation)]);
+            let first = wait_for_workspace_waiters(root, 1);
+            children.0.push(start_repair(root, &id, &token));
+            let both = wait_for_workspace_waiters(root, 2);
+            assert_eq!(first[0], both[0], "competing writer must enter before repair");
+            drop(authority);
+            let outputs = children.finish(Duration::from_secs(20));
+            assert!(outputs[0].status.success(), "competing {change}: {:?}", outputs[0]);
+            assert!(!outputs[1].status.success(), "stale repair must fail: {:?}", outputs[1]);
+
+            let shown = run_br_in_dir(root, ["show", &id, "--json"]);
+            assert!(shown.success, "{shown:?}");
+            let shown: Value = serde_json::from_str(&shown.stdout).unwrap();
+            assert_eq!(shown[0]["status"], "blocked");
+            if change == "ownership" {
+                assert_eq!(shown[0]["assignee"], "alice");
+                assert_eq!(shown[0]["notes"], "concurrent ownership");
+            }
+            let storage = beads_rust::storage::SqliteStorage::open(&root.join(".beads/beads.db"))
+                .unwrap();
+            assert!(storage.get_events(&id, 0).unwrap().iter().all(|event| event.actor != "repairer"));
+            assert!(storage.get_comments(&id).unwrap().is_empty(), "refused repair left audit comment");
+            if change == "dependency" {
+                let dependencies = storage.get_dependencies(&id).unwrap();
+                assert!(dependencies.contains(&competing));
+            }
+            drop(storage);
+            let ready = run_br_in_dir(root, ["ready", "--limit", "0", "--json"]);
+            assert!(ready.success, "{ready:?}");
+            assert!(extract_issues_array(&ready.stdout).iter().all(|issue| issue["id"] != id));
+        }
+    }
+
+    /// Cancellation before transaction entry must not consume the reviewed
+    /// state. Mid-transaction rollback is covered separately at storage level.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unblock_595_interrupted_repair_preserves_state_and_can_be_retried() {
+        use rustix::process::{Pid, Signal, kill_process};
+        use std::os::unix::process::ExitStatusExt;
+
+        for signal in [Signal::TERM, Signal::KILL] {
+            let (workspace, id, _, token) = seed();
+            let root = &workspace.root;
+            let jsonl_before = fs::read(root.join(".beads/issues.jsonl")).unwrap();
+            let database_before = database_payload_bytes(root);
+            let authority = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+            let mut children = QueuedBrChildren(vec![start_repair(root, &id, &token)]);
+            wait_for_workspace_waiters(root, 1);
+            wait_for_child_owned_workspace_registration(root, &mut children.0[0]);
+            wait_for_child_to_block_on_write_lock(&mut children.0[0], "unblock repair");
+            if signal == Signal::TERM {
+                request_and_observe_cooperative_shutdown(&mut children.0[0]);
+            } else {
+                let pid = Pid::from_raw(i32::try_from(children.0[0].id()).unwrap()).unwrap();
+                kill_process(pid, Signal::KILL).expect("kill owned repair waiter");
+            }
+            drop(authority);
+            let output = children.finish(Duration::from_secs(10)).remove(0);
+            if signal == Signal::TERM {
+                assert_eq!(output.status.code(), Some(143), "{output:?}");
+            } else {
+                assert_eq!(output.status.signal(), Some(9), "{output:?}");
+            }
+            assert_eq!(database_payload_bytes(root), database_before, "interrupted repair wrote DB");
+            assert_eq!(fs::read(root.join(".beads/issues.jsonl")).unwrap(), jsonl_before);
+
+            // Reuse the exact original review: cancellation did not change its
+            // authority or leave a partially applied status/audit operation.
+            let output = QueuedBrChildren(vec![start_repair(root, &id, &token)])
+                .finish(Duration::from_secs(10))
+                .remove(0);
+            assert!(output.status.success(), "retry after {signal:?}: {output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["changed"], serde_json::json!([id]));
+            let ready = run_br_in_dir(root, ["ready", "--limit", "0", "--json"]);
+            assert!(ready.success, "{ready:?}");
+            assert!(extract_issues_array(&ready.stdout).iter().any(|issue| issue["id"] == id));
+        }
+    }
+}

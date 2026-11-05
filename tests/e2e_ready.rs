@@ -1477,3 +1477,876 @@ fn ready_cli_quiet_suppresses_truncation_note() {
         result.stderr
     );
 }
+
+/// GH #595: status recovery must recover ready work without interpreting a
+/// satisfied dependency graph as permission to remove a manual block.
+mod dependency_unblock {
+    use super::*;
+    use common::cli::{BrRun, run_br_with_env};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn command(workspace: &BrWorkspace, args: &[&str], label: &str) -> BrRun {
+        let mut argv = vec!["--actor", "repairer"];
+        argv.extend_from_slice(args);
+        run_br(workspace, argv, label)
+    }
+
+    fn success(workspace: &BrWorkspace, args: &[&str], label: &str) -> BrRun {
+        let result = command(workspace, args, label);
+        assert!(result.status.success(), "{label}: {result:?}");
+        result
+    }
+
+    fn json(workspace: &BrWorkspace, args: &[&str], label: &str) -> Value {
+        let result = success(workspace, args, label);
+        serde_json::from_str(&extract_json_payload(&result.stdout))
+            .unwrap_or_else(|error| panic!("{label}: {error}: {}", result.stdout))
+    }
+
+    fn attributed_command(
+        workspace: &BrWorkspace,
+        args: &[&str],
+        attribution: &[(&str, &str)],
+        label: &str,
+    ) -> BrRun {
+        let mut argv = vec!["--actor", "repairer"];
+        argv.extend_from_slice(args);
+        run_br_with_env(workspace, argv, attribution.iter().copied(), label)
+    }
+
+    fn attributed_json(
+        workspace: &BrWorkspace,
+        args: &[&str],
+        attribution: &[(&str, &str)],
+        label: &str,
+    ) -> Value {
+        let result = attributed_command(workspace, args, attribution, label);
+        assert!(result.status.success(), "{label}: {result:?}");
+        serde_json::from_str(&extract_json_payload(&result.stdout))
+            .unwrap_or_else(|error| panic!("{label}: {error}: {}", result.stdout))
+    }
+
+    fn workspace() -> BrWorkspace {
+        let workspace = BrWorkspace::new();
+        success(&workspace, &["init"], "unblock_init");
+        workspace
+    }
+
+    fn create(workspace: &BrWorkspace, title: &str) -> String {
+        let result = success(workspace, &["create", title], "unblock_create");
+        let id = parse_created_id(&result.stdout);
+        assert!(!id.is_empty(), "created ID missing: {result:?}");
+        id
+    }
+
+    fn dependency(workspace: &BrWorkspace, dependent: &str, blocker: &str) {
+        success(
+            workspace,
+            &["dep", "add", dependent, blocker],
+            "unblock_add_dependency",
+        );
+    }
+
+    fn block(workspace: &BrWorkspace, id: &str, dependency_only: bool) {
+        let mut args = vec!["update", id, "--status", "blocked"];
+        if dependency_only {
+            args.push("--blocked-by-dependencies");
+        }
+        success(workspace, &args, "unblock_set_blocked");
+    }
+
+    fn close(workspace: &BrWorkspace, id: &str) {
+        success(
+            workspace,
+            &["close", id, "--reason", "verified prerequisite completed"],
+            "unblock_close",
+        );
+    }
+
+    fn pair(workspace: &BrWorkspace, dependency_only: bool) -> (String, String) {
+        let blocker = create(workspace, "prerequisite A");
+        let dependent = create(workspace, "dependent B");
+        dependency(workspace, &dependent, &blocker);
+        block(workspace, &dependent, dependency_only);
+        (blocker, dependent)
+    }
+
+    fn show(workspace: &BrWorkspace, id: &str) -> Value {
+        json(workspace, &["show", id, "--json"], "unblock_show")[0].clone()
+    }
+
+    fn ready_contains(workspace: &BrWorkspace, id: &str) -> bool {
+        let result = json(
+            workspace,
+            &["ready", "--limit", "0", "--json"],
+            "unblock_ready",
+        );
+        issue_list_contains_id(result.as_array().expect("ready array"), id)
+    }
+
+    fn preview(workspace: &BrWorkspace, options: &[&str]) -> Value {
+        let mut args = vec!["doctor", "unblock", "--json"];
+        args.extend_from_slice(options);
+        json(workspace, &args, "unblock_preview")
+    }
+
+    fn apply(workspace: &BrWorkspace, options: &[&str], token: &str) -> BrRun {
+        let mut args = vec!["doctor", "unblock", "--apply", "--expect", token, "--json"];
+        args.extend_from_slice(options);
+        command(workspace, &args, "unblock_apply")
+    }
+
+    fn repair(workspace: &BrWorkspace, options: &[&str]) -> Value {
+        let plan = preview(workspace, options);
+        let token = plan["plan_token"].as_str().expect("review token");
+        let applied = apply(workspace, options, token);
+        assert!(applied.status.success(), "repair: {applied:?}");
+        let result: Value =
+            serde_json::from_str(&extract_json_payload(&applied.stdout)).expect("repair report");
+        assert_eq!(result["plan_token"], token);
+        result
+    }
+
+    fn candidate<'a>(plan: &'a Value, id: &str) -> Option<&'a Value> {
+        plan["candidates"]
+            .as_array()
+            .expect("candidate array")
+            .iter()
+            .find(|candidate| candidate["id"].as_str() == Some(id))
+    }
+
+    fn eligible(plan: &Value, id: &str) -> bool {
+        candidate(plan, id).is_some_and(|candidate| candidate["eligible"] == true)
+    }
+
+    fn persisted_files(workspace: &BrWorkspace) -> BTreeMap<PathBuf, Vec<u8>> {
+        let beads = workspace.root.join(".beads");
+        walkdir::WalkDir::new(&beads)
+            .into_iter()
+            .map(|entry| entry.expect("read tracker inventory"))
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                let path = entry.path();
+                let mut bytes = fs::read(path).expect("read tracker file");
+                // A read-only WAL opener may register its snapshot in this
+                // read-mark range. Every other persisted byte is witnessed,
+                // including audit tables, JSONL, cache and history files.
+                if path.to_string_lossy().ends_with("-shm") && bytes.len() >= 120 {
+                    bytes[100..120].fill(0);
+                }
+                (path.strip_prefix(&beads).unwrap().to_path_buf(), bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unblock_595_reporter_reproduction_requires_reviewed_authorization() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, false);
+        close(&workspace, &blocker);
+        assert_eq!(show(&workspace, &dependent)["status"], "blocked");
+        assert!(!ready_contains(&workspace, &dependent));
+
+        let before = persisted_files(&workspace);
+        let plan = preview(&workspace, &[]);
+        assert_eq!(persisted_files(&workspace), before, "preview wrote tracker data");
+        assert_eq!(preview(&workspace, &["--dry-run"]), plan);
+        assert_eq!(
+            json(
+                &workspace,
+                &["doctor", "--dry-run", "unblock", "--json"],
+                "unblock_parent_dry_run",
+            ),
+            plan
+        );
+        assert_eq!(persisted_files(&workspace), before);
+        let stale = candidate(&plan, &dependent).expect("graph-stale dependent is reported");
+        assert_eq!(stale["eligible"], false, "a manual status change is not proof");
+        assert!(stale["reason"].as_str().is_some_and(|reason| !reason.is_empty()));
+        assert_eq!(plan["planned_ids"], serde_json::json!([]));
+        let no_permission = apply(&workspace, &[], plan["plan_token"].as_str().unwrap());
+        assert!(no_permission.status.success(), "safe empty apply: {no_permission:?}");
+        assert_eq!(show(&workspace, &dependent)["status"], "blocked");
+
+        let result = repair(&workspace, &["--authorize", &dependent]);
+        assert_eq!(result["changed"], serde_json::json!([dependent]));
+        let repaired = show(&workspace, &dependent);
+        assert_eq!(repaired["status"], "open");
+        assert!(ready_contains(&workspace, &dependent));
+        assert!(
+            repaired["comments"].as_array().unwrap().iter().any(|comment| {
+                comment["author"] == "repairer"
+                    && comment["text"].as_str().is_some_and(|text| text.contains(&blocker))
+            }),
+            "repair must explain the satisfied blocker in an attributed audit comment: {repaired}"
+        );
+        let exported = issue_from_jsonl(&workspace, &dependent);
+        assert_eq!(exported["status"], "open");
+        assert!(exported["dependencies"].as_array().unwrap().iter().any(|edge| {
+            edge["depends_on_id"] == blocker
+        }), "repair must preserve satisfied dependency history");
+        let no_op = repair(&workspace, &[]);
+        assert_eq!(no_op["changed"], serde_json::json!([]));
+        assert_eq!(show(&workspace, &dependent), repaired, "retry added duplicate audit data");
+    }
+
+    #[test]
+    fn unblock_595_dependency_provenance_waits_for_every_blocker() {
+        let workspace = workspace();
+        let blocker_a = create(&workspace, "first prerequisite");
+        let blocker_c = create(&workspace, "second prerequisite");
+        let dependent = create(&workspace, "requires both prerequisites");
+        dependency(&workspace, &dependent, &blocker_a);
+        dependency(&workspace, &dependent, &blocker_c);
+        block(&workspace, &dependent, true);
+        close(&workspace, &blocker_a);
+
+        assert!(!eligible(&preview(&workspace, &[]), &dependent));
+        let forced = repair(&workspace, &["--authorize", &dependent]);
+        assert_eq!(forced["changed"], serde_json::json!([]));
+        assert_eq!(show(&workspace, &dependent)["status"], "blocked");
+        close(&workspace, &blocker_c);
+        assert!(eligible(&preview(&workspace, &[]), &dependent));
+        let result = repair(&workspace, &[]);
+        assert_eq!(result["changed"], serde_json::json!([dependent]));
+        assert!(ready_contains(&workspace, &dependent));
+    }
+
+    #[test]
+    fn unblock_595_chained_dependents_wait_for_completion_not_reopening() {
+        let workspace = workspace();
+        let (first, middle) = pair(&workspace, true);
+        let last = create(&workspace, "requires middle to complete");
+        dependency(&workspace, &last, &middle);
+        block(&workspace, &last, true);
+        close(&workspace, &first);
+
+        let result = repair(&workspace, &[]);
+        assert_eq!(result["changed"], serde_json::json!([middle]));
+        assert!(ready_contains(&workspace, &middle));
+        assert_eq!(show(&workspace, &last)["status"], "blocked");
+        assert!(!ready_contains(&workspace, &last));
+        close(&workspace, &middle);
+        assert_eq!(repair(&workspace, &[])["changed"], serde_json::json!([last]));
+        assert!(ready_contains(&workspace, &last));
+    }
+
+    #[test]
+    fn unblock_595_manual_and_external_holds_are_preserved() {
+        let workspace = workspace();
+        let (blocker, manual) = pair(&workspace, false);
+        success(
+            &workspace,
+            &["update", &manual, "--notes", "Waiting for the customer's approval"],
+            "manual_external_hold",
+        );
+        let unlinked = create(&workspace, "Waiting for an off-tracker deployment");
+        block(&workspace, &unlinked, false);
+        let external = create(&workspace, "Requires unavailable external provider");
+        dependency(&workspace, &external, &blocker);
+        dependency(&workspace, &external, "external:unavailable:approval");
+        block(&workspace, &external, false);
+        close(&workspace, &blocker);
+
+        let report = repair(&workspace, &[]);
+        assert_eq!(report["changed"], serde_json::json!([]));
+        let authorized = repair(&workspace, &["--authorize", &external]);
+        assert_eq!(authorized["changed"], serde_json::json!([]));
+        for id in [&manual, &unlinked, &external] {
+            assert_eq!(show(&workspace, id)["status"], "blocked");
+            assert!(!ready_contains(&workspace, id));
+        }
+        assert_eq!(
+            show(&workspace, &manual)["notes"],
+            "Waiting for the customer's approval"
+        );
+    }
+
+    #[test]
+    fn unblock_595_parent_and_epic_gates_survive_authorization() {
+        let workspace = workspace();
+        let (closed, child) = pair(&workspace, false);
+        let parent = create(&workspace, "parent with a live prerequisite");
+        let parent_blocker = create(&workspace, "parent prerequisite");
+        dependency(&workspace, &parent, &parent_blocker);
+        success(&workspace, &["update", &child, "--parent", &parent], "set_parent");
+        close(&workspace, &closed);
+        assert_eq!(
+            repair(&workspace, &["--authorize", &child])["changed"],
+            serde_json::json!([])
+        );
+        assert!(!ready_contains(&workspace, &child));
+        close(&workspace, &parent_blocker);
+        assert_eq!(
+            repair(&workspace, &["--authorize", &child])["changed"],
+            serde_json::json!([child])
+        );
+        assert!(ready_contains(&workspace, &child));
+
+        let epic = create(&workspace, "epic waiting for its child");
+        success(&workspace, &["update", &epic, "--type", "epic"], "set_epic");
+        dependency(&workspace, &epic, &closed);
+        block(&workspace, &epic, false);
+        success(&workspace, &["update", &child, "--parent", &epic], "set_epic_parent");
+        assert_eq!(
+            repair(&workspace, &["--authorize", &epic])["changed"],
+            serde_json::json!([])
+        );
+        assert!(!ready_contains(&workspace, &epic));
+        close(&workspace, &child);
+        assert_eq!(
+            repair(&workspace, &["--authorize", &epic])["changed"],
+            serde_json::json!([epic])
+        );
+        assert!(ready_contains(&workspace, &epic));
+    }
+
+    #[test]
+    fn unblock_595_custom_workflow_target_and_transition_are_enforced() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, true);
+        close(&workspace, &blocker);
+        write_policy(
+            &workspace,
+            "workflow:\n  strict: true\n  statuses: [open, blocked, rework, closed]\n  transitions:\n    blocked: [rework]\n  status_groups:\n    ready: [open, rework]\n  required_fields:\n    rework: [transition_comment]\n",
+        );
+        assert!(!eligible(&preview(&workspace, &["--to-status", "open"]), &dependent));
+        let denied = repair(&workspace, &["--to-status", "open", "--authorize", &dependent]);
+        assert_eq!(denied["changed"], serde_json::json!([]));
+        assert_eq!(show(&workspace, &dependent)["status"], "blocked");
+
+        write_policy(
+            &workspace,
+            "workflow:\n  strict: true\n  statuses: [open, blocked, rework, closed]\n  transitions:\n    blocked: [rework]\n  status_groups:\n    ready: [rework]\n  required_fields:\n    rework: [transition_comment]\n",
+        );
+        let non_ready_target = command(
+            &workspace,
+            &["doctor", "unblock", "--to-status", "open", "--json"],
+            "unblock_non_ready_target",
+        );
+        assert!(!non_ready_target.status.success(), "repair target must belong to ready group");
+        assert_eq!(show(&workspace, &dependent)["status"], "blocked");
+        let result = repair(&workspace, &["--to-status", "rework"]);
+        assert_eq!(result["changed"], serde_json::json!([dependent]));
+        assert_eq!(show(&workspace, &dependent)["status"], "rework");
+        assert!(ready_contains(&workspace, &dependent));
+    }
+
+    #[test]
+    fn unblock_595_workflow_required_fields_and_defer_time_are_not_bypassed() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, false);
+        close(&workspace, &blocker);
+        write_policy(
+            &workspace,
+            "workflow:\n  required_fields:\n    open: [acceptance_criteria_present]\n",
+        );
+        let options = ["--authorize", dependent.as_str()];
+        assert!(!eligible(&preview(&workspace, &options), &dependent));
+        assert_eq!(repair(&workspace, &options)["changed"], serde_json::json!([]));
+        success(
+            &workspace,
+            &["update", &dependent, "--acceptance-criteria", "- [ ] verified delivery", "--defer", "2999-01-01T00:00:00Z"],
+            "unblock_required_fields_and_defer",
+        );
+        assert!(!eligible(&preview(&workspace, &options), &dependent));
+        assert_eq!(repair(&workspace, &options)["changed"], serde_json::json!([]));
+        assert_eq!(show(&workspace, &dependent)["status"], "blocked");
+        success(&workspace, &["update", &dependent, "--defer", ""], "clear_future_defer");
+        assert_eq!(repair(&workspace, &options)["changed"], serde_json::json!([dependent]));
+        assert!(ready_contains(&workspace, &dependent));
+    }
+
+    #[test]
+    fn unblock_595_authorization_does_not_take_someone_elses_ownership() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, false);
+        success(
+            &workspace,
+            &["update", &dependent, "--assignee", "alice", "--owner", "alice"],
+            "assign_to_alice",
+        );
+        close(&workspace, &blocker);
+        let before = show(&workspace, &dependent);
+        let report = repair(&workspace, &["--authorize", &dependent]);
+        assert_eq!(report["changed"], serde_json::json!([]));
+        assert_eq!(show(&workspace, &dependent), before);
+
+        let plan = run_br(
+            &workspace,
+            ["--actor", "alice", "doctor", "unblock", "--authorize", &dependent, "--json"],
+            "owner_unblock_preview",
+        );
+        assert!(plan.status.success(), "owner preview: {plan:?}");
+        let plan: Value = serde_json::from_str(&extract_json_payload(&plan.stdout)).unwrap();
+        assert!(eligible(&plan, &dependent));
+        let applied = run_br(
+            &workspace,
+            ["--actor", "alice", "doctor", "unblock", "--authorize", &dependent, "--apply", "--expect", plan["plan_token"].as_str().unwrap(), "--json"],
+            "owner_unblock_apply",
+        );
+        assert!(applied.status.success(), "owner repair: {applied:?}");
+        let after = show(&workspace, &dependent);
+        assert_eq!(after["status"], "open");
+        assert_eq!(after["assignee"], "alice");
+        assert_eq!(after["owner"], "alice");
+        assert!(ready_contains(&workspace, &dependent));
+    }
+
+    #[test]
+    fn unblock_595_scoped_capacity_enforces_and_records_reviewed_attribution() {
+        for scope in ["harness", "session"] {
+            let workspace = workspace();
+            let (blocker, dependent) = pair(&workspace, true);
+            close(&workspace, &blocker);
+            let occupied = create(&workspace, "already admitted work");
+            success(
+                &workspace,
+                &["update", &occupied, "--status", "in_progress"],
+                "leave_ready_before_scoped_admission",
+            );
+            write_policy(
+                &workspace,
+                &format!(
+                    "workflow:\n  statuses: [open, in_progress, blocked, closed]\n  capacity:\n    scopes:\n      {scope}:\n        statuses:\n          open:\n            hard: 1\n"
+                ),
+            );
+            let attribution = [
+                ("BR_HARNESS", if scope == "harness" { "repair-scope" } else { "" }),
+                ("BR_SESSION", if scope == "session" { "repair-scope" } else { "" }),
+            ];
+            let admission = attributed_command(
+                &workspace,
+                &["update", &occupied, "--status", "open"],
+                &attribution,
+                "occupy_scoped_ready_capacity",
+            );
+            assert!(admission.status.success(), "{scope}: {admission:?}");
+            let args = [
+                "doctor",
+                "unblock",
+                "--authorize",
+                &dependent,
+                "--agent-name",
+                "recovery-worker",
+                "--model",
+                "reviewed-model",
+                "--json",
+            ];
+            let before = persisted_files(&workspace);
+            let full = attributed_json(&workspace, &args, &attribution, "scoped_full_preview");
+            assert_eq!(persisted_files(&workspace), before);
+            let skipped = candidate(&full, &dependent).expect("blocked candidate");
+            assert_eq!(skipped["eligible"], false, "{scope}: {full}");
+            assert_eq!(skipped["reason"], "capacity_policy", "{scope}: {full}");
+            let mut apply_args = args.to_vec();
+            apply_args.extend_from_slice(&["--apply", "--expect", full["plan_token"].as_str().unwrap()]);
+            let no_change = attributed_json(
+                &workspace,
+                &apply_args,
+                &attribution,
+                "scoped_full_apply",
+            );
+            assert_eq!(no_change["changed"], serde_json::json!([]));
+            assert_eq!(show(&workspace, &dependent)["status"], "blocked");
+
+            close(&workspace, &occupied);
+            let allowed = attributed_json(&workspace, &args, &attribution, "scoped_available_preview");
+            assert!(eligible(&allowed, &dependent), "{scope}: {allowed}");
+            let mut apply_args = args.to_vec();
+            apply_args.extend_from_slice(&["--apply", "--expect", allowed["plan_token"].as_str().unwrap()]);
+            for changed in ["scope", "agent", "model"] {
+                let mut changed_args = apply_args.clone();
+                let mut changed_attribution = attribution;
+                match changed {
+                    "scope" => changed_attribution[usize::from(scope == "session")].1 = "different-scope",
+                    "agent" => changed_args[5] = "different-worker",
+                    "model" => changed_args[7] = "different-model",
+                    _ => unreachable!(),
+                }
+                let before = persisted_files(&workspace);
+                let rejected = attributed_command(
+                    &workspace,
+                    &changed_args,
+                    &changed_attribution,
+                    "scoped_changed_attribution",
+                );
+                assert!(
+                    !rejected.status.success(),
+                    "{scope}/{changed} must invalidate the reviewed token: {rejected:?}"
+                );
+                assert_eq!(persisted_files(&workspace), before);
+            }
+            let applied = attributed_json(&workspace, &apply_args, &attribution, "scoped_allowed_apply");
+            assert_eq!(applied["changed"], serde_json::json!([dependent]));
+            assert!(ready_contains(&workspace, &dependent));
+            let stats = json(&workspace, &["stats", "--json"], "scoped_occupancy_stats");
+            let occupancy = stats["capacity"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["scope"] == scope && row["scope_key"] == "repair-scope" && row["name"] == "open")
+                .unwrap_or_else(|| panic!("{scope} occupancy missing: {stats}"));
+            assert_eq!(occupancy["counted"], 1, "{scope}: {occupancy}");
+
+            let storage = beads_rust::storage::SqliteStorage::open(&workspace.root.join(".beads/beads.db")).unwrap();
+            let events = storage.get_events(&dependent, 0).unwrap();
+            let event = events.iter().find(|event| {
+                event.event_type == beads_rust::model::EventType::StatusChanged
+                    && event.old_value.as_deref() == Some("blocked")
+                    && event.new_value.as_deref() == Some("open")
+            }).expect("repair status event");
+            assert_eq!(event.actor, "repairer");
+            assert_eq!(event.agent_name.as_deref(), Some("recovery-worker"));
+            assert_eq!(event.model.as_deref(), Some("reviewed-model"));
+            assert_eq!(event.harness.as_deref(), (scope == "harness").then_some("repair-scope"));
+        }
+    }
+
+    #[test]
+    fn unblock_595_capacity_warnings_are_preserved_in_preview_and_apply() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, true);
+        close(&workspace, &blocker);
+        write_policy(
+            &workspace,
+            "workflow:\n  statuses: [open, blocked, closed]\n  capacity:\n    scopes:\n      harness:\n        statuses:\n          open:\n            soft: 1\n",
+        );
+        let args = ["doctor", "unblock", "--harness", "warning-scope", "--json"];
+        let before = persisted_files(&workspace);
+        let plan = json(&workspace, &args, "capacity_warning_preview");
+        assert_eq!(persisted_files(&workspace), before);
+        assert!(eligible(&plan, &dependent));
+        let warnings = plan["capacity_warnings"].as_array().expect("preview warnings");
+        assert_eq!(warnings.len(), 1, "{plan}");
+        assert_eq!(warnings[0]["issue_id"], dependent);
+        assert_eq!(warnings[0]["scope"], "harness");
+        assert_eq!(warnings[0]["scope_key"], "warning-scope");
+        assert_eq!(warnings[0]["prospective"], 1);
+        assert_eq!(warnings[0]["policy_path"], "workflow.capacity.scopes.harness.statuses.open");
+        let mut apply_args = args.to_vec();
+        apply_args.extend_from_slice(&["--apply", "--expect", plan["plan_token"].as_str().unwrap()]);
+        let applied = json(&workspace, &apply_args, "capacity_warning_apply");
+        assert_eq!(applied["changed"], serde_json::json!([dependent]));
+        assert_eq!(applied["capacity_warnings"], plan["capacity_warnings"]);
+        assert!(ready_contains(&workspace, &dependent));
+    }
+
+    #[test]
+    fn unblock_595_later_edits_invalidate_dependency_only_intent() {
+        for edit in ["status", "notes", "label", "comment"] {
+            let workspace = workspace();
+            let (blocker, dependent) = pair(&workspace, true);
+            match edit {
+                "status" => block(&workspace, &dependent, false),
+                "notes" => {
+                    success(
+                        &workspace,
+                        &[
+                            "update",
+                            &dependent,
+                            "--notes",
+                            "Now also waiting for external approval",
+                        ],
+                        "record_new_external_hold",
+                    );
+                }
+                "label" => {
+                    success(
+                        &workspace,
+                        &["label", "add", &dependent, "external-approval"],
+                        "label_new_external_hold",
+                    );
+                }
+                "comment" => {
+                    success(
+                        &workspace,
+                        &[
+                            "comments",
+                            "add",
+                            &dependent,
+                            "--author",
+                            "approval-bot",
+                            "--message",
+                            "External approval is now required before this work can resume",
+                        ],
+                        "comment_new_external_hold",
+                    );
+                }
+                _ => unreachable!(),
+            }
+            close(&workspace, &blocker);
+            assert!(
+                !eligible(&preview(&workspace, &[]), &dependent),
+                "{edit} must invalidate the earlier dependency-only declaration"
+            );
+            let before = show(&workspace, &dependent);
+            assert_eq!(repair(&workspace, &[])["changed"], serde_json::json!([]));
+            assert_eq!(show(&workspace, &dependent), before);
+            assert_eq!(before["status"], "blocked");
+        }
+    }
+
+    #[test]
+    fn unblock_595_supersedes_relationship_and_custom_status_keep_blocker_live() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, true);
+        let replacement = create(&workspace, "replacement for an unfinished prerequisite");
+        success(
+            &workspace,
+            &["dep", "add", &replacement, &blocker, "--type", "supersedes"],
+            "record_supersedes_relationship",
+        );
+        success(
+            &workspace,
+            &["update", &blocker, "--status", "superseded"],
+            "record_custom_superseded_status",
+        );
+        assert_eq!(show(&workspace, &blocker)["status"], "superseded");
+        assert!(!eligible(&preview(&workspace, &[]), &dependent));
+        assert_eq!(
+            repair(&workspace, &["--authorize", &dependent])["changed"],
+            serde_json::json!([])
+        );
+        assert_eq!(show(&workspace, &dependent)["status"], "blocked");
+        assert!(!ready_contains(&workspace, &dependent));
+
+        // Only the actual terminal transition satisfies B's blocking edge;
+        // neither an informational edge nor a similarly named custom status
+        // provides evidence that the prerequisite completed.
+        close(&workspace, &blocker);
+        assert!(eligible(&preview(&workspace, &[]), &dependent));
+        assert_eq!(
+            repair(&workspace, &[])["changed"],
+            serde_json::json!([dependent])
+        );
+        assert!(ready_contains(&workspace, &dependent));
+    }
+
+    #[test]
+    fn unblock_595_soft_delete_preserves_orphaned_manual_status() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, true);
+        success(
+            &workspace,
+            &[
+                "delete",
+                &blocker,
+                "--force",
+                "--reason",
+                "prerequisite withdrawn without completing the work",
+            ],
+            "soft_delete_prerequisite",
+        );
+        assert_eq!(issue_from_jsonl(&workspace, &blocker)["status"], "tombstone");
+        let before = show(&workspace, &dependent);
+        assert_eq!(before["status"], "blocked");
+        assert!(
+            issue_from_jsonl(&workspace, &dependent)["dependencies"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "delete --force removes the forward dependency, including on soft delete"
+        );
+
+        // The stale-blocked detector requires retained dependency history.
+        // Deletion orphans this record, so authorization must not manufacture
+        // the missing evidence or treat disappearance as completion.
+        let options = ["--authorize", dependent.as_str()];
+        let plan = preview(&workspace, &options);
+        let orphan = candidate(&plan, &dependent).expect("orphan is reported as skipped");
+        assert_eq!(orphan["eligible"], false);
+        assert_eq!(orphan["reason"], "no_dependency_history");
+        assert_eq!(orphan["blockers"], serde_json::json!([]));
+        assert_eq!(repair(&workspace, &options)["changed"], serde_json::json!([]));
+        assert_eq!(show(&workspace, &dependent), before);
+        assert!(!ready_contains(&workspace, &dependent));
+    }
+
+    #[test]
+    fn unblock_595_dependency_intent_cannot_be_invented_for_an_existing_manual_hold() {
+        let workspace = workspace();
+        let dependent = create(&workspace, "manual approval required");
+        let before = show(&workspace, &dependent);
+        let declare = [
+            "update",
+            dependent.as_str(),
+            "--status",
+            "blocked",
+            "--blocked-by-dependencies",
+            "--json",
+        ];
+        let no_blocker = command(&workspace, &declare, "dependency_intent_without_blocker");
+        assert!(!no_blocker.status.success(), "no live dependency: {no_blocker:?}");
+        assert_eq!(show(&workspace, &dependent), before);
+
+        let blocker = create(&workspace, "added prerequisite");
+        dependency(&workspace, &dependent, &blocker);
+        block(&workspace, &dependent, false);
+        let manual = show(&workspace, &dependent);
+        let already_blocked = command(&workspace, &declare, "dependency_intent_after_manual_block");
+        assert!(!already_blocked.status.success(), "existing manual block: {already_blocked:?}");
+        assert_eq!(show(&workspace, &dependent), manual);
+        close(&workspace, &blocker);
+        assert!(!eligible(&preview(&workspace, &[]), &dependent));
+    }
+
+    #[test]
+    fn unblock_595_stale_review_refuses_the_whole_batch() {
+        for change in ["notes", "assignee", "blocker", "policy"] {
+            let workspace = workspace();
+            let (blocker, first) = pair(&workspace, false);
+            let second = create(&workspace, "second reviewed dependent");
+            dependency(&workspace, &second, &blocker);
+            block(&workspace, &second, false);
+            let competing = create(&workspace, "new concurrent prerequisite");
+            close(&workspace, &blocker);
+            let options = ["--authorize", first.as_str(), "--authorize", second.as_str()];
+            let plan = preview(&workspace, &options);
+            assert_eq!(plan["planned_ids"].as_array().unwrap().len(), 2);
+            match change {
+                "notes" => {
+                    success(&workspace, &["update", &second, "--notes", "competing edit"], "competing_notes");
+                }
+                "assignee" => {
+                    success(&workspace, &["update", &second, "--assignee", "alice"], "competing_assignee");
+                }
+                "blocker" => dependency(&workspace, &second, &competing),
+                "policy" => write_policy(
+                    &workspace,
+                    "workflow:\n  strict: true\n  statuses: [open, blocked, closed]\n  transitions:\n    blocked: [closed]\n",
+                ),
+                _ => unreachable!(),
+            }
+            let before_first = show(&workspace, &first);
+            let before_second = show(&workspace, &second);
+            let before = persisted_files(&workspace);
+            let result = apply(&workspace, &options, plan["plan_token"].as_str().unwrap());
+            assert!(!result.status.success(), "{change} must invalidate review: {result:?}");
+            assert_eq!(persisted_files(&workspace), before, "{change}: refused repair wrote state");
+            assert_eq!(show(&workspace, &first), before_first, "{change}: first row partially repaired");
+            assert_eq!(show(&workspace, &second), before_second, "{change}: competing edit overwritten");
+        }
+    }
+
+    #[test]
+    fn unblock_595_review_binds_authorization_and_requires_explicit_apply_token() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, false);
+        close(&workspace, &blocker);
+        let plan = preview(&workspace, &[]);
+        let unauthorized_token = apply(
+            &workspace,
+            &["--authorize", &dependent],
+            plan["plan_token"].as_str().unwrap(),
+        );
+        assert!(!unauthorized_token.status.success(), "authorization changed the reviewed plan");
+        let missing = command(
+            &workspace,
+            &["doctor", "unblock", "--authorize", &dependent, "--apply", "--json"],
+            "unblock_missing_token",
+        );
+        assert!(!missing.status.success(), "apply without reviewed token must fail");
+        assert_eq!(show(&workspace, &dependent)["status"], "blocked");
+    }
+
+    #[test]
+    fn unblock_595_review_token_cannot_cross_identical_workspaces() {
+        let source = workspace();
+        let (blocker, dependent) = pair(&source, false);
+        close(&source, &blocker);
+        let options = ["--authorize", dependent.as_str()];
+        let source_plan = preview(&source, &options);
+
+        // Clone the closed fixture only after every CLI process has exited.
+        // The issue IDs, graph, audit and settings are identical, so this
+        // refusal specifically tests workspace binding rather than missing IDs.
+        let clone = BrWorkspace::new();
+        let source_beads = source.root.join(".beads");
+        let clone_beads = clone.root.join(".beads");
+        for entry in walkdir::WalkDir::new(&source_beads) {
+            let entry = entry.expect("read fixture tree");
+            let target = clone_beads.join(entry.path().strip_prefix(&source_beads).unwrap());
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&target).expect("clone fixture directory");
+            } else {
+                assert!(entry.file_type().is_file(), "fixture contains a special file");
+                fs::copy(entry.path(), &target).expect("clone tracker data");
+            }
+        }
+        let clone_plan = preview(&clone, &options);
+        assert_eq!(clone_plan["planned_ids"], source_plan["planned_ids"]);
+        assert_eq!(clone_plan["planned_ids"], serde_json::json!([dependent]));
+        assert_ne!(clone_plan["plan_token"], source_plan["plan_token"]);
+        let before = persisted_files(&clone);
+        let wrong_workspace = apply(
+            &clone,
+            &options,
+            source_plan["plan_token"].as_str().unwrap(),
+        );
+        assert!(
+            !wrong_workspace.status.success(),
+            "a token from another workspace must be rejected: {wrong_workspace:?}"
+        );
+        assert_eq!(persisted_files(&clone), before);
+        assert_eq!(show(&clone, &dependent)["status"], "blocked");
+
+        let applied = apply(&clone, &options, clone_plan["plan_token"].as_str().unwrap());
+        assert!(applied.status.success(), "local reviewed repair: {applied:?}");
+        assert!(ready_contains(&clone, &dependent));
+        assert_eq!(show(&source, &dependent)["status"], "blocked");
+        assert!(!ready_contains(&source, &dependent));
+    }
+
+    #[test]
+    fn unblock_595_flat_doctor_modes_cannot_override_reviewed_repair() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, false);
+        close(&workspace, &blocker);
+        let options = ["--authorize", dependent.as_str()];
+        let plan = preview(&workspace, &options);
+        let bundle = workspace.root.join("unexpected-doctor-bundle.tar.gz");
+        let cases: &[&[&str]] = &[
+            &["--repair"],
+            &["--fix"],
+            &["--repair-indexes"],
+            &["--robot-triage"],
+            &["--quick"],
+            &["--selftest"],
+            &["--bundle", bundle.to_str().unwrap()],
+            &["--only=fm-deps-stale-blocked"],
+            &["--skip=fm-deps-stale-blocked"],
+            &["--allow-repeated-repair"],
+            &["--unsafe-auto-fix"],
+            &["--git-runtime-files"],
+            &["--dry-run"],
+        ];
+        for flags in cases {
+            let before = persisted_files(&workspace);
+            let mut args = vec!["doctor"];
+            args.extend_from_slice(flags);
+            args.extend_from_slice(&[
+                "unblock",
+                "--authorize",
+                &dependent,
+                "--apply",
+                "--expect",
+                plan["plan_token"].as_str().unwrap(),
+                "--json",
+            ]);
+            let result = command(&workspace, &args, "unblock_conflicting_doctor_mode");
+            assert!(
+                !result.status.success(),
+                "{flags:?} must not dispatch another doctor mode: {result:?}"
+            );
+            assert_eq!(
+                persisted_files(&workspace),
+                before,
+                "{flags:?} changed tracker data before refusing the mixed modes"
+            );
+            assert!(!bundle.exists(), "bundle mode ran before unblock validation");
+        }
+        assert_eq!(show(&workspace, &dependent)["status"], "blocked");
+        assert!(!ready_contains(&workspace, &dependent));
+    }
+}
