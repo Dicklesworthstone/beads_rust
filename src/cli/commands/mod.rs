@@ -351,6 +351,23 @@ pub(crate) fn session_attribution_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Capture the command's identity for mutations without attribution flags.
+/// Dependency removal and deletion can now admit dependent work, so their
+/// automatic transitions must retain the same harness/session capacity scopes
+/// and audit identity as explicit status updates. Restage this snapshot before
+/// each mutation because storage consumes pending attribution on commit.
+pub(crate) fn event_attribution_from_env() -> crate::storage::EventAttribution {
+    let agent_name = std::env::var("BR_AGENT_NAME").ok();
+    let harness = std::env::var("BR_HARNESS").ok();
+    let model = std::env::var("BR_MODEL").ok();
+    crate::storage::EventAttribution::new(
+        agent_name.as_deref(),
+        harness.as_deref(),
+        model.as_deref(),
+        session_attribution_from_env().as_deref(),
+    )
+}
+
 pub(super) fn update_issues_atomically_with_recovery(
     storage_ctx: &mut OpenStorageResult,
     allow_recovery: bool,

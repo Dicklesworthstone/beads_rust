@@ -13684,19 +13684,25 @@ fn inspect_doctor_jsonl(
         && matches!(jsonl_count, JsonlCountState::Available(_))
         && let Some(path) = jsonl_path.as_ref()
     {
-        match crate::close_policy::load_for_beads_dir(beads_dir).and_then(|policy| {
-            policy.workflow.validate_ready_status_group()?;
-            Ok(policy.workflow.ready_status_group())
-        }) {
-            Ok(ready_statuses) => {
-                check_dependency_graph_jsonl_with_ready_statuses(path, &ready_statuses, checks);
-            }
-            Err(error) => push_inspection_error(
+        let ready_statuses =
+            crate::close_policy::load_for_beads_dir(beads_dir).and_then(|policy| {
+                policy.workflow.validate_ready_status_group()?;
+                Ok(policy.workflow.ready_status_group())
+            });
+        // Edge integrity is independent of workflow policy. A broken policy
+        // prevents readiness classification, but must not hide dangling edges.
+        check_dependency_graph_jsonl_with_ready_statuses(
+            path,
+            ready_statuses.as_deref().ok(),
+            checks,
+        );
+        if let Err(error) = ready_statuses {
+            push_inspection_error(
                 checks,
                 "dep.fully_unblocked_open",
                 "Cannot classify ready work without a valid workflow policy",
                 &error,
-            ),
+            );
         }
     }
 
@@ -13748,12 +13754,14 @@ fn inspect_doctor_jsonl(
 /// health check, #292).
 #[cfg(test)]
 fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
-    check_dependency_graph_jsonl_with_ready_statuses(path, &["open".to_string()], checks);
+    check_dependency_graph_jsonl_with_ready_statuses(path, Some(&["open".to_string()]), checks);
 }
 
+/// Always audit dependency edges; classify ready work only with validated
+/// workflow statuses. The caller reports a policy error when they are absent.
 fn check_dependency_graph_jsonl_with_ready_statuses(
     path: &Path,
-    ready_statuses: &[String],
+    ready_statuses: Option<&[String]>,
     checks: &mut Vec<CheckResult>,
 ) {
     use crate::storage::sqlite::{
@@ -13777,8 +13785,6 @@ fn check_dependency_graph_jsonl_with_ready_statuses(
         .iter()
         .map(|issue| (issue.id.as_str(), issue))
         .collect();
-    // The same pure classification drives the transactional repair preflight.
-    let classified = fully_unblocked_issues(&issues, ready_statuses);
     let mut dead_edge_issues: Vec<serde_json::Value> = Vec::new();
     let mut dangling_edge_issue_ids: Vec<String> = Vec::new();
 
@@ -13815,7 +13821,11 @@ fn check_dependency_graph_jsonl_with_ready_statuses(
     }
 
     emit_dead_closed_blocking_edges(&dead_edge_issues, &dangling_edge_issue_ids, checks);
-    emit_fully_unblocked_open(&classified, checks);
+    if let Some(ready_statuses) = ready_statuses {
+        // The same pure classification drives the transactional repair preflight.
+        let classified = fully_unblocked_issues(&issues, ready_statuses);
+        emit_fully_unblocked_open(&classified, checks);
+    }
 }
 
 /// Read and parse JSONL issue records for the dependency-graph audit, skipping
@@ -14200,7 +14210,7 @@ fn unblock_review_context(paths: &config::ConfigPaths) -> Result<String> {
     let mut witnesses = Vec::new();
     for path in inputs {
         let content = match fs::read(&path) {
-            Ok(bytes) => Some(format!("{:x}", Sha256::digest(bytes))),
+            Ok(bytes) => Some(crate::util::hex_encode(&Sha256::digest(bytes))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
@@ -16983,6 +16993,68 @@ mod tests {
     }
 
     #[test]
+    fn test_dep_graph_jsonl_preserves_edge_audit_with_invalid_workflow() {
+        for policy in [
+            "workflow: [\n",
+            "workflow:\n  strict: true\n  statuses: [open, blocked, closed]\n  status_groups:\n    ready: [unknown]\n",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            fs::create_dir_all(&beads_dir).unwrap();
+            let jsonl = beads_dir.join("issues.jsonl");
+            write_issues_jsonl(
+                &jsonl,
+                &[
+                    issue_with_blockers(
+                        "bd-dependent",
+                        Status::Blocked,
+                        &["bd-done", "bd-missing"],
+                    ),
+                    closed_issue_with_reason("bd-done", "Completed blocker", "done"),
+                ],
+            );
+            fs::write(beads_dir.join("policy.yaml"), policy).unwrap();
+            let paths = config::ConfigPaths {
+                beads_dir: beads_dir.clone(),
+                db_path: beads_dir.join("beads.db"),
+                jsonl_path: jsonl.clone(),
+                metadata: config::Metadata::default(),
+            };
+            let mut checks = Vec::new();
+            let (selected, count) =
+                inspect_doctor_jsonl(&beads_dir, &paths, DoctorInspectionMode::Full, &mut checks);
+            assert_eq!(selected.as_deref(), Some(jsonl.as_path()));
+            assert_eq!(count, JsonlCountState::Available(2), "{checks:?}");
+
+            let dead = find_check(&checks, "dep.dead_closed_blocking_edges").unwrap();
+            assert_eq!(dead.status, CheckStatus::Warn, "{dead:?}");
+            let details = dead.details.as_ref().unwrap();
+            assert_eq!(details["dangling_count"], 1);
+            assert_eq!(details["issues"][0]["id"], "bd-dependent");
+            assert_eq!(
+                details["issues"][0]["satisfied_blockers"],
+                serde_json::json!(["bd-done"])
+            );
+            assert_eq!(
+                details["issues"][0]["dangling_blockers"],
+                serde_json::json!(["bd-missing"])
+            );
+
+            let readiness = find_check(&checks, "dep.fully_unblocked_open").unwrap();
+            assert_eq!(readiness.status, CheckStatus::Error, "{readiness:?}");
+            assert!(readiness.details.is_none(), "{readiness:?}");
+            assert_eq!(
+                checks
+                    .iter()
+                    .filter(|check| check.name == "dep.fully_unblocked_open")
+                    .count(),
+                1,
+                "Invalid policy must not also emit a readiness classification"
+            );
+        }
+    }
+
+    #[test]
     fn test_dep_graph_jsonl_uses_configured_ready_statuses() {
         let temp = TempDir::new().unwrap();
         let jsonl = temp.path().join("issues.jsonl");
@@ -17005,7 +17077,7 @@ mod tests {
         let mut checks = Vec::new();
         check_dependency_graph_jsonl_with_ready_statuses(
             &jsonl,
-            &["rework".to_string(), "blocked".to_string()],
+            Some(&["rework".to_string(), "blocked".to_string()]),
             &mut checks,
         );
         let unblocked = find_check(&checks, "dep.fully_unblocked_open").unwrap();

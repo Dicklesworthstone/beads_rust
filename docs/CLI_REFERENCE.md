@@ -2509,6 +2509,15 @@ external prerequisites, required fields, workflow gates and capacity refusals
 leave the dependent blocked. The source completion can still succeed; the
 guarded repair explains and rechecks the remaining restriction.
 
+Automatic releases retain the command's audit identity and harness/session
+capacity scopes across every mutation, including parent-only updates and
+multi-issue batches. `dep remove` and `delete` read `BR_AGENT_NAME`, `BR_HARNESS`,
+`BR_MODEL` and `BR_SESSION` for this purpose. Their JSON/TOON results include
+`capacity_warnings` when a release reaches a soft limit; `update` and `close`
+retain their existing `warnings` receipts. Human-readable output also reports
+these warnings. A hard limit preserves the dependent's blocked status while
+allowing the dependency removal or deletion itself to complete.
+
 Subsequent manual edits, including reasserting `blocked`, invalidate the
 declaration. Removing some existing gates preserves the declaration for the
 remaining gates; introducing new gates does not silently renew it. An explicit
