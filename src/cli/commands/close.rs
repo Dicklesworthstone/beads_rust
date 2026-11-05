@@ -2,9 +2,9 @@
 
 use crate::cli::CloseArgs as CliCloseArgs;
 use crate::cli::commands::{
-    RouteResources, acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
-    finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
-    report_auto_flush_failure, resolve_issue_ids, same_workspace,
+    RouteResources, acquire_routed_workspace_write_lock, auto_import_external_projects_if_stale,
+    auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
+    preserve_blocked_cache_on_error, report_auto_flush_failure, resolve_issue_ids, same_workspace,
     update_issues_atomically_with_recovery,
 };
 use crate::close_policy::{self, AttributionValues, CloseEvidence, ClosePolicy, PolicyViolation};
@@ -13,7 +13,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
-use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
+use crate::storage::{EventAttribution, IssueUpdate, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -868,6 +868,50 @@ fn summarize_skip_reasons(skipped: &[SkippedIssue]) -> String {
     parts.join("; ")
 }
 
+/// Suggest only previously blocked issues admitted by the same readiness
+/// query and external-prerequisite checks as `br ready`. In particular, a
+/// custom ready status must not be filtered through `Status::is_active`, and a
+/// removed local blocker must not hide a remaining external gate or deferral.
+fn newly_ready_after_close(
+    storage: &SqliteStorage,
+    workflow: &close_policy::Workflow,
+    blocked_before: &[String],
+    config_layer: &config::ConfigLayer,
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+) -> Result<Vec<UnblockedIssue>> {
+    workflow.validate_ready_status_group()?;
+    if blocked_before.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let filters = ReadyFilters {
+        ready_statuses: workflow.ready_status_group(),
+        ..ReadyFilters::default()
+    };
+    let mut ready =
+        storage.get_ready_summary_issues_for_command_output(&filters, ReadySortPolicy::Hybrid)?;
+    let previously_blocked: HashSet<&str> = blocked_before.iter().map(String::as_str).collect();
+    ready.retain(|issue| previously_blocked.contains(issue.id.as_str()));
+
+    if !ready.is_empty() && storage.has_external_dependencies(true)? {
+        auto_import_external_projects_if_stale(config_layer, beads_dir, cli);
+        let paths = config::external_project_db_paths(config_layer, beads_dir);
+        let statuses = storage.resolve_external_dependency_statuses(&paths, true)?;
+        let blockers = storage.external_blockers(&statuses)?;
+        ready.retain(|issue| !blockers.contains_key(&issue.id));
+    }
+
+    Ok(ready
+        .into_iter()
+        .map(|issue| UnblockedIssue {
+            id: issue.id,
+            title: issue.title,
+            priority: issue.priority.0,
+        })
+        .collect())
+}
+
 fn execute_route(
     args: &CloseArgs,
     cli: &config::CliOverrides,
@@ -1317,79 +1361,29 @@ fn execute_route_with_storage(
     }
 
     let unblocked_issues: Vec<UnblockedIssue> = if args.suggest_next && !closed_issues.is_empty() {
-        let blocked_after_result = storage_ctx.storage.get_blocked_issues();
-        let blocked_after = match preserve_blocked_cache_on_error(
+        let ready_result = newly_ready_after_close(
+            &storage_ctx.storage,
+            &policy_doc.workflow,
+            &blocked_before,
+            &config_layer,
+            beads_dir,
+            cli,
+        );
+        match preserve_blocked_cache_on_error(
             &mut storage_ctx.storage,
             cache_dirty,
             "close",
-            blocked_after_result,
+            ready_result,
         ) {
-            Ok(blocked_after) => Some(
-                blocked_after
-                    .into_iter()
-                    .map(|(issue, _)| issue.id)
-                    .collect::<Vec<_>>(),
-            ),
+            Ok(unblocked) => unblocked,
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    "Skipping suggest-next calculation after committed close because blocked-cache lookup failed"
+                    "Skipping suggest-next calculation after committed close because ready lookup failed"
                 );
-                None
-            }
-        };
-
-        let Some(blocked_after) = blocked_after else {
-            storage_ctx.flush_no_db_if_dirty()?;
-            return Ok((
-                CloseExecution {
-                    closed: closed_issues,
-                    skipped: skipped_issues,
-                    unblocked: Vec::new(),
-                    ordered_outcomes,
-                    capacity_warnings,
-                },
-                RouteResources {
-                    storage_ctx,
-                    _routed_write_lock: routed_write_lock,
-                },
-            ));
-        };
-
-        let newly_unblocked: Vec<String> = blocked_before
-            .into_iter()
-            .filter(|id| !blocked_after.contains(id))
-            .collect();
-
-        tracing::debug!(unblocked = ?newly_unblocked, "Issues unblocked by close");
-
-        let mut unblocked = Vec::new();
-        for uid in newly_unblocked {
-            let issue_result = storage_ctx.storage.get_issue(&uid);
-            match preserve_blocked_cache_on_error(
-                &mut storage_ctx.storage,
-                cache_dirty,
-                "close",
-                issue_result,
-            ) {
-                Ok(Some(issue)) if issue.status.is_active() => {
-                    unblocked.push(UnblockedIssue {
-                        id: issue.id,
-                        title: issue.title,
-                        priority: issue.priority.0,
-                    });
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        issue_id = %uid,
-                        error = %error,
-                        "Skipping suggest-next candidate after committed close because issue lookup failed"
-                    );
-                }
+                Vec::new()
             }
         }
-        unblocked
     } else {
         Vec::new()
     };

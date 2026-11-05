@@ -9,7 +9,7 @@
 mod common;
 
 use beads_rust::model::{Dependency, DependencyType, EventType, Status};
-use beads_rust::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
+use beads_rust::storage::{IssueUpdate, ReadyFilters, ReadySortPolicy, SqliteStorage};
 #[allow(unused_imports)]
 use common::ordering::{
     assert_contains_exactly_one, assert_hybrid_ordered, assert_no_duplicate_ids,
@@ -44,6 +44,165 @@ fn blocked_ids_for(storage: &SqliteStorage) -> Vec<String> {
         .into_iter()
         .map(|(issue, _)| issue.id)
         .collect()
+}
+
+fn automatic_unblock_snapshot(storage: &SqliteStorage) -> serde_json::Value {
+    let mut ids = storage.get_all_ids().unwrap();
+    ids.sort();
+    let issues: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "issue": storage.get_issue(id).unwrap(),
+                "comments": storage.get_comments(id).unwrap(),
+                "dependencies": storage.get_dependencies_full(id).unwrap(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "issues": issues,
+        "events": storage.get_all_events(0).unwrap(),
+        "dirty": storage.get_dirty_issue_metadata().unwrap(),
+        "needs_flush": storage.get_metadata("needs_flush").unwrap(),
+        "blocked_cache_state": storage.get_metadata("blocked_cache_state").unwrap(),
+    })
+}
+
+#[test]
+fn automatic_unblock_rolls_back_with_a_stale_explicit_batch_revision() {
+    let mut storage = test_db();
+    let blocker = fixtures::issue("rollback-blocker");
+    let dependent = fixtures::issue("rollback-dependent");
+    let other = fixtures::issue("rollback-other");
+    for issue in [&blocker, &dependent, &other] {
+        storage.create_issue(issue, "closer").unwrap();
+    }
+    storage
+        .add_dependency(&dependent.id, &blocker.id, "blocks", "closer")
+        .unwrap();
+    storage
+        .update_issue(
+            &dependent.id,
+            &IssueUpdate {
+                status: Some(Status::Blocked),
+                blocked_by_dependencies: true,
+                ..IssueUpdate::default()
+            },
+            "closer",
+        )
+        .unwrap();
+    let current = storage.get_issue(&other.id).unwrap().unwrap();
+    let before = automatic_unblock_snapshot(&storage);
+    let error = storage
+        .update_issues_atomically(
+            &[
+                (
+                    blocker.id.clone(),
+                    IssueUpdate {
+                        status: Some(Status::Closed),
+                        ..IssueUpdate::default()
+                    },
+                ),
+                (
+                    other.id.clone(),
+                    IssueUpdate {
+                        title: Some("stale replacement".to_string()),
+                        expect_updated_at: Some(current.updated_at - chrono::Duration::seconds(1)),
+                        ..IssueUpdate::default()
+                    },
+                ),
+            ],
+            "closer",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        beads_rust::error::BeadsError::UpdatePreconditionFailed { .. }
+    ));
+    assert_eq!(automatic_unblock_snapshot(&storage), before);
+
+    // The rejected writer must not consume provenance or leave a partial
+    // close. A subsequent valid source completion still releases the hold.
+    storage
+        .update_issue(
+            &blocker.id,
+            &IssueUpdate {
+                status: Some(Status::Closed),
+                ..IssueUpdate::default()
+            },
+            "closer",
+        )
+        .unwrap();
+    assert_eq!(
+        storage.get_issue(&dependent.id).unwrap().unwrap().status,
+        Status::Open
+    );
+    assert_eq!(storage.get_comments(&dependent.id).unwrap().len(), 1);
+}
+
+#[test]
+fn automatic_unblock_respects_explicit_blocked_status_in_the_same_batch() {
+    let mut storage = test_db();
+    let blocker = fixtures::issue("batch-blocker");
+    let held = fixtures::issue("batch-held");
+    let released = fixtures::issue("batch-released");
+    for issue in [&blocker, &held, &released] {
+        storage.create_issue(issue, "closer").unwrap();
+    }
+    for issue in [&held, &released] {
+        storage
+            .add_dependency(&issue.id, &blocker.id, "blocks", "closer")
+            .unwrap();
+        storage
+            .update_issue(
+                &issue.id,
+                &IssueUpdate {
+                    status: Some(Status::Blocked),
+                    blocked_by_dependencies: true,
+                    ..IssueUpdate::default()
+                },
+                "closer",
+            )
+            .unwrap();
+    }
+    storage
+        .update_issues_atomically(
+            &[
+                (
+                    blocker.id.clone(),
+                    IssueUpdate {
+                        status: Some(Status::Closed),
+                        ..IssueUpdate::default()
+                    },
+                ),
+                (
+                    held.id.clone(),
+                    IssueUpdate {
+                        status: Some(Status::Blocked),
+                        ..IssueUpdate::default()
+                    },
+                ),
+            ],
+            "closer",
+        )
+        .unwrap();
+    assert_eq!(
+        storage.get_issue(&held.id).unwrap().unwrap().status,
+        Status::Blocked
+    );
+    assert!(storage.get_comments(&held.id).unwrap().is_empty());
+    assert_eq!(
+        storage.get_issue(&released.id).unwrap().unwrap().status,
+        Status::Open
+    );
+    assert_eq!(storage.get_comments(&released.id).unwrap().len(), 1);
+    let ready = storage
+        .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
+        .unwrap();
+    assert_eq!(
+        ready.iter().map(|issue| &issue.id).collect::<Vec<_>>(),
+        vec![&released.id]
+    );
 }
 
 // ============================================================================
