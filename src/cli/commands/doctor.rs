@@ -14210,7 +14210,7 @@ fn unblock_review_context(paths: &config::ConfigPaths) -> Result<String> {
     let mut witnesses = Vec::new();
     for path in inputs {
         let content = match fs::read(&path) {
-            Ok(bytes) => Some(format!("{:x}", Sha256::digest(bytes))),
+            Ok(bytes) => Some(crate::util::hex_encode(&Sha256::digest(bytes))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
@@ -16148,6 +16148,54 @@ mod tests {
 
     fn find_check<'a>(checks: &'a [CheckResult], name: &str) -> Option<&'a CheckResult> {
         checks.iter().find(|check| check.name == name)
+    }
+
+    #[test]
+    fn test_unblock_review_context_hashes_raw_inputs_and_distinguishes_absence() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let paths = config::ConfigPaths {
+            db_path: beads_dir.join("beads.db"),
+            jsonl_path: beads_dir.join("issues.jsonl"),
+            beads_dir: beads_dir.clone(),
+            metadata: config::Metadata::default(),
+        };
+        let missing = unblock_review_context(&paths).unwrap();
+        let witness: serde_json::Value = serde_json::from_str(&missing).unwrap();
+        let inputs = witness["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 4);
+        assert!(inputs.iter().all(|entry| entry[1].is_null()));
+
+        fs::write(&paths.jsonl_path, b"").unwrap();
+        let empty = unblock_review_context(&paths).unwrap();
+        let witness: serde_json::Value = serde_json::from_str(&empty).unwrap();
+        assert_ne!(missing, empty);
+        assert_eq!(
+            witness["inputs"][0][1].as_str(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+
+        for (index, input) in [
+            paths.jsonl_path.clone(),
+            beads_dir.join(crate::close_policy::POLICY_FILE_NAME),
+            beads_dir.join("config.yaml"),
+            beads_dir.join("metadata.json"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let before = unblock_review_context(&paths).unwrap();
+            fs::write(input, b"\x00\xff\n").unwrap();
+            let current = unblock_review_context(&paths).unwrap();
+            let witness: serde_json::Value = serde_json::from_str(&current).unwrap();
+            assert_ne!(before, current);
+            assert_eq!(
+                witness["inputs"][index][1].as_str(),
+                Some("712450d3c4a79eea9509e75dc1dacdeff58034df538536cfae2da882bd8a0c50")
+            );
+            assert_eq!(current, unblock_review_context(&paths).unwrap());
+        }
     }
 
     fn backdate_file_two_hours(path: &Path) {
