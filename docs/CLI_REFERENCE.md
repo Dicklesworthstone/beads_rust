@@ -2476,8 +2476,14 @@ caused only by dependencies. Older records, imported records without evidence,
 and records with a manual or external hold remain unchanged unless their exact
 IDs are authorized. `--authorize` never overrides a live blocker, parent-child
 gate, future deferral, pin, template/wisp exclusion, another actor's assignment,
-or workflow policy. Issues without forward blocking edges are outside this
-repair's scope.
+or workflow policy. Repair recomputes these gates from the current database,
+including missing local targets and unresolved external dependencies inherited
+through parents; an incomplete dependency cannot be authorized away. Issues
+without forward blocking edges are outside this repair's scope.
+
+The dependency diagnostic uses `workflow.status_groups.ready`, including custom
+statuses. A `blocked` status explicitly included in that group is not stale,
+and the repair leaves it unchanged even when its exact ID is authorized.
 
 For future work, declare dependency-only intent when setting the block:
 

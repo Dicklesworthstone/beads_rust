@@ -183,14 +183,25 @@ fn hierarchy_gated_issue_ids<'a>(
     gated
 }
 
-fn classify_fully_unblocked(issue: &Issue, hierarchy_gated: bool) -> FullyUnblockedIssue {
+fn classify_fully_unblocked(
+    issue: &Issue,
+    hierarchy_gated: bool,
+    ready_statuses: &[String],
+) -> FullyUnblockedIssue {
     let mut excluded_reasons = Vec::new();
-    match &issue.status {
-        Status::Open | Status::Blocked | Status::Closed | Status::Tombstone | Status::Draft => {}
-        Status::InProgress => excluded_reasons.push("claimed (status in_progress)"),
-        Status::Deferred => excluded_reasons.push("status deferred"),
-        Status::Pinned => excluded_reasons.push("status pinned"),
-        Status::Custom(_) => excluded_reasons.push("custom status"),
+    let ready_status = ready_statuses
+        .iter()
+        .any(|status| status.eq_ignore_ascii_case(issue.status.as_str()));
+    if !ready_status {
+        match &issue.status {
+            Status::Blocked | Status::Closed | Status::Tombstone | Status::Draft => {}
+            Status::InProgress => excluded_reasons.push("claimed (status in_progress)"),
+            Status::Deferred => excluded_reasons.push("status deferred"),
+            Status::Pinned => excluded_reasons.push("status pinned"),
+            Status::Open | Status::Custom(_) => {
+                excluded_reasons.push("status outside configured ready group");
+            }
+        }
     }
     if issue.defer_until.is_some_and(|until| until > Utc::now()) {
         excluded_reasons.push("defer_until in the future");
@@ -213,15 +224,22 @@ fn classify_fully_unblocked(issue: &Issue, hierarchy_gated: bool) -> FullyUnbloc
     FullyUnblockedIssue {
         id: issue.id.clone(),
         excluded_reasons,
-        stale_blocked: issue.status == Status::Blocked && !hierarchy_gated && !issue.is_template,
+        stale_blocked: issue.status == Status::Blocked
+            && !ready_status
+            && !hierarchy_gated
+            && !issue.is_template,
     }
 }
 
 /// The existing `stale_blocked` partition, independent of storage/cache state.
 /// External references remain blocking because this detector cannot prove
 /// their completion. Missing local targets retain the doctor's dangling-edge
-/// classification; repair requires explicit authorization for those records.
-pub(crate) fn fully_unblocked_issues(issues: &[Issue]) -> Vec<FullyUnblockedIssue> {
+/// classification. The transactional repair separately checks live database
+/// blockers: a missing target cannot be authorized away.
+pub(crate) fn fully_unblocked_issues(
+    issues: &[Issue],
+    ready_statuses: &[String],
+) -> Vec<FullyUnblockedIssue> {
     let issue_by_id: HashMap<&str, &Issue> = issues
         .iter()
         .map(|issue| (issue.id.as_str(), issue))
@@ -237,11 +255,35 @@ pub(crate) fn fully_unblocked_issues(issues: &[Issue]) -> Vec<FullyUnblockedIssu
                     .iter()
                     .all(|target| blocker_fate(target, &issue_by_id) != BlockerFate::Live)
         })
-        .map(|issue| classify_fully_unblocked(issue, hierarchy_gated.contains(issue.id.as_str())))
+        .map(|issue| {
+            classify_fully_unblocked(
+                issue,
+                hierarchy_gated.contains(issue.id.as_str()),
+                ready_statuses,
+            )
+        })
         .collect()
 }
 
 impl SqliteStorage {
+    /// Recompute readiness gates from the current transaction, independently
+    /// of the persisted cache and the JSONL detector's post-import semantics.
+    /// Unknown external state remains blocking, including inherited and epic
+    /// child gates, because this local transaction cannot certify another DB.
+    pub(super) fn dependency_repair_blockers_in_tx(
+        conn: &Connection,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut blockers = Self::compute_blocked_issues_map_impl(conn)?;
+        for (id, external) in Self::external_blockers_impl(conn, &HashMap::new())? {
+            blockers.entry(id).or_default().extend(external);
+        }
+        for refs in blockers.values_mut() {
+            refs.sort();
+            refs.dedup();
+        }
+        Ok(blockers)
+    }
+
     /// Inspect dependency-unblocked work without changing tracker state.
     ///
     /// # Errors
@@ -361,7 +403,8 @@ impl SqliteStorage {
             .map(|issue| (issue.id.as_str(), issue))
             .collect();
         let selected = selected_ids(&request, &issues, &issue_by_id)?;
-        let classifications = fully_unblocked_issues(&issues);
+        let classifications = fully_unblocked_issues(&issues, &ready_statuses);
+        let current_blockers = Self::dependency_repair_blockers_in_tx(conn)?;
         let classification_by_id: HashMap<&str, &FullyUnblockedIssue> = classifications
             .iter()
             .map(|classification| (classification.id.as_str(), classification))
@@ -378,6 +421,7 @@ impl SqliteStorage {
                 proof.as_ref(),
                 &request,
                 &ready_statuses,
+                current_blockers.get(id).map_or(&[], Vec::as_slice),
                 actor,
                 authorized,
             );
@@ -661,6 +705,7 @@ fn candidate_for_issue(
     proof: Option<&DependencyBlockProof>,
     request: &DependencyUnblockRequest,
     ready_statuses: &[String],
+    current_blockers: &[String],
     actor: &str,
     authorized: bool,
 ) -> DependencyUnblockCandidate {
@@ -699,6 +744,19 @@ fn candidate_for_issue(
         (
             "not_blocked",
             "The current status is not blocked".to_string(),
+        )
+    } else if ready_statuses.iter().any(|status| status == "blocked") {
+        (
+            "already_ready_status",
+            "The blocked status already belongs to workflow.status_groups.ready".to_string(),
+        )
+    } else if !current_blockers.is_empty() {
+        (
+            "remaining_blockers",
+            format!(
+                "Current dependency or parent-child gates remain: {}",
+                current_blockers.join(", ")
+            ),
         )
     } else if blockers.is_empty() {
         (
@@ -1178,6 +1236,95 @@ mod tests {
         );
         workflow.capacity.exemptions.providers = vec!["operator".to_string()];
         workflow
+    }
+
+    #[test]
+    fn missing_local_and_inherited_blockers_cannot_be_authorized_away() {
+        for inherited in [false, true] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let dependent = "bd-repair-dependent";
+            let parent = "bd-repair-parent";
+            let gate = "bd-repair-gate";
+            for id in [BLOCKER, dependent, parent, gate] {
+                storage.create_issue(&issue(id), ACTOR).unwrap();
+            }
+            storage
+                .add_dependency(dependent, BLOCKER, "blocks", ACTOR)
+                .unwrap();
+            let gated = if inherited { parent } else { dependent };
+            storage
+                .add_dependency(gated, gate, "blocks", ACTOR)
+                .unwrap();
+            if inherited {
+                storage
+                    .add_dependency(dependent, parent, "parent-child", ACTOR)
+                    .unwrap();
+            }
+            storage
+                .update_issue(
+                    dependent,
+                    &IssueUpdate {
+                        status: Some(Status::Blocked),
+                        blocked_by_dependencies: true,
+                        ..IssueUpdate::default()
+                    },
+                    ACTOR,
+                )
+                .unwrap();
+            storage
+                .update_issue(
+                    BLOCKER,
+                    &IssueUpdate {
+                        status: Some(Status::Closed),
+                        ..IssueUpdate::default()
+                    },
+                    ACTOR,
+                )
+                .unwrap();
+            // Model a dangling live database edge and an untrustworthy empty
+            // cache. JSONL's post-import classifier alone misses this gate.
+            storage
+                .conn
+                .execute_with_params(
+                    "UPDATE dependencies SET depends_on_id = ? WHERE issue_id = ? AND depends_on_id = ?",
+                    &[
+                        SqliteValue::from("bd-repair-missing"),
+                        SqliteValue::from(gated),
+                        SqliteValue::from(gate),
+                    ],
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute("DELETE FROM blocked_issues_cache")
+                .unwrap();
+
+            for authorized in [false, true] {
+                let request = DependencyUnblockRequest {
+                    ids: vec![dependent.to_string()],
+                    authorized_ids: if authorized {
+                        vec![dependent.to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..DependencyUnblockRequest::default()
+                };
+                let before = logical_snapshot(&storage);
+                let plan = storage.preview_dependency_unblock(&request, ACTOR).unwrap();
+                assert!(plan.planned_ids.is_empty(), "{plan:?}");
+                assert_eq!(plan.candidates[0].reason, "remaining_blockers");
+                assert_eq!(logical_snapshot(&storage), before);
+                let report = storage
+                    .apply_dependency_unblock(&request, &plan.plan_token, ACTOR)
+                    .unwrap();
+                assert!(report.changed.is_empty(), "{report:?}");
+                assert_eq!(logical_snapshot(&storage), before);
+                assert_eq!(
+                    storage.get_issue(dependent).unwrap().unwrap().status,
+                    Status::Blocked
+                );
+            }
+        }
     }
 
     #[test]

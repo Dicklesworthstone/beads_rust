@@ -13347,11 +13347,18 @@ impl SqliteStorage {
         &self,
         external_statuses: &HashMap<String, bool>,
     ) -> Result<HashMap<String, Vec<String>>> {
+        Self::external_blockers_impl(&self.conn, external_statuses)
+    }
+
+    fn external_blockers_impl(
+        conn: &Connection,
+        external_statuses: &HashMap<String, bool>,
+    ) -> Result<HashMap<String, Vec<String>>> {
         let mut blockers: HashMap<String, Vec<String>> = HashMap::new();
 
         // Direct external blockers.
         // 1. Local issues blocked by external targets (standard blocking types)
-        let rows = self.conn.query(
+        let rows = conn.query(
             "SELECT issue_id, depends_on_id
              FROM dependencies
              WHERE depends_on_id LIKE 'external:%'
@@ -13376,7 +13383,7 @@ impl SqliteStorage {
         // 2. Local epic parents blocked by external children. This mirrors
         // `load_local_open_child_blockers_impl`: child-open rollup is an epic
         // aggregation rule, not a property of every parent-child edge.
-        let rows = self.conn.query(
+        let rows = conn.query(
             "SELECT d.depends_on_id, d.issue_id
              FROM dependencies d
              JOIN issues p ON d.depends_on_id = p.id
@@ -13398,7 +13405,7 @@ impl SqliteStorage {
         }
 
         // Propagate externally blocked parents down through local parent-child relationships.
-        let edge_rows = self.conn.query(
+        let edge_rows = conn.query(
             "SELECT issue_id, depends_on_id
              FROM dependencies
              WHERE type = 'parent-child'
