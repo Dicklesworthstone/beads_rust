@@ -307,6 +307,7 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
     insert_comment_command_shapes(&mut commands);
     insert_dependency_command_shapes(&mut commands);
     insert_aggregate_command_shapes(&mut commands);
+    insert_coordination_command_shapes(&mut commands);
     insert_label_command_shapes(&mut commands);
     commands.insert(
         "init",
@@ -600,6 +601,9 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             ),
         },
     );
+}
+
+fn insert_coordination_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
     commands.insert(
         "coordination status",
         CommandShape {

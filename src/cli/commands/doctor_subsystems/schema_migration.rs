@@ -4098,7 +4098,7 @@ fn run_post_migration_maintenance(
                      database generations",
                     displaced_dir.display()
                 ),
-                source: Box::new(error),
+                source: error,
             });
         }
         let rollback = restore_present_sidecars(
@@ -4108,7 +4108,7 @@ fn run_post_migration_maintenance(
             "rollback-restore-live-sidecars",
         );
         return match rollback {
-            Ok(()) => Err(error),
+            Ok(()) => Err(*error),
             Err(rollback_error) => Err(BeadsError::internal(format!(
                 "compacted database installation failed ({error}); restoring retained sidecars \
                  also failed ({rollback_error})"
@@ -4560,7 +4560,9 @@ enum CompactedInstallFailureDisposition {
 #[derive(Debug)]
 struct CompactedInstallFailure {
     disposition: CompactedInstallFailureDisposition,
-    error: BeadsError,
+    /// Boxed so this `Err` payload stays under clippy's `result_large_err`
+    /// limit: an unboxed `BeadsError` plus the disposition and stage exceed it.
+    error: Box<BeadsError>,
     /// The installation-state-machine step whose failure produced this value;
     /// surfaced as `failed_stage` in the failure receipt.
     stage: Option<&'static str>,
@@ -4570,7 +4572,7 @@ impl CompactedInstallFailure {
     fn restored(error: BeadsError) -> Self {
         Self {
             disposition: CompactedInstallFailureDisposition::OriginalRestored,
-            error,
+            error: Box::new(error),
             stage: None,
         }
     }
@@ -4578,7 +4580,7 @@ impl CompactedInstallFailure {
     fn uncertain(error: BeadsError) -> Self {
         Self {
             disposition: CompactedInstallFailureDisposition::LiveStateUncertain,
-            error,
+            error: Box::new(error),
             stage: None,
         }
     }

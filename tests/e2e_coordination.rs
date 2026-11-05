@@ -1190,9 +1190,12 @@ mod reclaim {
     fn capacity_refusal_rolls_back_audit_and_ownership_together() {
         let _log = common::test_log("capacity_refusal_rolls_back_audit_and_ownership_together");
         let fixture = fixture();
+        // Capacity is only valid once workflow.statuses declares the statuses
+        // it counts; without them the handoff fails policy validation instead
+        // of reaching the capacity check this test is about.
         fs::write(
             fixture.workspace.root.join(".beads/policy.yaml"),
-            "workflow:\n  capacity:\n    scopes:\n      assignee:\n        statuses:\n          in_progress:\n            hard: 1\n",
+            "workflow:\n  statuses: [open, in_progress, closed]\n  capacity:\n    scopes:\n      assignee:\n        statuses:\n          in_progress:\n            hard: 1\n",
         ).expect("assignee capacity policy");
         let before = state(&fixture.workspace, ISSUE_ID);
         let other_before = state(&fixture.workspace, "bd-fresh");
@@ -1826,7 +1829,8 @@ mod reclaim {
         );
         assert!(
             database.starts_with(dunce::canonicalize(&cache).expect("resolved database cache")),
-            "{database:?}"
+            "{}",
+            database.display()
         );
         assert!(!workspace.root.join(".beads/beads.db").exists());
         let jsonl_path = workspace.root.join(".beads/issues.jsonl");
