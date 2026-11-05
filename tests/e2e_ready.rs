@@ -2043,7 +2043,7 @@ mod dependency_unblock {
             block(&workspace, &retained, true);
             write_policy(
                 &workspace,
-                "workflow:\n  capacity:\n    statuses:\n      open: {hard: 1}\n",
+                "workflow:\n  statuses: [open, in_progress, blocked, closed, tombstone]\n  capacity:\n    statuses:\n      open: {hard: 1}\n",
             );
 
             let mut args = vec!["delete", blocker.as_str()];
@@ -2171,7 +2171,7 @@ mod dependency_unblock {
                 write_policy(
                     &workspace,
                     &format!(
-                        "workflow:\n  capacity:\n    scopes:\n      {scope}:\n        statuses:\n          open: {{hard: 1}}\n"
+                        "workflow:\n  statuses: [open, blocked, closed]\n  capacity:\n    scopes:\n      {scope}:\n        statuses:\n          open: {{hard: 1}}\n"
                     ),
                 );
                 let mut args = vec!["update", parent, "--parent", "", "--json"];
@@ -2218,7 +2218,7 @@ mod dependency_unblock {
                 write_policy(
                     &workspace,
                     &format!(
-                        "workflow:\n  capacity:\n    scopes:\n      {scope}:\n        statuses:\n          open: {{soft: 1}}\n"
+                        "workflow:\n  statuses: [open, blocked, closed]\n  capacity:\n    scopes:\n      {scope}:\n        statuses:\n          open: {{soft: 1}}\n"
                     ),
                 );
                 let mut args = vec!["update"];
@@ -2426,7 +2426,7 @@ mod dependency_unblock {
         }
         write_policy(
             &workspace,
-            "workflow:\n  capacity:\n    statuses:\n      open: {hard: 1}\n",
+            "workflow:\n  statuses: [open, blocked, closed]\n  capacity:\n    statuses:\n      open: {hard: 1}\n",
         );
         close(&workspace, &blocker);
         let ready = json(
