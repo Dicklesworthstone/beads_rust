@@ -1005,6 +1005,11 @@ fn execute_prepared_route_with_resources(
             &prepared.resolved_parent,
             &prepared.actor,
             defer_blocked_cache_rebuild,
+            if prepared.update.status.is_some() {
+                &prepared.resolved_ids
+            } else {
+                &[]
+            },
         );
         preserve_blocked_cache_on_error(
             &mut prepared.storage_ctx.storage,
@@ -2155,6 +2160,7 @@ fn apply_parent_update(
     parent: &ParentUpdatePlan,
     actor: &str,
     skip_cache_rebuild: bool,
+    preserve_status_for: &[String],
 ) -> Result<()> {
     match parent {
         ParentUpdatePlan::Unchanged => Ok(()),
@@ -2163,7 +2169,15 @@ fn apply_parent_update(
             allow_recovery,
             "update parent clear",
             Some(issue_id),
-            |storage| storage.set_parent_with_options(issue_id, None, actor, skip_cache_rebuild),
+            |storage| {
+                storage.set_parent_with_options_preserving_status(
+                    issue_id,
+                    None,
+                    actor,
+                    skip_cache_rebuild,
+                    preserve_status_for,
+                )
+            },
         ),
         ParentUpdatePlan::Set(parent_id) => retry_mutation_with_jsonl_recovery(
             storage_ctx,
@@ -2171,11 +2185,12 @@ fn apply_parent_update(
             "update parent set",
             Some(issue_id),
             |storage| {
-                storage.set_parent_with_options(
+                storage.set_parent_with_options_preserving_status(
                     issue_id,
                     Some(parent_id),
                     actor,
                     skip_cache_rebuild,
+                    preserve_status_for,
                 )
             },
         ),

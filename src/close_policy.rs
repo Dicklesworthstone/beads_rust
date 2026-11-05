@@ -1550,6 +1550,55 @@ impl Workflow {
         out
     }
 
+    /// Choose an actionable ready destination for a dependency-only release.
+    /// Prefer the proven previous ready status when current vocabulary and
+    /// transition policy permit it; otherwise require exactly one permitted
+    /// ready route. Source order must never choose between distinct workflows.
+    ///
+    /// The caller still enforces required fields, gates and capacity inside the
+    /// mutation transaction. A refusal of the chosen target must not trigger a
+    /// search for another destination with weaker requirements.
+    #[must_use]
+    pub fn unblock_target(
+        &self,
+        issue_type: &str,
+        previous_ready_status: Option<&str>,
+    ) -> Option<String> {
+        if self.validate_ready_status_group().is_err() {
+            return None;
+        }
+        let candidates: Vec<String> = self
+            .ready_status_group()
+            .into_iter()
+            .filter(|status| {
+                !matches!(
+                    status.as_str(),
+                    "blocked"
+                        | "in_progress"
+                        | "inprogress"
+                        | "deferred"
+                        | "draft"
+                        | "pinned"
+                        | "closed"
+                        | "tombstone"
+                ) && self.validate_status(status).is_ok()
+                    && self
+                        .validate_transition(Some("blocked"), status, Some(issue_type))
+                        .is_ok()
+            })
+            .collect();
+        if let Some(previous) = previous_ready_status {
+            let previous = previous.trim().to_lowercase();
+            if let Some(target) = candidates.iter().find(|target| **target == previous) {
+                return Some(target.clone());
+            }
+        }
+        match candidates.as_slice() {
+            [target] => Some(target.clone()),
+            _ => None,
+        }
+    }
+
     /// Validate the configured ready status group (issue #354). When
     /// `workflow.strict` is set *and* `workflow.statuses` is non-empty, every
     /// member of the configured ready group must appear in the allowed status
@@ -3247,6 +3296,60 @@ mod tests {
         // #354: unconfigured workflow → ready group is [open].
         let workflow = Workflow::default();
         assert_eq!(workflow.ready_status_group(), vec!["open".to_string()]);
+    }
+
+    #[test]
+    fn unblock_target_requires_an_actionable_unambiguous_workflow_route() {
+        let mut workflow = Workflow::default();
+        assert_eq!(
+            workflow.unblock_target("task", None).as_deref(),
+            Some("open")
+        );
+        workflow.status_groups.ready = vec!["queued".into(), "rework".into()];
+        assert_eq!(workflow.unblock_target("task", None), None);
+        assert_eq!(workflow.unblock_target("task", Some("open")), None);
+        assert_eq!(
+            workflow.unblock_target("task", Some("REWORK")).as_deref(),
+            Some("rework")
+        );
+        workflow.status_groups.ready = vec!["in_progress".into(), "queued".into()];
+        assert_eq!(
+            workflow
+                .unblock_target("task", Some("in_progress"))
+                .as_deref(),
+            Some("queued")
+        );
+    }
+
+    #[test]
+    fn unblock_target_respects_current_vocabulary_global_and_class_edges() {
+        let document: PolicyDocument = serde_yml::from_str(
+            r"workflow:
+  strict: true
+  statuses: [blocked, open, rework]
+  status_groups:
+    ready: [open, rework]
+  transitions:
+    blocked: [rework]
+  class_transitions:
+    - {issue_type: bug, from: blocked, to: open}
+",
+        )
+        .unwrap();
+        let mut workflow = document.workflow;
+        assert_eq!(
+            workflow.unblock_target("task", Some("open")).as_deref(),
+            Some("rework")
+        );
+        assert_eq!(workflow.unblock_target("bug", None), None);
+        assert_eq!(
+            workflow.unblock_target("bug", Some("open")).as_deref(),
+            Some("open")
+        );
+        workflow.transitions.insert("blocked".into(), Vec::new());
+        assert_eq!(workflow.unblock_target("task", Some("rework")), None);
+        workflow.status_groups.ready = vec!["missing".into()];
+        assert_eq!(workflow.unblock_target("bug", Some("missing")), None);
     }
 
     #[test]

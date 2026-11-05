@@ -65,6 +65,9 @@ jobs:
       - name: Verify guarded dependency repair transaction invariants
         run: cargo test --locked --lib storage::sqlite::dependency_repair::tests -- --nocapture
 
+      - name: Verify automatic ready-status selection
+        run: cargo test --locked --lib unblock_target -- --nocapture
+
       - name: Verify dependency doctor classification
         run: cargo test --locked --lib test_dep_graph_jsonl_ -- --nocapture
 

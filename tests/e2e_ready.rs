@@ -1529,7 +1529,7 @@ mod dependency_unblock {
 
     fn workspace() -> BrWorkspace {
         let workspace = BrWorkspace::new();
-        success(&workspace, &["init"], "unblock_init");
+        success(&workspace, &["init", "--prefix", "unblock"], "unblock_init");
         workspace
     }
 
@@ -1541,9 +1541,13 @@ mod dependency_unblock {
     }
 
     fn dependency(workspace: &BrWorkspace, dependent: &str, blocker: &str) {
+        typed_dependency(workspace, dependent, blocker, "blocks");
+    }
+
+    fn typed_dependency(workspace: &BrWorkspace, dependent: &str, blocker: &str, kind: &str) {
         success(
             workspace,
-            &["dep", "add", dependent, blocker],
+            &["dep", "add", dependent, blocker, "--type", kind],
             "unblock_add_dependency",
         );
     }
@@ -1562,6 +1566,39 @@ mod dependency_unblock {
             &["close", id, "--reason", "verified prerequisite completed"],
             "unblock_close",
         );
+    }
+
+    /// A peer import can leave an older dependency-only block stale without
+    /// executing the local close transition. Keep repair fixtures on that
+    /// path so they continue to test recovery after automatic close release.
+    fn import_completed_blocker(workspace: &BrWorkspace, id: &str) {
+        let path = workspace.root.join(".beads/issues.jsonl");
+        let contents = fs::read_to_string(&path).expect("read peer import fixture");
+        let mut rows: Vec<Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse peer issue"))
+            .collect();
+        let blocker = rows
+            .iter_mut()
+            .find(|row| row["id"].as_str() == Some(id))
+            .expect("peer blocker exists");
+        let completed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        blocker["status"] = serde_json::json!("closed");
+        blocker["closed_at"] = serde_json::json!(completed_at);
+        blocker["updated_at"] = serde_json::json!(completed_at);
+        blocker["close_reason"] = serde_json::json!("prerequisite completed by an imported peer");
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).expect("serialize peer issue"))
+            .collect();
+        fs::write(path, format!("{}\n", lines.join("\n"))).expect("write peer completion");
+        let imported = json(
+            workspace,
+            &["sync", "--import-only", "--json"],
+            "unblock_import_peer_completion",
+        );
+        assert_eq!(imported["updated"], 1, "{imported}");
+        assert_eq!(show(workspace, id)["status"], "closed");
     }
 
     fn pair(workspace: &BrWorkspace, dependency_only: bool) -> (String, String) {
@@ -1583,6 +1620,11 @@ mod dependency_unblock {
             "unblock_ready",
         );
         issue_list_contains_id(result.as_array().expect("ready array"), id)
+    }
+
+    fn assert_state(workspace: &BrWorkspace, id: &str, status: &str, ready: bool) {
+        assert_eq!(show(workspace, id)["status"], status, "{id}");
+        assert_eq!(ready_contains(workspace, id), ready, "{id}");
     }
 
     fn preview(workspace: &BrWorkspace, options: &[&str]) -> Value {
@@ -1736,10 +1778,9 @@ mod dependency_unblock {
         assert_eq!(forced["changed"], serde_json::json!([]));
         assert_eq!(show(&workspace, &dependent)["status"], "blocked");
         close(&workspace, &blocker_c);
-        assert!(eligible(&preview(&workspace, &[]), &dependent));
-        let result = repair(&workspace, &[]);
-        assert_eq!(result["changed"], serde_json::json!([dependent]));
+        assert_eq!(show(&workspace, &dependent)["status"], "open");
         assert!(ready_contains(&workspace, &dependent));
+        assert_eq!(repair(&workspace, &[])["changed"], serde_json::json!([]));
     }
 
     #[test]
@@ -1751,17 +1792,514 @@ mod dependency_unblock {
         block(&workspace, &last, true);
         close(&workspace, &first);
 
-        let result = repair(&workspace, &[]);
-        assert_eq!(result["changed"], serde_json::json!([middle]));
+        assert_eq!(show(&workspace, &middle)["status"], "open");
         assert!(ready_contains(&workspace, &middle));
         assert_eq!(show(&workspace, &last)["status"], "blocked");
         assert!(!ready_contains(&workspace, &last));
         close(&workspace, &middle);
-        assert_eq!(
-            repair(&workspace, &[])["changed"],
-            serde_json::json!([last])
-        );
+        assert_eq!(show(&workspace, &last)["status"], "open");
         assert!(ready_contains(&workspace, &last));
+        assert_eq!(repair(&workspace, &[])["changed"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn unblock_595_automatic_close_persists_ready_state_and_attributed_audit() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, true);
+        assert_state(&workspace, &dependent, "blocked", false);
+        close(&workspace, &blocker);
+        assert_state(&workspace, &dependent, "open", true);
+
+        let comments = json(
+            &workspace,
+            &["comments", "list", &dependent, "--json"],
+            "automatic_unblock_audit",
+        );
+        let comments = comments.as_array().expect("comment array");
+        assert_eq!(comments.len(), 1, "one automatic release comment");
+        assert_eq!(comments[0]["author"], "repairer");
+        let text = comments[0]["text"].as_str().expect("audit text");
+        assert!(text.starts_with("Automatically unblocked after "), "{text}");
+        assert!(
+            text.contains(&blocker),
+            "audit names the completed gate: {text}"
+        );
+        let exported = issue_from_jsonl(&workspace, &dependent);
+        assert_eq!(exported["status"], "open");
+        assert_eq!(exported["dependencies"][0]["depends_on_id"], blocker);
+        assert_eq!(exported["dependencies"][0]["type"], "blocks");
+
+        let restored = self::workspace();
+        fs::copy(
+            workspace.root.join(".beads/issues.jsonl"),
+            restored.root.join(".beads/issues.jsonl"),
+        )
+        .expect("copy completed transition into a fresh tracker");
+        success(
+            &restored,
+            &["sync", "--import-only"],
+            "import_automatic_unblock",
+        );
+        assert_state(&restored, &dependent, "open", true);
+        let restored_comments = json(
+            &restored,
+            &["comments", "list", &dependent, "--json"],
+            "imported_automatic_unblock_audit",
+        );
+        assert_eq!(restored_comments.as_array().expect("comments").len(), 1);
+        assert_eq!(restored_comments[0]["text"], comments[0]["text"]);
+    }
+
+    #[test]
+    fn unblock_595_imported_completion_can_be_recovered_without_local_close() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, true);
+        import_completed_blocker(&workspace, &blocker);
+        assert_state(&workspace, &dependent, "blocked", false);
+        let before = persisted_files(&workspace);
+        let plan = preview(&workspace, &[]);
+        assert!(eligible(&plan, &dependent), "{plan}");
+        assert_eq!(plan["planned_ids"], serde_json::json!([dependent]));
+        assert_eq!(persisted_files(&workspace), before, "preview is read-only");
+        let applied = apply(&workspace, &[], plan["plan_token"].as_str().unwrap());
+        assert!(applied.status.success(), "{applied:?}");
+        assert_state(&workspace, &dependent, "open", true);
+        assert_eq!(repair(&workspace, &[])["changed"], serde_json::json!([]));
+        assert_eq!(
+            issue_from_jsonl(&workspace, &dependent)["dependencies"][0]["depends_on_id"],
+            blocker
+        );
+    }
+
+    #[test]
+    fn unblock_595_automatic_close_waits_for_all_blocking_edge_types() {
+        for kind in ["blocks", "conditional-blocks", "waits-for"] {
+            let workspace = workspace();
+            let first = create(&workspace, "first gate");
+            let last = create(&workspace, "remaining gate");
+            let dependent = create(&workspace, "requires every gate");
+            dependency(&workspace, &dependent, &first);
+            typed_dependency(&workspace, &dependent, &last, kind);
+            block(&workspace, &dependent, true);
+            close(&workspace, &first);
+            assert_state(&workspace, &dependent, "blocked", false);
+            close(&workspace, &last);
+            assert_state(&workspace, &dependent, "open", true);
+            assert_eq!(
+                issue_from_jsonl(&workspace, &dependent)["dependencies"]
+                    .as_array()
+                    .expect("retained edges")
+                    .len(),
+                2,
+                "{kind}: release preserves completed dependency history"
+            );
+        }
+    }
+
+    #[test]
+    fn unblock_595_automatic_release_uses_close_and_delete_entry_points() {
+        for tombstone in [false, true] {
+            let workspace = workspace();
+            let (blocker, dependent) = pair(&workspace, true);
+            if tombstone {
+                success(
+                    &workspace,
+                    &[
+                        "delete",
+                        &blocker,
+                        "--force",
+                        "--reason",
+                        "prerequisite withdrawn",
+                    ],
+                    "delete_final_dependency",
+                );
+            } else {
+                let refused = command(
+                    &workspace,
+                    &["update", &blocker, "--status", "closed"],
+                    "refuse_terminal_update_bypass",
+                );
+                assert!(
+                    !refused.status.success(),
+                    "close must retain its policy boundary"
+                );
+                assert_state(&workspace, &dependent, "blocked", false);
+                assert_eq!(show(&workspace, &blocker)["status"], "open");
+                close(&workspace, &blocker);
+            }
+            assert_state(&workspace, &dependent, "open", true);
+            assert_eq!(
+                issue_from_jsonl(&workspace, &blocker)["status"],
+                if tombstone { "tombstone" } else { "closed" }
+            );
+        }
+    }
+
+    #[test]
+    fn unblock_595_automatic_release_preserves_inherited_and_epic_gates() {
+        let workspace = workspace();
+        let ancestor_gate = create(&workspace, "ancestor prerequisite");
+        let parent = create(&workspace, "gated parent task");
+        let own_gate = create(&workspace, "child direct prerequisite");
+        let child = create(&workspace, "dependent child");
+        dependency(&workspace, &parent, &ancestor_gate);
+        typed_dependency(&workspace, &child, &parent, "parent-child");
+        dependency(&workspace, &child, &own_gate);
+        block(&workspace, &child, true);
+        close(&workspace, &own_gate);
+        assert_state(&workspace, &child, "blocked", false);
+        close(&workspace, &ancestor_gate);
+        assert_state(&workspace, &child, "open", true);
+
+        let epic = json(
+            &workspace,
+            &[
+                "create",
+                "epic with unfinished child",
+                "--type",
+                "epic",
+                "--json",
+            ],
+            "create_dependency_gated_epic",
+        )["id"]
+            .as_str()
+            .expect("epic ID")
+            .to_string();
+        let epic_child = create(&workspace, "unfinished epic child");
+        typed_dependency(&workspace, &epic_child, &epic, "parent-child");
+        block(&workspace, &epic, true);
+        assert_state(&workspace, &epic, "blocked", false);
+        close(&workspace, &epic_child);
+        assert_state(&workspace, &epic, "open", true);
+    }
+
+    #[test]
+    fn unblock_595_parent_changes_release_only_the_original_dependency_hold() {
+        let workspace = workspace();
+        let first_gate = create(&workspace, "first parent prerequisite");
+        let next_gate = create(&workspace, "next parent prerequisite");
+        let first_parent = create(&workspace, "first gated parent");
+        let next_parent = create(&workspace, "next gated parent");
+        let cleared = create(&workspace, "child whose parent gate is removed");
+        let reparented = create(&workspace, "child given a new gated parent");
+        let held = create(&workspace, "child explicitly retained as blocked");
+        dependency(&workspace, &first_parent, &first_gate);
+        dependency(&workspace, &next_parent, &next_gate);
+        for child in [&cleared, &reparented, &held] {
+            typed_dependency(&workspace, child, &first_parent, "parent-child");
+            block(&workspace, child, true);
+        }
+
+        success(
+            &workspace,
+            &["update", &cleared, "--parent", ""],
+            "remove_parent_gate",
+        );
+        assert_state(&workspace, &cleared, "open", true);
+        success(
+            &workspace,
+            &["update", &reparented, "--parent", &next_parent],
+            "replace_parent_gate",
+        );
+        assert_state(&workspace, &reparented, "blocked", false);
+        close(&workspace, &next_gate);
+        assert_state(&workspace, &reparented, "blocked", false);
+        success(
+            &workspace,
+            &["update", &held, "--status", "blocked", "--parent", ""],
+            "remove_parent_with_explicit_hold",
+        );
+        assert_state(&workspace, &held, "blocked", false);
+    }
+
+    #[test]
+    fn unblock_595_dependency_removal_preserves_intent_until_the_final_gate() {
+        for final_action in ["remove", "close"] {
+            let workspace = workspace();
+            let first = create(&workspace, "first removable gate");
+            let last = create(&workspace, "last remaining gate");
+            let dependent = create(&workspace, "depends on both gates");
+            let manual = create(&workspace, "manual hold with an informational edge");
+            dependency(&workspace, &dependent, &first);
+            dependency(&workspace, &dependent, &last);
+            typed_dependency(&workspace, &manual, &first, "related");
+            block(&workspace, &dependent, true);
+            block(&workspace, &manual, false);
+            success(
+                &workspace,
+                &["dep", "remove", &dependent, &first],
+                "remove_nonfinal_dependency",
+            );
+            assert_state(&workspace, &dependent, "blocked", false);
+            if final_action == "close" {
+                close(&workspace, &last);
+            } else {
+                success(
+                    &workspace,
+                    &["dep", "remove", &dependent, &last],
+                    "remove_final_dependency",
+                );
+            }
+            assert_state(&workspace, &dependent, "open", true);
+            success(
+                &workspace,
+                &["dep", "remove", &manual, &first],
+                "remove_informational_relationship",
+            );
+            assert_state(&workspace, &manual, "blocked", false);
+        }
+    }
+
+    #[test]
+    fn unblock_595_automatic_release_uses_configured_ready_status_and_comment_policy() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, true);
+        write_policy(
+            &workspace,
+            "workflow:\n  strict: true\n  statuses: [open, blocked, rework, closed]\n  status_groups:\n    ready: [rework]\n  transitions:\n    open: [closed]\n    blocked: [rework]\n  required_fields:\n    'blocked -> rework': [transition_comment]\n",
+        );
+        let closed = json(
+            &workspace,
+            &["close", &blocker, "--suggest-next", "--json"],
+            "suggest_custom_ready_transition",
+        );
+        assert_state(&workspace, &dependent, "rework", true);
+        assert_eq!(
+            closed["unblocked"].as_array().expect("suggestions").len(),
+            1
+        );
+        assert_eq!(closed["unblocked"][0]["id"], dependent);
+    }
+
+    #[test]
+    fn unblock_595_automatic_release_restores_previous_ready_status_without_guessing() {
+        let workspace = workspace();
+        let blocker = create(&workspace, "shared configurable workflow gate");
+        let known = create(&workspace, "previously ready in rework");
+        let unknown = create(&workspace, "previously ready in open");
+        write_policy(
+            &workspace,
+            "workflow:\n  status_groups:\n    ready: [open, rework]\n",
+        );
+        success(
+            &workspace,
+            &["update", &known, "--status", "rework"],
+            "set_previous_ready_status",
+        );
+        for dependent in [&known, &unknown] {
+            dependency(&workspace, dependent, &blocker);
+            block(&workspace, dependent, true);
+        }
+        write_policy(
+            &workspace,
+            "workflow:\n  strict: true\n  statuses: [open, blocked, queued, rework, closed]\n  status_groups:\n    ready: [queued, rework]\n  transitions:\n    open: [closed]\n    blocked: [queued, rework]\n",
+        );
+        close(&workspace, &blocker);
+        assert_state(&workspace, &known, "rework", true);
+        assert_state(&workspace, &unknown, "blocked", false);
+    }
+
+    #[test]
+    fn unblock_595_automatic_policy_refusals_do_not_reject_source_completion() {
+        for policy in [
+            "workflow:\n  strict: true\n  statuses: [open, blocked, closed]\n  transitions:\n    open: [closed]\n    blocked: []\n",
+            "workflow:\n  required_fields:\n    'blocked -> open': [acceptance_criteria_present]\n",
+            "workflow:\n  gates:\n    'blocked -> open':\n      require_all: [dependency_review]\n",
+        ] {
+            let workspace = workspace();
+            let (blocker, dependent) = pair(&workspace, true);
+            write_policy(&workspace, policy);
+            close(&workspace, &blocker);
+            assert_state(&workspace, &blocker, "closed", false);
+            assert_state(&workspace, &dependent, "blocked", false);
+            let comments = json(
+                &workspace,
+                &["comments", "list", &dependent, "--json"],
+                "refused_release_has_no_transition_comment",
+            );
+            assert!(
+                comments.as_array().expect("comments").is_empty(),
+                "{policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn unblock_595_automatic_release_counts_capacity_across_the_whole_batch() {
+        let workspace = workspace();
+        let blocker = create(&workspace, "shared capacity gate");
+        let first = create(&workspace, "first capacity candidate");
+        let second = create(&workspace, "second capacity candidate");
+        for dependent in [&first, &second] {
+            dependency(&workspace, dependent, &blocker);
+            block(&workspace, dependent, true);
+        }
+        write_policy(
+            &workspace,
+            "workflow:\n  capacity:\n    statuses:\n      open: {hard: 1}\n",
+        );
+        close(&workspace, &blocker);
+        let ready = json(
+            &workspace,
+            &["ready", "--limit", "0", "--json"],
+            "capacity_ready",
+        );
+        let ready = ready.as_array().expect("ready array");
+        assert_eq!(ready.len(), 1, "the released batch has one available slot");
+        let selected = ready[0]["id"].as_str().expect("selected ID");
+        assert!(selected == first || selected == second);
+        let held = if selected == first { &second } else { &first };
+        assert_state(&workspace, held, "blocked", false);
+    }
+
+    #[test]
+    fn unblock_595_automatic_release_preserves_ownership_and_later_deferrals() {
+        let workspace = workspace();
+        let blocker = create(&workspace, "shared ownership gate");
+        let own = create(&workspace, "repairer's dependency-only hold");
+        let other = create(&workspace, "alice's dependency-only hold");
+        let deferred = create(&workspace, "dependency hold later deferred");
+        for dependent in [&own, &other, &deferred] {
+            dependency(&workspace, dependent, &blocker);
+        }
+        for (dependent, actor) in [(&own, "repairer"), (&other, "alice")] {
+            let declared = run_br(
+                &workspace,
+                [
+                    "--actor",
+                    actor,
+                    "update",
+                    dependent,
+                    "--assignee",
+                    actor,
+                    "--status",
+                    "blocked",
+                    "--blocked-by-dependencies",
+                ],
+                "owner_declares_dependency_hold",
+            );
+            assert!(declared.status.success(), "{actor}: {declared:?}");
+        }
+        block(&workspace, &deferred, true);
+        success(
+            &workspace,
+            &["update", &deferred, "--defer", "2999-01-01T00:00:00Z"],
+            "defer_after_dependency_hold",
+        );
+        close(&workspace, &blocker);
+        assert_state(&workspace, &own, "open", true);
+        assert_eq!(show(&workspace, &own)["assignee"], "repairer");
+        assert_state(&workspace, &other, "blocked", false);
+        assert_eq!(show(&workspace, &other)["assignee"], "alice");
+        assert_state(&workspace, &deferred, "blocked", false);
+    }
+
+    #[test]
+    fn unblock_595_automatic_release_preserves_unresolved_external_gate() {
+        let workspace = workspace();
+        let provider = self::workspace();
+        fs::write(
+            workspace.root.join(".beads/config.yaml"),
+            format!(
+                "issue_prefix: unblock\nexternal_projects:\n  provider: \"{}\"\n",
+                provider.root.display()
+            ),
+        )
+        .expect("configure external provider");
+        let blocker = create(&workspace, "local prerequisite");
+        let dependent = create(&workspace, "requires unavailable external capability");
+        dependency(&workspace, &dependent, &blocker);
+        dependency(
+            &workspace,
+            &dependent,
+            "external:provider:unfinished-capability",
+        );
+        block(&workspace, &dependent, true);
+        close(&workspace, &blocker);
+        assert_state(&workspace, &dependent, "blocked", false);
+    }
+
+    #[test]
+    fn unblock_595_configured_blocked_ready_group_keeps_its_status() {
+        let workspace = workspace();
+        let (blocker, dependent) = pair(&workspace, true);
+        write_policy(
+            &workspace,
+            "workflow:\n  status_groups:\n    ready: [blocked]\n",
+        );
+        assert_state(&workspace, &dependent, "blocked", false);
+        let closed = json(
+            &workspace,
+            &["close", &blocker, "--suggest-next", "--json"],
+            "suggest_explicit_blocked_ready_group",
+        );
+        assert_state(&workspace, &dependent, "blocked", true);
+        assert_eq!(
+            closed["unblocked"].as_array().expect("suggestions").len(),
+            1
+        );
+        assert_eq!(closed["unblocked"][0]["id"], dependent);
+    }
+
+    #[test]
+    fn unblock_595_suggest_next_matches_actual_ready_eligibility() {
+        let workspace = workspace();
+        let provider = self::workspace();
+        fs::write(
+            workspace.root.join(".beads/config.yaml"),
+            format!(
+                "issue_prefix: unblock\nexternal_projects:\n  provider: \"{}\"\n",
+                provider.root.display()
+            ),
+        )
+        .expect("configure external provider for suggestions");
+        let blocker = create(&workspace, "suggestion prerequisite");
+        let ready = create(&workspace, "newly ready suggestion");
+        let deferred = create(&workspace, "time-deferred suggestion");
+        let claimed = create(&workspace, "in-progress suggestion");
+        let external = create(&workspace, "externally gated suggestion");
+        let independent = create(&workspace, "already ready independent work");
+        success(
+            &workspace,
+            &["update", &claimed, "--status", "in_progress"],
+            "claim_suggestion",
+        );
+        success(
+            &workspace,
+            &["update", &deferred, "--defer", "2999-01-01T00:00:00Z"],
+            "defer_suggestion",
+        );
+        let ephemeral = json(
+            &workspace,
+            &["create", "ephemeral suggestion", "--ephemeral", "--json"],
+            "create_ephemeral_suggestion",
+        )["id"]
+            .as_str()
+            .expect("ephemeral ID")
+            .to_string();
+        for dependent in [&ready, &deferred, &claimed, &external, &ephemeral] {
+            dependency(&workspace, dependent, &blocker);
+        }
+        dependency(
+            &workspace,
+            &external,
+            "external:provider:unfinished-capability",
+        );
+        block(&workspace, &ready, true);
+        let closed = json(
+            &workspace,
+            &["close", &blocker, "--suggest-next", "--json"],
+            "suggest_only_newly_ready_work",
+        );
+        let suggestions = closed["unblocked"].as_array().expect("suggestions");
+        assert_eq!(suggestions.len(), 1, "{closed}");
+        assert_eq!(suggestions[0]["id"], ready);
+        assert_state(&workspace, &ready, "open", true);
+        assert_state(&workspace, &independent, "open", true);
+        assert_state(&workspace, &deferred, "open", false);
+        assert_state(&workspace, &claimed, "in_progress", false);
+        assert_state(&workspace, &external, "open", false);
+        assert_state(&workspace, &ephemeral, "open", false);
     }
 
     #[test]
@@ -1851,7 +2389,7 @@ mod dependency_unblock {
     fn unblock_595_custom_workflow_target_and_transition_are_enforced() {
         let workspace = workspace();
         let (blocker, dependent) = pair(&workspace, true);
-        close(&workspace, &blocker);
+        import_completed_blocker(&workspace, &blocker);
         write_policy(
             &workspace,
             "workflow:\n  strict: true\n  statuses: [open, blocked, rework, closed]\n  transitions:\n    blocked: [rework]\n  status_groups:\n    ready: [open, rework]\n  required_fields:\n    rework: [transition_comment]\n",
@@ -1999,7 +2537,7 @@ mod dependency_unblock {
         for scope in ["harness", "session"] {
             let workspace = workspace();
             let (blocker, dependent) = pair(&workspace, true);
-            close(&workspace, &blocker);
+            import_completed_blocker(&workspace, &blocker);
             let occupied = create(&workspace, "already admitted work");
             success(
                 &workspace,
@@ -2146,7 +2684,7 @@ mod dependency_unblock {
     fn unblock_595_capacity_warnings_are_preserved_in_preview_and_apply() {
         let workspace = workspace();
         let (blocker, dependent) = pair(&workspace, true);
-        close(&workspace, &blocker);
+        import_completed_blocker(&workspace, &blocker);
         write_policy(
             &workspace,
             "workflow:\n  statuses: [open, blocked, closed]\n  capacity:\n    scopes:\n      harness:\n        statuses:\n          open:\n            soft: 1\n",
@@ -2238,8 +2776,12 @@ mod dependency_unblock {
     #[test]
     fn unblock_595_supersedes_relationship_and_custom_status_keep_blocker_live() {
         let workspace = workspace();
-        let (blocker, dependent) = pair(&workspace, true);
+        let blocker = create(&workspace, "unfinished superseded prerequisite");
+        let dependent = create(&workspace, "supersession dependent");
         let replacement = create(&workspace, "replacement for an unfinished prerequisite");
+        dependency(&workspace, &dependent, &blocker);
+        typed_dependency(&workspace, &dependent, &replacement, "supersedes");
+        block(&workspace, &dependent, true);
         success(
             &workspace,
             &["dep", "add", &replacement, &blocker, "--type", "supersedes"],
@@ -2262,19 +2804,26 @@ mod dependency_unblock {
         // Only the actual terminal transition satisfies B's blocking edge;
         // neither an informational edge nor a similarly named custom status
         // provides evidence that the prerequisite completed.
-        close(&workspace, &blocker);
-        assert!(eligible(&preview(&workspace, &[]), &dependent));
-        assert_eq!(
-            repair(&workspace, &[])["changed"],
-            serde_json::json!([dependent])
+        success(
+            &workspace,
+            &[
+                "close",
+                &blocker,
+                "--reason",
+                &format!("Superseded by {replacement}"),
+            ],
+            "close_superseded_prerequisite",
         );
+        assert_eq!(show(&workspace, &dependent)["status"], "open");
         assert!(ready_contains(&workspace, &dependent));
+        assert_eq!(show(&workspace, &replacement)["status"], "open");
+        assert_eq!(repair(&workspace, &[])["changed"], serde_json::json!([]));
     }
 
     #[test]
     fn unblock_595_soft_delete_preserves_orphaned_manual_status() {
         let workspace = workspace();
-        let (blocker, dependent) = pair(&workspace, true);
+        let (blocker, dependent) = pair(&workspace, false);
         success(
             &workspace,
             &[
