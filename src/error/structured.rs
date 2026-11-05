@@ -2097,7 +2097,10 @@ mod tests {
         assert_eq!(structured.code, ErrorCode::SyncConflict);
         assert!(!structured.retryable);
         let context = structured.context.expect("committed maintenance evidence");
-        assert_eq!(context["primary_commit_state"], "committed_maintenance_failed");
+        assert_eq!(
+            context["primary_commit_state"],
+            "committed_maintenance_failed"
+        );
         assert_eq!(context["primary_committed"], true);
         assert_eq!(context["primary_witnessed"], true);
         assert_eq!(context["retryable"], false);

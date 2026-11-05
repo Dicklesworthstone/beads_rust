@@ -30,6 +30,6 @@ pub(crate) use search::unicode_issue_fields_match;
 pub(crate) use sqlite::{BulkDependencyInsert, ChangelogIssueRow};
 pub use sqlite::{
     CloseMetadataRow, DependencyUnblockCandidate, DependencyUnblockPlan, DependencyUnblockReport,
-    DependencyUnblockRequest, EventAttribution, IssueUpdate, LabelSetChanges, LabelUpdate, ListFilters,
-    ReadyFilters, ReadySortPolicy, SqliteStorage, StatsIssueRow,
+    DependencyUnblockRequest, EventAttribution, IssueUpdate, LabelSetChanges, LabelUpdate,
+    ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage, StatsIssueRow,
 };

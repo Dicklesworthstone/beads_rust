@@ -41,12 +41,13 @@ use std::time::Duration;
 #[path = "dependency_repair.rs"]
 mod dependency_repair;
 
+pub(crate) use dependency_repair::{
+    BlockerFate, FullyUnblockedIssue, blocker_fate, forward_blocking_targets,
+    fully_unblocked_issues,
+};
 pub use dependency_repair::{
     DependencyUnblockCandidate, DependencyUnblockPlan, DependencyUnblockReport,
     DependencyUnblockRequest,
-};
-pub(crate) use dependency_repair::{
-    BlockerFate, FullyUnblockedIssue, blocker_fate, forward_blocking_targets, fully_unblocked_issues,
 };
 
 #[cfg(test)]
@@ -8077,7 +8078,8 @@ impl SqliteStorage {
             }
         }
 
-        if dependency_unblock_guard.is_none() && updates.iter().all(|(_, update)| update.is_empty()) {
+        if dependency_unblock_guard.is_none() && updates.iter().all(|(_, update)| update.is_empty())
+        {
             // This path does not call `mutate()`, so explicitly consume staged
             // attribution just like the historical single-update no-op path.
             self.pending_event_attribution = None;

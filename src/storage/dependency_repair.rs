@@ -99,10 +99,7 @@ pub(crate) enum BlockerFate {
     NonGating,
 }
 
-pub(crate) fn blocker_fate(
-    target: &str,
-    issue_by_id: &HashMap<&str, &Issue>,
-) -> BlockerFate {
+pub(crate) fn blocker_fate(target: &str, issue_by_id: &HashMap<&str, &Issue>) -> BlockerFate {
     if target.starts_with("external:") {
         return BlockerFate::Live;
     }
@@ -121,7 +118,9 @@ pub(crate) fn forward_blocking_targets(issue: &Issue) -> Vec<&str> {
         .filter(|dependency| {
             matches!(
                 dependency.dep_type,
-                DependencyType::Blocks | DependencyType::ConditionalBlocks | DependencyType::WaitsFor
+                DependencyType::Blocks
+                    | DependencyType::ConditionalBlocks
+                    | DependencyType::WaitsFor
             ) && dependency.depends_on_id != issue.id
         })
         .map(|dependency| dependency.depends_on_id.as_str())
@@ -289,23 +288,25 @@ impl SqliteStorage {
             request,
             expected_token,
         };
-        let maintenance_error =
-            match self.update_issues_atomically_guarded(&updates, actor, Some(&guard)) {
-                Ok(_) => None,
-                Err(error @ BeadsError::CommittedMaintenanceFailure { .. }) => {
-                    Some(error.to_string())
-                }
-                Err(error) if error.primary_mutation_committed() => {
-                    return Err(BeadsError::WithContext {
-                        context: format!(
-                            "dependency repair for [{}] with review {} committed but its current database state cannot be certified; inspect before retrying",
-                            plan.planned_ids.join(", "), plan.plan_token,
-                        ),
-                        source: Box::new(error),
-                    });
-                }
-                Err(error) => return Err(error),
-            };
+        let maintenance_error = match self.update_issues_atomically_guarded(
+            &updates,
+            actor,
+            Some(&guard),
+        ) {
+            Ok(_) => None,
+            Err(error @ BeadsError::CommittedMaintenanceFailure { .. }) => Some(error.to_string()),
+            Err(error) if error.primary_mutation_committed() => {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "dependency repair for [{}] with review {} committed but its current database state cannot be certified; inspect before retrying",
+                        plan.planned_ids.join(", "),
+                        plan.plan_token,
+                    ),
+                    source: Box::new(error),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         Ok(DependencyUnblockReport {
             plan_token: plan.plan_token,
             changed: plan.planned_ids,
@@ -346,7 +347,10 @@ impl SqliteStorage {
         attribution: &EventAttribution,
     ) -> Result<DependencyUnblockPlan> {
         if actor.trim().is_empty() {
-            return Err(BeadsError::validation("actor", "dependency repair requires a named actor"));
+            return Err(BeadsError::validation(
+                "actor",
+                "dependency repair requires a named actor",
+            ));
         }
         workflow.validate_ready_status_group()?;
         let ready_statuses = workflow.ready_status_group();
@@ -378,8 +382,8 @@ impl SqliteStorage {
                 authorized,
             );
             if candidate.eligible {
-                let preflight = candidate_update(&candidate, actor, PREVIEW_PLAN_TOKEN)
-                    .and_then(|update| {
+                let preflight =
+                    candidate_update(&candidate, actor, PREVIEW_PLAN_TOKEN).and_then(|update| {
                         Self::enforce_workflow_transition_batch_in_tx(
                             conn,
                             workflow,
@@ -463,7 +467,10 @@ impl SqliteStorage {
             &candidates,
             &capacity_warnings,
         ))?;
-        let plan_token = format!("sha256:{}", crate::util::hex_encode(&Sha256::digest(witness)));
+        let plan_token = format!(
+            "sha256:{}",
+            crate::util::hex_encode(&Sha256::digest(witness))
+        );
         let planned_ids = candidates
             .iter()
             .filter(|candidate| candidate.eligible)
@@ -492,7 +499,10 @@ impl SqliteStorage {
         workflow: &Workflow,
     ) -> Result<BTreeMap<String, DependencyBlockProof>> {
         let mut proofs = BTreeMap::new();
-        if !updates.iter().any(|(_, update)| update.blocked_by_dependencies) {
+        if !updates
+            .iter()
+            .any(|(_, update)| update.blocked_by_dependencies)
+        {
             return Ok(proofs);
         }
         workflow.validate_ready_status_group()?;
@@ -502,17 +512,24 @@ impl SqliteStorage {
             .map(|issue| (issue.id.as_str(), issue))
             .collect::<HashMap<_, _>>();
         let ready_statuses = workflow.ready_status_group();
-        for (id, update) in updates.iter().filter(|(_, update)| update.blocked_by_dependencies) {
+        for (id, update) in updates
+            .iter()
+            .filter(|(_, update)| update.blocked_by_dependencies)
+        {
             let issue = by_id
                 .get(id.as_str())
                 .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
             if update.status != Some(Status::Blocked)
-                || !ready_statuses.iter().any(|status| status == issue.status.as_str())
+                || !ready_statuses
+                    .iter()
+                    .any(|status| status == issue.status.as_str())
                 || !actionable_repair_status(issue.status.as_str())
             {
                 return Err(BeadsError::validation(
                     "blocked_by_dependencies",
-                    format!("issue {id}: --blocked-by-dependencies requires a real transition from a ready status to blocked"),
+                    format!(
+                        "issue {id}: --blocked-by-dependencies requires a real transition from a ready status to blocked"
+                    ),
                 ));
             }
             let assignee = update.assignee.as_ref().unwrap_or(&issue.assignee);
@@ -529,7 +546,9 @@ impl SqliteStorage {
             {
                 return Err(BeadsError::validation(
                     "blocked_by_dependencies",
-                    format!("issue {id}: dependency-only provenance cannot override ownership, claim, deferral or ready-work exclusions"),
+                    format!(
+                        "issue {id}: dependency-only provenance cannot override ownership, claim, deferral or ready-work exclusions"
+                    ),
                 ));
             }
             let mut blockers = forward_blocking_targets(issue)
@@ -545,13 +564,16 @@ impl SqliteStorage {
                     format!("issue {id}: no live forward dependency blocker exists to record"),
                 ));
             }
-            proofs.insert(id.clone(), DependencyBlockProof {
-                schema: BLOCK_PROVENANCE_SCHEMA.to_string(),
-                previous_status: issue.status.as_str().to_string(),
-                blockers,
-                updated_at: String::new(),
-                issue_fingerprint: String::new(),
-            });
+            proofs.insert(
+                id.clone(),
+                DependencyBlockProof {
+                    schema: BLOCK_PROVENANCE_SCHEMA.to_string(),
+                    previous_status: issue.status.as_str().to_string(),
+                    blockers,
+                    updated_at: String::new(),
+                    issue_fingerprint: String::new(),
+                },
+            );
         }
         Ok(proofs)
     }
@@ -589,7 +611,9 @@ fn normalized_request(
         if !ready_statuses.contains(target) || !actionable_repair_status(target) {
             return Err(BeadsError::validation(
                 "to_status",
-                format!("repair target '{target}' must be an actionable status in workflow.status_groups.ready"),
+                format!(
+                    "repair target '{target}' must be an actionable status in workflow.status_groups.ready"
+                ),
             ));
         }
     }
@@ -672,23 +696,50 @@ fn candidate_for_issue(
         "ambiguous"
     };
     let (reason, detail) = if issue.status != Status::Blocked {
-        ("not_blocked", "The current status is not blocked".to_string())
+        (
+            "not_blocked",
+            "The current status is not blocked".to_string(),
+        )
     } else if blockers.is_empty() {
-        ("no_dependency_history", "No forward blocking dependency exists; preserve manual or external blocks".to_string())
+        (
+            "no_dependency_history",
+            "No forward blocking dependency exists; preserve manual or external blocks".to_string(),
+        )
     } else if classification.is_none() {
-        ("remaining_blockers", "A live or unresolved external dependency still blocks this issue".to_string())
+        (
+            "remaining_blockers",
+            "A live or unresolved external dependency still blocks this issue".to_string(),
+        )
     } else if classification.is_some_and(|entry| !entry.stale_blocked) {
-        ("hierarchy_or_template", "A parent-child gate or template exclusion still applies".to_string())
+        (
+            "hierarchy_or_template",
+            "A parent-child gate or template exclusion still applies".to_string(),
+        )
     } else if let Some(entry) = classification.filter(|entry| !entry.excluded_reasons.is_empty()) {
         ("ready_exclusion", entry.excluded_reasons.join(", "))
     } else if owned_by_other(issue.assignee.as_deref(), actor) {
-        ("ownership", format!("Assigned to {}; repair never transfers another actor's work", issue.assignee.as_deref().unwrap_or_default()))
+        (
+            "ownership",
+            format!(
+                "Assigned to {}; repair never transfers another actor's work",
+                issue.assignee.as_deref().unwrap_or_default()
+            ),
+        )
     } else if !authorized && trustworthy_proof.is_none() {
         ("authorization_required", "Dependency-only intent is unproven; preview again with --authorize and this exact ID if its manual/external block is resolved".to_string())
-    } else if target.as_deref().is_none_or(|status| !actionable_repair_status(status)) {
-        ("target_required", "Choose an actionable workflow ready status with --to-status".to_string())
+    } else if target
+        .as_deref()
+        .is_none_or(|status| !actionable_repair_status(status))
+    {
+        (
+            "target_required",
+            "Choose an actionable workflow ready status with --to-status".to_string(),
+        )
     } else {
-        ("eligible", "No dependency, hierarchy, ownership or ready-work exclusion remains".to_string())
+        (
+            "eligible",
+            "No dependency, hierarchy, ownership or ready-work exclusion remains".to_string(),
+        )
     };
     DependencyUnblockCandidate {
         id: issue.id.clone(),
@@ -704,7 +755,10 @@ fn candidate_for_issue(
 
 fn actionable_repair_status(status: &str) -> bool {
     !status.trim().is_empty()
-        && matches!(status.parse::<Status>(), Ok(Status::Open | Status::Custom(_)))
+        && matches!(
+            status.parse::<Status>(),
+            Ok(Status::Open | Status::Custom(_))
+        )
 }
 
 fn owned_by_other(assignee: Option<&str>, actor: &str) -> bool {
@@ -724,7 +778,8 @@ fn candidate_update(
     })?;
     let comment = format!(
         "Dependency-unblocked by {actor}: no live blockers or parent-child gates remain. Dependency history: {}. Authorization: {}. Review: {token}.",
-        candidate.blockers.join(", "), candidate.provenance,
+        candidate.blockers.join(", "),
+        candidate.provenance,
     );
     // Preview and apply use the same validator as the actual insertion. In
     // particular, an invalid actor or NUL-bearing audit must not be advertised
@@ -744,7 +799,12 @@ fn dependency_unblock_updates(
     plan.candidates
         .iter()
         .filter(|candidate| candidate.eligible)
-        .map(|candidate| Ok((candidate.id.clone(), candidate_update(candidate, actor, &plan.plan_token)?)))
+        .map(|candidate| {
+            Ok((
+                candidate.id.clone(),
+                candidate_update(candidate, actor, &plan.plan_token)?,
+            ))
+        })
         .collect()
 }
 
@@ -768,9 +828,16 @@ fn current_dependency_block_proof(
     }
     let rows = conn.query_with_params(
         "SELECT comment FROM events WHERE issue_id = ? AND event_type = ? ORDER BY id DESC LIMIT 1",
-        &[SqliteValue::from(issue.id.as_str()), SqliteValue::from(BLOCK_PROVENANCE_EVENT)],
+        &[
+            SqliteValue::from(issue.id.as_str()),
+            SqliteValue::from(BLOCK_PROVENANCE_EVENT),
+        ],
     )?;
-    let Some(raw) = rows.first().and_then(|row| row.get(0)).and_then(SqliteValue::as_text) else {
+    let Some(raw) = rows
+        .first()
+        .and_then(|row| row.get(0))
+        .and_then(SqliteValue::as_text)
+    else {
         return Ok(None);
     };
     let Ok(proof) = serde_json::from_str::<DependencyBlockProof>(raw) else {
@@ -898,18 +965,29 @@ fn checked_issue_ids(issues: &[Issue]) -> Result<HashSet<String>> {
 /// Preserve SQLite value types, float bits and row multiplicity in a canonical
 /// row witness. Sorting makes the digest independent of query-plan row order.
 fn rows_digest(rows: &[Row]) -> Result<String> {
-    let mut encoded = rows.iter().map(|row| {
-        let values = row.values().iter().map(|value| match value {
-            SqliteValue::Null => serde_json::json!(["null"]),
-            SqliteValue::Integer(value) => serde_json::json!(["integer", value]),
-            SqliteValue::Float(value) => serde_json::json!(["float", value.to_bits()]),
-            SqliteValue::Text(value) => serde_json::json!(["text", value.as_ref()]),
-            SqliteValue::Blob(value) => serde_json::json!(["blob", crate::util::hex_encode(value)]),
-        }).collect::<Vec<_>>();
-        serde_json::to_vec(&values).map_err(BeadsError::from)
-    }).collect::<Result<Vec<_>>>()?;
+    let mut encoded = rows
+        .iter()
+        .map(|row| {
+            let values = row
+                .values()
+                .iter()
+                .map(|value| match value {
+                    SqliteValue::Null => serde_json::json!(["null"]),
+                    SqliteValue::Integer(value) => serde_json::json!(["integer", value]),
+                    SqliteValue::Float(value) => serde_json::json!(["float", value.to_bits()]),
+                    SqliteValue::Text(value) => serde_json::json!(["text", value.as_ref()]),
+                    SqliteValue::Blob(value) => {
+                        serde_json::json!(["blob", crate::util::hex_encode(value)])
+                    }
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_vec(&values).map_err(BeadsError::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
     encoded.sort();
-    Ok(crate::util::hex_encode(&Sha256::digest(serde_json::to_vec(&encoded)?)))
+    Ok(crate::util::hex_encode(&Sha256::digest(
+        serde_json::to_vec(&encoded)?,
+    )))
 }
 
 fn tables_digest(conn: &Connection, tables: &[&str]) -> Result<String> {
@@ -919,7 +997,9 @@ fn tables_digest(conn: &Connection, tables: &[&str]) -> Result<String> {
         let rows = conn.query(&format!("SELECT * FROM {table}"))?;
         fingerprints.insert(*table, rows_digest(&rows)?);
     }
-    Ok(crate::util::hex_encode(&Sha256::digest(serde_json::to_vec(&fingerprints)?)))
+    Ok(crate::util::hex_encode(&Sha256::digest(
+        serde_json::to_vec(&fingerprints)?,
+    )))
 }
 
 fn issue_fingerprint(conn: &Connection, id: &str) -> Result<String> {
@@ -936,7 +1016,9 @@ fn issue_fingerprint(conn: &Connection, id: &str) -> Result<String> {
         )?;
         fingerprints.insert(table, rows_digest(&rows)?);
     }
-    Ok(crate::util::hex_encode(&Sha256::digest(serde_json::to_vec(&fingerprints)?)))
+    Ok(crate::util::hex_encode(&Sha256::digest(
+        serde_json::to_vec(&fingerprints)?,
+    )))
 }
 
 pub(super) fn check_repair_interruption() -> Result<()> {
@@ -1027,7 +1109,9 @@ mod tests {
         storage.create_issue(&issue(BLOCKER), ACTOR).unwrap();
         for id in dependents {
             storage.create_issue(&issue(id), ACTOR).unwrap();
-            storage.add_dependency(id, BLOCKER, "blocks", ACTOR).unwrap();
+            storage
+                .add_dependency(id, BLOCKER, "blocks", ACTOR)
+                .unwrap();
             storage
                 .update_issue(
                     id,
@@ -1104,8 +1188,7 @@ mod tests {
             let plan = storage.preview_dependency_unblock(&request, ACTOR).unwrap();
             assert_eq!(plan.planned_ids, ["bd-repair-b", "bd-repair-c"]);
             let before = logical_snapshot(&storage);
-            FAIL_REPAIR_AFTER_UPDATES
-                .with(|flag| flag.set((!fail_after_audit).then_some(1)));
+            FAIL_REPAIR_AFTER_UPDATES.with(|flag| flag.set((!fail_after_audit).then_some(1)));
             FAIL_REPAIR_BEFORE_COMMIT.with(|flag| flag.set(fail_after_audit));
             let result = storage.apply_dependency_unblock(&request, &plan.plan_token, ACTOR);
             FAIL_REPAIR_AFTER_UPDATES.with(|flag| flag.set(None));
@@ -1183,7 +1266,9 @@ mod tests {
     #[test]
     fn preview_leaves_expired_capacity_exemptions_untouched_and_apply_audits_expiry() {
         let mut storage = unblocked_fixture(&["bd-repair-b"]);
-        storage.create_issue(&issue("bd-repair-slot"), ACTOR).unwrap();
+        storage
+            .create_issue(&issue("bd-repair-slot"), ACTOR)
+            .unwrap();
         storage.set_workflow_policy(open_capacity(2, Some(2)));
         storage
             .grant_capacity_exemption(
@@ -1201,9 +1286,7 @@ mod tests {
                 conn.execute_with_params(
                     "UPDATE capacity_exemptions SET expires_at = ? WHERE issue_id = ?",
                     &[
-                        SqliteValue::from(
-                            (Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
-                        ),
+                        SqliteValue::from((Utc::now() - chrono::Duration::hours(1)).to_rfc3339()),
                         SqliteValue::from("bd-repair-slot"),
                     ],
                 )?;
@@ -1222,7 +1305,9 @@ mod tests {
             "preview must not audit lazy expiry"
         );
         assert!(
-            storage.list_capacity_exemptions(Some("bd-repair-slot")).unwrap()[0]
+            storage
+                .list_capacity_exemptions(Some("bd-repair-slot"))
+                .unwrap()[0]
                 .ended_at
                 .is_none()
         );
@@ -1233,7 +1318,9 @@ mod tests {
         assert_eq!(report.changed, ["bd-repair-b"]);
         assert_eq!(report.capacity_warnings, plan.capacity_warnings);
         assert!(
-            storage.list_capacity_exemptions(Some("bd-repair-slot")).unwrap()[0]
+            storage
+                .list_capacity_exemptions(Some("bd-repair-slot"))
+                .unwrap()[0]
                 .ended_at
                 .is_some()
         );
@@ -1318,6 +1405,9 @@ mod tests {
         assert!(duplicate.to_string().contains("duplicate stored issue ID"));
 
         let storage = unblocked_fixture(&["bd-repair-b"]);
+        // Deliberately corrupt a referenced primary key; normal FK enforcement
+        // would reject the fixture before the preservation decoder can inspect it.
+        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
         storage
             .conn
             .execute_with_params(
@@ -1328,6 +1418,7 @@ mod tests {
                 ],
             )
             .unwrap();
+        SqliteStorage::restore_foreign_keys(&storage.conn, "malformed repair fixture").unwrap();
         let before = logical_snapshot(&storage);
         let error = storage
             .preview_dependency_unblock(&DependencyUnblockRequest::default(), ACTOR)
@@ -1352,7 +1443,9 @@ mod tests {
                 .preview_dependency_unblock(&DependencyUnblockRequest::default(), ACTOR)
                 .unwrap_err();
             assert!(
-                error.to_string().contains(&format!("unrepresentable {column}")),
+                error
+                    .to_string()
+                    .contains(&format!("unrepresentable {column}")),
                 "{error}"
             );
             assert_eq!(logical_snapshot(&storage), before);

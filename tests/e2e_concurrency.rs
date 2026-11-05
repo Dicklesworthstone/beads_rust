@@ -6960,7 +6960,11 @@ mod dependency_unblock_races {
         let init = run_br_in_dir(root, ["init"]);
         assert!(init.success, "{init:?}");
         let mut ids = Vec::new();
-        for title in ["completed prerequisite", "dependent awaiting review", "competing prerequisite"] {
+        for title in [
+            "completed prerequisite",
+            "dependent awaiting review",
+            "competing prerequisite",
+        ] {
             let created = run_br_in_dir(root, ["--actor", "seed", "create", title, "--json"]);
             assert!(created.success, "{created:?}");
             let created: Value = serde_json::from_str(&created.stdout).unwrap();
@@ -6976,7 +6980,15 @@ mod dependency_unblock_races {
         }
         let preview = run_br_in_dir(
             root,
-            ["--actor", "repairer", "doctor", "unblock", "--authorize", &ids[1], "--json"],
+            [
+                "--actor",
+                "repairer",
+                "doctor",
+                "unblock",
+                "--authorize",
+                &ids[1],
+                "--json",
+            ],
         );
         assert!(preview.success, "{preview:?}");
         let preview: Value = serde_json::from_str(&preview.stdout).unwrap();
@@ -6989,8 +7001,18 @@ mod dependency_unblock_races {
         spawn_br_child_in_dir(
             root,
             [
-                "--actor", "repairer", "--lock-timeout", "30000", "doctor", "unblock",
-                "--authorize", id, "--apply", "--expect", token, "--json",
+                "--actor",
+                "repairer",
+                "--lock-timeout",
+                "30000",
+                "doctor",
+                "unblock",
+                "--authorize",
+                id,
+                "--apply",
+                "--expect",
+                token,
+                "--json",
             ],
         )
     }
@@ -7002,7 +7024,14 @@ mod dependency_unblock_races {
             let root = &workspace.root;
             let authority = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
             let mutation = if change == "ownership" {
-                vec!["update", id.as_str(), "--assignee", "alice", "--notes", "concurrent ownership"]
+                vec![
+                    "update",
+                    id.as_str(),
+                    "--assignee",
+                    "alice",
+                    "--notes",
+                    "concurrent ownership",
+                ]
             } else {
                 vec!["dep", "add", id.as_str(), competing.as_str()]
             };
@@ -7010,11 +7039,22 @@ mod dependency_unblock_races {
             let first = wait_for_workspace_waiters(root, 1);
             children.0.push(start_repair(root, &id, &token));
             let both = wait_for_workspace_waiters(root, 2);
-            assert_eq!(first[0], both[0], "competing writer must enter before repair");
+            assert_eq!(
+                first[0], both[0],
+                "competing writer must enter before repair"
+            );
             drop(authority);
             let outputs = children.finish(Duration::from_secs(20));
-            assert!(outputs[0].status.success(), "competing {change}: {:?}", outputs[0]);
-            assert!(!outputs[1].status.success(), "stale repair must fail: {:?}", outputs[1]);
+            assert!(
+                outputs[0].status.success(),
+                "competing {change}: {:?}",
+                outputs[0]
+            );
+            assert!(
+                !outputs[1].status.success(),
+                "stale repair must fail: {:?}",
+                outputs[1]
+            );
 
             let shown = run_br_in_dir(root, ["show", &id, "--json"]);
             assert!(shown.success, "{shown:?}");
@@ -7024,10 +7064,19 @@ mod dependency_unblock_races {
                 assert_eq!(shown[0]["assignee"], "alice");
                 assert_eq!(shown[0]["notes"], "concurrent ownership");
             }
-            let storage = beads_rust::storage::SqliteStorage::open(&root.join(".beads/beads.db"))
-                .unwrap();
-            assert!(storage.get_events(&id, 0).unwrap().iter().all(|event| event.actor != "repairer"));
-            assert!(storage.get_comments(&id).unwrap().is_empty(), "refused repair left audit comment");
+            let storage =
+                beads_rust::storage::SqliteStorage::open(&root.join(".beads/beads.db")).unwrap();
+            assert!(
+                storage
+                    .get_events(&id, 0)
+                    .unwrap()
+                    .iter()
+                    .all(|event| event.actor != "repairer")
+            );
+            assert!(
+                storage.get_comments(&id).unwrap().is_empty(),
+                "refused repair left audit comment"
+            );
             if change == "dependency" {
                 let dependencies = storage.get_dependencies(&id).unwrap();
                 assert!(dependencies.contains(&competing));
@@ -7035,7 +7084,11 @@ mod dependency_unblock_races {
             drop(storage);
             let ready = run_br_in_dir(root, ["ready", "--limit", "0", "--json"]);
             assert!(ready.success, "{ready:?}");
-            assert!(extract_issues_array(&ready.stdout).iter().all(|issue| issue["id"] != id));
+            assert!(
+                extract_issues_array(&ready.stdout)
+                    .iter()
+                    .all(|issue| issue["id"] != id)
+            );
         }
     }
 
@@ -7070,20 +7123,34 @@ mod dependency_unblock_races {
             } else {
                 assert_eq!(output.status.signal(), Some(9), "{output:?}");
             }
-            assert_eq!(database_payload_bytes(root), database_before, "interrupted repair wrote DB");
-            assert_eq!(fs::read(root.join(".beads/issues.jsonl")).unwrap(), jsonl_before);
+            assert_eq!(
+                database_payload_bytes(root),
+                database_before,
+                "interrupted repair wrote DB"
+            );
+            assert_eq!(
+                fs::read(root.join(".beads/issues.jsonl")).unwrap(),
+                jsonl_before
+            );
 
             // Reuse the exact original review: cancellation did not change its
             // authority or leave a partially applied status/audit operation.
             let output = QueuedBrChildren(vec![start_repair(root, &id, &token)])
                 .finish(Duration::from_secs(10))
                 .remove(0);
-            assert!(output.status.success(), "retry after {signal:?}: {output:?}");
+            assert!(
+                output.status.success(),
+                "retry after {signal:?}: {output:?}"
+            );
             let report: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(report["changed"], serde_json::json!([id]));
             let ready = run_br_in_dir(root, ["ready", "--limit", "0", "--json"]);
             assert!(ready.success, "{ready:?}");
-            assert!(extract_issues_array(&ready.stdout).iter().any(|issue| issue["id"] == id));
+            assert!(
+                extract_issues_array(&ready.stdout)
+                    .iter()
+                    .any(|issue| issue["id"] == id)
+            );
         }
     }
 }

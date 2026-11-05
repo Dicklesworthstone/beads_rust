@@ -14190,7 +14190,6 @@ fn unblock_review_context(paths: &config::ConfigPaths) -> Result<String> {
     }))?)
 }
 
-
 /// Runtime witness for the read-only contract (GitHub #476).
 ///
 /// On a private copy of the database family, a current-schema read-only open

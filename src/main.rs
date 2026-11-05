@@ -4290,7 +4290,12 @@ mod tests {
             assert!(!command_must_refuse_during_pending_merge(&command));
         }
         let command = Cli::parse_from([
-            "br", "doctor", "unblock", "--apply", "--expect", "reviewed-token",
+            "br",
+            "doctor",
+            "unblock",
+            "--apply",
+            "--expect",
+            "reviewed-token",
         ])
         .command;
         assert!(needs_write_lock(&command));
@@ -4301,11 +4306,19 @@ mod tests {
         // separately; startup must not perform an unrelated automatic sync.
         assert!(!is_mutating_command(&command));
         assert!(Cli::try_parse_from(["br", "doctor", "unblock", "--apply"]).is_err());
-        assert!(Cli::try_parse_from([
-            "br", "doctor", "unblock", "--apply", "--expect", "token", "--dry-run",
-        ]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "br",
+                "doctor",
+                "unblock",
+                "--apply",
+                "--expect",
+                "token",
+                "--dry-run",
+            ])
+            .is_err()
+        );
     }
-
 
     #[test]
     fn coordination_reclaim_uses_mutation_authority_not_read_only_fallbacks() {
