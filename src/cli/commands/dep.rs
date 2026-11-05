@@ -2,7 +2,7 @@
 
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, cli_for_routed_workspace,
+    auto_import_storage_ctx_if_stale, cli_for_routed_workspace, event_attribution_from_env,
     external_project_db_paths_after_auto_import_if_needed, finalize_batched_blocked_cache_refresh,
     report_auto_flush_failure, resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
@@ -381,6 +381,9 @@ struct DepActionResult {
     /// never resolve (#531). Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+    /// Capacity warnings from automatically released dependency holds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
 /// JSON output for dep import operations.
@@ -658,6 +661,7 @@ fn dep_add(
             dep_type: dep_type.as_str().to_string(),
             action: if added { "added" } else { "already_exists" }.to_string(),
             warnings: external_warning.into_iter().map(str::to_string).collect(),
+            capacity_warnings: Vec::new(),
         };
         if ctx.is_toon() {
             ctx.toon(&result);
@@ -788,6 +792,7 @@ fn dep_remove(
         resolve_issue_id(&storage_ctx.storage, resolver, &args.depends_on)?
     };
 
+    let attribution = event_attribution_from_env();
     let (removed, dep_type) = retry_mutation_with_jsonl_recovery(
         storage_ctx,
         true,
@@ -806,6 +811,7 @@ fn dep_remove(
                 None => dependency_type_for_pair(storage, &issue_id, &depends_on_id)?
                     .unwrap_or_else(|| "unknown".to_string()),
             };
+            storage.set_pending_event_attribution(attribution.clone());
             let removed = storage.remove_dependency(
                 &issue_id,
                 &depends_on_id,
@@ -816,6 +822,7 @@ fn dep_remove(
         },
     )?;
 
+    let capacity_warnings = storage_ctx.storage.take_capacity_warnings();
     finalize_dep_mutation(storage_ctx, removed, "dep remove")?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
         report_auto_flush_failure(
@@ -827,6 +834,12 @@ fn dep_remove(
     }
     crate::util::set_last_touched_id(local_beads_dir, &issue_id);
 
+    if !ctx.is_json() && !ctx.is_toon() && !ctx.is_quiet() {
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
+        }
+    }
+
     if ctx.is_json() || ctx.is_toon() {
         let result = DepActionResult {
             status: if removed { "ok" } else { "not_found" }.to_string(),
@@ -835,6 +848,7 @@ fn dep_remove(
             dep_type,
             action: if removed { "removed" } else { "not_found" }.to_string(),
             warnings: Vec::new(),
+            capacity_warnings,
         };
         if ctx.is_toon() {
             ctx.toon(&result);
@@ -3124,6 +3138,7 @@ mod tests {
             dep_type: "blocks".to_string(),
             action: "added".to_string(),
             warnings: Vec::new(),
+            capacity_warnings: Vec::new(),
         };
 
         let json = serde_json::to_string(&result).unwrap();

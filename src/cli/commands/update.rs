@@ -998,6 +998,16 @@ fn execute_prepared_route_with_resources(
         let label_diff = label_diffs.remove(id).unwrap_or_default();
 
         // Apply parent
+        if parent_changes_cache {
+            // Each parent mutation can now release dependency-only holds.
+            // The scalar batch above consumed its one-mutation attribution;
+            // restage it for every parent write so scoped capacity admission
+            // and the resulting audit keep this command's harness/session.
+            prepared
+                .storage_ctx
+                .storage
+                .set_pending_event_attribution(prepared.attribution.clone());
+        }
         let parent_result = apply_parent_update(
             &mut prepared.storage_ctx,
             !route_has_mutated,
@@ -1018,6 +1028,9 @@ fn execute_prepared_route_with_resources(
             parent_result,
         )?;
         if parent_changes_cache {
+            // A subsequent mutation clears the storage warning slot. Retain
+            // each automatic release's evidence before the next parent write.
+            capacity_warnings.extend(prepared.storage_ctx.storage.take_capacity_warnings());
             route_has_mutated = true;
             blocked_cache_dirty = true;
         }

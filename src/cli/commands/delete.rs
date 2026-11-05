@@ -6,8 +6,8 @@
 use crate::cli::DeleteArgs;
 use crate::cli::commands::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, report_auto_flush_failure, resolve_issue_ids,
-    retry_mutation_with_jsonl_recovery,
+    auto_import_storage_ctx_if_stale, event_attribution_from_env, report_auto_flush_failure,
+    resolve_issue_ids, retry_mutation_with_jsonl_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -32,6 +32,8 @@ pub struct DeleteResult {
     pub events_removed: usize,
     pub references_updated: usize,
     pub orphaned_issues: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
 impl DeleteResult {
@@ -44,6 +46,7 @@ impl DeleteResult {
             events_removed: 0,
             references_updated: 0,
             orphaned_issues: Vec::new(),
+            capacity_warnings: Vec::new(),
         }
     }
 }
@@ -288,6 +291,7 @@ pub fn execute(
 
         // 6. Get actor
         let actor = config::resolve_actor(&config_layer);
+        let attribution = event_attribution_from_env();
 
         // 7. Perform deletion
         let mut result = DeleteResult::new();
@@ -300,8 +304,14 @@ pub fn execute(
                 !batch_has_mutated,
                 "delete remove dependencies",
                 Some(id.as_str()),
-                |storage| storage.remove_all_dependencies_preserving_status(id, &actor, &final_ids),
+                |storage| {
+                    storage.set_pending_event_attribution(attribution.clone());
+                    storage.remove_all_dependencies_preserving_status(id, &actor, &final_ids)
+                },
             )?;
+            result
+                .capacity_warnings
+                .extend(storage_ctx.storage.take_capacity_warnings());
             result.dependencies_removed += deps_removed;
             if deps_removed > 0 {
                 batch_has_mutated = true;
@@ -324,7 +334,10 @@ pub fn execute(
                     !batch_has_mutated,
                     "delete purge",
                     Some(id.as_str()),
-                    |storage| storage.purge_issue(id, &actor),
+                    |storage| {
+                        storage.set_pending_event_attribution(attribution.clone());
+                        storage.purge_issue(id, &actor)
+                    },
                 )?;
             } else {
                 retry_mutation_with_jsonl_recovery(
@@ -332,9 +345,15 @@ pub fn execute(
                     !batch_has_mutated,
                     "delete tombstone",
                     Some(id.as_str()),
-                    |storage| storage.delete_issue(id, &actor, &args.reason, None),
+                    |storage| {
+                        storage.set_pending_event_attribution(attribution.clone());
+                        storage.delete_issue(id, &actor, &args.reason, None)
+                    },
                 )?;
             }
+            result
+                .capacity_warnings
+                .extend(storage_ctx.storage.take_capacity_warnings());
             batch_has_mutated = true;
             result.deleted.push(id.clone());
         }
@@ -363,6 +382,10 @@ pub fn execute(
 
     if ctx.is_quiet() {
         return Ok(());
+    }
+
+    for warning in &result.capacity_warnings {
+        ctx.warning(&warning.to_string());
     }
 
     if ctx.is_rich() {
@@ -596,6 +619,10 @@ fn execute_routed(
         return Ok(());
     }
 
+    for warning in &result.capacity_warnings {
+        ctx.warning(&warning.to_string());
+    }
+
     ctx.success(&format!("Deleted {} issue(s)", result.deleted_count));
     for id in &result.deleted {
         ctx.print_line(&format!("  - {}", delete_display_text(id)));
@@ -692,6 +719,7 @@ fn apply_delete_route(
     auto_import_storage_ctx_if_stale(&mut storage_ctx, &route.route_cli)?;
     let config_layer = storage_ctx.load_config(&route.route_cli)?;
     let actor = config::resolve_actor(&config_layer);
+    let attribution = event_attribution_from_env();
 
     let mut result = DeleteResult::new();
     let mut batch_has_mutated = false;
@@ -702,6 +730,7 @@ fn apply_delete_route(
             "delete remove dependencies",
             Some(id.as_str()),
             |storage| {
+                storage.set_pending_event_attribution(attribution.clone());
                 storage.remove_all_dependencies_preserving_status(
                     id,
                     &actor,
@@ -709,6 +738,9 @@ fn apply_delete_route(
                 )
             },
         )?;
+        result
+            .capacity_warnings
+            .extend(storage_ctx.storage.take_capacity_warnings());
         result.dependencies_removed += deps_removed;
         if deps_removed > 0 {
             batch_has_mutated = true;
@@ -728,7 +760,10 @@ fn apply_delete_route(
                 !batch_has_mutated,
                 "delete purge",
                 Some(id.as_str()),
-                |storage| storage.purge_issue(id, &actor),
+                |storage| {
+                    storage.set_pending_event_attribution(attribution.clone());
+                    storage.purge_issue(id, &actor)
+                },
             )?;
         } else {
             retry_mutation_with_jsonl_recovery(
@@ -736,9 +771,15 @@ fn apply_delete_route(
                 !batch_has_mutated,
                 "delete tombstone",
                 Some(id.as_str()),
-                |storage| storage.delete_issue(id, &actor, &args.reason, None),
+                |storage| {
+                    storage.set_pending_event_attribution(attribution.clone());
+                    storage.delete_issue(id, &actor, &args.reason, None)
+                },
             )?;
         }
+        result
+            .capacity_warnings
+            .extend(storage_ctx.storage.take_capacity_warnings());
         batch_has_mutated = true;
         result.deleted.push(id.clone());
     }
@@ -841,6 +882,9 @@ fn render_routed_delete_preview(ctx: &OutputContext, preview: &DeletePreviewResu
 
 fn merge_delete_result(result: &mut DeleteResult, mut batch_result: DeleteResult) {
     result.deleted.append(&mut batch_result.deleted);
+    result
+        .capacity_warnings
+        .append(&mut batch_result.capacity_warnings);
     result.dependencies_removed += batch_result.dependencies_removed;
     result.labels_removed += batch_result.labels_removed;
     result.events_removed += batch_result.events_removed;

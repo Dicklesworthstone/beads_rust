@@ -1482,7 +1482,9 @@ fn ready_cli_quiet_suppresses_truncation_note() {
 /// satisfied dependency graph as permission to remove a manual block.
 mod dependency_unblock {
     use super::*;
+    use beads_rust::franken_sync::Connection;
     use common::cli::{BrRun, run_br_with_env};
+    use fsqlite_types::SqliteValue;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -1500,7 +1502,7 @@ mod dependency_unblock {
 
     fn json(workspace: &BrWorkspace, args: &[&str], label: &str) -> Value {
         let result = success(workspace, args, label);
-        serde_json::from_str(&extract_json_payload(&result.stdout))
+        serde_json::from_str(&result.stdout)
             .unwrap_or_else(|error| panic!("{label}: {error}: {}", result.stdout))
     }
 
@@ -1523,7 +1525,7 @@ mod dependency_unblock {
     ) -> Value {
         let result = attributed_command(workspace, args, attribution, label);
         assert!(result.status.success(), "{label}: {result:?}");
-        serde_json::from_str(&extract_json_payload(&result.stdout))
+        serde_json::from_str(&result.stdout)
             .unwrap_or_else(|error| panic!("{label}: {error}: {}", result.stdout))
     }
 
@@ -1550,6 +1552,37 @@ mod dependency_unblock {
             &["dep", "add", dependent, blocker, "--type", kind],
             "unblock_add_dependency",
         );
+    }
+
+    fn retarget_fixture_blocker(
+        workspace: &BrWorkspace,
+        previous: &str,
+        replacement: &str,
+        expected_edges: usize,
+    ) {
+        // Public deletion deliberately removes incoming edges, and JSONL
+        // import cleans dangling targets. Retarget only this fixture's edges
+        // to exercise an existing database with unresolved local references.
+        let conn = Connection::open(
+            workspace
+                .root
+                .join(".beads/beads.db")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("open dependency fixture");
+        assert_eq!(
+            conn.execute_with_params(
+                "UPDATE dependencies SET depends_on_id = ? WHERE depends_on_id = ?",
+                &[SqliteValue::from(replacement), SqliteValue::from(previous)],
+            )
+            .expect("retarget fixture dependencies"),
+            expected_edges,
+        );
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('blocked_cache_state', 'stale')",
+        )
+        .expect("invalidate fixture blocked cache");
     }
 
     fn block(workspace: &BrWorkspace, id: &str, dependency_only: bool) {
@@ -1609,6 +1642,45 @@ mod dependency_unblock {
         (blocker, dependent)
     }
 
+    fn parent_release_candidates(workspace: &BrWorkspace, count: usize) -> Vec<(String, String)> {
+        let blocker = create(workspace, "Unfinished ancestor prerequisite");
+        let ancestor = create(workspace, "Ancestor carrying the dependency gate");
+        dependency(workspace, &ancestor, &blocker);
+        (0..count)
+            .map(|index| {
+                let parent = create(workspace, &format!("Reparentable branch {index}"));
+                let child = create(workspace, &format!("Dependency-only child {index}"));
+                typed_dependency(workspace, &parent, &ancestor, "parent-child");
+                typed_dependency(workspace, &child, &parent, "parent-child");
+                block(workspace, &child, true);
+                (parent, child)
+            })
+            .collect()
+    }
+
+    fn parent_release_attribution(scope: &str) -> [(&'static str, &'static str); 4] {
+        [
+            (
+                "BR_HARNESS",
+                if scope == "harness" {
+                    "parent-scope"
+                } else {
+                    ""
+                },
+            ),
+            (
+                "BR_SESSION",
+                if scope == "session" {
+                    "parent-scope"
+                } else {
+                    ""
+                },
+            ),
+            ("BR_AGENT_NAME", "parent-release-worker"),
+            ("BR_MODEL", "parent-release-model"),
+        ]
+    }
+
     fn show(workspace: &BrWorkspace, id: &str) -> Value {
         json(workspace, &["show", id, "--json"], "unblock_show")[0].clone()
     }
@@ -1644,8 +1716,7 @@ mod dependency_unblock {
         let token = plan["plan_token"].as_str().expect("review token");
         let applied = apply(workspace, options, token);
         assert!(applied.status.success(), "repair: {applied:?}");
-        let result: Value =
-            serde_json::from_str(&extract_json_payload(&applied.stdout)).expect("repair report");
+        let result: Value = serde_json::from_str(&applied.stdout).expect("repair report");
         assert_eq!(result["plan_token"], token);
         result
     }
@@ -2084,6 +2155,154 @@ mod dependency_unblock {
     }
 
     #[test]
+    fn unblock_595_parent_updates_preserve_harness_and_session_hard_capacity() {
+        for scope in ["harness", "session"] {
+            for combined_update in [false, true] {
+                let workspace = workspace();
+                let candidates = parent_release_candidates(&workspace, 1);
+                let (parent, child) = &candidates[0];
+                let attribution = parent_release_attribution(scope);
+                attributed_json(
+                    &workspace,
+                    &["create", "Already occupies the scoped ready slot", "--json"],
+                    &attribution,
+                    "parent_capacity_occupant",
+                );
+                write_policy(
+                    &workspace,
+                    &format!(
+                        "workflow:\n  capacity:\n    scopes:\n      {scope}:\n        statuses:\n          open: {{hard: 1}}\n"
+                    ),
+                );
+                let mut args = vec!["update", parent, "--parent", "", "--json"];
+                if combined_update {
+                    // This earlier scalar transaction consumes its attribution.
+                    // The later parent operation must stage the same identity.
+                    args.extend_from_slice(&["--priority", "1"]);
+                }
+                let result = attributed_json(
+                    &workspace,
+                    &args,
+                    &attribution,
+                    "parent_hard_capacity_release",
+                );
+                assert_eq!(result[0]["id"], parent.as_str(), "{result}");
+                if combined_update {
+                    assert_eq!(show(&workspace, parent)["priority"], 1);
+                }
+                let deps = json(
+                    &workspace,
+                    &["dep", "list", parent, "--json"],
+                    "parent_gate_was_removed",
+                );
+                assert!(deps.as_array().expect("parent dependencies").is_empty());
+                assert_state(&workspace, child, "blocked", false);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn unblock_595_parent_batches_report_attributed_soft_capacity_warnings() {
+        for scope in ["harness", "session"] {
+            for combined_update in [false, true] {
+                let workspace = workspace();
+                let candidates = parent_release_candidates(&workspace, 2);
+                let attribution = parent_release_attribution(scope);
+                attributed_json(
+                    &workspace,
+                    &["create", "Already occupies a scoped ready slot", "--json"],
+                    &attribution,
+                    "parent_soft_capacity_occupant",
+                );
+                write_policy(
+                    &workspace,
+                    &format!(
+                        "workflow:\n  capacity:\n    scopes:\n      {scope}:\n        statuses:\n          open: {{soft: 1}}\n"
+                    ),
+                );
+                let mut args = vec!["update"];
+                args.extend(candidates.iter().map(|(parent, _)| parent.as_str()));
+                args.extend_from_slice(&["--parent", "", "--json"]);
+                if combined_update {
+                    args.extend_from_slice(&["--priority", "1"]);
+                }
+                let result = attributed_json(
+                    &workspace,
+                    &args,
+                    &attribution,
+                    "parent_soft_capacity_batch",
+                );
+                assert_eq!(
+                    result["updated"].as_array().expect("updated parents").len(),
+                    2
+                );
+                let warnings = result["warnings"]
+                    .as_array()
+                    .expect("parent release warnings");
+                assert_eq!(warnings.len(), 2, "{scope}/{combined_update}: {result}");
+                let mut prospective = Vec::new();
+                for (_, child) in &candidates {
+                    let warning = warnings
+                        .iter()
+                        .find(|warning| warning["issue_id"] == child.as_str())
+                        .unwrap_or_else(|| panic!("missing warning for {child}: {result}"));
+                    assert_eq!(warning["scope"], scope);
+                    assert_eq!(warning["scope_key"], "parent-scope");
+                    prospective.push(warning["prospective"].as_u64().expect("prospective count"));
+                    assert_state(&workspace, child, "open", true);
+                }
+                prospective.sort_unstable();
+                assert_eq!(
+                    prospective,
+                    [2, 3],
+                    "each parent mutation retains its warning"
+                );
+
+                let stats = json(
+                    &workspace,
+                    &["stats", "--json"],
+                    "parent_capacity_occupancy",
+                );
+                let occupancy = stats["capacity"]
+                    .as_array()
+                    .expect("capacity stats")
+                    .iter()
+                    .find(|row| {
+                        row["scope"] == scope
+                            && row["scope_key"] == "parent-scope"
+                            && row["name"] == "open"
+                    })
+                    .unwrap_or_else(|| panic!("missing {scope} occupancy: {stats}"));
+                assert_eq!(occupancy["counted"], 3, "{stats}");
+
+                let storage = beads_rust::storage::SqliteStorage::open(
+                    &workspace.root.join(".beads/beads.db"),
+                )
+                .expect("open parent release audit");
+                for (_, child) in &candidates {
+                    let events = storage.get_events(child, 0).expect("child audit events");
+                    let event = events
+                        .iter()
+                        .find(|event| {
+                            event.event_type == beads_rust::model::EventType::StatusChanged
+                                && event.old_value.as_deref() == Some("blocked")
+                                && event.new_value.as_deref() == Some("open")
+                        })
+                        .expect("automatic release audit event");
+                    assert_eq!(event.actor, "repairer");
+                    assert_eq!(event.agent_name.as_deref(), Some("parent-release-worker"));
+                    assert_eq!(event.model.as_deref(), Some("parent-release-model"));
+                    assert_eq!(
+                        event.harness.as_deref(),
+                        (scope == "harness").then_some("parent-scope")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unblock_595_dependency_removal_preserves_intent_until_the_final_gate() {
         for final_action in ["remove", "close"] {
             let workspace = workspace();
@@ -2454,6 +2673,93 @@ mod dependency_unblock {
             serde_json::json!([epic])
         );
         assert!(ready_contains(&workspace, &epic));
+    }
+
+    #[test]
+    fn unblock_595_missing_local_blockers_cannot_be_authorized() {
+        for dep_type in ["blocks", "conditional-blocks", "waits-for"] {
+            let workspace = workspace();
+            let blocker = create(&workspace, "Completed local prerequisite");
+            let dependent = create(&workspace, "Blocked dependency-repair candidate");
+            let control = create(&workspace, "Open issue sharing the same prerequisite");
+            for id in [&dependent, &control] {
+                typed_dependency(&workspace, id, &blocker, dep_type);
+            }
+            block(&workspace, &dependent, false);
+            close(&workspace, &blocker);
+            retarget_fixture_blocker(&workspace, &blocker, "br-missing-local", 2);
+
+            // A missing target has no completion evidence. Verify this with
+            // the actual ready command on an open record, independently of
+            // the candidate's blocked workflow status.
+            assert!(!ready_contains(&workspace, &control), "{dep_type}");
+            let before = show(&workspace, &dependent);
+            let options = [dependent.as_str(), "--authorize", dependent.as_str()];
+            let plan = preview(&workspace, &options);
+            let skipped = candidate(&plan, &dependent).expect("missing-target candidate");
+            assert_eq!(skipped["eligible"], false, "{dep_type}: {plan}");
+            assert_eq!(
+                skipped["reason"], "remaining_blockers",
+                "{dep_type}: {plan}"
+            );
+            assert!(
+                skipped["detail"]
+                    .as_str()
+                    .expect("candidate detail")
+                    .contains("br-missing-local"),
+                "missing blocker must remain visible: {plan}",
+            );
+            let report = repair(&workspace, &options);
+            assert_eq!(report["changed"], serde_json::json!([]), "{dep_type}");
+            assert_eq!(report["skipped"], serde_json::json!([dependent]));
+            assert_eq!(show(&workspace, &dependent), before, "{dep_type}");
+
+            // Restoring the edge to its closed target supplies the completion
+            // evidence. The same explicit authorization may now recover it.
+            retarget_fixture_blocker(&workspace, "br-missing-local", &blocker, 2);
+            let report = repair(&workspace, &options);
+            assert_eq!(report["changed"], serde_json::json!([dependent]));
+            assert!(ready_contains(&workspace, &dependent), "{dep_type}");
+            assert!(ready_contains(&workspace, &control), "{dep_type}");
+        }
+    }
+
+    #[test]
+    fn unblock_595_missing_parent_blocker_cannot_be_authorized() {
+        let workspace = workspace();
+        let (completed, child) = pair(&workspace, false);
+        let parent = create(&workspace, "Parent with an unresolved prerequisite");
+        let parent_blocker = create(&workspace, "Completed parent prerequisite");
+        let sibling = create(&workspace, "Open sibling under the same parent");
+        dependency(&workspace, &parent, &parent_blocker);
+        for id in [&child, &sibling] {
+            success(
+                &workspace,
+                &["update", id, "--parent", &parent],
+                "unblock_set_missing_target_parent",
+            );
+        }
+        close(&workspace, &completed);
+        close(&workspace, &parent_blocker);
+        retarget_fixture_blocker(&workspace, &parent_blocker, "br-missing-parent", 1);
+
+        assert!(!ready_contains(&workspace, &sibling));
+        let before = show(&workspace, &child);
+        let options = [child.as_str(), "--authorize", child.as_str()];
+        let plan = preview(&workspace, &options);
+        let skipped = candidate(&plan, &child).expect("inherited missing-target candidate");
+        assert_eq!(skipped["eligible"], false, "{plan}");
+        assert_eq!(skipped["reason"], "remaining_blockers", "{plan}");
+        let report = repair(&workspace, &options);
+        assert_eq!(report["changed"], serde_json::json!([]));
+        assert_eq!(report["skipped"], serde_json::json!([child]));
+        assert_eq!(show(&workspace, &child), before);
+
+        retarget_fixture_blocker(&workspace, "br-missing-parent", &parent_blocker, 1);
+        let report = repair(&workspace, &options);
+        assert_eq!(report["changed"], serde_json::json!([child]));
+        assert!(ready_contains(&workspace, &child));
+        assert!(ready_contains(&workspace, &sibling));
     }
 
     #[test]
