@@ -764,6 +764,182 @@ fn chokepoint_dry_run_on_healthy_workspace_creates_no_gitignore() {
 }
 
 #[test]
+fn doctor_dependency_readiness_matches_configured_group_and_preserves_ready_blocked() {
+    let temp = isolated_tempdir();
+    let root = temp.path();
+    br_init(root);
+    let checked = |args: &[&str]| {
+        let output = br_cmd(root).args(args).output().unwrap();
+        assert!(output.status.success(), "br {args:?}: {output:?}");
+        output
+    };
+    let create = |title: &str| {
+        let output = checked(&["create", title, "--json"]);
+        let issue: Value = serde_json::from_slice(&output.stdout).unwrap();
+        issue["id"].as_str().unwrap().to_string()
+    };
+    let blocker = create("Completed prerequisite");
+    let open = create("Open outside the ready group");
+    let rework = create("Custom ready status");
+    let blocked = create("Blocked explicitly included in ready group");
+    for id in [&open, &rework, &blocked] {
+        checked(&["dep", "add", id, &blocker]);
+    }
+    checked(&["close", &blocker]);
+    checked(&["update", &rework, "--status", "rework"]);
+    checked(&["update", &blocked, "--status", "blocked"]);
+    fs::write(
+        root.join(".beads/policy.yaml"),
+        "workflow:\n  strict: true\n  statuses: [open, blocked, rework, closed]\n  status_groups:\n    ready: [rework, blocked]\n",
+    )
+    .unwrap();
+
+    let ready = checked(&["ready", "--json"]);
+    let ready: Value = serde_json::from_slice(&ready.stdout).unwrap();
+    let ready = ready.as_array().unwrap();
+    assert_eq!(ready.len(), 2, "{ready:?}");
+    for id in [&rework, &blocked] {
+        assert!(ready.iter().any(|issue| issue["id"] == id.as_str()));
+    }
+    let doctor = br_cmd(root).args(["doctor", "--json"]).output().unwrap();
+    assert!(
+        doctor.status.success() || doctor.status.code() == Some(1),
+        "{doctor:?}"
+    );
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let classification = doctor_check(&doctor, "dep.fully_unblocked_open");
+    assert_eq!(classification["status"], "ok", "{classification}");
+    assert_eq!(
+        classification["details"]["stale_blocked"],
+        serde_json::json!([])
+    );
+    for id in [&rework, &blocked] {
+        assert!(
+            classification["details"]["ready"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|ready_id| ready_id == id.as_str())
+        );
+    }
+    assert_eq!(classification["details"]["excluded"][0]["id"], open);
+
+    let plan = checked(&[
+        "doctor",
+        "unblock",
+        &blocked,
+        "--authorize",
+        &blocked,
+        "--json",
+    ]);
+    let plan: Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert_eq!(plan["planned_ids"], serde_json::json!([]));
+    assert_eq!(plan["candidates"][0]["reason"], "already_ready_status");
+    let applied = checked(&[
+        "doctor",
+        "unblock",
+        &blocked,
+        "--authorize",
+        &blocked,
+        "--apply",
+        "--expect",
+        plan["plan_token"].as_str().unwrap(),
+        "--json",
+    ]);
+    let applied: Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(applied["changed"], serde_json::json!([]));
+    let shown = checked(&["show", &blocked, "--json"]);
+    let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown[0]["status"], "blocked");
+}
+
+#[test]
+fn doctor_unblock_recovers_preserved_proof_after_parent_removal_policy_refusal() {
+    let temp = isolated_tempdir();
+    let root = temp.path();
+    br_init(root);
+    let checked = |args: &[&str]| {
+        let output = br_cmd(root)
+            .args(["--actor", "repair-operator"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "br {args:?}: {output:?}");
+        output
+    };
+    let json = |args: &[&str]| -> Value {
+        serde_json::from_slice(&checked(args).stdout).expect("command JSON")
+    };
+    let create = |title: &str| {
+        json(&["create", title, "--json"])["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let gate = create("Live parent prerequisite");
+    let parent = create("Parent carrying the only prerequisite");
+    let child = create("Child with dependency-only inherited hold");
+    checked(&["dep", "add", &parent, &gate]);
+    checked(&["update", &child, "--parent", &parent]);
+    checked(&[
+        "update",
+        &child,
+        "--status",
+        "blocked",
+        "--blocked-by-dependencies",
+    ]);
+
+    let policy = root.join(".beads/policy.yaml");
+    fs::write(
+        &policy,
+        "workflow:\n  strict: true\n  statuses: [open, blocked, closed]\n  transitions:\n    blocked: []\n",
+    )
+    .unwrap();
+    // Removing this relation changes the child's own revision and removes
+    // its only gate. The refused automatic release must renew the original
+    // dependency-only proof without inventing operator authorization.
+    checked(&["update", &child, "--parent", ""]);
+    assert_eq!(json(&["show", &child, "--json"])[0]["status"], "blocked");
+    assert_eq!(json(&["show", &gate, "--json"])[0]["status"], "open");
+    let refused = json(&["doctor", "unblock", &child, "--json"]);
+    assert_eq!(refused["planned_ids"], serde_json::json!([]));
+    assert_eq!(refused["candidates"][0]["reason"], "workflow_policy");
+    assert_eq!(refused["candidates"][0]["provenance"], "dependency_only");
+
+    fs::write(
+        &policy,
+        "workflow:\n  strict: true\n  statuses: [open, blocked, closed]\n  transitions:\n    blocked: [open]\n",
+    )
+    .unwrap();
+    let before_preview = complete_workspace_inventory(root);
+    let plan = json(&["doctor", "unblock", &child, "--dry-run", "--json"]);
+    assert_complete_workspace_unchanged(root, &before_preview);
+    assert_eq!(plan["planned_ids"], serde_json::json!([child]));
+    assert_eq!(plan["candidates"][0]["provenance"], "dependency_only");
+    assert_eq!(plan["candidates"][0]["to_status"], "open");
+    let applied = json(&[
+        "doctor",
+        "unblock",
+        &child,
+        "--apply",
+        "--expect",
+        plan["plan_token"].as_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(applied["plan_token"], plan["plan_token"]);
+    assert_eq!(applied["changed"], serde_json::json!([child]));
+    assert_eq!(json(&["show", &child, "--json"])[0]["status"], "open");
+    let ready = json(&["ready", "--limit", "0", "--json"]);
+    assert!(
+        ready
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["id"] == child)
+    );
+}
+
+#[test]
 fn doctor_repair_previews_do_not_create_a_missing_database_or_lock_files() {
     let tmp = isolated_tempdir();
     let root = tmp.path();

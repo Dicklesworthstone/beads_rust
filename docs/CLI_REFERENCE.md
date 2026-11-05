@@ -2476,8 +2476,16 @@ caused only by dependencies. Older records, imported records without evidence,
 and records with a manual or external hold remain unchanged unless their exact
 IDs are authorized. `--authorize` never overrides a live blocker, parent-child
 gate, future deferral, pin, template/wisp exclusion, another actor's assignment,
-or workflow policy. Issues without forward blocking edges are outside this
-repair's scope.
+or workflow policy. Repair recomputes these gates from the current database,
+including missing local targets and unresolved external dependencies inherited
+through parents; an incomplete dependency cannot be authorized away. Issues
+without forward blocking edges or a current dependency-only declaration are
+outside this repair's scope. Proven inherited-parent and epic-child waits can
+be recovered after their gates disappear.
+
+The dependency diagnostic uses `workflow.status_groups.ready`, including custom
+statuses. A `blocked` status explicitly included in that group is not stale,
+and the repair leaves it unchanged even when its exact ID is authorized.
 
 For future work, declare dependency-only intent when setting the block:
 
@@ -2486,11 +2494,27 @@ br update br-example --status blocked --blocked-by-dependencies
 ```
 
 This declaration requires a real transition from an actionable status and live
-dependency blockers. Its local audit evidence is bound to the resulting issue
-revision and relations. Subsequent manual edits, including reasserting
-`blocked`, invalidate the evidence. Missing evidence after an import or database
-rebuild is treated as ambiguous. A plain `--status blocked` continues to make
-no dependency-only declaration.
+dependency or parent-child gates. Its local audit evidence is bound to the
+resulting issue revision and relations. When a local close, tombstone,
+dependency removal, or parent change clears the final gate, the same storage
+transaction automatically restores eligible work to a ready status. Multiple
+blockers, inherited gates and unfinished epic children continue to protect the
+dependent until all of them are satisfied.
+
+Automatic release prefers the recorded previous ready status when the current
+workflow permits it. Otherwise, exactly one permitted actionable ready status
+must exist. It never assigns claimed, deferred, draft, pinned or terminal
+statuses. Ambiguous destinations, another actor's assignment, unresolved
+external prerequisites, required fields, workflow gates and capacity refusals
+leave the dependent blocked. The source completion can still succeed; the
+guarded repair explains and rechecks the remaining restriction.
+
+Subsequent manual edits, including reasserting `blocked`, invalidate the
+declaration. Removing some existing gates preserves the declaration for the
+remaining gates; introducing new gates does not silently renew it. An explicit
+status requested in the same command takes precedence over automatic release.
+Missing evidence after an import or database rebuild is treated as ambiguous.
+A plain `--status blocked` continues to make no dependency-only declaration.
 
 The JSON preview includes `plan_token`, `candidates`, `planned_ids`,
 `skipped_ids`, and `capacity_warnings`. Each candidate names its eligibility,
@@ -2517,12 +2541,11 @@ remain present in the committed receipt. Preview never imports JSONL or repairs
 storage; unimported JSONL changes must be synchronized before reviewing a plan.
 This initial repair requires database mode.
 
-Closing or tombstoning a blocker does not automatically reopen dependent
-issues. Run the guarded repair after those operations. A `supersedes` relation
-or custom `superseded` status does not itself make a blocker terminal. Automatic
-unblocking would need to evaluate proven dependency-only intent, ownership and
-workflow rules within the terminal operation's own transaction; graph-stale
-status alone is insufficient. This dedicated command is discoverable through
+Older blocked records and completions imported from another workspace can
+still need the reviewed repair. A `supersedes` relation or custom `superseded`
+status does not itself make a blocker terminal; closing it with a superseded
+reason does. `close --suggest-next` uses the configured ready-status group and
+the same readiness exclusions as `br ready`. The dedicated repair is discoverable through
 `br doctor explain dep.fully_unblocked_open`; it does not run as part of generic
 `doctor --repair` or restore raw database files through `doctor undo`.
 

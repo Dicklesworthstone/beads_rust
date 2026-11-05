@@ -8151,6 +8151,23 @@ impl SqliteStorage {
                 )?;
                 ctx.capacity_warnings.extend(capacity_warnings);
 
+                let mut completed_ids = transitions
+                    .iter()
+                    .filter(|transition| {
+                        matches!(transition.to.as_str(), "closed" | "tombstone")
+                            && !transition.from.as_deref().is_some_and(|status| {
+                                matches!(status, "closed" | "tombstone")
+                            })
+                    })
+                    .map(|transition| transition.issue_id.clone())
+                    .collect::<Vec<_>>();
+                completed_ids.sort();
+                let automatic_before = if completed_ids.is_empty() {
+                    None
+                } else {
+                    Some(Self::capture_automatic_dependency_unblock_in_tx(conn, actor)?)
+                };
+
                 for (index, (id, update)) in updates.iter().enumerate() {
                     if dependency_unblock_guard.is_some() {
                         dependency_repair::check_repair_interruption()?;
@@ -8216,6 +8233,19 @@ impl SqliteStorage {
                             actor,
                         )?;
                     }
+                }
+
+                if let Some(before) = &automatic_before {
+                    let preserve_status_for = updates.iter().map(|(id, _)| id.as_str()).collect();
+                    Self::apply_automatic_dependency_unblock_in_tx(
+                        conn,
+                        ctx,
+                        before,
+                        &workflow_policy,
+                        &capacity_policy,
+                        &preserve_status_for,
+                        &format!("completing {}", completed_ids.join(", ")),
+                    )?;
                 }
                 Ok(())
             })?;
@@ -8942,6 +8972,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the issue doesn't exist or the update fails.
+    #[allow(clippy::too_many_lines)]
     pub fn delete_issue(
         &mut self,
         id: &str,
@@ -8949,25 +8980,27 @@ impl SqliteStorage {
         reason: &str,
         deleted_at: Option<DateTime<Utc>>,
     ) -> Result<Issue> {
-        let issue = self
-            .get_issue(id)?
-            .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
-
-        if issue.status == Status::Tombstone {
-            return Ok(issue);
-        }
-
-        let was_terminal = issue.status.is_terminal();
-        let previous_status = issue.status.as_str().to_string();
-        let original_type = issue.issue_type.as_str().to_string();
         let timestamp = deleted_at.unwrap_or_else(Utc::now);
-        let mut tombstone_issue = issue;
-        tombstone_issue.status = Status::Tombstone;
-        let tombstone_hash = crate::util::content_hash(&tombstone_issue);
-
         let capacity_policy = self.workflow_capacity_policy.clone();
-        let tombstone_assignee = tombstone_issue.assignee.clone();
+        let workflow_policy = self.workflow_transition_policy.clone();
         self.mutate("delete_issue", actor, |conn, ctx| {
+            let mut issue = Self::get_issue_from_conn(conn, id)?
+                .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
+            if issue.status == Status::Tombstone {
+                return Ok(());
+            }
+            let was_terminal = issue.status.is_terminal();
+            let previous_status = issue.status.as_str().to_string();
+            let original_type = issue.issue_type.as_str().to_string();
+            let automatic_before = if was_terminal {
+                None
+            } else {
+                Some(Self::capture_automatic_dependency_unblock_in_tx(
+                    conn, actor,
+                )?)
+            };
+            issue.status = Status::Tombstone;
+            let tombstone_hash = crate::util::content_hash(&issue);
             let acting = CapacityActingContext::new(&ctx.actor, &ctx.attribution);
             let capacity_warnings = Self::enforce_workflow_capacity_in_tx(
                 conn,
@@ -8977,8 +9010,8 @@ impl SqliteStorage {
                 "tombstone",
                 None,
                 CapacityTransitionAssignee {
-                    current: tombstone_assignee.as_deref(),
-                    prospective: tombstone_assignee.as_deref(),
+                    current: issue.assignee.as_deref(),
+                    prospective: issue.assignee.as_deref(),
                 },
                 &acting,
             )?;
@@ -9031,6 +9064,18 @@ impl SqliteStorage {
             }
             ctx.mark_dirty(id);
             ctx.invalidate_cache();
+
+            if let Some(before) = &automatic_before {
+                Self::apply_automatic_dependency_unblock_in_tx(
+                    conn,
+                    ctx,
+                    before,
+                    &workflow_policy,
+                    &capacity_policy,
+                    &HashSet::from([id]),
+                    &format!("deleting {id}"),
+                )?;
+            }
 
             Ok(())
         })?;
@@ -13347,11 +13392,18 @@ impl SqliteStorage {
         &self,
         external_statuses: &HashMap<String, bool>,
     ) -> Result<HashMap<String, Vec<String>>> {
+        Self::external_blockers_impl(&self.conn, external_statuses)
+    }
+
+    fn external_blockers_impl(
+        conn: &Connection,
+        external_statuses: &HashMap<String, bool>,
+    ) -> Result<HashMap<String, Vec<String>>> {
         let mut blockers: HashMap<String, Vec<String>> = HashMap::new();
 
         // Direct external blockers.
         // 1. Local issues blocked by external targets (standard blocking types)
-        let rows = self.conn.query(
+        let rows = conn.query(
             "SELECT issue_id, depends_on_id
              FROM dependencies
              WHERE depends_on_id LIKE 'external:%'
@@ -13376,7 +13428,7 @@ impl SqliteStorage {
         // 2. Local epic parents blocked by external children. This mirrors
         // `load_local_open_child_blockers_impl`: child-open rollup is an epic
         // aggregation rule, not a property of every parent-child edge.
-        let rows = self.conn.query(
+        let rows = conn.query(
             "SELECT d.depends_on_id, d.issue_id
              FROM dependencies d
              JOIN issues p ON d.depends_on_id = p.id
@@ -13398,7 +13450,7 @@ impl SqliteStorage {
         }
 
         // Propagate externally blocked parents down through local parent-child relationships.
-        let edge_rows = self.conn.query(
+        let edge_rows = conn.query(
             "SELECT issue_id, depends_on_id
              FROM dependencies
              WHERE type = 'parent-child'
@@ -14134,6 +14186,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database update fails.
+    #[allow(clippy::too_many_lines)]
     pub fn remove_dependency(
         &mut self,
         issue_id: &str,
@@ -14143,6 +14196,8 @@ impl SqliteStorage {
     ) -> Result<bool> {
         let dep_type =
             dep_type.map(|kind| Self::canonical_standard_dependency_type(kind).unwrap_or(kind));
+        let workflow = self.workflow_transition_policy.clone();
+        let capacity = self.workflow_capacity_policy.clone();
         self.mutate("remove_dependency", actor, |conn, ctx| {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "remove dependency from")?;
 
@@ -14169,6 +14224,14 @@ impl SqliteStorage {
                 })?
             };
 
+            let automatic_before = if matches!(
+                selected_type,
+                "blocks" | "conditional-blocks" | "waits-for" | "parent-child"
+            ) {
+                Some(Self::capture_automatic_dependency_unblock_in_tx(conn, actor)?)
+            } else {
+                None
+            };
             let rows = conn.execute_with_params(
                 "DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ? AND type = ?",
                 &[
@@ -14195,6 +14258,17 @@ impl SqliteStorage {
                 ctx.mark_dirty(issue_id);
                 // Defer rebuild for the same reason as add_dependency_with_metadata.
                 ctx.invalidate_cache_deferred();
+                if let Some(before) = &automatic_before {
+                    Self::apply_automatic_dependency_unblock_in_tx(
+                        conn,
+                        ctx,
+                        before,
+                        &workflow,
+                        &capacity,
+                        &HashSet::new(),
+                        &format!("removing dependency {issue_id} -> {depends_on_id} ({selected_type})"),
+                    )?;
+                }
             }
 
             Ok(rows > 0)
@@ -14207,7 +14281,24 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn remove_all_dependencies(&mut self, issue_id: &str, actor: &str) -> Result<usize> {
+        self.remove_all_dependencies_preserving_status(issue_id, actor, &[])
+    }
+
+    /// Preserve every pending deletion's status while dependency cleanup can
+    /// unblock surviving issues in the same transaction.
+    pub(crate) fn remove_all_dependencies_preserving_status(
+        &mut self,
+        issue_id: &str,
+        actor: &str,
+        preserve_status_for: &[String],
+    ) -> Result<usize> {
+        let workflow = self.workflow_transition_policy.clone();
+        let capacity = self.workflow_capacity_policy.clone();
+        let mut preserved_ids: HashSet<&str> =
+            preserve_status_for.iter().map(String::as_str).collect();
+        preserved_ids.insert(issue_id);
         self.mutate("remove_all_dependencies", actor, |conn, ctx| {
+            let automatic_before = Self::capture_automatic_dependency_unblock_in_tx(conn, actor)?;
             let affected_rows = conn.query_with_params(
                 "SELECT DISTINCT issue_id FROM dependencies WHERE depends_on_id = ?",
                 &[SqliteValue::from(issue_id)],
@@ -14260,6 +14351,15 @@ impl SqliteStorage {
                 cache_ids.push(issue_id);
                 cache_ids.extend(affected.iter().map(String::as_str));
                 ctx.invalidate_cache_for(&cache_ids);
+                Self::apply_automatic_dependency_unblock_in_tx(
+                    conn,
+                    ctx,
+                    &automatic_before,
+                    &workflow,
+                    &capacity,
+                    &preserved_ids,
+                    &format!("removing dependencies for deleted issue {issue_id}"),
+                )?;
             }
 
             Ok(total)
@@ -14272,6 +14372,8 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn remove_parent(&mut self, issue_id: &str, actor: &str) -> Result<bool> {
+        let workflow = self.workflow_transition_policy.clone();
+        let capacity = self.workflow_capacity_policy.clone();
         self.mutate("remove_parent", actor, |conn, ctx| {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "clear parent from")?;
 
@@ -14283,6 +14385,12 @@ impl SqliteStorage {
                 .iter()
                 .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_string))
                 .collect::<Vec<_>>();
+
+            let automatic_before = if previous_parents.is_empty() {
+                None
+            } else {
+                Some(Self::capture_automatic_dependency_unblock_in_tx(conn, actor)?)
+            };
 
             let rows = conn.execute_with_params(
                 "DELETE FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
@@ -14312,6 +14420,17 @@ impl SqliteStorage {
                     }
                 }
                 ctx.invalidate_cache_for(&cache_ids);
+                if let Some(before) = &automatic_before {
+                    Self::apply_automatic_dependency_unblock_in_tx(
+                        conn,
+                        ctx,
+                        before,
+                        &workflow,
+                        &capacity,
+                        &HashSet::new(),
+                        &format!("removing parent of {issue_id}"),
+                    )?;
+                }
             }
 
             Ok(rows > 0)
@@ -14344,6 +14463,28 @@ impl SqliteStorage {
         actor: &str,
         skip_cache_rebuild: bool,
     ) -> Result<()> {
+        self.set_parent_with_options_preserving_status(
+            issue_id,
+            parent_id,
+            actor,
+            skip_cache_rebuild,
+            &[],
+        )
+    }
+
+    /// Change hierarchy without automatically overriding explicit status
+    /// requests staged by the same CLI batch.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn set_parent_with_options_preserving_status(
+        &mut self,
+        issue_id: &str,
+        parent_id: Option<&str>,
+        actor: &str,
+        skip_cache_rebuild: bool,
+        preserve_status_for: &[String],
+    ) -> Result<()> {
+        let workflow = self.workflow_transition_policy.clone();
+        let capacity = self.workflow_capacity_policy.clone();
         self.mutate("set_parent", actor, |conn, ctx| {
             let action = if parent_id.is_some() {
                 "set parent on"
@@ -14366,6 +14507,8 @@ impl SqliteStorage {
             {
                 return Ok(());
             }
+
+            let automatic_before = Self::capture_automatic_dependency_unblock_in_tx(conn, actor)?;
 
             // Remove existing parent
             conn.execute_with_params(
@@ -14439,6 +14582,16 @@ impl SqliteStorage {
                 }
                 ctx.invalidate_cache_for(&cache_ids);
             }
+            let preserve_status_for = preserve_status_for.iter().map(String::as_str).collect();
+            Self::apply_automatic_dependency_unblock_in_tx(
+                conn,
+                ctx,
+                &automatic_before,
+                &workflow,
+                &capacity,
+                &preserve_status_for,
+                &format!("changing parent of {issue_id}"),
+            )?;
             Ok(())
         })
     }

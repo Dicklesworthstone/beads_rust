@@ -13684,7 +13684,20 @@ fn inspect_doctor_jsonl(
         && matches!(jsonl_count, JsonlCountState::Available(_))
         && let Some(path) = jsonl_path.as_ref()
     {
-        check_dependency_graph_jsonl(path, checks);
+        match crate::close_policy::load_for_beads_dir(beads_dir).and_then(|policy| {
+            policy.workflow.validate_ready_status_group()?;
+            Ok(policy.workflow.ready_status_group())
+        }) {
+            Ok(ready_statuses) => {
+                check_dependency_graph_jsonl_with_ready_statuses(path, &ready_statuses, checks);
+            }
+            Err(error) => push_inspection_error(
+                checks,
+                "dep.fully_unblocked_open",
+                "Cannot classify ready work without a valid workflow policy",
+                &error,
+            ),
+        }
     }
 
     (jsonl_path, jsonl_count)
@@ -13708,7 +13721,8 @@ fn inspect_doctor_jsonl(
 ///   not a defect — it is reported `Ok` with details, split into `ready`
 ///   (satisfies every `br ready` condition derivable from the record) and
 ///   `excluded` (deliberately kept off the ready queue: claimed, deferred,
-///   pinned, ephemeral/wisp, template, custom status, parent-child
+///   pinned, ephemeral/wisp, template, status outside the configured ready
+///   group, parent-child
 ///   hierarchy — with the reason named). The one derivable inconsistency —
 ///   status still `blocked` while nothing gates the issue any more — is
 ///   reported `Warn` (`stale_blocked`).
@@ -13732,7 +13746,16 @@ fn inspect_doctor_jsonl(
 /// `db.no_db_mode` pattern: fully visible and machine-readable without
 /// degrading a healthy workspace (`doctor.ok` treats every warn as a failed
 /// health check, #292).
+#[cfg(test)]
 fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
+    check_dependency_graph_jsonl_with_ready_statuses(path, &["open".to_string()], checks);
+}
+
+fn check_dependency_graph_jsonl_with_ready_statuses(
+    path: &Path,
+    ready_statuses: &[String],
+    checks: &mut Vec<CheckResult>,
+) {
     use crate::storage::sqlite::{
         BlockerFate, blocker_fate, forward_blocking_targets, fully_unblocked_issues,
     };
@@ -13755,7 +13778,7 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
         .map(|issue| (issue.id.as_str(), issue))
         .collect();
     // The same pure classification drives the transactional repair preflight.
-    let classified = fully_unblocked_issues(&issues);
+    let classified = fully_unblocked_issues(&issues, ready_statuses);
     let mut dead_edge_issues: Vec<serde_json::Value> = Vec::new();
     let mut dangling_edge_issue_ids: Vec<String> = Vec::new();
 
@@ -16957,6 +16980,47 @@ mod tests {
         // Satisfied-only edges: the dead-edge check stays Ok.
         let dead = find_check(&checks, "dep.dead_closed_blocking_edges").unwrap();
         assert_eq!(dead.status, CheckStatus::Ok, "{dead:?}");
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_uses_configured_ready_statuses() {
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let mut closed = sample_issue("bd-done", "completed blocker");
+        closed.status = Status::Closed;
+        closed.closed_at = Some(Utc::now());
+        write_issues_jsonl(
+            &jsonl,
+            &[
+                issue_with_blockers("bd-open", Status::Open, &["bd-done"]),
+                issue_with_blockers(
+                    "bd-rework",
+                    Status::Custom("rework".to_string()),
+                    &["bd-done"],
+                ),
+                issue_with_blockers("bd-blocked", Status::Blocked, &["bd-done"]),
+                closed,
+            ],
+        );
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl_with_ready_statuses(
+            &jsonl,
+            &["rework".to_string(), "blocked".to_string()],
+            &mut checks,
+        );
+        let unblocked = find_check(&checks, "dep.fully_unblocked_open").unwrap();
+        assert_eq!(unblocked.status, CheckStatus::Ok, "{unblocked:?}");
+        let details = unblocked.details.as_ref().unwrap();
+        assert_eq!(
+            details["ready"],
+            serde_json::json!(["bd-rework", "bd-blocked"])
+        );
+        assert_eq!(details["stale_blocked"], serde_json::json!([]));
+        assert_eq!(details["excluded"][0]["id"], "bd-open");
+        assert_eq!(
+            details["excluded"][0]["reasons"],
+            serde_json::json!(["status outside configured ready group"])
+        );
     }
 
     fn parent_child_dependency(child_id: &str, parent_id: &str) -> crate::model::Dependency {

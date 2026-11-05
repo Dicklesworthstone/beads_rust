@@ -21,8 +21,11 @@
   `src/cli/commands/doctor.rs` (`test_dep_graph_jsonl_*`) because
   planting a truly absent record requires surgery that `--repair`'s
   DB↔JSONL reconciliation would undo.
-- **Repair contract**: DETECT-ONLY. `--repair` must leave the planted
-  graph untouched and both informational payloads truthfully present.
+- **Repair contract**: satisfied edges and the already-open dependent are
+  informational. Both generic `--repair` and `doctor unblock` must leave the
+  planted graph untouched and retain both diagnostic payloads. Stale `blocked`
+  records can be recovered separately with the reviewed `doctor unblock` API;
+  exact-ID authorization does not override remaining database dependency gates.
 - **Plant**: pure public CLI — create two issues, `br dep add` the
   forward edge, `br close` the blocker, flush. No direct DB writes.
 - **Expected exit codes**:

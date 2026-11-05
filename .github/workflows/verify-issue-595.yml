@@ -1,0 +1,109 @@
+# Temporary verification branch only; do not merge this workflow into main.
+# Its three action pins also require matching temporary inventory rows.
+name: Verify issue 595
+
+'on':
+  push:
+    branches:
+      - verify/issue-595
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-issue-595-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_BUILD_JOBS: '1'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+  RUST_TEST_THREADS: '2'
+  NO_COLOR: '1'
+  RUST_LOG: error
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    name: Rust and CLI regression verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out the exact verification commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the repository's pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # Reviewed 2026-10-09 snapshot
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # Reviewed 2026-08-17 snapshot
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets with default features
+        run: cargo check --locked --all-targets
+
+      - name: Clippy all targets with default features
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Verify action pin inventory and workflow controls
+        run: cargo test --locked --test workflow_action_pins -- --nocapture
+
+      - name: Verify guarded dependency repair transaction invariants
+        run: cargo test --locked --lib storage::sqlite::dependency_repair::tests -- --nocapture
+
+      - name: Verify automatic ready-status selection
+        run: cargo test --locked --lib unblock_target -- --nocapture
+
+      - name: Verify dependency doctor classification
+        run: cargo test --locked --lib test_dep_graph_jsonl_ -- --nocapture
+
+      - name: Verify doctor capability advertisement
+        run: cargo test --locked --lib every_fixer_filter_gate_id_is_advertised_in_capabilities -- --nocapture
+
+      - name: Verify dependency storage and independent model
+        run: >-
+          cargo test --locked
+          --test storage_deps
+          --test model_based_storage
+          --test storage_blocked_cache
+          --test storage_crud
+          -- --nocapture
+
+      - name: Verify ready queue and dependency CLI behavior
+        run: >-
+          cargo test --locked
+          --test e2e_ready
+          --test e2e_relations
+          --test e2e_epic
+          -- --nocapture
+
+      - name: Verify lifecycle and stale writer protection
+        run: >-
+          cargo test --locked
+          --test e2e_basic_lifecycle
+          --test e2e_update_if_unchanged
+          --test e2e_errors
+          -- --nocapture
+
+      - name: Verify doctor repair and recovery chokepoint
+        run: cargo test --locked --test e2e_doctor_chokepoint -- --nocapture
+
+      - name: Verify competing close and update preserve dependency cache integrity
+        run: cargo test --locked --test e2e_concurrency e2e_close_update_reopen_preserve_blocked_cache_integrity -- --exact --nocapture
+
+      - name: Verify dependency repair against competing writers and interruption
+        run: cargo test --locked --test e2e_concurrency unblock_595_ -- --nocapture

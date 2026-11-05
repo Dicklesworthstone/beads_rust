@@ -84,6 +84,11 @@ pub(super) struct DependencyBlockProof {
     issue_fingerprint: String,
 }
 
+#[derive(Default)]
+pub(super) struct AutomaticDependencyUnblockSnapshot {
+    candidates: BTreeMap<String, (DependencyBlockProof, Vec<String>)>,
+}
+
 /// Classification shared by the JSONL doctor detector and transactional repair.
 pub(crate) struct FullyUnblockedIssue {
     pub(crate) id: String,
@@ -183,14 +188,25 @@ fn hierarchy_gated_issue_ids<'a>(
     gated
 }
 
-fn classify_fully_unblocked(issue: &Issue, hierarchy_gated: bool) -> FullyUnblockedIssue {
+fn classify_fully_unblocked(
+    issue: &Issue,
+    hierarchy_gated: bool,
+    ready_statuses: &[String],
+) -> FullyUnblockedIssue {
     let mut excluded_reasons = Vec::new();
-    match &issue.status {
-        Status::Open | Status::Blocked | Status::Closed | Status::Tombstone | Status::Draft => {}
-        Status::InProgress => excluded_reasons.push("claimed (status in_progress)"),
-        Status::Deferred => excluded_reasons.push("status deferred"),
-        Status::Pinned => excluded_reasons.push("status pinned"),
-        Status::Custom(_) => excluded_reasons.push("custom status"),
+    let ready_status = ready_statuses
+        .iter()
+        .any(|status| status.eq_ignore_ascii_case(issue.status.as_str()));
+    if !ready_status {
+        match &issue.status {
+            Status::Blocked | Status::Closed | Status::Tombstone | Status::Draft => {}
+            Status::InProgress => excluded_reasons.push("claimed (status in_progress)"),
+            Status::Deferred => excluded_reasons.push("status deferred"),
+            Status::Pinned => excluded_reasons.push("status pinned"),
+            Status::Open | Status::Custom(_) => {
+                excluded_reasons.push("status outside configured ready group");
+            }
+        }
     }
     if issue.defer_until.is_some_and(|until| until > Utc::now()) {
         excluded_reasons.push("defer_until in the future");
@@ -213,15 +229,22 @@ fn classify_fully_unblocked(issue: &Issue, hierarchy_gated: bool) -> FullyUnbloc
     FullyUnblockedIssue {
         id: issue.id.clone(),
         excluded_reasons,
-        stale_blocked: issue.status == Status::Blocked && !hierarchy_gated && !issue.is_template,
+        stale_blocked: issue.status == Status::Blocked
+            && !ready_status
+            && !hierarchy_gated
+            && !issue.is_template,
     }
 }
 
 /// The existing `stale_blocked` partition, independent of storage/cache state.
 /// External references remain blocking because this detector cannot prove
 /// their completion. Missing local targets retain the doctor's dangling-edge
-/// classification; repair requires explicit authorization for those records.
-pub(crate) fn fully_unblocked_issues(issues: &[Issue]) -> Vec<FullyUnblockedIssue> {
+/// classification. The transactional repair separately checks live database
+/// blockers: a missing target cannot be authorized away.
+pub(crate) fn fully_unblocked_issues(
+    issues: &[Issue],
+    ready_statuses: &[String],
+) -> Vec<FullyUnblockedIssue> {
     let issue_by_id: HashMap<&str, &Issue> = issues
         .iter()
         .map(|issue| (issue.id.as_str(), issue))
@@ -237,11 +260,66 @@ pub(crate) fn fully_unblocked_issues(issues: &[Issue]) -> Vec<FullyUnblockedIssu
                     .iter()
                     .all(|target| blocker_fate(target, &issue_by_id) != BlockerFate::Live)
         })
-        .map(|issue| classify_fully_unblocked(issue, hierarchy_gated.contains(issue.id.as_str())))
+        .map(|issue| {
+            classify_fully_unblocked(
+                issue,
+                hierarchy_gated.contains(issue.id.as_str()),
+                ready_statuses,
+            )
+        })
         .collect()
 }
 
 impl SqliteStorage {
+    /// Recompute readiness gates from the current transaction, independently
+    /// of the persisted cache and the JSONL detector's post-import semantics.
+    /// Unknown external state remains blocking, including inherited and epic
+    /// child gates, because this local transaction cannot certify another DB.
+    pub(super) fn dependency_repair_blockers_in_tx(
+        conn: &Connection,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut blockers = Self::compute_blocked_issues_map_impl(conn)?;
+        // A missing parent has unknown workflow gates. Propagate only these
+        // additional gates: propagating the complete map again would feed an
+        // epic's child-open gate back into the children that can resolve it.
+        let mut missing_parents: HashMap<String, Vec<String>> = HashMap::new();
+        for row in conn.query(
+            "SELECT d.issue_id, d.depends_on_id
+             FROM dependencies d
+             LEFT JOIN issues parent ON parent.id = d.depends_on_id
+             WHERE d.type = 'parent-child'
+               AND d.issue_id NOT LIKE 'external:%'
+               AND d.depends_on_id NOT LIKE 'external:%'
+               AND parent.id IS NULL",
+        )? {
+            let child = row.get(0).and_then(SqliteValue::as_text).ok_or_else(|| {
+                BeadsError::validation("dependencies", "non-text missing-parent child ID")
+            })?;
+            let parent = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+                BeadsError::validation("dependencies", "non-text missing-parent target ID")
+            })?;
+            missing_parents
+                .entry(child.to_string())
+                .or_default()
+                .push(format!("{parent}:parent-missing"));
+        }
+        Self::propagate_blocked_parents(
+            &mut missing_parents,
+            &Self::load_local_parent_child_edges_impl(conn)?,
+        );
+        for (id, missing) in missing_parents {
+            blockers.entry(id).or_default().extend(missing);
+        }
+        for (id, external) in Self::external_blockers_impl(conn, &HashMap::new())? {
+            blockers.entry(id).or_default().extend(external);
+        }
+        for refs in blockers.values_mut() {
+            refs.sort();
+            refs.dedup();
+        }
+        Ok(blockers)
+    }
+
     /// Inspect dependency-unblocked work without changing tracker state.
     ///
     /// # Errors
@@ -361,7 +439,8 @@ impl SqliteStorage {
             .map(|issue| (issue.id.as_str(), issue))
             .collect();
         let selected = selected_ids(&request, &issues, &issue_by_id)?;
-        let classifications = fully_unblocked_issues(&issues);
+        let classifications = fully_unblocked_issues(&issues, &ready_statuses);
+        let current_blockers = Self::dependency_repair_blockers_in_tx(conn)?;
         let classification_by_id: HashMap<&str, &FullyUnblockedIssue> = classifications
             .iter()
             .map(|classification| (classification.id.as_str(), classification))
@@ -378,6 +457,7 @@ impl SqliteStorage {
                 proof.as_ref(),
                 &request,
                 &ready_statuses,
+                current_blockers.get(id).map_or(&[], Vec::as_slice),
                 actor,
                 authorized,
             );
@@ -490,6 +570,181 @@ impl SqliteStorage {
         })
     }
 
+    /// Capture current dependency-only intent and real gates under the source
+    /// mutation's write transaction. An unrelated completion cannot sweep up
+    /// already-stale records or manual holds. Preserve this witness before a
+    /// relationship removal changes the dependent's own revision/fingerprint.
+    pub(super) fn capture_automatic_dependency_unblock_in_tx(
+        conn: &Connection,
+        actor: &str,
+    ) -> Result<AutomaticDependencyUnblockSnapshot> {
+        if conn
+            .query("SELECT 1 FROM events WHERE event_type = 'dependency_blocked' LIMIT 1")?
+            .is_empty()
+        {
+            return Ok(AutomaticDependencyUnblockSnapshot::default());
+        }
+        let issues = load_dependency_graph(conn)?;
+        let blockers = Self::dependency_repair_blockers_in_tx(conn)?;
+        let mut candidates = BTreeMap::new();
+        for issue in issues {
+            if !automatic_unblock_allowed(&issue, actor) {
+                continue;
+            }
+            let Some(gates) = blockers.get(&issue.id) else {
+                continue;
+            };
+            if let Some(proof) = current_dependency_block_proof(conn, &issue)? {
+                let mut gates = gates.clone();
+                gates.sort();
+                gates.dedup();
+                candidates.insert(issue.id, (proof, gates));
+            }
+        }
+        Ok(AutomaticDependencyUnblockSnapshot { candidates })
+    }
+
+    /// Release only proven holds that lost their last effective gate during
+    /// this mutation. Manual batch targets remain authoritative. Policy or
+    /// capacity refusals preserve the dependent without rejecting a legitimate
+    /// source completion; storage failures roll back the whole transaction.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) fn apply_automatic_dependency_unblock_in_tx(
+        conn: &Connection,
+        ctx: &mut MutationContext,
+        before: &AutomaticDependencyUnblockSnapshot,
+        workflow: &Workflow,
+        capacity: &CapacityPolicy,
+        preserve_status_for: &HashSet<&str>,
+        cause: &str,
+    ) -> Result<()> {
+        if before.candidates.is_empty()
+            || workflow
+                .ready_status_group()
+                .iter()
+                .any(|status| status == "blocked")
+        {
+            return Ok(());
+        }
+        let blockers = Self::dependency_repair_blockers_in_tx(conn)?;
+        // Bind every admission to one expiry observation in this write
+        // transaction. A second clock sample after selecting candidates could
+        // expire an exemption and reject an otherwise valid source completion.
+        let exemptions = Self::load_capacity_exemption_index_in_tx(conn, capacity)?;
+        let acting = CapacityActingContext::new(&ctx.actor, &ctx.attribution);
+        let mut updates = Vec::new();
+        let mut transitions = Vec::new();
+        let mut warnings = Vec::new();
+        for (id, (proof, prior_gates)) in &before.candidates {
+            if preserve_status_for.contains(id.as_str()) {
+                continue;
+            }
+            let Some(row) = Self::get_issue_row_from_conn(conn, id)? else {
+                continue;
+            };
+            let issue = Self::issue_from_row_for_preservation(&row)?;
+            if issue.id != *id || !automatic_unblock_allowed(&issue, &ctx.actor) {
+                continue;
+            }
+            if let Some(remaining) = blockers.get(id) {
+                // Removing one of several gates does not revoke dependency-only
+                // intent. New gates or unrelated edits still invalidate it.
+                if remaining.iter().all(|gate| prior_gates.contains(gate))
+                    && current_dependency_block_proof(conn, &issue)?.is_none()
+                {
+                    let mut retained = proof.clone();
+                    retained.blockers.clone_from(remaining);
+                    Self::record_dependency_block_proof_in_tx(conn, ctx, id, retained)?;
+                }
+                continue;
+            }
+            let Some(target) =
+                workflow.unblock_target(issue.issue_type.as_str(), Some(&proof.previous_status))
+            else {
+                if current_dependency_block_proof(conn, &issue)?.is_none() {
+                    Self::record_dependency_block_proof_in_tx(conn, ctx, id, proof.clone())?;
+                }
+                continue;
+            };
+            let comment = format!(
+                "Automatically unblocked after {cause}. Previous dependency gates: {}.",
+                prior_gates.join(", "),
+            );
+            super::validate_new_comment(id, &ctx.actor, &comment)?;
+            let update = IssueUpdate {
+                status: Some(target.parse()?),
+                transition_comment: Some(comment),
+                ..IssueUpdate::default()
+            };
+            transitions.push(CapacityBatchTransition {
+                issue_id: id.clone(),
+                from: Some("blocked".into()),
+                to: target,
+                issue_type: None,
+                current_assignee: issue.assignee.clone(),
+                prospective_assignee: issue.assignee.clone(),
+                ownership_handoff: false,
+            });
+            let decision = Self::enforce_workflow_transition_batch_in_tx(
+                conn,
+                workflow,
+                &[(id.clone(), update.clone())],
+            )
+            .and_then(|()| {
+                Self::evaluate_workflow_capacity_with_exemptions(
+                    conn,
+                    capacity,
+                    &transitions,
+                    &acting,
+                    &exemptions,
+                )
+            });
+            match decision {
+                Ok(admission_warnings) => {
+                    updates.push((id.clone(), update));
+                    warnings = admission_warnings;
+                }
+                Err(
+                    error @ (BeadsError::PolicyViolation { .. }
+                    | BeadsError::WorkflowCapacityExceeded { .. }),
+                ) => {
+                    transitions.pop();
+                    if current_dependency_block_proof(conn, &issue)?.is_none() {
+                        Self::record_dependency_block_proof_in_tx(conn, ctx, id, proof.clone())?;
+                    }
+                    tracing::info!(issue_id = %id, reason = %error, "Dependency-only hold retained");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        // Candidate selection only reads issue/status rows and stages proof
+        // events. The last successful cumulative admission therefore covers
+        // exactly the batch applied below, including its canonical warnings.
+        let actor = ctx.actor.clone();
+        for (id, update) in &updates {
+            Self::update_issue_in_tx(conn, ctx, id, update, &actor)?;
+            Self::record_capacity_occupancy_in_tx(conn, id, &actor, &ctx.attribution)?;
+            Self::end_departed_capacity_exemptions_in_tx(
+                conn,
+                capacity,
+                id,
+                "blocked",
+                update
+                    .status
+                    .as_ref()
+                    .expect("automatic ready target")
+                    .as_str(),
+                &actor,
+            )?;
+        }
+        ctx.invalidate_cache();
+        ctx.capacity_warnings.extend(warnings);
+        Ok(())
+    }
+
     /// Validate explicit dependency-only intent before touching any row.
     #[allow(clippy::too_many_lines)]
     pub(super) fn prepare_dependency_block_proofs_in_tx(
@@ -512,6 +767,7 @@ impl SqliteStorage {
             .map(|issue| (issue.id.as_str(), issue))
             .collect::<HashMap<_, _>>();
         let ready_statuses = workflow.ready_status_group();
+        let effective_blockers = Self::dependency_repair_blockers_in_tx(conn)?;
         for (id, update) in updates
             .iter()
             .filter(|(_, update)| update.blocked_by_dependencies)
@@ -551,17 +807,13 @@ impl SqliteStorage {
                     ),
                 ));
             }
-            let mut blockers = forward_blocking_targets(issue)
-                .into_iter()
-                .filter(|target| blocker_fate(target, &by_id) == BlockerFate::Live)
-                .map(str::to_string)
-                .collect::<Vec<_>>();
+            let mut blockers = effective_blockers.get(id).cloned().unwrap_or_default();
             blockers.sort();
             blockers.dedup();
             if blockers.is_empty() {
                 return Err(BeadsError::validation(
                     "blocked_by_dependencies",
-                    format!("issue {id}: no live forward dependency blocker exists to record"),
+                    format!("issue {id}: no live dependency or parent-child gate exists to record"),
                 ));
             }
             proofs.insert(
@@ -661,6 +913,7 @@ fn candidate_for_issue(
     proof: Option<&DependencyBlockProof>,
     request: &DependencyUnblockRequest,
     ready_statuses: &[String],
+    current_blockers: &[String],
     actor: &str,
     authorized: bool,
 ) -> DependencyUnblockCandidate {
@@ -670,10 +923,12 @@ fn candidate_for_issue(
         .collect::<Vec<_>>();
     blockers.sort();
     blockers.dedup();
+    let no_forward_history = blockers.is_empty();
     let dangling = blockers
         .iter()
         .any(|target| blocker_fate(target, by_id) == BlockerFate::Dangling);
     let trustworthy_proof = proof.filter(|_| !dangling);
+    let proof_only = no_forward_history && trustworthy_proof.is_some();
     let target = request.target_status.clone().or_else(|| {
         trustworthy_proof
             .filter(|proof| ready_statuses.contains(&proof.previous_status))
@@ -700,12 +955,25 @@ fn candidate_for_issue(
             "not_blocked",
             "The current status is not blocked".to_string(),
         )
-    } else if blockers.is_empty() {
+    } else if ready_statuses.iter().any(|status| status == "blocked") {
+        (
+            "already_ready_status",
+            "The blocked status already belongs to workflow.status_groups.ready".to_string(),
+        )
+    } else if !current_blockers.is_empty() {
+        (
+            "remaining_blockers",
+            format!(
+                "Current dependency or parent-child gates remain: {}",
+                current_blockers.join(", ")
+            ),
+        )
+    } else if no_forward_history && !proof_only {
         (
             "no_dependency_history",
             "No forward blocking dependency exists; preserve manual or external blocks".to_string(),
         )
-    } else if classification.is_none() {
+    } else if classification.is_none() && !proof_only {
         (
             "remaining_blockers",
             "A live or unresolved external dependency still blocks this issue".to_string(),
@@ -717,6 +985,11 @@ fn candidate_for_issue(
         )
     } else if let Some(entry) = classification.filter(|entry| !entry.excluded_reasons.is_empty()) {
         ("ready_exclusion", entry.excluded_reasons.join(", "))
+    } else if proof_only && !automatic_unblock_allowed(issue, actor) {
+        (
+            "ready_exclusion",
+            "A ready-work or ownership exclusion still applies".to_string(),
+        )
     } else if owned_by_other(issue.assignee.as_deref(), actor) {
         (
             "ownership",
@@ -741,6 +1014,9 @@ fn candidate_for_issue(
             "No dependency, hierarchy, ownership or ready-work exclusion remains".to_string(),
         )
     };
+    if proof_only {
+        blockers.clone_from(&trustworthy_proof.expect("proof-backed hierarchy").blockers);
+    }
     DependencyUnblockCandidate {
         id: issue.id.clone(),
         eligible: reason == "eligible",
@@ -766,6 +1042,16 @@ fn owned_by_other(assignee: Option<&str>, actor: &str) -> bool {
         .map(str::trim)
         .filter(|owner| !owner.is_empty())
         .is_some_and(|owner| owner != actor.trim())
+}
+
+fn automatic_unblock_allowed(issue: &Issue, actor: &str) -> bool {
+    issue.status == Status::Blocked
+        && !owned_by_other(issue.assignee.as_deref(), actor)
+        && !issue.pinned
+        && !issue.ephemeral
+        && !issue.is_template
+        && !issue.id.contains("-wisp-")
+        && issue.defer_until.is_none_or(|until| until <= Utc::now())
 }
 
 fn candidate_update(
@@ -906,7 +1192,10 @@ fn load_dependency_graph(conn: &Connection) -> Result<Vec<Issue>> {
             metadata: optional_text(5, "metadata")?,
             thread_id: optional_text(6, "thread_id")?,
         };
-        if !issue_ids.contains(&dependency.issue_id)
+        let external_child = dependency.issue_id.starts_with("external:")
+            && dependency.dep_type == DependencyType::ParentChild
+            && issue_ids.contains(&dependency.depends_on_id);
+        if (!issue_ids.contains(&dependency.issue_id) && !external_child)
             || dependency.depends_on_id.trim().is_empty()
             || dependency.depends_on_id.contains('\0')
             || dependency.depends_on_id.trim() != dependency.depends_on_id
@@ -1124,16 +1413,14 @@ mod tests {
                 )
                 .unwrap();
         }
-        storage
-            .update_issue(
-                BLOCKER,
-                &IssueUpdate {
-                    status: Some(Status::Closed),
-                    ..IssueUpdate::default()
-                },
-                ACTOR,
-            )
-            .unwrap();
+        // A peer's imported completion preserves historical blocked records;
+        // local completion now performs the automatic release in its own tx.
+        let mut completed = storage.get_issue(BLOCKER).unwrap().unwrap();
+        completed.status = Status::Closed;
+        completed.closed_at = Some(Utc::now());
+        completed.updated_at = Utc::now();
+        completed.content_hash = Some(crate::util::content_hash(&completed));
+        storage.upsert_issue_for_import(&completed).unwrap();
         storage
     }
 
@@ -1178,6 +1465,183 @@ mod tests {
         );
         workflow.capacity.exemptions.providers = vec!["operator".to_string()];
         workflow
+    }
+
+    #[test]
+    fn missing_local_and_inherited_blockers_cannot_be_authorized_away() {
+        for inherited in [false, true] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let dependent = "bd-repair-dependent";
+            let parent = "bd-repair-parent";
+            let gate = "bd-repair-gate";
+            for id in [BLOCKER, dependent, parent, gate] {
+                storage.create_issue(&issue(id), ACTOR).unwrap();
+            }
+            storage
+                .add_dependency(dependent, BLOCKER, "blocks", ACTOR)
+                .unwrap();
+            let gated = if inherited { parent } else { dependent };
+            storage
+                .add_dependency(gated, gate, "blocks", ACTOR)
+                .unwrap();
+            if inherited {
+                storage
+                    .add_dependency(dependent, parent, "parent-child", ACTOR)
+                    .unwrap();
+            }
+            storage
+                .update_issue(
+                    dependent,
+                    &IssueUpdate {
+                        status: Some(Status::Blocked),
+                        blocked_by_dependencies: true,
+                        ..IssueUpdate::default()
+                    },
+                    ACTOR,
+                )
+                .unwrap();
+            storage
+                .update_issue(
+                    BLOCKER,
+                    &IssueUpdate {
+                        status: Some(Status::Closed),
+                        ..IssueUpdate::default()
+                    },
+                    ACTOR,
+                )
+                .unwrap();
+            // Model a dangling live database edge and an untrustworthy empty
+            // cache. JSONL's post-import classifier alone misses this gate.
+            storage
+                .conn
+                .execute_with_params(
+                    "UPDATE dependencies SET depends_on_id = ? WHERE issue_id = ? AND depends_on_id = ?",
+                    &[
+                        SqliteValue::from("bd-repair-missing"),
+                        SqliteValue::from(gated),
+                        SqliteValue::from(gate),
+                    ],
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute("DELETE FROM blocked_issues_cache")
+                .unwrap();
+            for authorized in [false, true] {
+                let request = DependencyUnblockRequest {
+                    ids: vec![dependent.to_string()],
+                    authorized_ids: if authorized {
+                        vec![dependent.to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..DependencyUnblockRequest::default()
+                };
+                let before = logical_snapshot(&storage);
+                let plan = storage.preview_dependency_unblock(&request, ACTOR).unwrap();
+                assert!(plan.planned_ids.is_empty(), "{plan:?}");
+                assert_eq!(plan.candidates[0].reason, "remaining_blockers");
+                assert_eq!(logical_snapshot(&storage), before);
+                let report = storage
+                    .apply_dependency_unblock(&request, &plan.plan_token, ACTOR)
+                    .unwrap();
+                assert!(report.changed.is_empty(), "{report:?}");
+                assert_eq!(logical_snapshot(&storage), before);
+                assert_eq!(
+                    storage.get_issue(dependent).unwrap().unwrap().status,
+                    Status::Blocked
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_parent_and_inherited_parent_cannot_be_authorized_away() {
+        for inherited in [false, true] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let dependent = "bd-parent-repair-dependent";
+            let ancestor = "bd-parent-repair-ancestor";
+            let parent = "bd-parent-repair-parent";
+            for id in [BLOCKER, dependent, ancestor, parent] {
+                storage.create_issue(&issue(id), ACTOR).unwrap();
+            }
+            storage
+                .add_dependency(dependent, BLOCKER, "blocks", ACTOR)
+                .unwrap();
+            let gated = if inherited { ancestor } else { dependent };
+            storage
+                .add_dependency(gated, parent, "parent-child", ACTOR)
+                .unwrap();
+            if inherited {
+                storage
+                    .add_dependency(dependent, ancestor, "parent-child", ACTOR)
+                    .unwrap();
+            }
+            storage
+                .update_issue(
+                    dependent,
+                    &IssueUpdate {
+                        status: Some(Status::Blocked),
+                        blocked_by_dependencies: true,
+                        ..IssueUpdate::default()
+                    },
+                    ACTOR,
+                )
+                .unwrap();
+            // The inherited variant preserves the dependent's own proof and
+            // relations: only its ancestor now references an absent parent.
+            storage
+                .conn
+                .execute_with_params(
+                    "UPDATE dependencies SET depends_on_id = ? WHERE issue_id = ? AND depends_on_id = ? AND type = 'parent-child'",
+                    &[
+                        SqliteValue::from("bd-parent-repair-missing"),
+                        SqliteValue::from(gated),
+                        SqliteValue::from(parent),
+                    ],
+                )
+                .unwrap();
+            storage
+                .update_issue(
+                    BLOCKER,
+                    &IssueUpdate {
+                        status: Some(Status::Closed),
+                        ..IssueUpdate::default()
+                    },
+                    ACTOR,
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute("DELETE FROM blocked_issues_cache")
+                .unwrap();
+            assert_eq!(
+                storage.get_issue(dependent).unwrap().unwrap().status,
+                Status::Blocked
+            );
+
+            for authorized in [false, true] {
+                let request = DependencyUnblockRequest {
+                    ids: vec![dependent.to_string()],
+                    authorized_ids: if authorized {
+                        vec![dependent.to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..DependencyUnblockRequest::default()
+                };
+                let before = logical_snapshot(&storage);
+                let plan = storage.preview_dependency_unblock(&request, ACTOR).unwrap();
+                assert!(plan.planned_ids.is_empty(), "{plan:?}");
+                assert_eq!(plan.candidates[0].reason, "remaining_blockers");
+                assert_eq!(logical_snapshot(&storage), before);
+                let report = storage
+                    .apply_dependency_unblock(&request, &plan.plan_token, ACTOR)
+                    .unwrap();
+                assert!(report.changed.is_empty(), "{report:?}");
+                assert_eq!(logical_snapshot(&storage), before);
+            }
+        }
     }
 
     #[test]

@@ -6,7 +6,8 @@
 # checks must report status `ok` while still carrying their FM id and a
 # populated, discriminating details payload. Warn is reserved for
 # dangling edges / stale `blocked` status (unit-tested in doctor.rs).
-# Both checks stay DETECT-ONLY: --repair must leave the graph untouched.
+# The satisfied graph is informational: repair must retain every edge and
+# leave the already-open dependent unchanged, including doctor unblock.
 
 set -euo pipefail
 target_dir="${1:?usage: assert.sh <target_dir> <stage>}"

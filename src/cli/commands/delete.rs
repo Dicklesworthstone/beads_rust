@@ -283,6 +283,8 @@ pub fn execute(
         if let Some(cascade_ids) = &cascade_dependents {
             final_delete_set.extend(cascade_ids.iter().cloned());
         }
+        let mut final_ids: Vec<String> = final_delete_set.into_iter().collect();
+        final_ids.sort();
 
         // 6. Get actor
         let actor = config::resolve_actor(&config_layer);
@@ -292,13 +294,13 @@ pub fn execute(
 
         // First, remove all dependency links for issues being deleted
         let mut batch_has_mutated = false;
-        for id in &final_delete_set {
+        for id in &final_ids {
             let deps_removed = retry_mutation_with_jsonl_recovery(
                 &mut storage_ctx,
                 !batch_has_mutated,
                 "delete remove dependencies",
                 Some(id.as_str()),
-                |storage| storage.remove_all_dependencies(id, &actor),
+                |storage| storage.remove_all_dependencies_preserving_status(id, &actor, &final_ids),
             )?;
             result.dependencies_removed += deps_removed;
             if deps_removed > 0 {
@@ -312,8 +314,6 @@ pub fn execute(
         }
 
         // Delete each issue (create tombstone, then purge if --hard)
-        let mut final_ids: Vec<String> = final_delete_set.into_iter().collect();
-        final_ids.sort();
         for id in &final_ids {
             if args.hard {
                 result.labels_removed += storage_ctx.storage.get_labels(id)?.len();
@@ -701,7 +701,13 @@ fn apply_delete_route(
             !batch_has_mutated,
             "delete remove dependencies",
             Some(id.as_str()),
-            |storage| storage.remove_all_dependencies(id, &actor),
+            |storage| {
+                storage.remove_all_dependencies_preserving_status(
+                    id,
+                    &actor,
+                    &route.final_delete_ids,
+                )
+            },
         )?;
         result.dependencies_removed += deps_removed;
         if deps_removed > 0 {
