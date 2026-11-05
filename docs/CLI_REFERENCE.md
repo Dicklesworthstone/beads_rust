@@ -438,6 +438,7 @@ br update [OPTIONS] [IDS]...
 | `--append-notes <TEXT>` | Append a line to notes without rewriting the field: existing bytes are kept, the text starts on a new line (the field is created when empty); repeatable; re-running the same append is a no-op; conflicts with `--notes`; never needs `--force` |
 | `--transition-comment <TEXT>` | Add a fresh comment atomically with a status transition |
 | `-s, --status <STATUS>` | Change status |
+| `--blocked-by-dependencies` | Declare dependency-only intent for a new `blocked` status with live blockers; later manual edits invalidate the declaration |
 | `-p, --priority <N>` | Change priority |
 | `-t, --type <TYPE>` | Change issue type |
 | `--assignee <NAME>` | Assign (empty string clears) |
@@ -2447,6 +2448,84 @@ Doctor observations and previews use private database snapshots. `doctor`,
 writable probes. A repair preview reports findings and filtered candidate
 repairs; actual execution still performs each repair's authority and safety
 checks. A missing database remains missing during a preview.
+
+#### Recovering dependency-unblocked work
+
+`br doctor unblock` previews the existing `stale_blocked` diagnostic against
+the current database and dependency graph. It does not change status by default:
+
+```bash
+br doctor unblock --dry-run --json
+br doctor unblock br-example --authorize br-example --dry-run --json
+# After reviewing that preview, repeat its actor and options with its token:
+br doctor unblock br-example --authorize br-example \
+  --apply --expect '<plan_token from the preview>' --json
+```
+
+| Option | Meaning |
+|--------|---------|
+| `[IDS...]` | Restrict inspection to exact issue IDs; no IDs scans blocked records |
+| `--dry-run` | Explicit non-mutating preview; also the default |
+| `--authorize <ID>` | Approve one ambiguous/manual block for recovery; repeat for each exact ID |
+| `--to-status <STATUS>` | Choose `open` or a custom actionable status in `workflow.status_groups.ready` |
+| `--apply --expect <TOKEN>` | Apply the unchanged reviewed plan in one transaction |
+| `--agent-name`, `--harness`, `--model` | Audit attribution, also read from `BR_AGENT_NAME`, `BR_HARNESS`, and `BR_MODEL`; harness and `BR_SESSION` retain their capacity scopes |
+
+A completed dependency does not prove that an issue's `blocked` status was
+caused only by dependencies. Older records, imported records without evidence,
+and records with a manual or external hold remain unchanged unless their exact
+IDs are authorized. `--authorize` never overrides a live blocker, parent-child
+gate, future deferral, pin, template/wisp exclusion, another actor's assignment,
+or workflow policy. Issues without forward blocking edges are outside this
+repair's scope.
+
+For future work, declare dependency-only intent when setting the block:
+
+```bash
+br update br-example --status blocked --blocked-by-dependencies
+```
+
+This declaration requires a real transition from an actionable status and live
+dependency blockers. Its local audit evidence is bound to the resulting issue
+revision and relations. Subsequent manual edits, including reasserting
+`blocked`, invalidate the evidence. Missing evidence after an import or database
+rebuild is treated as ambiguous. A plain `--status blocked` continues to make
+no dependency-only declaration.
+
+The JSON preview includes `plan_token`, `candidates`, `planned_ids`,
+`skipped_ids`, and `capacity_warnings`. Each candidate names its eligibility,
+provenance and reason. The token binds the workspace, selected inputs, actor,
+attribution, options, policy and database state. Apply repeats the checks under
+database and JSONL write authority and revalidates the witness inside the same
+transaction as the status changes. A stale token refuses the whole application;
+rerun the preview instead of retrying the old token. Workflow transitions,
+required fields, scoped gates and capacity rules remain enforced. Ownership is
+preserved.
+
+The receipt reports exact `changed` and `skipped` IDs. Status transitions,
+comments, audit events, dirty markers and blocked-cache invalidation commit or
+roll back together. JSONL export follows that commit: `export_status: pending`
+and `export_error` mean the database repair succeeded but publication failed;
+resolve the export error and run `br sync --flush-only`. `disabled` respects
+`--no-auto-flush`, and `pending_shutdown` preserves committed changes for the
+next flush after interruption. `maintenance_error` with
+`export_status: pending_maintenance` means the primary transaction committed,
+but connection or cache maintenance failed. The command retains the exact
+change receipt, skips export and exits nonzero; inspect and repair storage
+before flushing, without replaying the committed repair. Capacity warnings
+remain present in the committed receipt. Preview never imports JSONL or repairs
+storage; unimported JSONL changes must be synchronized before reviewing a plan.
+This initial repair requires database mode.
+
+Closing or tombstoning a blocker does not automatically reopen dependent
+issues. Run the guarded repair after those operations. A `supersedes` relation
+or custom `superseded` status does not itself make a blocker terminal. Automatic
+unblocking would need to evaluate proven dependency-only intent, ownership and
+workflow rules within the terminal operation's own transaction; graph-stale
+status alone is insufficient. This dedicated command is discoverable through
+`br doctor explain dep.fully_unblocked_open`; it does not run as part of generic
+`doctor --repair` or restore raw database files through `doctor undo`.
+
 
 #### JSONL rebuild verification
 

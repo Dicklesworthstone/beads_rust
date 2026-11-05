@@ -194,6 +194,18 @@ pub enum BeadsError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The primary transaction committed and its authority was witnessed, but
+    /// subsequent connection or cache maintenance failed. Replaying the
+    /// mutation would duplicate work; callers must preserve its change receipt.
+    #[error(
+        "{operation} committed, but subsequent maintenance failed; inspect the committed state and repair maintenance before retrying: {source}"
+    )]
+    CommittedMaintenanceFailure {
+        operation: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// A JSONL exchange completed, but the displaced generation did not match
     /// the exact source generation the exporting session had retained.
     ///
@@ -499,6 +511,7 @@ impl BeadsError {
     pub fn primary_mutation_committed(&self) -> bool {
         match self {
             Self::CommittedStateUnwitnessed { .. }
+            | Self::CommittedMaintenanceFailure { .. }
             | Self::JsonlPublicationConflict { .. }
             | Self::JsonlPublishedButNotDurable { .. }
             | Self::JsonlPublishedButUnwitnessed { .. }
@@ -571,6 +584,9 @@ impl BeadsError {
             ),
             Self::CommittedStateUnwitnessed { .. } => Some(
                 "Do not retry automatically. Reconcile the committed database state and authority first.",
+            ),
+            Self::CommittedMaintenanceFailure { .. } => Some(
+                "Do not replay the committed mutation. Inspect its change receipt, repair storage maintenance, then flush pending JSONL changes.",
             ),
             Self::JsonlPublicationConflict { .. }
             | Self::JsonlPublishedButNotDurable { .. }

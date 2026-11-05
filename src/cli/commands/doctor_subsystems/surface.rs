@@ -97,6 +97,7 @@ pub fn dispatch_subcommand(
         DoctorSubcommand::Undo(a) => execute_undo(a, &repo_root),
         DoctorSubcommand::MigrateSchema(a) => super::schema_migration::execute(a, cli, ctx),
         DoctorSubcommand::Explain(a) => execute_explain(a, cli),
+        DoctorSubcommand::Unblock(a) => super::super::doctor::execute_unblock(a, cli, ctx),
     }
 }
 
@@ -264,6 +265,26 @@ br doctor --repair                          # exit 0/2/3 depending on fixer outc
 br doctor undo latest                       # exit 0; restores from the latest run
 ```
 
+### Dependency-unblocked work
+
+`br doctor unblock` previews a guarded issue-status repair. Start with
+`br doctor unblock --dry-run --json`.
+
+Apply requires the preview's `plan_token`, the same actor, and the same
+issue IDs, `--authorize` options, and target-status option. Use
+`br doctor unblock --apply --expect "$PLAN_TOKEN" --json` with those same
+reviewed options.
+
+Manual or external holds require explicit authorization for each issue ID.
+Live blockers, parent-child gates, ownership, and workflow policy still
+apply. Flat doctor modes and filters cannot be combined with `unblock`.
+
+This repair commits issue changes and their audit trail in one normal
+storage transaction. Its receipt reports the changed IDs and any pending
+JSONL export. Its changes are recorded in issue history and are outside
+`doctor undo`; reversing a transition requires a fresh workflow-valid
+issue update.
+
 ### Recovery (worked through `mutate()`)
 
 Every `--repair` lays down `<repo>/.doctor/runs/<run-id>/`:
@@ -281,14 +302,15 @@ Every `--repair` lays down `<repo>/.doctor/runs/<run-id>/`:
 
 1. Delete files. Anything that "needs to delete" is renamed into
    `<run-dir>/quarantine/` instead, so `undo` can reverse it.
-2. Run destructive shell. There is no `Command::new("git")` in the
-   doctor — the chokepoint is the only writer.
+2. Run destructive shell. Flat database/file repairs use the chokepoint;
+   `unblock` uses the normal issue transaction.
 3. Write outside its declared `write_scopes` (`.beads/`, `.doctor/`).
-4. Skip the verbatim backup — every mutation is preceded by a strict
-   byte-by-byte `cmp -s` of the live file against the freshly-written
-   backup.
-5. Mutate without an audit trail — every action lands in
-   `actions.jsonl` so `br doctor undo` can replay it in reverse.
+4. Apply a flat `--repair` mutation without its verbatim backup. Each such
+   mutation is preceded by a strict byte-by-byte `cmp -s` of the live file
+   against the freshly-written backup.
+5. Mutate without an audit trail. Flat repairs record `actions.jsonl`
+   entries for `br doctor undo`; `unblock` records issue events and
+   transition comments in its transaction.
 
 ## Recovery without br
 
@@ -2164,6 +2186,16 @@ fn explain_fixers(
                     .any(|name| name == check_name)
         })
         .map(|fixer| {
+            if fixer.id == "dependency_unblock" {
+                return ExplainFixer {
+                    id: fixer.id.clone(),
+                    subsystem: fixer.subsystem.clone(),
+                    auto_fixable: false,
+                    mutates: true,
+                    dry_run_command: "br doctor unblock --dry-run --json".to_string(),
+                    command: "br doctor unblock --apply --expect <PLAN_TOKEN> (repeat reviewed --authorize/--to-status/ID options)".to_string(),
+                };
+            }
             let only = fixer
                 .filter_ids
                 .first()

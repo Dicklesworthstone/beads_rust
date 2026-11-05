@@ -319,6 +319,7 @@ beads_rust/
 │   ├── storage/
 │   │   ├── mod.rs                 # Concrete SqliteStorage and storage-type exports
 │   │   ├── sqlite.rs              # FrankenSQLite backend (the core engine)
+│   │   ├── dependency_repair.rs   # Guarded dependency-unblock analysis, provenance, and atomic repair
 │   │   ├── schema.rs              # DDL migrations
 │   │   ├── events.rs              # Append-only audit log
 │   │   └── portable_history.rs    # Portable audit snapshots and deterministic replay

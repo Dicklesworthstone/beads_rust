@@ -685,13 +685,24 @@ fn fixer_entry_from_row(row: &FixerRow) -> FixerEntry {
 fn build_fixer_registry() -> Vec<FixerEntry> {
     // (id, subsystem, auto_fixable, mutates_via_chokepoint,
     //  addressed_findings, filter_ids)
-    early_chokepoint_fixer_rows()
+    let mut fixers: Vec<_> = early_chokepoint_fixer_rows()
         .iter()
         .chain(legacy_fixer_rows())
         .chain(rebuild_fixer_rows())
         .chain(refuse_gate_fixer_rows())
         .map(fixer_entry_from_row)
-        .collect()
+        .collect();
+    // A reviewed issue transition, deliberately outside flat --repair/--only.
+    // It uses normal storage transaction/audit machinery, not raw DB restore.
+    fixers.push(FixerEntry {
+        id: "dependency_unblock".to_string(),
+        subsystem: "dependencies".to_string(),
+        auto_fixable: false,
+        mutates: true,
+        addressed_findings: vec!["dep.fully_unblocked_open".to_string()],
+        filter_ids: Vec::new(),
+    });
+    fixers
 }
 
 /// Build the check-name → finding-id map from the canonical table in
@@ -849,6 +860,7 @@ mod tests {
                 "doctor.repair_database_sidecars",
                 "refuse_gates.schema_version_downgrade",
                 "refuse_gates.recovery_fingerprint_integrity",
+                "dependency_unblock",
             ],
             "fixer registry order is part of the stable capabilities JSON"
         );

@@ -13733,11 +13733,13 @@ fn inspect_doctor_jsonl(
 /// degrading a healthy workspace (`doctor.ok` treats every warn as a failed
 /// health check, #292).
 fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
+    use crate::storage::sqlite::{
+        BlockerFate, blocker_fate, forward_blocking_targets, fully_unblocked_issues,
+    };
+
     let issues = match read_jsonl_issues_for_graph(path) {
         Ok(issues) => issues,
         Err(err) => {
-            // Non-fatal: jsonl.parse already owns the hard parse error. Emit a
-            // Warn so the graph audit's absence is visible, not silent.
             push_check(
                 checks,
                 "dep.dead_closed_blocking_edges",
@@ -13748,89 +13750,32 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
             return;
         }
     };
-
-    // Index issues by id. Terminal = closed or tombstone (a satisfied blocker).
     let issue_by_id: std::collections::HashMap<&str, &crate::model::Issue> = issues
         .iter()
         .map(|issue| (issue.id.as_str(), issue))
         .collect();
-
-    // A blocker is "live" (still blocking) when it exists AND is non-terminal.
-    // A blocker is "dead" when its target is terminal OR absent (and not an
-    // external ref, whose state `br` cannot resolve). #432: the two dead
-    // states are opposite conditions — a present-but-terminal blocker is a
-    // SATISFIED dependency (the normal end of completed work), while an
-    // absent one is a DANGLING edge (points at nothing) — so classify rather
-    // than collapse. A non-terminal template target is neither: the blocked
-    // cache never lets a template gate ready work, yet the edge is not a
-    // completed dependency either, so it is kept out of the dead-edge report.
-    let blocker_fate = |target: &str| -> BlockerFate {
-        if target.starts_with("external:") {
-            return BlockerFate::Live;
-        }
-        match issue_by_id.get(target) {
-            Some(issue) if issue.status.is_terminal() => BlockerFate::Satisfied,
-            Some(issue) if issue.is_template => BlockerFate::NonGating,
-            Some(_) => BlockerFate::Live,
-            None => BlockerFate::Dangling,
-        }
-    };
-    let hierarchy_gated_ids = hierarchy_gated_issue_ids(&issues, &issue_by_id);
-
+    // The same pure classification drives the transactional repair preflight.
+    let classified = fully_unblocked_issues(&issues);
     let mut dead_edge_issues: Vec<serde_json::Value> = Vec::new();
     let mut dangling_edge_issue_ids: Vec<String> = Vec::new();
-    let mut fully_unblocked_issues: Vec<FullyUnblockedIssue> = Vec::new();
 
     for issue in &issues {
-        // Only audit open (non-terminal, non-draft) issues — the work surface.
         if issue.status.is_terminal() || issue.status.is_draft() {
             continue;
         }
-
-        // Forward "blocked_by" edges only: an issue's own `depends_on_id`
-        // targets it is blocked by. Restricted to the forward blocking types
-        // (`blocks`/`conditional-blocks`/`waits-for`) — `parent-child` is
-        // INTENTIONALLY excluded because its blocking direction is reversed
-        // (the parent is blocked by the child, encoded as `issue_id=child,
-        // depends_on_id=parent`), so it is not a forward "blocked_by" edge for
-        // `issue`. This matches the ready-query forward-edge semantics.
-        let blocking_targets: Vec<&str> = issue
-            .dependencies
-            .iter()
-            .filter(|dep| {
-                matches!(
-                    dep.dep_type,
-                    crate::model::DependencyType::Blocks
-                        | crate::model::DependencyType::ConditionalBlocks
-                        | crate::model::DependencyType::WaitsFor
-                )
-            })
-            .map(|dep| dep.depends_on_id.as_str())
-            // An issue can't meaningfully block itself; ignore self-edges.
-            .filter(|target| *target != issue.id)
-            .collect();
-
-        if blocking_targets.is_empty() {
-            continue;
-        }
-
         let mut satisfied: Vec<&str> = Vec::new();
         let mut dangling: Vec<&str> = Vec::new();
-        let mut live_count = 0usize;
-        for target in &blocking_targets {
-            match blocker_fate(target) {
-                BlockerFate::Live => live_count += 1,
+        for target in forward_blocking_targets(issue) {
+            match blocker_fate(target, &issue_by_id) {
                 BlockerFate::Satisfied => satisfied.push(target),
                 BlockerFate::Dangling => dangling.push(target),
-                BlockerFate::NonGating => {}
+                BlockerFate::Live | BlockerFate::NonGating => {}
             }
         }
         let dead_count = satisfied.len() + dangling.len();
-
         if dead_count > 0 {
-            // `dead_blockers` is retained for consumers of the pre-#432
-            // shape; `satisfied_blockers`/`dangling_blockers` carry the
-            // discrimination.
+            // Preserve completed dependencies as project history. Only an
+            // absent local target is a dangling-edge defect.
             let mut dead: Vec<&str> = Vec::with_capacity(dead_count);
             dead.extend(&satisfied);
             dead.extend(&dangling);
@@ -13844,192 +13789,10 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
                 dangling_edge_issue_ids.push(issue.id.clone());
             }
         }
-
-        // Fully unblocked: every declared blocker is dead (closed/absent) or a
-        // template, so no forward blocker remains to gate this open issue.
-        if live_count == 0 {
-            fully_unblocked_issues.push(classify_fully_unblocked(
-                issue,
-                hierarchy_gated_ids.contains(issue.id.as_str()),
-            ));
-        }
     }
 
     emit_dead_closed_blocking_edges(&dead_edge_issues, &dangling_edge_issue_ids, checks);
-    emit_fully_unblocked_open(&fully_unblocked_issues, checks);
-}
-
-/// #432: classification of a dead blocking edge's target.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BlockerFate {
-    /// Present and non-terminal (or an `external:` ref br cannot resolve) —
-    /// still a real blocker.
-    Live,
-    /// Present and closed/tombstoned — the dependency was satisfied. Benign.
-    Satisfied,
-    /// Absent from the JSONL entirely — the edge points at nothing. A defect.
-    Dangling,
-    /// Present, non-terminal template. The blocked cache never lets a
-    /// template gate ready work, but the dependency is not completed either,
-    /// so it is neither live nor reported as a dead edge.
-    NonGating,
-}
-
-/// #432: a fully-unblocked open issue plus its readiness classification,
-/// derived purely from fields on the already-deserialized record (the same
-/// conditions `br ready` applies, minus the blocked cache — which is exactly
-/// what the graph audit has just recomputed as empty).
-struct FullyUnblockedIssue {
-    id: String,
-    /// Reasons this issue is deliberately excluded from `br ready` despite
-    /// having no live blockers (claimed, deferred, pinned, ...). Empty =
-    /// the issue satisfies every derivable ready condition.
-    excluded_reasons: Vec<&'static str>,
-    /// True when status is still `blocked` although no live blocker remains —
-    /// the one derivable real inconsistency in this check. Never set while
-    /// the parent-child hierarchy still gates the issue, or for templates:
-    /// reopening those would not make them ready.
-    stale_blocked: bool,
-}
-
-/// Issue ids the blocked cache would consider blocked once this JSONL is
-/// imported, so the doctor's readiness verdict cannot drift from `br ready`.
-/// Mirrors `SqliteStorage::compute_blocked_issues_map_impl`:
-///
-/// 1. direct `blocks`/`conditional-blocks`/`waits-for` blockers gate when the
-///    target is present and neither terminal nor a template, or is an
-///    `external:` ref (unresolved externals block `br ready` — fail closed).
-///    A missing local target does not gate: import drops dependency rows
-///    whose target is absent, so the database never sees the edge;
-/// 2. a directly or transitively blocked parent blocks every local
-///    descendant (`propagate_blocked_parents`);
-/// 3. only then, epics are blocked by their open, non-template children
-///    (`load_local_open_child_blockers_impl`), so an epic blocked solely by
-///    its children does not transitively block those same children.
-///
-/// Self-edges are ignored, matching the forward-edge audit above. For an
-/// issue whose forward blockers are all dead or templates, membership can
-/// only come from steps 2 and 3, hence the name.
-fn hierarchy_gated_issue_ids<'a>(
-    issues: &'a [crate::model::Issue],
-    issue_by_id: &std::collections::HashMap<&str, &crate::model::Issue>,
-) -> std::collections::HashSet<&'a str> {
-    use crate::model::{DependencyType, IssueType};
-    use std::collections::{HashMap, HashSet};
-
-    let mut children_by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
-    for issue in issues {
-        for dependency in &issue.dependencies {
-            if dependency.dep_type == DependencyType::ParentChild
-                && !issue.id.starts_with("external:")
-                && !dependency.depends_on_id.starts_with("external:")
-            {
-                children_by_parent
-                    .entry(dependency.depends_on_id.as_str())
-                    .or_default()
-                    .push(issue.id.as_str());
-            }
-        }
-    }
-
-    let mut gated: HashSet<&str> = issues
-        .iter()
-        .filter(|issue| {
-            issue.dependencies.iter().any(|dependency| {
-                matches!(
-                    dependency.dep_type,
-                    DependencyType::Blocks
-                        | DependencyType::ConditionalBlocks
-                        | DependencyType::WaitsFor
-                ) && dependency.depends_on_id != issue.id
-                    && (dependency.depends_on_id.starts_with("external:")
-                        || issue_by_id
-                            .get(dependency.depends_on_id.as_str())
-                            .is_some_and(|target| {
-                                !target.status.is_terminal() && !target.is_template
-                            }))
-            })
-        })
-        .map(|issue| issue.id.as_str())
-        .collect();
-
-    let mut queue: Vec<&str> = gated.iter().copied().collect();
-    while let Some(parent_id) = queue.pop() {
-        if let Some(children) = children_by_parent.get(parent_id) {
-            for &child_id in children {
-                if gated.insert(child_id) {
-                    queue.push(child_id);
-                }
-            }
-        }
-    }
-
-    for (parent_id, children) in &children_by_parent {
-        let Some(parent) = issue_by_id.get(parent_id) else {
-            continue;
-        };
-        if parent.issue_type != IssueType::Epic {
-            continue;
-        }
-        if children.iter().any(|child_id| {
-            issue_by_id
-                .get(child_id)
-                .is_some_and(|child| !child.status.is_terminal() && !child.is_template)
-        }) {
-            gated.insert(*parent_id);
-        }
-    }
-
-    gated
-}
-
-fn classify_fully_unblocked(
-    issue: &crate::model::Issue,
-    hierarchy_gated: bool,
-) -> FullyUnblockedIssue {
-    use crate::model::Status;
-    let mut excluded_reasons: Vec<&'static str> = Vec::new();
-    let mut stale_blocked = false;
-    match &issue.status {
-        // Open is ready; terminal and draft statuses were filtered out
-        // before this point.
-        Status::Open | Status::Closed | Status::Tombstone | Status::Draft => {}
-        Status::InProgress => excluded_reasons.push("claimed (status in_progress)"),
-        Status::Blocked => stale_blocked = true,
-        Status::Deferred => excluded_reasons.push("status deferred"),
-        Status::Pinned => excluded_reasons.push("status pinned"),
-        Status::Custom(_) => excluded_reasons.push("custom status"),
-    }
-    if issue
-        .defer_until
-        .is_some_and(|until| until > chrono::Utc::now())
-    {
-        excluded_reasons.push("defer_until in the future");
-    }
-    if issue.pinned {
-        excluded_reasons.push("pinned");
-    }
-    if issue.ephemeral {
-        excluded_reasons.push("ephemeral");
-    }
-    if issue.id.contains("-wisp-") {
-        excluded_reasons.push("wisp");
-    }
-    if issue.is_template {
-        excluded_reasons.push("template");
-    }
-    if hierarchy_gated {
-        excluded_reasons.push("blocked through the parent-child hierarchy");
-    }
-    // A persisted `blocked` status is stale only when nothing `br ready`
-    // honors still gates the issue: an inherited or epic-rollup blocker keeps
-    // the status truthful, and a template is never ready-work.
-    let stale_blocked = stale_blocked && !hierarchy_gated && !issue.is_template;
-    FullyUnblockedIssue {
-        id: issue.id.clone(),
-        excluded_reasons,
-        stale_blocked,
-    }
+    emit_fully_unblocked_open(&classified, checks);
 }
 
 /// Read and parse JSONL issue records for the dependency-graph audit, skipping
@@ -14118,7 +13881,7 @@ fn emit_dead_closed_blocking_edges(
 /// the one derivable defect — status still `blocked` with no live blocker —
 /// warns.
 fn emit_fully_unblocked_open(
-    fully_unblocked: &[FullyUnblockedIssue],
+    fully_unblocked: &[crate::storage::sqlite::FullyUnblockedIssue],
     checks: &mut Vec<CheckResult>,
 ) {
     if fully_unblocked.is_empty() {
@@ -14182,7 +13945,7 @@ fn emit_fully_unblocked_open(
         map.insert(
             "remediation".to_string(),
             serde_json::Value::String(
-                "These issues have status `blocked` but no live blocker or parent-child gate remains — update their status (e.g. `br update <id> --status open`) so they surface as ready.".to_string(),
+                "These issues have status `blocked` but no live dependency or parent-child gate remains. Preview `br doctor unblock --dry-run --json`; manual or external holds require explicit issue-ID authorization and are never inferred from satisfied edges.".to_string(),
             ),
         );
     }
@@ -14198,6 +13961,235 @@ fn emit_fully_unblocked_open(
         Some(details),
     );
 }
+
+/// Preview or apply a reviewed issue-status repair. This is an ordinary
+/// audited issue transaction, not a raw database repair or doctor undo action.
+/// Preview uses an observational snapshot and never imports or repairs storage.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn execute_unblock(
+    args: &crate::cli::DoctorUnblockArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
+    if args.apply != args.expect.is_some() || (args.apply && args.dry_run) {
+        return Err(BeadsError::validation(
+            "expect",
+            "--apply requires the preview's --expect token; preview and --dry-run cannot apply a token",
+        ));
+    }
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let paths = config::resolve_paths(&beads_dir, cli.db.as_ref())?;
+    // Apply holds both families: --no-db writers also change the reviewed
+    // JSONL and must not race the repair or its subsequent publication.
+    let write_authority = if args.apply {
+        Some(
+            if let Some(authority) =
+                cli.database_family_write_authority_for(&beads_dir, &paths.db_path)
+            {
+                authority.verify_database_authority()?;
+                Arc::clone(authority)
+            } else {
+                acquire_doctor_database_write_authority(
+                    &beads_dir,
+                    &paths.db_path,
+                    cli.lock_timeout,
+                )?
+            },
+        )
+    } else {
+        None
+    };
+    let jsonl_authority = if args.apply {
+        Some(blocking_jsonl_family_write_lock_with_timeout(
+            &paths.jsonl_path,
+            cli.lock_timeout,
+        )?)
+    } else {
+        None
+    };
+
+    let mut observational = cli.clone();
+    observational.read_only_storage = true;
+    observational.read_only_fast_open = false;
+    observational.no_auto_import = Some(true);
+    observational.mark_no_db_write_intent(false);
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, &observational)?;
+    if storage_ctx.no_db {
+        return Err(BeadsError::validation(
+            "no-db",
+            "doctor unblock requires an existing database; import the tracker before reviewing a repair",
+        ));
+    }
+    if storage_ctx.paths.db_path != paths.db_path
+        || storage_ctx.paths.jsonl_path != paths.jsonl_path
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "Workspace routing changed while opening the repair preview; preview again"
+                .to_string(),
+        });
+    }
+    let pending = storage_ctx.storage.inspect_pending_sync_merge()?;
+    if !pending.permits_automatic_mutation() {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "{}; finish `br sync --merge` before reviewing an unblock repair",
+                pending.diagnostic()
+            ),
+        });
+    }
+    if compute_staleness(&storage_ctx.storage, &paths.jsonl_path)?.jsonl_newer {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL contains unimported changes; run `br sync --import-only`, then preview the unblock repair again".to_string(),
+        });
+    }
+    let layer = storage_ctx.load_config(&observational)?;
+    let actor = config::resolve_actor(&layer);
+    let attribution = crate::storage::EventAttribution::new(
+        args.agent_name.as_deref(),
+        args.harness.as_deref(),
+        args.model.as_deref(),
+        super::session_attribution_from_env().as_deref(),
+    );
+    storage_ctx
+        .storage
+        .set_pending_event_attribution(attribution.clone());
+    let request = crate::storage::DependencyUnblockRequest {
+        ids: args.ids.clone(),
+        authorized_ids: args.authorized_ids.clone(),
+        target_status: args.to_status.clone(),
+        context: unblock_review_context(&paths)?,
+    };
+    let plan = storage_ctx
+        .storage
+        .preview_dependency_unblock(&request, &actor)?;
+    if request.context != unblock_review_context(&paths)? {
+        return Err(BeadsError::SyncConflict {
+            message: "Repair inputs changed during preview; preview again".to_string(),
+        });
+    }
+    let mut payload = if let Some(expected) = args.expect.as_deref() {
+        if expected != plan.plan_token {
+            return Err(BeadsError::validation(
+                "expect",
+                "unblock preview is stale or its actor/options/workspace changed; review a new preview before applying",
+            ));
+        }
+        let authority = write_authority.as_ref().ok_or_else(|| {
+            BeadsError::internal("unblock apply is missing database write authority")
+        })?;
+        if crate::shutdown::is_requested() {
+            return Err(BeadsError::validation(
+                "unblock",
+                "repair interrupted before application; no issues were changed",
+            ));
+        }
+        // This strict reopen never reconstructs, migrates, or heals a database.
+        storage_ctx.reopen_current_for_auto_import(authority)?;
+        storage_ctx
+            .storage
+            .set_workflow_policy(crate::close_policy::load_for_beads_dir(&beads_dir)?.workflow);
+        // Strict reopen creates a new handle. Preserve the exact identity
+        // reviewed by preview, including harness/session capacity scopes.
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(attribution);
+        if request.context != unblock_review_context(&paths)? {
+            return Err(BeadsError::SyncConflict {
+                message: "Repair inputs changed before application; preview again".to_string(),
+            });
+        }
+        let report = storage_ctx
+            .storage
+            .apply_dependency_unblock(&request, expected, &actor)?;
+        let mut payload = serde_json::to_value(&report)?;
+        let export = if let Some(error) = &report.maintenance_error {
+            ctx.warning(&format!(
+                "Unblock changes committed, but storage maintenance failed: {error}. Do not replay the repair; inspect storage before flushing the pending JSONL changes."
+            ));
+            crate::output::record_pending_exit_code(
+                crate::error::ErrorCode::SyncConflict.exit_code(),
+            );
+            "pending_maintenance"
+        } else if report.changed.is_empty() {
+            "not_needed"
+        } else if config::no_auto_flush_from_layer(&layer).unwrap_or(false) {
+            "disabled"
+        } else if crate::shutdown::is_requested() {
+            "pending_shutdown"
+        } else {
+            let history = storage_ctx.resolved_history_config();
+            match crate::sync::auto_flush_with_authority(
+                &mut storage_ctx.storage,
+                &beads_dir,
+                &paths.jsonl_path,
+                config::implicit_external_jsonl_allowed(
+                    &beads_dir,
+                    &paths.db_path,
+                    &paths.jsonl_path,
+                ),
+                paths.metadata.deletions_retention_days,
+                history,
+                jsonl_authority.as_ref(),
+            ) {
+                Ok(_) => "complete",
+                Err(error) => {
+                    // The database already committed. Preserve that receipt
+                    // and its dirty state instead of implying a rollback.
+                    payload["export_error"] = serde_json::json!(error.to_string());
+                    super::report_auto_flush_failure(ctx, &beads_dir, &paths.jsonl_path, &error);
+                    "pending"
+                }
+            }
+        };
+        payload["export_status"] = serde_json::json!(export);
+        payload
+    } else {
+        let mut payload = serde_json::to_value(&plan)?;
+        payload["changed"] = serde_json::json!([]);
+        payload["skipped"] = serde_json::json!(plan.skipped_ids);
+        payload
+    };
+    payload["schema_version"] = serde_json::json!("br.doctor.unblock.v1");
+    payload["applied"] = serde_json::json!(args.apply);
+    if ctx.is_json() {
+        ctx.json_pretty(&payload);
+    } else if ctx.is_toon() {
+        ctx.toon(&payload);
+    } else if !ctx.is_quiet() {
+        // The same complete receipt is readable in text mode, including
+        // every skipped reason and the exact token required by --apply.
+        ctx.print_line(&serde_json::to_string_pretty(&payload)?);
+    }
+    Ok(())
+}
+
+/// Bind review to the selected workspace, routing and immutable input bytes.
+/// The storage witness separately binds the graph, issue/audit revisions and
+/// effective workflow. Missing and empty files are distinct inputs.
+fn unblock_review_context(paths: &config::ConfigPaths) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let inputs = [
+        paths.jsonl_path.clone(),
+        paths.beads_dir.join(crate::close_policy::POLICY_FILE_NAME),
+        paths.beads_dir.join("config.yaml"),
+        paths.beads_dir.join("metadata.json"),
+    ];
+    let mut witnesses = Vec::new();
+    for path in inputs {
+        let content = match fs::read(&path) {
+            Ok(bytes) => Some(format!("{:x}", Sha256::digest(bytes))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        witnesses.push((crate::sync::canonical_sync_path_sha256(&path), content));
+    }
+    Ok(serde_json::to_string(&serde_json::json!({
+        "workspace": fs::canonicalize(&paths.beads_dir)?,
+        "database": crate::sync::canonical_database_authority_path(&paths.db_path)?,
+        "inputs": witnesses,
+    }))?)
+}
+
 
 /// Runtime witness for the read-only contract (GitHub #476).
 ///
@@ -14443,6 +14435,25 @@ fn inspect_existing_doctor_database(
 /// acquired before the pending-merge gate is violated.
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    if let Some(crate::cli::DoctorSubcommand::Unblock(unblock)) = &args.subcommand
+        && (args.repair
+            || args.repair_indexes
+            || args.robot_triage
+            || args.selftest
+            || args.bundle.is_some()
+            || args.quick
+            || args.git_runtime_files
+            || !args.only.is_empty()
+            || !args.skip.is_empty()
+            || args.allow_repeated_repair
+            || args.unsafe_auto_fix
+            || (args.dry_run && unblock.apply))
+    {
+        return Err(BeadsError::validation(
+            "unblock",
+            "doctor unblock is a separately reviewed repair; do not combine it with flat doctor modes or filters, or --dry-run with --apply",
+        ));
+    }
     if args.git_runtime_files
         && (args.subcommand.is_some()
             || args.selftest

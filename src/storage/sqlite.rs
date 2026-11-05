@@ -38,6 +38,17 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "dependency_repair.rs"]
+mod dependency_repair;
+
+pub use dependency_repair::{
+    DependencyUnblockCandidate, DependencyUnblockPlan, DependencyUnblockReport,
+    DependencyUnblockRequest,
+};
+pub(crate) use dependency_repair::{
+    BlockerFate, FullyUnblockedIssue, blocker_fate, forward_blocking_targets, fully_unblocked_issues,
+};
+
 #[cfg(test)]
 thread_local! {
     static REPLACE_ATTACHED_DATABASE_AFTER_COMMIT: std::cell::Cell<bool> =
@@ -6427,7 +6438,25 @@ impl SqliteStorage {
         }
 
         let exemptions = Self::load_capacity_exemption_index_in_tx(conn, policy)?;
-        let mut engine = CapacityCountEngine::new(conn, &policy.counting, transitions, &exemptions);
+        Self::evaluate_workflow_capacity_with_exemptions(
+            conn,
+            policy,
+            transitions,
+            acting,
+            &exemptions,
+        )
+    }
+
+    /// Pure capacity calculation shared by enforcement and read-only repair
+    /// preview. Only the caller chooses whether to audit lazy expirations.
+    fn evaluate_workflow_capacity_with_exemptions(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transitions: &[CapacityBatchTransition],
+        acting: &CapacityActingContext,
+        exemptions: &CapacityExemptionIndex,
+    ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
+        let mut engine = CapacityCountEngine::new(conn, &policy.counting, transitions, exemptions);
         let mut warnings = Vec::new();
         Self::evaluate_capacity_status_limits_in_tx(policy, &mut engine, &mut warnings)?;
         Self::evaluate_capacity_group_limits_in_tx(policy, &mut engine, &mut warnings)?;
@@ -6436,7 +6465,7 @@ impl SqliteStorage {
             conn,
             policy,
             transitions,
-            &exemptions,
+            exemptions,
             acting,
             &mut warnings,
         )?;
@@ -7383,20 +7412,42 @@ impl SqliteStorage {
                 Self::upsert_metadata_key_in_tx(&storage.conn, NEEDS_FLUSH_KEY, "true")?;
             }
 
+            // A repair can be signaled while writing audit rows or refreshing
+            // the cache, after its issue loop. Still roll the whole batch back
+            // before returning to the COMMIT boundary.
+            if op == dependency_repair::DEPENDENCY_UNBLOCK_OPERATION {
+                dependency_repair::before_dependency_unblock_commit()?;
+            }
             Ok((result, blocked_cache_plan, ctx.capacity_warnings))
         });
 
         // Consume the staged attribution only now that the transaction has
         // COMMITTED (#312 hardening, F1). On a recoverable error the slot is
         // intentionally left intact so the JSONL-recovery retry can re-stamp it.
-        if tx_result.is_ok() {
+        let primary_committed = tx_result.is_ok();
+        if primary_committed {
             self.pending_event_attribution = None;
+            if op == dependency_repair::DEPENDENCY_UNBLOCK_OPERATION
+                && let Ok((_, _, warnings)) = &tx_result
+            {
+                // Preserve canonical warnings even when the following
+                // post-commit connection maintenance fails.
+                self.last_capacity_warnings.clone_from(warnings);
+            }
         }
 
         // Re-enable FK enforcement after the transaction completes
         // (regardless of success or failure).
+        let finished = Self::finish_foreign_key_suppressed_result(&self.conn, op, tx_result);
         let (result, blocked_cache_plan, capacity_warnings) =
-            Self::finish_foreign_key_suppressed_result(&self.conn, op, tx_result)?;
+            if op == dependency_repair::DEPENDENCY_UNBLOCK_OPERATION && primary_committed {
+                if finished.is_err() {
+                    self.verify_attached_database_authority_after_commit(op)?;
+                }
+                dependency_repair::committed_maintenance_result(finished)?
+            } else {
+                finished?
+            };
 
         self.last_capacity_warnings = capacity_warnings;
 
@@ -7413,12 +7464,32 @@ impl SqliteStorage {
             }
             Some(ref plan) => {
                 if let Err(error) = self.refresh_blocked_cache_after_commit(op, plan) {
-                    self.handle_blocked_cache_refresh_error(op, error)?;
+                    if op == dependency_repair::DEPENDENCY_UNBLOCK_OPERATION
+                        && error.primary_mutation_committed()
+                    {
+                        return Err(error);
+                    }
+                    let maintenance = self.handle_blocked_cache_refresh_error(op, error);
+                    if op == dependency_repair::DEPENDENCY_UNBLOCK_OPERATION {
+                        self.verify_attached_database_authority_after_commit(op)?;
+                        dependency_repair::committed_maintenance_result(maintenance)?;
+                    } else {
+                        maintenance?;
+                    }
                 }
             }
             None => {}
         }
 
+        if op == dependency_repair::DEPENDENCY_UNBLOCK_OPERATION {
+            // A disposable post-commit cache refresh must not hide loss of
+            // authority to the database containing the primary repair.
+            self.verify_attached_database_authority_after_commit(op)?;
+            #[cfg(test)]
+            dependency_repair::committed_maintenance_result(
+                dependency_repair::after_dependency_unblock_commit(),
+            )?;
+        }
         Ok(result)
     }
 
@@ -7978,11 +8049,20 @@ impl SqliteStorage {
     ///
     /// Returns an error without modifying any issue when any ID, validation,
     /// claim guard, uniqueness check, or workflow-capacity rule fails.
-    #[allow(clippy::too_many_lines)]
     pub fn update_issues_atomically(
         &mut self,
         updates: &[(String, IssueUpdate)],
         actor: &str,
+    ) -> Result<Vec<Issue>> {
+        self.update_issues_atomically_guarded(updates, actor, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn update_issues_atomically_guarded(
+        &mut self,
+        updates: &[(String, IssueUpdate)],
+        actor: &str,
+        dependency_unblock_guard: Option<&dependency_repair::DependencyUnblockGuard<'_>>,
     ) -> Result<Vec<Issue>> {
         self.last_capacity_warnings.clear();
 
@@ -7997,14 +8077,29 @@ impl SqliteStorage {
             }
         }
 
-        if updates.iter().all(|(_, update)| update.is_empty()) {
+        if dependency_unblock_guard.is_none() && updates.iter().all(|(_, update)| update.is_empty()) {
             // This path does not call `mutate()`, so explicitly consume staged
             // attribution just like the historical single-update no-op path.
             self.pending_event_attribution = None;
         } else {
             let capacity_policy = self.workflow_capacity_policy.clone();
             let workflow_policy = self.workflow_transition_policy.clone();
-            self.mutate("update_issues_atomically", actor, |conn, ctx| {
+            let operation = if dependency_unblock_guard.is_some() {
+                dependency_repair::DEPENDENCY_UNBLOCK_OPERATION
+            } else {
+                "update_issues_atomically"
+            };
+            self.mutate(operation, actor, |conn, ctx| {
+                if let Some(guard) = dependency_unblock_guard {
+                    Self::validate_dependency_unblock_guard_in_tx(
+                        conn,
+                        guard,
+                        actor,
+                        &workflow_policy,
+                        &capacity_policy,
+                        &ctx.attribution,
+                    )?;
+                }
                 // Reclaims bind ownership and the issue revision before any
                 // workflow check, so a competing claim keeps its meaningful
                 // contention diagnostic. Derive the audit again on each retry.
@@ -8042,6 +8137,8 @@ impl SqliteStorage {
                 }
 
                 Self::enforce_workflow_transition_batch_in_tx(conn, &workflow_policy, updates)?;
+                let mut dependency_block_proofs =
+                    Self::prepare_dependency_block_proofs_in_tx(conn, updates, actor, &workflow_policy)?;
 
                 let acting = CapacityActingContext::new(&ctx.actor, &ctx.attribution);
                 let capacity_warnings = Self::evaluate_workflow_capacity_batch_in_tx(
@@ -8052,9 +8149,18 @@ impl SqliteStorage {
                 )?;
                 ctx.capacity_warnings.extend(capacity_warnings);
 
-                for (id, update) in updates {
+                for (index, (id, update)) in updates.iter().enumerate() {
+                    if dependency_unblock_guard.is_some() {
+                        dependency_repair::check_repair_interruption()?;
+                    }
                     if !update.is_empty() {
                         Self::update_issue_in_tx(conn, ctx, id, update, actor)?;
+                    }
+                    if let Some(proof) = dependency_block_proofs.remove(id) {
+                        Self::record_dependency_block_proof_in_tx(conn, ctx, id, proof)?;
+                    }
+                    if dependency_unblock_guard.is_some() {
+                        dependency_repair::after_dependency_unblock_update(index + 1)?;
                     }
                 }
 
@@ -8111,6 +8217,13 @@ impl SqliteStorage {
                 }
                 Ok(())
             })?;
+        }
+
+        if dependency_unblock_guard.is_some() {
+            // Repair reports the transaction's reviewed IDs. Fetching issue
+            // rows after COMMIT is unnecessary and would introduce another
+            // fallible read after the status changes are already durable.
+            return Ok(Vec::new());
         }
 
         updates
@@ -20267,6 +20380,10 @@ pub struct IssueUpdate {
     pub prerequisites: Option<Option<String>>,
     pub notes: Option<Option<String>>,
     pub status: Option<Status>,
+    /// Explicitly attest that this new blocked status is caused only by the
+    /// current dependency blockers. Recorded with the issue revision in the
+    /// same transaction; never inferred from a bare "--status blocked".
+    pub blocked_by_dependencies: bool,
     pub priority: Option<Priority>,
     pub issue_type: Option<IssueType>,
     pub assignee: Option<Option<String>>,
@@ -20342,6 +20459,7 @@ impl IssueUpdate {
             && self.prerequisites.is_none()
             && self.notes.is_none()
             && self.status.is_none()
+            && !self.blocked_by_dependencies
             && self.priority.is_none()
             && self.issue_type.is_none()
             && self.assignee.is_none()

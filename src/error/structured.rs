@@ -423,6 +423,14 @@ impl StructuredError {
                 witnessed: None,
                 requires_reconciliation: true,
             },
+            BeadsError::CommittedMaintenanceFailure { .. } => ArtifactCommitEvidence {
+                state: "committed_maintenance_failed",
+                namespace_changed: false,
+                committed: Some(true),
+                durable: None,
+                witnessed: Some(true),
+                requires_reconciliation: true,
+            },
             BeadsError::CommittedStateUnwitnessed { .. }
             | BeadsError::CommittedArtifactFailure { .. } => ArtifactCommitEvidence {
                 state: "committed_unwitnessed",
@@ -813,6 +821,24 @@ impl StructuredError {
                     "retryable": false,
                     "requires_reconciliation": true,
                     "source_context": source_context,
+                    })),
+                )
+            }
+            BeadsError::CommittedMaintenanceFailure { operation, source } => {
+                let source_context = source.downcast_ref::<BeadsError>().and_then(|error| {
+                    let (_, context) = Self::extract_code_and_context(error);
+                    context
+                });
+                (
+                    ErrorCode::SyncConflict,
+                    Some(json!({
+                        "operation": operation,
+                        "primary_commit_state": "committed_maintenance_failed",
+                        "primary_committed": true,
+                        "primary_witnessed": true,
+                        "retryable": false,
+                        "requires_reconciliation": true,
+                        "source_context": source_context,
                     })),
                 )
             }
@@ -2053,5 +2079,28 @@ mod tests {
         let colored = err.to_human(true);
         assert!(colored.contains("\x1b[31m")); // Red color code
         assert!(colored.contains("\x1b[33m")); // Yellow color code
+    }
+
+    #[test]
+    fn committed_maintenance_failure_preserves_receipt_semantics_through_context() {
+        let committed = BeadsError::CommittedMaintenanceFailure {
+            operation: "dependency_unblock".to_string(),
+            source: Box::new(io::Error::other("foreign-key restoration failed")),
+        };
+        assert!(committed.primary_mutation_committed());
+        let err = BeadsError::WithContext {
+            context: "reviewed dependency repair".to_string(),
+            source: Box::new(committed),
+        };
+        assert!(err.primary_mutation_committed());
+        let structured = StructuredError::from_error(&err);
+        assert_eq!(structured.code, ErrorCode::SyncConflict);
+        assert!(!structured.retryable);
+        let context = structured.context.expect("committed maintenance evidence");
+        assert_eq!(context["primary_commit_state"], "committed_maintenance_failed");
+        assert_eq!(context["primary_committed"], true);
+        assert_eq!(context["primary_witnessed"], true);
+        assert_eq!(context["retryable"], false);
+        assert!(structured.message.contains("committed"));
     }
 }

@@ -1400,6 +1400,7 @@ const fn doctor_requires_read_only_storage(args: &beads_rust::cli::DoctorArgs) -
     match &args.subcommand {
         None => args.robot_triage || args.dry_run || !(args.repair || args.repair_indexes),
         Some(beads_rust::cli::DoctorSubcommand::Undo(undo)) => undo.dry_run,
+        Some(beads_rust::cli::DoctorSubcommand::Unblock(unblock)) => !unblock.apply,
         Some(beads_rust::cli::DoctorSubcommand::MigrateSchema(migration)) => {
             match &migration.command {
                 beads_rust::cli::DoctorMigrateSchemaCommand::Plan(_) => true,
@@ -4274,6 +4275,37 @@ mod tests {
         assert!(!is_mutating_command(&sync_cmd));
         assert!(!should_auto_import(&sync_cmd));
     }
+
+    #[test]
+    fn doctor_unblock_preview_and_apply_have_distinct_authority() {
+        for argv in [
+            vec!["br", "doctor", "unblock"],
+            vec!["br", "doctor", "unblock", "--dry-run"],
+        ] {
+            let command = Cli::parse_from(argv).command;
+            assert!(requires_read_only_storage(&command));
+            assert!(!needs_write_lock(&command));
+            assert!(!should_auto_import(&command));
+            assert!(!is_mutating_command(&command));
+            assert!(!command_must_refuse_during_pending_merge(&command));
+        }
+        let command = Cli::parse_from([
+            "br", "doctor", "unblock", "--apply", "--expect", "reviewed-token",
+        ])
+        .command;
+        assert!(needs_write_lock(&command));
+        assert!(!requires_read_only_storage(&command));
+        assert!(command_must_refuse_during_pending_merge(&command));
+        assert!(!should_auto_import(&command));
+        // The dedicated handler reports its committed transaction and export
+        // separately; startup must not perform an unrelated automatic sync.
+        assert!(!is_mutating_command(&command));
+        assert!(Cli::try_parse_from(["br", "doctor", "unblock", "--apply"]).is_err());
+        assert!(Cli::try_parse_from([
+            "br", "doctor", "unblock", "--apply", "--expect", "token", "--dry-run",
+        ]).is_err());
+    }
+
 
     #[test]
     fn coordination_reclaim_uses_mutation_authority_not_read_only_fallbacks() {

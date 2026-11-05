@@ -1306,6 +1306,11 @@ pub struct UpdateArgs {
     #[arg(long, short = 's', add = ArgValueCompleter::new(status_completer))]
     pub status: Option<String>,
 
+    /// Declare that this new blocked status is caused only by live dependencies.
+    /// Later edits invalidate this declaration; ordinary blocked updates stay manual.
+    #[arg(long, requires = "status", conflicts_with = "claim")]
+    pub blocked_by_dependencies: bool,
+
     /// Change priority (0-4 or P0-P4)
     #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
     pub priority: Option<String>,
@@ -3609,6 +3614,43 @@ pub enum DoctorSubcommand {
     MigrateSchema(DoctorMigrateSchemaArgs),
     /// Explain one finding: registry entry, live observation, fixers, next commands.
     Explain(DoctorExplainArgs),
+    /// Preview or apply a guarded repair of dependency-unblocked work.
+    Unblock(DoctorUnblockArgs),
+}
+
+/// Arguments for the explicitly reviewed stale-blocked repair.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorUnblockArgs {
+    /// Limit inspection to these exact issue IDs (default: all blocked issues).
+    pub ids: Vec<String>,
+    /// Preview without changing issues, events, caches, or export files (default).
+    #[arg(long, conflicts_with = "apply")]
+    pub dry_run: bool,
+    /// Apply the reviewed plan in one transaction; requires its --expect token.
+    #[arg(long, requires = "expect")]
+    pub apply: bool,
+    /// Token from an unchanged preview with the same actor and options.
+    #[arg(long, value_name = "PLAN_TOKEN", requires = "apply")]
+    pub expect: Option<String>,
+    /// Explicitly authorize one ambiguous/manual blocked issue; repeat for each ID.
+    /// This never bypasses live blockers, ownership, or workflow policy.
+    #[arg(long = "authorize", value_name = "ISSUE_ID")]
+    pub authorized_ids: Vec<String>,
+    /// Actionable target status from workflow.status_groups.ready.
+    #[arg(long, value_name = "STATUS")]
+    pub to_status: Option<String>,
+
+    /// Agent identity recorded on repair events (env: BR_AGENT_NAME).
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Harness identity for audit and capacity scopes (env: BR_HARNESS).
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Model identity recorded on repair events (env: BR_MODEL).
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 /// Arguments for `br doctor capabilities`.

@@ -1900,6 +1900,13 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         args.status.as_ref().map(|s| s.parse()).transpose()?
     };
 
+    if args.blocked_by_dependencies && status != Some(Status::Blocked) {
+        return Err(BeadsError::validation(
+            "blocked-by-dependencies",
+            "--blocked-by-dependencies requires --status blocked",
+        ));
+    }
+
     let priority = args.priority.as_ref().map(|p| p.parse()).transpose()?;
 
     let issue_type = args.type_.as_ref().map(|t| t.parse()).transpose()?;
@@ -1935,6 +1942,7 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         prerequisites: args.prerequisites.clone().map(Some),
         notes: args.notes.clone().map(Some),
         status,
+        blocked_by_dependencies: args.blocked_by_dependencies,
         priority,
         issue_type,
         assignee,
