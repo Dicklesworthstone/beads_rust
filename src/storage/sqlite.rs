@@ -14281,8 +14281,22 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn remove_all_dependencies(&mut self, issue_id: &str, actor: &str) -> Result<usize> {
+        self.remove_all_dependencies_preserving_status(issue_id, actor, &[])
+    }
+
+    /// Preserve every pending deletion's status while dependency cleanup can
+    /// unblock surviving issues in the same transaction.
+    pub(crate) fn remove_all_dependencies_preserving_status(
+        &mut self,
+        issue_id: &str,
+        actor: &str,
+        preserve_status_for: &[String],
+    ) -> Result<usize> {
         let workflow = self.workflow_transition_policy.clone();
         let capacity = self.workflow_capacity_policy.clone();
+        let mut preserved_ids: HashSet<&str> =
+            preserve_status_for.iter().map(String::as_str).collect();
+        preserved_ids.insert(issue_id);
         self.mutate("remove_all_dependencies", actor, |conn, ctx| {
             let automatic_before = Self::capture_automatic_dependency_unblock_in_tx(conn, actor)?;
             let affected_rows = conn.query_with_params(
@@ -14343,7 +14357,7 @@ impl SqliteStorage {
                     &automatic_before,
                     &workflow,
                     &capacity,
-                    &HashSet::from([issue_id]),
+                    &preserved_ids,
                     &format!("removing dependencies for deleted issue {issue_id}"),
                 )?;
             }

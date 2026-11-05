@@ -1936,6 +1936,77 @@ mod dependency_unblock {
     }
 
     #[test]
+    fn unblock_595_delete_batches_never_admit_work_selected_for_deletion() {
+        for cascade in [false, true] {
+            let workspace = workspace();
+            let [blocker, removed, retained] = [
+                "a-deleted-blocker",
+                "b-deleted-dependent",
+                "c-retained-dependent",
+            ]
+            .map(|slug| {
+                json(
+                    &workspace,
+                    &["create", slug, "--slug", slug, "--json"],
+                    "create_ordered_delete_fixture",
+                )["id"]
+                    .as_str()
+                    .expect("created ID")
+                    .to_string()
+            });
+            assert!(blocker < removed && removed < retained);
+            success(
+                &workspace,
+                &["update", &blocker, "--status", "in_progress"],
+                "keep_delete_source_outside_ready_capacity",
+            );
+            dependency(&workspace, &removed, &blocker);
+            if cascade {
+                // Cascade follows child -> parent gates, so this child is
+                // outside the deletion set but inherits its parent's blocker.
+                typed_dependency(&workspace, &retained, &removed, "parent-child");
+            } else {
+                dependency(&workspace, &retained, &blocker);
+            }
+            block(&workspace, &removed, true);
+            block(&workspace, &retained, true);
+            write_policy(
+                &workspace,
+                "workflow:\n  capacity:\n    statuses:\n      open: {hard: 1}\n",
+            );
+
+            let mut args = vec!["delete", blocker.as_str()];
+            if cascade {
+                args.push("--cascade");
+            } else {
+                args.extend_from_slice(&[removed.as_str(), "--force"]);
+            }
+            args.extend_from_slice(&["--reason", "remove obsolete workflow branch", "--json"]);
+            let deleted = json(&workspace, &args, "delete_without_intermediate_admission");
+            assert_eq!(deleted["deleted_count"], 2, "{deleted}");
+            for id in [&blocker, &removed] {
+                assert_eq!(issue_from_jsonl(&workspace, id)["status"], "tombstone");
+            }
+            assert_state(&workspace, &retained, "open", true);
+
+            let storage =
+                beads_rust::storage::SqliteStorage::open(&workspace.root.join(".beads/beads.db"))
+                    .unwrap();
+            let events = storage.get_events(&removed, 0).unwrap();
+            assert!(
+                !events.iter().any(|event| {
+                    event.event_type == beads_rust::model::EventType::StatusChanged
+                        && event.old_value.as_deref() == Some("blocked")
+                        && event.new_value.as_deref() == Some("open")
+                }),
+                "deletion target temporarily consumed a ready slot: {events:?}"
+            );
+            assert!(storage.get_comments(&removed).unwrap().is_empty());
+            assert_eq!(storage.get_comments(&retained).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn unblock_595_automatic_release_preserves_inherited_and_epic_gates() {
         let workspace = workspace();
         let ancestor_gate = create(&workspace, "ancestor prerequisite");
@@ -2104,7 +2175,7 @@ mod dependency_unblock {
         for policy in [
             "workflow:\n  strict: true\n  statuses: [open, blocked, closed]\n  transitions:\n    open: [closed]\n    blocked: []\n",
             "workflow:\n  required_fields:\n    'blocked -> open': [acceptance_criteria_present]\n",
-            "workflow:\n  gates:\n    'blocked -> open':\n      require_all: [dependency_review]\n",
+            "workflow:\n  strict: true\n  gates:\n    'blocked -> open':\n      require_all: [dependency_review]\n",
         ] {
             let workspace = workspace();
             let (blocker, dependent) = pair(&workspace, true);

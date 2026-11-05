@@ -627,10 +627,14 @@ impl SqliteStorage {
             return Ok(());
         }
         let blockers = Self::dependency_repair_blockers_in_tx(conn)?;
-        let exemptions = Self::load_capacity_exemption_index_read_only(conn, capacity)?;
+        // Bind every admission to one expiry observation in this write
+        // transaction. A second clock sample after selecting candidates could
+        // expire an exemption and reject an otherwise valid source completion.
+        let exemptions = Self::load_capacity_exemption_index_in_tx(conn, capacity)?;
         let acting = CapacityActingContext::new(&ctx.actor, &ctx.attribution);
         let mut updates = Vec::new();
         let mut transitions = Vec::new();
+        let mut warnings = Vec::new();
         for (id, (proof, prior_gates)) in &before.candidates {
             if preserve_status_for.contains(id.as_str()) {
                 continue;
@@ -696,7 +700,10 @@ impl SqliteStorage {
                 )
             });
             match decision {
-                Ok(_) => updates.push((id.clone(), update)),
+                Ok(admission_warnings) => {
+                    updates.push((id.clone(), update));
+                    warnings = admission_warnings;
+                }
                 Err(
                     error @ (BeadsError::PolicyViolation { .. }
                     | BeadsError::WorkflowCapacityExceeded { .. }),
@@ -713,8 +720,9 @@ impl SqliteStorage {
         if updates.is_empty() {
             return Ok(());
         }
-        let warnings =
-            Self::evaluate_workflow_capacity_batch_in_tx(conn, capacity, &transitions, &acting)?;
+        // Candidate selection only reads issue/status rows and stages proof
+        // events. The last successful cumulative admission therefore covers
+        // exactly the batch applied below, including its canonical warnings.
         let actor = ctx.actor.clone();
         for (id, update) in &updates {
             Self::update_issue_in_tx(conn, ctx, id, update, &actor)?;
