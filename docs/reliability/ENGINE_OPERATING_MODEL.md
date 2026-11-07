@@ -242,10 +242,13 @@ The reset recreates the data tables while retaining config, metadata and JSONL
 row receipts, and verifies the resulting runtime layout before returning.
 
 New plans include `forecast.schema19_preservation` with profile
-`schema19-layout-preservation-v1` and `source_sha256`. The digest binds raw
-source values and storage classes, multiplicities, application/operator table
+`schema19-layout-preservation-v2` and `source_sha256`. The digest binds exact
+source values and storage classes, including non-UTF-8 SQLite TEXT bytes,
+multiplicities, application/operator table
 hidden row IDs, sequence names/high-water values, and admitted operator schema.
 SQLite's sequence catalog's own row IDs are not application identities.
+Historical v1 profile digests keep their original encoding for receipt
+verification; retained-source comparisons still require exact TEXT bytes.
 The candidate must preserve that authority, pass fresh-connection integrity
 checks and have the expected target layout. Existing closing actors and
 receipt rows remain exact; a newly added actor is NULL and a new receipt table

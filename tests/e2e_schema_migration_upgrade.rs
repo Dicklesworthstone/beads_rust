@@ -343,6 +343,9 @@ fn engine_rows(db_path: &Path, columns: Option<&TableRows>) -> TableRows {
         Some(SqliteValue::Null) => "NULL".to_owned(),
         Some(SqliteValue::Integer(value)) => format!("integer {value}"),
         Some(SqliteValue::Float(value)) => format!("real {value:?}"),
+        Some(SqliteValue::Text(text)) if !text.is_valid_utf8() => {
+            format!("raw text {:?}", text.as_bytes_direct())
+        }
         Some(SqliteValue::Text(_)) => format!("text {:?}", value.and_then(SqliteValue::as_text)),
         Some(SqliteValue::Blob(bytes)) => format!("blob {bytes:?}"),
     };
@@ -1360,7 +1363,7 @@ fn released_schema19_unknown_layouts_refuse_without_a_noop_or_source_mutation() 
 
 fn assert_schema19_preservation_profile(plan: &Value) {
     let preservation = &plan["forecast"]["schema19_preservation"];
-    assert_eq!(preservation["profile"], "schema19-layout-preservation-v1");
+    assert_eq!(preservation["profile"], "schema19-layout-preservation-v2");
     let digest = preservation["source_sha256"].as_str().unwrap();
     assert_eq!(digest.len(), 64);
     assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -1774,6 +1777,108 @@ fn schema19_workflows_plan_rejects_rowid_drift_and_pending_merge() {
         );
         assert!(format!("{}{}", refused.stdout, refused.stderr).contains("pending"));
         assert_eq!(workflow_schema19_durable_files(&workspace), pending);
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn schema19_raw_text_changes_stale_plans_and_refuse_undo_without_losing_bytes() {
+    for (table, column, predicate) in [
+        ("config", "value", "key='operator_raw_text'"),
+        ("release_operator_records", "note", "rowid=17"),
+    ] {
+        let workspace = workflow_schema19_workspace();
+        seed_workflow_schema19_operator_state(&workspace);
+        edit_schema19_fixture(
+            &workspace,
+            &[
+                "INSERT INTO config (key, value) VALUES ('operator_raw_text', CAST(X'80' AS TEXT))",
+                "UPDATE release_operator_records SET note=CAST(X'80' AS TEXT) WHERE rowid=17",
+            ],
+        );
+        let db = workspace.root.join(".beads/beads.db");
+        let source_rows = workflow_schema19_authority(&db);
+        let plan = workflow_schema19_plan(&workspace);
+        assert_schema19_preservation_profile(&plan);
+        let update =
+            |hex| format!("UPDATE {table} SET {column}=CAST(X'{hex}' AS TEXT) WHERE {predicate}");
+        edit_schema19_fixture(&workspace, &[&update("81")]);
+        let drifted_rows = workflow_schema19_authority(&db);
+        assert_ne!(
+            drifted_rows, source_rows,
+            "the SQLite TEXT bytes really changed"
+        );
+        let next = workflow_schema19_plan(&workspace);
+        assert_eq!(
+            next["logical_witness"], plan["logical_witness"],
+            "negative control: both distinct payloads have the same lossy v1 witness"
+        );
+        assert_ne!(next["plan_token"], plan["plan_token"]);
+        assert_ne!(
+            next["forecast"]["schema19_preservation"]["source_sha256"],
+            plan["forecast"]["schema19_preservation"]["source_sha256"]
+        );
+        let drifted_files = workflow_schema19_durable_files(&workspace);
+        let refused = run_br(
+            &workspace,
+            [
+                "doctor",
+                "migrate-schema",
+                "apply",
+                "--plan-token",
+                plan["plan_token"].as_str().unwrap(),
+                "--json",
+            ],
+            "raw_text_stale_plan",
+        );
+        assert!(
+            !refused.status.success(),
+            "{} {}",
+            refused.stdout,
+            refused.stderr
+        );
+        assert_eq!(workflow_schema19_durable_files(&workspace), drifted_files);
+        assert_eq!(workflow_schema19_authority(&db), drifted_rows);
+
+        let applied = workflow_schema19_apply(&workspace, next["plan_token"].as_str().unwrap());
+        assert_eq!(engine_rows(&db, Some(&drifted_rows)), drifted_rows);
+        let run_id = applied["run_id"].as_str().unwrap();
+        edit_schema19_fixture(&workspace, &[&update("82")]);
+        let newer_rows = workflow_schema19_authority(&db);
+        let newer_files = workflow_schema19_durable_files(&workspace);
+        for dry_run in [true, false] {
+            let mut args = vec!["doctor", "migrate-schema", "undo", run_id, "--json"];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let refused = run_br(&workspace, args, "raw_text_newer_work_undo");
+            assert!(
+                !refused.status.success(),
+                "{} {}",
+                refused.stdout,
+                refused.stderr
+            );
+            assert!(format!("{}{}", refused.stdout, refused.stderr).contains("changed"));
+            assert_eq!(workflow_schema19_durable_files(&workspace), newer_files);
+            assert_eq!(workflow_schema19_authority(&db), newer_rows);
+        }
+        let run_dir = workspace
+            .root
+            .join(".beads/.br_recovery/schema-migrations")
+            .join(run_id);
+        assert!(!run_dir.join("undone.json").exists());
+
+        // Restore the exact applied payload, not its replacement-character
+        // string. The unchanged control must still restore the source family.
+        edit_schema19_fixture(&workspace, &[&update("81")]);
+        schema19_json(&run_br(
+            &workspace,
+            ["doctor", "migrate-schema", "undo", run_id, "--json"],
+            "raw_text_unchanged_undo",
+        ));
+        assert!(run_dir.join("undone.json").is_file());
+        assert_eq!(workflow_schema19_durable_files(&workspace), drifted_files);
+        assert_eq!(workflow_schema19_authority(&db), drifted_rows);
     }
 }
 

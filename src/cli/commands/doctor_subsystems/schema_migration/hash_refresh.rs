@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use super::{
     BeadsError, Connection, LegacyTableProjection, MigrationForecast, Result, SqliteValue,
-    legacy_projection_rowid, legacy_rows_projection, preservation_text, quote_identifier,
+    legacy_projection_rowid, preservation_text, quote_identifier, reviewed_rows_projection,
 };
 use crate::storage::schema::hash_refresh as schema;
 
@@ -111,7 +111,7 @@ pub(super) fn project_source_issues(
     }
     Ok(CandidateIssueProjection {
         columns,
-        projection: legacy_rows_projection("issues", rowid.is_some(), &rows)?,
+        projection: reviewed_rows_projection("issues", rowid.is_some(), &rows)?,
     })
 }
 

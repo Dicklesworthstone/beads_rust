@@ -2774,15 +2774,17 @@ New schema-19 layout plans also include `forecast.schema19_preservation`:
 
 ```json
 {
-  "profile": "schema19-layout-preservation-v1",
+  "profile": "schema19-layout-preservation-v2",
   "source_sha256": "<digest of the complete source preservation witness>"
 }
 ```
 
 This versioned proof binds the original records, application/operator row IDs,
-sequence reservations and admitted schema into the plan token. A rowid-only
-change that alters duplicate configuration or metadata precedence therefore
-invalidates the reviewed plan. Apply verifies the proof before building and
+sequence reservations and admitted schema into the plan token. SQLite TEXT
+uses its exact stored bytes, including invalid UTF-8. Distinct byte payloads
+with the same replacement-character display and rowid-only changes that alter
+duplicate configuration or metadata precedence invalidate the reviewed plan.
+Apply verifies the proof before building and
 installing the candidate; interrupted completion and undo verify it against a
 private copy of the retained source family. Earlier installed receipts retain
 their original token and preservation semantics for guarded recovery and undo.

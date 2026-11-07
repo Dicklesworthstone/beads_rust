@@ -851,8 +851,9 @@ operator tables. It checks raw values and storage classes, row multiplicities,
 application/operator table hidden row IDs, sequence names/high-water values,
 and admitted schema. New plans bind these checks in
 `forecast.schema19_preservation`, using profile
-`schema19-layout-preservation-v1` and `source_sha256`. A change confined to
-application row IDs invalidates the token. Existing closure attribution and
+`schema19-layout-preservation-v2` and `source_sha256`. A change confined to
+application row IDs or otherwise indistinguishable non-UTF-8 TEXT bytes
+invalidates the token. Existing closure attribution and
 receipts remain exact; absent structures are added with unknown closers as
 NULL and no invented receipts. JSONL and configuration files stay unchanged.
 

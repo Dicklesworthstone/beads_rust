@@ -145,7 +145,16 @@ struct LegacyV15Projection {
     retired_indexes: Vec<String>,
 }
 
-const SCHEMA19_PRESERVATION_PROFILE: &str = "schema19-layout-preservation-v1";
+const LEGACY_SCHEMA19_PRESERVATION_PROFILE: &str = "schema19-layout-preservation-v1";
+const SCHEMA19_PRESERVATION_PROFILE: &str = "schema19-layout-preservation-v2";
+
+#[derive(Clone, Copy)]
+enum PreservationTextEncoding {
+    /// Persisted v1 witnesses used `SmallText`'s lossy UTF-8 string view.
+    LegacyLossyUtf8,
+    /// SQLite TEXT may contain bytes that are not valid UTF-8.
+    ExactBytes,
+}
 
 /// Bind original storage values and hidden rowids as well as the layout.
 /// Absent on historical receipts so their token serialization is unchanged.
@@ -2893,7 +2902,10 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                     })?;
                 forecast.schema19_preservation = Some(Schema19PreservationProfile {
                     profile: SCHEMA19_PRESERVATION_PROFILE.to_owned(),
-                    source_sha256: schema19_preservation_digest(&preservation)?,
+                    source_sha256: schema19_preservation_digest(
+                        &preservation,
+                        SCHEMA19_PRESERVATION_PROFILE,
+                    )?,
                 });
             }
             let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -5890,6 +5902,20 @@ fn capture_reviewed_state_preservation(
     db_path: &Path,
     forecast: &MigrationForecast,
 ) -> Result<Option<ReviewedStatePreservation>> {
+    capture_reviewed_state_preservation_with_text_encoding(
+        db_path,
+        forecast,
+        PreservationTextEncoding::ExactBytes,
+    )
+}
+
+/// Historical profile digests retain their original encoding. Every live
+/// source/candidate preservation comparison uses the byte-exact wrapper above.
+fn capture_reviewed_state_preservation_with_text_encoding(
+    db_path: &Path,
+    forecast: &MigrationForecast,
+    text_encoding: PreservationTextEncoding,
+) -> Result<Option<ReviewedStatePreservation>> {
     let preserve_hash_bookkeeping = hash_refresh::preserves_bookkeeping(forecast)?;
     if forecast.legacy_v15_conversion.is_some() || forecast.legacy_v4_conversion.is_some() {
         // These profiles already bind their exact projected destination,
@@ -5928,7 +5954,7 @@ fn capture_reviewed_state_preservation(
                      preserve the original database and supply a reviewed migration for its shape"
                 )));
             }
-            let projection = reviewed_table_projection(conn, &name, &columns, &[])?;
+            let projection = reviewed_table_projection(conn, &name, &columns, &[], text_encoding)?;
             let candidate = (preserve_hash_bookkeeping && name == "issues")
                 .then(|| {
                     hash_refresh::project_source_issues(
@@ -5982,6 +6008,7 @@ fn reviewed_table_projection(
     table: &str,
     columns: &[String],
     added_empty_sequences: &[String],
+    text_encoding: PreservationTextEncoding,
 ) -> Result<LegacyTableProjection> {
     let rowid = legacy_projection_rowid(conn, table)?;
     let escaped = table.replace('\'', "''");
@@ -6033,7 +6060,7 @@ fn reviewed_table_projection(
         }
         rows.push(row.values().to_vec());
     }
-    legacy_rows_projection(table, rowid.is_some(), &rows)
+    rows_projection_with_text_encoding(table, rowid.is_some(), &rows, text_encoding)
 }
 
 fn reviewed_schema_objects(
@@ -6098,7 +6125,13 @@ fn verify_reviewed_state_preservation(
             } else {
                 (table.columns.as_slice(), &table.projection)
             };
-            let observed = reviewed_table_projection(conn, &table.name, columns, sequences)?;
+            let observed = reviewed_table_projection(
+                conn,
+                &table.name,
+                columns,
+                sequences,
+                PreservationTextEncoding::ExactBytes,
+            )?;
             if &observed != projection {
                 return Err(BeadsError::Config(format!(
                     "reviewed migration preservation refused: table {} changed an authoritative \
@@ -6183,10 +6216,14 @@ fn verify_retained_migration_preservation_at(
 
 /// The generic v1 logical witness hashes a multiset of visible values. It
 /// cannot detect changed duplicate-config precedence caused only by rowids.
-/// New schema19 plans bind the stronger, existing preservation projection.
-fn schema19_preservation_digest(preservation: &ReviewedStatePreservation) -> Result<String> {
+/// Schema19 v2 plans also distinguish raw TEXT payloads with the same lossy
+/// UTF-8 view. The profile name binds that encoding into the existing token.
+fn schema19_preservation_digest(
+    preservation: &ReviewedStatePreservation,
+    profile: &str,
+) -> Result<String> {
     let mut hasher = Sha256::new();
-    hash_len_prefixed(&mut hasher, SCHEMA19_PRESERVATION_PROFILE.as_bytes());
+    hash_len_prefixed(&mut hasher, profile.as_bytes());
     for table in &preservation.tables {
         if table.candidate.is_some() {
             return Err(BeadsError::internal(
@@ -6220,7 +6257,10 @@ fn validate_schema19_preservation_profile(forecast: &MigrationForecast) -> Resul
     if forecast.from_version != 19
         || forecast.to_version != 19
         || forecast.schema19_runtime_upgrade.is_none()
-        || profile.profile != SCHEMA19_PRESERVATION_PROFILE
+        || !matches!(
+            profile.profile.as_str(),
+            LEGACY_SCHEMA19_PRESERVATION_PROFILE | SCHEMA19_PRESERVATION_PROFILE
+        )
         || !recovery_pruning_hash_is_valid(&profile.source_sha256)
     {
         return Err(BeadsError::Config(
@@ -6331,12 +6371,46 @@ fn legacy_rows_projection(
     rowid_included: bool,
     rows: &[Vec<SqliteValue>],
 ) -> Result<LegacyTableProjection> {
+    rows_projection_with_text_encoding(
+        table,
+        rowid_included,
+        rows,
+        PreservationTextEncoding::LegacyLossyUtf8,
+    )
+}
+
+fn reviewed_rows_projection(
+    table: &str,
+    rowid_included: bool,
+    rows: &[Vec<SqliteValue>],
+) -> Result<LegacyTableProjection> {
+    rows_projection_with_text_encoding(
+        table,
+        rowid_included,
+        rows,
+        PreservationTextEncoding::ExactBytes,
+    )
+}
+
+fn rows_projection_with_text_encoding(
+    table: &str,
+    rowid_included: bool,
+    rows: &[Vec<SqliteValue>],
+    text_encoding: PreservationTextEncoding,
+) -> Result<LegacyTableProjection> {
     let mut encoded_rows: Vec<Vec<u8>> = rows
         .iter()
         .map(|row| {
             let mut encoded = Vec::new();
             for value in row {
-                encode_sqlite_value(&mut encoded, value);
+                match text_encoding {
+                    PreservationTextEncoding::LegacyLossyUtf8 => {
+                        encode_sqlite_value(&mut encoded, value);
+                    }
+                    PreservationTextEncoding::ExactBytes => {
+                        encode_preserved_sqlite_value(&mut encoded, value);
+                    }
+                }
             }
             encoded
         })
@@ -6576,11 +6650,26 @@ fn verify_reviewed_profile(
             Ok(())
         })?;
         if project_source && let Some(profile) = &forecast.schema19_preservation {
-            let preservation =
-                capture_reviewed_state_preservation(db_path, forecast)?.ok_or_else(|| {
-                    BeadsError::internal("schema19 source preservation witness is absent")
-                })?;
-            if schema19_preservation_digest(&preservation)? != profile.source_sha256 {
+            let text_encoding = match profile.profile.as_str() {
+                LEGACY_SCHEMA19_PRESERVATION_PROFILE => PreservationTextEncoding::LegacyLossyUtf8,
+                SCHEMA19_PRESERVATION_PROFILE => PreservationTextEncoding::ExactBytes,
+                _ => {
+                    return Err(BeadsError::internal(
+                        "unvalidated schema19 preservation profile",
+                    ));
+                }
+            };
+            let preservation = capture_reviewed_state_preservation_with_text_encoding(
+                db_path,
+                forecast,
+                text_encoding,
+            )?
+            .ok_or_else(|| {
+                BeadsError::internal("schema19 source preservation witness is absent")
+            })?;
+            if schema19_preservation_digest(&preservation, &profile.profile)?
+                != profile.source_sha256
+            {
                 return Err(BeadsError::Config(
                     "schema19 source preservation witness changed: authoritative values, rowids, \
                      sequences, or schema differ from the reviewed plan; preserve the original and re-plan"
@@ -7014,6 +7103,18 @@ fn hash_sqlite_value(hasher: &mut Sha256, value: &SqliteValue) {
     let mut encoded = Vec::new();
     encode_sqlite_value(&mut encoded, value);
     hash_len_prefixed(hasher, &encoded);
+}
+
+/// Preserve TEXT storage bytes without changing historical v1 logical/legacy
+/// receipt encodings. `SmallText`'s `as_bytes()` dereferences its lossy `str`
+/// view, so distinct invalid UTF-8 payloads would otherwise share a witness.
+fn encode_preserved_sqlite_value(output: &mut Vec<u8>, value: &SqliteValue) {
+    if let SqliteValue::Text(text) = value {
+        output.push(3);
+        append_len_prefixed(output, text.as_bytes_direct());
+    } else {
+        encode_sqlite_value(output, value);
+    }
 }
 
 fn encode_sqlite_value(output: &mut Vec<u8>, value: &SqliteValue) {
@@ -9399,6 +9500,21 @@ mod tests {
         validate_schema19_preservation_profile(&forecast).unwrap();
         let current_token = compute_plan_token("db", &logical, &forecast).unwrap();
         assert_ne!(historical_token, current_token);
+        let mut legacy_profile = forecast.clone();
+        legacy_profile
+            .schema19_preservation
+            .as_mut()
+            .unwrap()
+            .profile = LEGACY_SCHEMA19_PRESERVATION_PROFILE.to_owned();
+        validate_schema19_preservation_profile(&legacy_profile).unwrap();
+        let serialized = serde_json::to_string(&legacy_profile).unwrap();
+        let restored: MigrationForecast = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(serde_json::to_string(&restored).unwrap(), serialized);
+        assert_ne!(
+            compute_plan_token("db", &logical, &legacy_profile).unwrap(),
+            current_token,
+            "the byte-exact profile must not reuse a lossy v1 plan token"
+        );
         let mut changed = forecast.clone();
         changed
             .schema19_preservation
@@ -9823,6 +9939,190 @@ mod tests {
                 "{sql}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn reviewed_text_projection_distinguishes_raw_bytes_and_keeps_legacy_encoding() {
+        let left = SqliteValue::Text(fsqlite_types::SmallText::from_bytes(&[0x80]));
+        let right = SqliteValue::Text(fsqlite_types::SmallText::from_bytes(&[0x81]));
+        assert_eq!(left.as_text(), right.as_text());
+        assert_ne!(left, right, "SQLite TEXT retains the original byte payload");
+        let mut legacy_left = Vec::new();
+        let mut legacy_right = Vec::new();
+        encode_sqlite_value(&mut legacy_left, &left);
+        encode_sqlite_value(&mut legacy_right, &right);
+        assert_eq!(
+            legacy_left,
+            vec![3, 3, 0, 0, 0, 0, 0, 0, 0, 0xef, 0xbf, 0xbd]
+        );
+        assert_eq!(
+            legacy_left, legacy_right,
+            "persisted v1 encoding stays unchanged"
+        );
+        let mut exact_left = Vec::new();
+        let mut exact_right = Vec::new();
+        encode_preserved_sqlite_value(&mut exact_left, &left);
+        encode_preserved_sqlite_value(&mut exact_right, &right);
+        assert_eq!(exact_left, vec![3, 1, 0, 0, 0, 0, 0, 0, 0, 0x80]);
+        assert_ne!(exact_left, exact_right);
+        let left_rows = vec![vec![left]];
+        let right_rows = vec![vec![right]];
+        assert_eq!(
+            legacy_rows_projection("opaque", false, &left_rows).unwrap(),
+            legacy_rows_projection("opaque", false, &right_rows).unwrap()
+        );
+        assert_ne!(
+            reviewed_rows_projection("opaque", false, &left_rows).unwrap(),
+            reviewed_rows_projection("opaque", false, &right_rows).unwrap()
+        );
+        for value in [
+            SqliteValue::from(""),
+            SqliteValue::from("valid UTF-8 café\0tail"),
+            SqliteValue::Null,
+            SqliteValue::Integer(17),
+            SqliteValue::Float(1.25),
+            SqliteValue::Blob(vec![0x80].into()),
+        ] {
+            let rows = vec![vec![value]];
+            assert_eq!(
+                reviewed_rows_projection("control", false, &rows).unwrap(),
+                legacy_rows_projection("control", false, &rows).unwrap()
+            );
+        }
+        assert_ne!(
+            reviewed_rows_projection("opaque", false, &left_rows).unwrap(),
+            reviewed_rows_projection(
+                "opaque",
+                false,
+                &[vec![SqliteValue::Blob(vec![0x80].into())]],
+            )
+            .unwrap(),
+            "TEXT and BLOB with the same bytes remain different storage values"
+        );
+    }
+
+    #[test]
+    fn reviewed_preservation_detects_distinct_invalid_utf8_text_values() {
+        for (table, column) in [("config", "value"), ("operator_notes", "payload")] {
+            let (_temp, db, forecast) = preservation_fixture();
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute(&format!("UPDATE {table} SET {column}=CAST(X'80' AS TEXT)"))
+                .unwrap();
+            close_connection(conn).unwrap();
+            let expected = capture_reviewed_state_preservation(&db, &forecast).unwrap();
+            let logical_before = logical_witness(&db).unwrap();
+            verify_reviewed_state_preservation(&db, expected.as_ref(), true).unwrap();
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute(&format!("UPDATE {table} SET {column}=CAST(X'81' AS TEXT)"))
+                .unwrap();
+            close_connection(conn).unwrap();
+            assert_eq!(
+                logical_witness(&db).unwrap(),
+                logical_before,
+                "negative control: the historical logical witness misses this byte change"
+            );
+            let error = verify_reviewed_state_preservation(&db, expected.as_ref(), true)
+                .expect_err("raw TEXT changes must not pass exact preservation");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("table {table} changed"))
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn schema19_legacy_text_profile_keeps_its_digest_but_checks_exact_retained_rows() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("beads.db");
+        let fixture = include_bytes!(
+            "../../../../tests/fixtures/schema_migration/schema19_v076_release.db.gz"
+        );
+        let mut released = Vec::new();
+        flate2::read::GzDecoder::new(&fixture[..])
+            .read_to_end(&mut released)
+            .unwrap();
+        fs::write(&db, released).unwrap();
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute("INSERT INTO config (key, value) VALUES ('raw_text', CAST(X'80' AS TEXT))")
+            .unwrap();
+        conn.execute("CREATE TABLE operator_raw_text (payload TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO operator_raw_text VALUES (CAST(X'80' AS TEXT))")
+            .unwrap();
+        close_connection(conn).unwrap();
+        let plan = build_plan(&db).unwrap();
+        let current = plan.forecast.as_ref().unwrap();
+        assert_eq!(
+            current.schema19_preservation.as_ref().unwrap().profile,
+            SCHEMA19_PRESERVATION_PROFILE
+        );
+        verify_reviewed_profile(&db, current, true).unwrap();
+
+        let mut historical = current.clone();
+        let legacy_proof = capture_reviewed_state_preservation_with_text_encoding(
+            &db,
+            &historical,
+            PreservationTextEncoding::LegacyLossyUtf8,
+        )
+        .unwrap()
+        .unwrap();
+        historical.schema19_preservation = Some(Schema19PreservationProfile {
+            profile: LEGACY_SCHEMA19_PRESERVATION_PROFILE.to_owned(),
+            source_sha256: schema19_preservation_digest(
+                &legacy_proof,
+                LEGACY_SCHEMA19_PRESERVATION_PROFILE,
+            )
+            .unwrap(),
+        });
+        verify_reviewed_profile(&db, &historical, true).unwrap();
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute("UPDATE config SET value=CAST(X'81' AS TEXT) WHERE key='raw_text'")
+            .unwrap();
+        close_connection(conn).unwrap();
+        assert_eq!(logical_witness(&db).unwrap(), plan.logical_witness);
+        verify_reviewed_profile(&db, &historical, true)
+            .expect("old receipt digests keep their historical meaning");
+        assert!(verify_reviewed_profile(&db, current, true).is_err());
+        assert_ne!(build_plan(&db).unwrap().plan_token, plan.plan_token);
+
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute("UPDATE config SET value=CAST(X'80' AS TEXT) WHERE key='raw_text'")
+            .unwrap();
+        close_connection(conn).unwrap();
+        assert_eq!(build_plan(&db).unwrap().plan_token, plan.plan_token);
+        let run_dir = temp.path().join("retained-v1-profile");
+        let before_dir = run_dir.join("before");
+        ensure_new_directory(&run_dir).unwrap();
+        ensure_new_directory(&before_dir).unwrap();
+        let original = raw_family_witness(&db).unwrap();
+        copy_family_to_backup(&db, &before_dir, &original).unwrap();
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        apply_reviewed_runtime_schema_upgrade_in_transaction(
+            &conn,
+            historical.schema19_runtime_upgrade.unwrap(),
+        )
+        .unwrap();
+        conn.execute("COMMIT").unwrap();
+        close_connection(conn).unwrap();
+        verify_retained_migration_preservation(&db, &run_dir, &original, &historical)
+            .expect("an unchanged historical v1 upgrade remains verifiable");
+        let installed = logical_witness(&db).unwrap();
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute("UPDATE operator_raw_text SET payload=CAST(X'81' AS TEXT)")
+            .unwrap();
+        close_connection(conn).unwrap();
+        assert_eq!(logical_witness(&db).unwrap(), installed);
+        let error = verify_retained_migration_preservation(&db, &run_dir, &original, &historical)
+            .expect_err("old receipt compatibility must not admit newer raw TEXT work");
+        assert!(
+            error
+                .to_string()
+                .contains("table operator_raw_text changed")
+        );
+        verify_backup_family(&db, &before_dir, &original).unwrap();
     }
 
     #[test]
