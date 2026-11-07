@@ -116,6 +116,50 @@ cargo test --test e2e_sync_git_safety --release -- --nocapture
 cargo test regression_sync_export_does_not_create_commits --release -- --nocapture
 ```
 
+### Actual v0.7.6 schema upgrade and downgrade boundary
+
+The normal `e2e_schema_migration_upgrade` tests use frozen databases created
+by the official v0.7.6 release. An additional, explicitly ignored test runs
+the checksum-pinned Linux amd64 release executable and the Cargo-built
+candidate through the upgrade/undo lifecycle. It requires a separately
+supplied release binary and never downloads one or substitutes a binary
+found on `PATH`.
+
+Obtain `br-0.7.6-linux_amd64.tar.gz` from the
+[official v0.7.6 release](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.7.6)
+and verify its archive SHA-256 before extracting it:
+`56baae2df5e7cc6f6537e05fd5f560192a9d5ceb02659c61b10b9610b45eb3ef`,
+with executable SHA-256
+`73cbef7f11680b8349ef5b465d002e404272cc6c06b0f95a86035b488b1844b9`.
+The test verifies the executable checksum, version, and embedded commit.
+It uses the richer workflow fixture, including an ephemeral database-only
+issue, gate and capacity history, and closure attribution; its hashes and
+generation recipe are recorded in
+[`schema19_v076_workflows.md`](../tests/fixtures/schema_migration/schema19_v076_workflows.md).
+
+```bash
+BR_V076_BINARY=/absolute/path/to/official-v0.7.6/br \
+  cargo test --test e2e_schema_migration_upgrade \
+  official_v076_refuses_upgraded_schema19_layout_and_reads_guarded_undo \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+For RCH, provision the verified executable on the selected worker, then run
+the same Cargo invocation through `rch exec -- env BR_V076_BINARY=/worker/path/br`.
+The selected test fails if the variable or executable is missing, or its
+checksum/version/commit differs. Normal test runs report this test as ignored;
+the gate contains no download step.
+
+The gate checks released reads, explicit migration, schema-specific v0.7.6
+refusal, guarded undo, and successful v0.7.6 reads after restoration. Old-binary
+calls use separate copies because v0.7.6 startup can create sidecars or change
+database bytes even during reads. The ordinary fixture tests additionally
+cover nonmutating inspection, doctor/plan/heal agreement, original row and
+rowid preservation, and exact database-family restoration. The
+`runtime_safety` tests verify unsafe health classification and generic repair
+refusal before any repair session or reconstruction. This is a local/RCH
+gate; it adds no GitHub Actions dependency.
+
 ## Conformance Tests
 
 Conformance tests verify br produces identical outputs to bd (Go implementation).
@@ -642,6 +686,7 @@ HARNESS_ARTIFACTS=1 cargo test --test e2e_sync_git_safety -- --nocapture
 | `HARNESS_ARTIFACTS` | 0 | Enable artifact logging |
 | `HARNESS_PRESERVE_SUCCESS` | 0 | Keep artifacts on success |
 | `BR_BINARY` | auto | Path to br binary |
+| `BR_V076_BINARY` | required for explicit release gate | Verified official v0.7.6 executable for schema upgrade/undo coverage |
 | `BD_BINARY` | auto | Path to bd binary |
 | `E2E_TIMEOUT` | 120 | E2E per-test timeout (seconds) |
 | `E2E_FULL_CONFIRM` | 0 | Skip full E2E confirmation |

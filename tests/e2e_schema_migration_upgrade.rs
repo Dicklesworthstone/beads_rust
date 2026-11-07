@@ -35,6 +35,8 @@
 //! re-apply.
 
 mod common;
+#[path = "schema_migration/runtime_safety.rs"]
+mod runtime_safety;
 
 use beads_rust::franken_sync::{Connection, SqliteValue};
 use common::cli::{BrRun, BrWorkspace, extract_json_payload, run_br};
