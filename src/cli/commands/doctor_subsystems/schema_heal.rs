@@ -1486,9 +1486,31 @@ pub(super) fn execute_heal_preview(
     args: &crate::cli::DoctorMigrateSchemaHealArgs,
     paths: &config::ConfigPaths,
 ) -> Result<()> {
+    let preview = super::schema_migration::with_database_transition_observation(
+        &paths.beads_dir,
+        &paths.db_path,
+        || build_heal_preview(paths),
+    )?;
+    emit_heal_preview(args, preview)
+}
+
+enum HealPreview {
+    NotNeeded,
+    Current(Box<super::schema_migration::MigrationPlanReceipt>),
+    Stale(Box<StaleHealPreview>),
+}
+
+struct StaleHealPreview {
+    from_version: u32,
+    plan: Option<super::schema_migration::MigrationPlanReceipt>,
+    migration_error: Option<BeadsError>,
+    audited: Result<StaleSchemaAudit>,
+}
+
+fn build_heal_preview(paths: &config::ConfigPaths) -> Result<HealPreview> {
     match std::fs::symlink_metadata(&paths.db_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return emit_not_needed(args.json);
+            return Ok(HealPreview::NotNeeded);
         }
         Err(error) => return Err(BeadsError::Io(error)),
         Ok(_) => {}
@@ -1497,8 +1519,49 @@ pub(super) fn execute_heal_preview(
         let Some(from_version) = stale_schema_version(snapshot)? else {
             let plan = inspected?;
             if !plan.eligible {
-                return emit_not_needed(args.json);
+                return Ok(HealPreview::NotNeeded);
             }
+            return Ok(HealPreview::Current(Box::new(plan)));
+        };
+        let (plan, migration_error) = match inspected {
+            Ok(plan) if !plan.eligible => return Ok(HealPreview::NotNeeded),
+            Ok(plan) => (Some(plan), None),
+            Err(error) => (None, Some(error)),
+        };
+        let audited = (|| {
+            let source = match std::fs::symlink_metadata(&paths.jsonl_path) {
+                Ok(_) => Some(crate::sync::capture_jsonl_source_snapshot(
+                    &paths.jsonl_path,
+                )?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(BeadsError::Io(error)),
+            };
+            audit_stale_database(snapshot, source.as_ref())
+        })();
+        let audited = match audited {
+            Ok(mut audit) => {
+                audit.from_version = from_version;
+                Ok(audit)
+            }
+            Err(error) if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from_version) => Err(error),
+            Err(error) => return Err(error),
+        };
+        Ok(HealPreview::Stale(Box::new(StaleHealPreview {
+            from_version,
+            plan,
+            migration_error,
+            audited,
+        })))
+    })
+}
+
+fn emit_heal_preview(
+    args: &crate::cli::DoctorMigrateSchemaHealArgs,
+    preview: HealPreview,
+) -> Result<()> {
+    let stale = match preview {
+        HealPreview::NotNeeded => return emit_not_needed(args.json),
+        HealPreview::Current(plan) => {
             let upgrade = plan
                 .forecast
                 .as_ref()
@@ -1532,65 +1595,55 @@ pub(super) fn execute_heal_preview(
                 println!("{}", plan.note);
             }
             return Ok(());
-        };
-        let (plan, migration_error) = match inspected {
-            Ok(plan) if !plan.eligible => return emit_not_needed(args.json),
-            Ok(plan) => (Some(plan), None),
-            Err(error) => (None, Some(error)),
-        };
-        let audited = (|| {
-            let source = match std::fs::symlink_metadata(&paths.jsonl_path) {
-                Ok(_) => Some(crate::sync::capture_jsonl_source_snapshot(
-                    &paths.jsonl_path,
-                )?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(BeadsError::Io(error)),
-            };
-            audit_stale_database(snapshot, source.as_ref())
-        })();
-        let mut audit = match audited {
-            Ok(audit) => audit,
-            Err(error) if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from_version) => {
-                return emit_migration_dry_run_without_audit(
-                    from_version,
-                    &error,
-                    plan.as_ref(),
-                    migration_error.as_ref(),
-                    args.json,
-                );
-            }
-            Err(error) => return Err(error),
-        };
-        audit.from_version = from_version;
-        let eligible = plan.as_ref().is_some_and(|plan| plan.eligible);
-        let action = migration_error.as_ref().map_or_else(
-            || planned_action(&audit, args.discard_db_only),
-            |error| format!("refuse migration: {error}"),
-        );
-        if args.json {
-            let payload = serde_json::json!({
-                "dry_run": true,
-                "heal_needed": true,
-                "from_version": from_version,
-                "to_version": current_version(),
-                "audit": audit,
-                "automatic_heal_allowed": eligible && audit.automatic_heal_allowed(),
-                "automatic_rebuild_allowed": false,
-                "migration_eligible": eligible,
-                "plan_token": plan.as_ref().and_then(|plan| plan.plan_token.as_deref()),
-                "migration_plan": plan,
-                "migration_error": migration_error.map(|error| error.to_string()),
-                "planned_action": action,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).map_err(BeadsError::Json)?
-            );
-        } else {
-            print_dry_run_audit(&audit, &action, eligible);
         }
-        Ok(())
-    })
+        HealPreview::Stale(stale) => stale,
+    };
+    let StaleHealPreview {
+        from_version,
+        plan,
+        migration_error,
+        audited,
+    } = *stale;
+    let audit = match audited {
+        Ok(audit) => audit,
+        Err(error) => {
+            return emit_migration_dry_run_without_audit(
+                from_version,
+                &error,
+                plan.as_ref(),
+                migration_error.as_ref(),
+                args.json,
+            );
+        }
+    };
+    let eligible = plan.as_ref().is_some_and(|plan| plan.eligible);
+    let action = migration_error.as_ref().map_or_else(
+        || planned_action(&audit, args.discard_db_only),
+        |error| format!("refuse migration: {error}"),
+    );
+    if args.json {
+        let payload = serde_json::json!({
+            "dry_run": true,
+            "heal_needed": true,
+            "from_version": from_version,
+            "to_version": current_version(),
+            "audit": audit,
+            "automatic_heal_allowed": eligible && audit.automatic_heal_allowed(),
+            "automatic_rebuild_allowed": false,
+            "migration_eligible": eligible,
+            "plan_token": plan.as_ref().and_then(|plan| plan.plan_token.as_deref()),
+            "migration_plan": plan,
+            "migration_error": migration_error.map(|error| error.to_string()),
+            "planned_action": action,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).map_err(BeadsError::Json)?
+        );
+    } else {
+        print_dry_run_audit(&audit, &action, eligible);
+    }
+    Ok(())
 }
 
 fn emit_not_needed(json: bool) -> Result<()> {

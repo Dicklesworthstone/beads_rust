@@ -1909,7 +1909,7 @@ mod tests {
             ));
             assert_eq!(create_preview_source_bytes(&beads_dir), before);
         }
-        let observed = config::open_sqlite_storage_read_only(&database).unwrap();
+        let observed = config::open_sqlite_storage_read_only(&beads_dir, &database).unwrap();
         assert_eq!(observed.get_dirty_issue_count().unwrap(), 1);
         assert_eq!(
             observed.get_metadata("needs_flush").unwrap().as_deref(),
@@ -1951,7 +1951,8 @@ mod tests {
                     .expect("a consumed preview context must release its database authority"),
                 );
                 let observed =
-                    config::open_sqlite_storage_read_only(&beads_dir.join("beads.db")).unwrap();
+                    config::open_sqlite_storage_read_only(&beads_dir, &beads_dir.join("beads.db"))
+                        .unwrap();
                 assert_eq!(observed.get_dirty_issue_count().unwrap(), 1);
                 assert_eq!(
                     observed.get_metadata("needs_flush").unwrap().as_deref(),

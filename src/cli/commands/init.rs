@@ -240,7 +240,7 @@ pub fn execute_with_authority(
     }
     // Init resolves its target independently of startup metadata and --db.
     // Admit that exact database before creating directories or changing files.
-    let db_existed = preservation::preflight(&effective_db_path)?;
+    let db_existed = preservation::preflight(&beads_dir, &effective_db_path)?;
     preservation::verify_authority_target(&effective_db_path, write_authority)?;
 
     let mut created_dir = false;

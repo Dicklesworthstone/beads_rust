@@ -65,6 +65,15 @@ const APPLIED_SCHEMA: &str = "br.doctor.schema_migration.applied.v1";
 const FAILED_SCHEMA: &str = "br.doctor.schema_migration.failed.v1";
 const UNDO_SCHEMA: &str = "br.doctor.schema_migration.undo.v1";
 const FAMILY_SUFFIXES: &[&str] = &["", "-wal", "-shm", "-journal"];
+const MIGRATION_RECEIPT_NAMES: &[&str] = &[
+    "prepared.json",
+    "commit-ready.json",
+    "applied.json",
+    "failed.json",
+    "undo-prepared.json",
+    "undone.json",
+];
+const MAX_RECEIPT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RawComponentWitness {
@@ -354,6 +363,346 @@ pub(super) struct MigrationContext {
     pub(super) write_authority: Arc<DatabaseFamilyWriteLock>,
 }
 
+/// Refuse ordinary database admission while a reviewed replacement is unfinished.
+///
+/// Process death releases native and namespace locks between family-member
+/// moves. The durable migration receipts still identify that unsafe interval,
+/// even when the live main alone looks like a valid current-schema database.
+/// This check reads receipts only; it neither opens the database nor hashes
+/// archived payloads. Completed runs do not bind later ordinary tracker writes.
+///
+/// Callers must retain writer authority or a shared opener lease from this
+/// check through storage admission. Explicit migration recovery uses its own
+/// stronger family proofs instead. Native SQLite and older br releases do not
+/// consult this fence.
+///
+/// # Errors
+///
+/// Returns a conflict when this routed database has an unfinished transition
+/// or the retained receipt chain cannot establish completion safely.
+pub fn refuse_incomplete_database_transition(beads_dir: &Path, db_path: &Path) -> Result<()> {
+    let directories = migration_receipt_directories(beads_dir, db_path)?;
+    if directories.runs.is_empty() {
+        return Ok(());
+    }
+    let requested = crate::sync::canonical_database_authority_path(db_path)?;
+    for run_dir in directories.runs {
+        require_completed_migration_run(beads_dir, &requested, &run_dir)
+            .map_err(|error| migration_startup_refusal(db_path, &run_dir, error))?;
+    }
+    Ok(())
+}
+
+/// Observe a private database copy without creating any source lock files.
+///
+/// A migration must publish its durable intent before moving live family
+/// members. Bind the complete receipt generation on both sides of a private
+/// observation so that even an apply followed by an undo cannot make an
+/// intermediate family look like a stable observation. The callback must not
+/// publish its result until this function returns successfully.
+///
+/// # Errors
+///
+/// Returns an admission conflict when either receipt generation is unfinished
+/// or changes during observation. Otherwise preserves the callback's result,
+/// including any observation error.
+pub fn with_database_transition_observation<T>(
+    beads_dir: &Path,
+    db_path: &Path,
+    observe: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let before = completed_migration_receipt_generation(beads_dir, db_path)?;
+    let observed = observe();
+    let after = completed_migration_receipt_generation(beads_dir, db_path)?;
+    require_unchanged_migration_receipt_generation(beads_dir, db_path, &before, &after)?;
+    observed
+}
+
+#[derive(PartialEq, Eq)]
+struct MigrationReceiptDirectories {
+    recovery_present: bool,
+    migrations_present: bool,
+    runs: Vec<PathBuf>,
+}
+
+fn migration_receipt_directories(
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<MigrationReceiptDirectories> {
+    let mut observed = MigrationReceiptDirectories {
+        recovery_present: false,
+        migrations_present: false,
+        runs: Vec::new(),
+    };
+    let root = migration_runs_root(beads_dir);
+    for directory in [beads_dir.join(".br_recovery"), root.clone()] {
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                if directory == root {
+                    observed.migrations_present = true;
+                } else {
+                    observed.recovery_present = true;
+                }
+            }
+            Ok(_) => {
+                return Err(migration_startup_refusal(
+                    db_path,
+                    &directory,
+                    "recovery receipts are not in a regular directory",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(observed),
+            Err(error) => return Err(migration_startup_refusal(db_path, &directory, error)),
+        }
+    }
+    let mut runs = fs::read_dir(&root)
+        .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+        .map_err(|error| migration_startup_refusal(db_path, &root, error))?;
+    runs.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in runs {
+        let run_dir = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|error| migration_startup_refusal(db_path, &run_dir, error))?;
+        if kind.is_symlink() {
+            return Err(migration_startup_refusal(
+                db_path,
+                &run_dir,
+                "a recovery run is a symlink",
+            ));
+        }
+        if kind.is_dir() {
+            observed.runs.push(run_dir);
+        }
+    }
+    Ok(observed)
+}
+
+#[derive(PartialEq, Eq)]
+struct MigrationReceiptGeneration {
+    directories: MigrationReceiptDirectories,
+    receipts: Vec<(PathBuf, String)>,
+}
+
+fn migration_receipt_generation(
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<MigrationReceiptGeneration> {
+    let directories = migration_receipt_directories(beads_dir, db_path)?;
+    let mut receipts = Vec::new();
+    for run_dir in &directories.runs {
+        for name in MIGRATION_RECEIPT_NAMES {
+            let path = run_dir.join(name);
+            let observed = (|| {
+                if secure_file_metadata(&path)?.is_some() {
+                    receipts.push((path.clone(), file_sha256(&path)?));
+                }
+                Ok(())
+            })();
+            observed
+                .map_err(|error: BeadsError| migration_startup_refusal(db_path, run_dir, error))?;
+        }
+    }
+    Ok(MigrationReceiptGeneration {
+        directories,
+        receipts,
+    })
+}
+
+fn completed_migration_receipt_generation(
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<MigrationReceiptGeneration> {
+    let before = migration_receipt_generation(beads_dir, db_path)?;
+    refuse_incomplete_database_transition(beads_dir, db_path)?;
+    let after = migration_receipt_generation(beads_dir, db_path)?;
+    require_unchanged_migration_receipt_generation(beads_dir, db_path, &before, &after)?;
+    Ok(after)
+}
+
+fn require_unchanged_migration_receipt_generation(
+    beads_dir: &Path,
+    db_path: &Path,
+    before: &MigrationReceiptGeneration,
+    after: &MigrationReceiptGeneration,
+) -> Result<()> {
+    if before != after {
+        return Err(migration_startup_refusal(
+            db_path,
+            &migration_runs_root(beads_dir),
+            "schema-migration receipts changed during private observation; retry after the \
+             explicit migration or undo has completed",
+        ));
+    }
+    Ok(())
+}
+
+fn migration_startup_refusal(
+    db_path: &Path,
+    run_dir: &Path,
+    reason: impl std::fmt::Display,
+) -> BeadsError {
+    BeadsError::SyncConflict {
+        message: format!(
+            "Refusing database startup for {} because schema-migration state in {} is \
+             incomplete or unverifiable: {reason}. Preserve the database and recovery files; \
+             resume the explicit migration before ordinary database operations",
+            db_path.display(),
+            run_dir.display(),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct MigrationReceiptRoute {
+    database_path: String,
+}
+
+fn migration_receipt_matches_route(recorded: &str, requested: &Path) -> Result<bool> {
+    let path = Path::new(recorded);
+    path.file_name().ok_or_else(|| {
+        BeadsError::internal("schema-migration receipt omits its database filename")
+    })?;
+    match crate::sync::canonical_database_authority_path(path) {
+        Ok(resolved) => Ok(resolved == requested),
+        Err(error) => {
+            // A missing live main can itself be an interrupted replacement.
+            // A foreign route whose parent no longer exists cannot alias this
+            // requested database, and must not strand an unrelated tracker.
+            // Use the exact writer-authority resolver for all resolvable
+            // paths, including Windows extended and relative path spellings.
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            if matches!(
+                fs::metadata(parent),
+                Err(ref missing) if missing.kind() == std::io::ErrorKind::NotFound
+            ) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn require_completed_migration_run(
+    beads_dir: &Path,
+    requested: &Path,
+    run_dir: &Path,
+) -> Result<()> {
+    let mut present = Vec::new();
+    for name in [
+        "commit-ready.json",
+        "applied.json",
+        "undo-prepared.json",
+        "undone.json",
+        "failed.json",
+    ] {
+        let path = run_dir.join(name);
+        if secure_file_metadata(&path)?.is_some() {
+            present.push((name, path));
+        }
+    }
+    // prepared.json alone cannot authorize a live-family move. An apply that
+    // failed before commit-ready also leaves the original family untouched.
+    if present.iter().all(|(name, _)| *name == "failed.json") {
+        return Ok(());
+    }
+    let mut matches_route = false;
+    for (_, path) in &present {
+        let route: MigrationReceiptRoute = read_json(path)?;
+        matches_route |= migration_receipt_matches_route(&route.database_path, requested)?;
+    }
+    if !matches_route {
+        return Ok(());
+    }
+    let has = |name| present.iter().any(|(observed, _)| *observed == name);
+    let marker: CommitReadyMigrationReceipt = read_json(&run_dir.join("commit-ready.json"))?;
+    validate_commit_ready_marker(&marker, run_dir)?;
+    if !migration_receipt_matches_route(&marker.database_path, requested)? {
+        return Err(BeadsError::internal(
+            "schema-migration receipts name different database routes",
+        ));
+    }
+    let stored_path = Path::new(&marker.database_path);
+    let args = DoctorMigrateSchemaUndoArgs {
+        run_id: marker.run_id.clone(),
+        dry_run: false,
+        json: false,
+    };
+    let applied = if has("applied.json") {
+        let applied: AppliedMigrationReceipt = read_json(&run_dir.join("applied.json"))?;
+        validate_applied_receipt_for_path(&applied, &args, stored_path, run_dir)?;
+        Some(applied)
+    } else {
+        None
+    };
+    let failed = if has("failed.json") {
+        let failed: FailedMigrationReceipt = read_json(&run_dir.join("failed.json"))?;
+        validate_failed_against_commit_ready(&failed, &marker, run_dir)?;
+        Some(failed)
+    } else {
+        None
+    };
+    let prepared_undo = if has("undo-prepared.json") {
+        let receipt: UndoReceipt = read_json(&run_dir.join("undo-prepared.json"))?;
+        let applied = applied.as_ref().ok_or_else(|| {
+            BeadsError::internal("prepared schema-migration undo has no applied receipt")
+        })?;
+        validate_prepared_undo_receipt_for_path(
+            &receipt,
+            &args,
+            stored_path,
+            run_dir,
+            &file_sha256(&run_dir.join("applied.json"))?,
+            applied,
+        )?;
+        Some(receipt)
+    } else {
+        None
+    };
+    if has("undone.json") {
+        let completed: UndoReceipt = read_json(&run_dir.join("undone.json"))?;
+        validate_completed_undo_receipt_chain(&completed, &args, beads_dir, stored_path)?;
+        if let Some(prepared) = prepared_undo
+            && (prepared.quarantine_path != completed.quarantine_path
+                || prepared.raw_live_before_undo != completed.raw_live_before_undo
+                || prepared.logical_live_before_undo != completed.logical_live_before_undo)
+        {
+            return Err(BeadsError::internal(
+                "completed schema-migration undo does not match its prepared family",
+            ));
+        }
+        return Ok(());
+    }
+    if prepared_undo.is_some() || applied.as_ref().is_some_and(|applied| !applied.attested) {
+        return Err(BeadsError::internal(format!(
+            "schema migration run {} requires explicit undo completion; run \
+             `br doctor migrate-schema undo {}`",
+            marker.run_id, marker.run_id,
+        )));
+    }
+    if applied.is_some() {
+        return Ok(());
+    }
+    if failed.as_ref().is_some_and(|failed| {
+        failed.raw_observed_after_failure.as_ref() == Some(&marker.raw_before)
+    }) {
+        // A pre-install retry keeps its original commit-ready and failed
+        // receipts, then creates a new run. The exact restored raw attestation
+        // terminates that old intent; it must not fence later successful work.
+        return Ok(());
+    }
+    Err(BeadsError::internal(format!(
+        "schema migration run {} has an unfinished apply; run \
+         `br doctor migrate-schema apply --plan-token {}`",
+        marker.run_id, marker.plan_token,
+    )))
+}
+
 /// Execute `br doctor migrate-schema ...`.
 ///
 /// # Errors
@@ -368,7 +717,7 @@ pub fn execute(
     match &args.command {
         DoctorMigrateSchemaCommand::Plan(plan) => {
             let paths = resolve_preview_paths(cli)?;
-            execute_plan(plan, &paths.db_path)
+            execute_plan(plan, &paths.beads_dir, &paths.db_path)
         }
         DoctorMigrateSchemaCommand::Undo(undo) if undo.dry_run => {
             let paths = resolve_preview_paths(cli)?;
@@ -379,12 +728,15 @@ pub fn execute(
             super::schema_heal::execute_heal_preview(heal, &paths)
         }
         DoctorMigrateSchemaCommand::Recover(recover) => {
-            execute_recover(recover, &resolve_context(cli)?)
+            let migration = resolve_context(cli)?;
+            refuse_incomplete_database_transition(&migration.beads_dir, &migration.db_path)?;
+            execute_recover(recover, &migration)
         }
         DoctorMigrateSchemaCommand::Apply(apply) => execute_apply(apply, &resolve_context(cli)?),
         DoctorMigrateSchemaCommand::Undo(undo) => execute_undo(undo, &resolve_context(cli)?),
         DoctorMigrateSchemaCommand::Heal(heal) => {
             let migration = resolve_context(cli)?;
+            refuse_incomplete_database_transition(&migration.beads_dir, &migration.db_path)?;
             super::schema_heal::execute_heal(
                 heal,
                 cli,
@@ -465,8 +817,14 @@ fn verify_excluded_migration_path(
     exclusion.verify_path(path, migration_file_identity(path)?)
 }
 
-fn execute_plan(args: &DoctorMigrateSchemaPlanArgs, db_path: &Path) -> Result<()> {
-    let plan = build_observational_plan(db_path)?;
+fn execute_plan(
+    args: &DoctorMigrateSchemaPlanArgs,
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
+    let plan = with_database_transition_observation(beads_dir, db_path, || {
+        build_observational_plan(db_path)
+    })?;
     emit_plan(&plan, args.json)?;
     Ok(())
 }
@@ -5754,6 +6112,18 @@ fn validate_completed_undo_receipt_structure(
     beads_dir: &Path,
     db_path: &Path,
 ) -> Result<()> {
+    let quarantine_dir = validate_completed_undo_receipt_chain(receipt, args, beads_dir, db_path)?;
+    verify_backup_family(db_path, &quarantine_dir, &receipt.raw_live_before_undo)
+}
+
+/// Receipt-only completion proof for startup. Explicit undo additionally
+/// verifies the retained quarantine payload and today's live restored family.
+fn validate_completed_undo_receipt_chain(
+    receipt: &UndoReceipt,
+    args: &DoctorMigrateSchemaUndoArgs,
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<PathBuf> {
     validate_raw_family_witness(&receipt.raw_expected_before)?;
     validate_raw_family_witness(&receipt.raw_live_before_undo)?;
     let run_dir = migration_runs_root(beads_dir).join(&args.run_id);
@@ -5802,7 +6172,7 @@ fn validate_completed_undo_receipt_structure(
             args.run_id
         )));
     }
-    verify_backup_family(db_path, &quarantine_dir, &receipt.raw_live_before_undo)
+    Ok(quarantine_dir)
 }
 
 fn validate_completed_undo_live_state(
@@ -5832,12 +6202,30 @@ fn validate_prepared_undo_receipt(
     applied_receipt_sha256: &str,
     applied: &AppliedMigrationReceipt,
 ) -> Result<()> {
+    validate_prepared_undo_receipt_for_path(
+        receipt,
+        args,
+        &migration.db_path,
+        run_dir,
+        applied_receipt_sha256,
+        applied,
+    )
+}
+
+fn validate_prepared_undo_receipt_for_path(
+    receipt: &UndoReceipt,
+    args: &DoctorMigrateSchemaUndoArgs,
+    db_path: &Path,
+    run_dir: &Path,
+    applied_receipt_sha256: &str,
+    applied: &AppliedMigrationReceipt,
+) -> Result<()> {
     validate_raw_family_witness(&receipt.raw_expected_before)?;
     validate_raw_family_witness(&receipt.raw_live_before_undo)?;
     if receipt.schema_version != UNDO_SCHEMA
         || receipt.run_id != args.run_id
         || receipt.dry_run
-        || receipt.database_path != migration.db_path.display().to_string()
+        || receipt.database_path != db_path.display().to_string()
         || !constant_time_text_eq(&receipt.applied_receipt_sha256, applied_receipt_sha256)
         || receipt.raw_expected_before != applied.raw_before
         || receipt.logical_expected_before != applied.logical_before
@@ -7786,32 +8174,54 @@ fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 fn file_sha256(path: &Path) -> Result<String> {
-    let metadata = secure_file_metadata(path)?.ok_or_else(|| {
-        BeadsError::internal(format!(
-            "schema migration artifact does not exist: {}",
-            path.display()
-        ))
-    })?;
-    let (_, sha256) = hash_regular_file(path, &metadata)?;
-    Ok(sha256)
+    Ok(hex_digest(&Sha256::digest(read_receipt_bytes(path)?)))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    serde_json::from_slice(&read_receipt_bytes(path)?).map_err(BeadsError::Json)
+}
+
+fn read_receipt_bytes(path: &Path) -> Result<Vec<u8>> {
     let metadata = secure_file_metadata(path)?.ok_or_else(|| {
         BeadsError::internal(format!(
             "schema migration receipt does not exist: {}",
             path.display()
         ))
     })?;
-    let (length, _) = hash_regular_file(path, &metadata)?;
-    if length > 16 * 1024 * 1024 {
+    if metadata.len() > MAX_RECEIPT_BYTES {
         return Err(BeadsError::internal(format!(
             "schema migration receipt exceeds 16 MiB: {}",
             path.display()
         )));
     }
-    let bytes = fs::read(path).map_err(BeadsError::Io)?;
-    serde_json::from_slice(&bytes).map_err(BeadsError::Json)
+    let mut file = File::open(path)?;
+    if !same_file_identity(&metadata, &file.metadata()?) {
+        return Err(BeadsError::internal(format!(
+            "schema migration receipt changed identity while opening {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    Read::take(&mut file, MAX_RECEIPT_BYTES + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECEIPT_BYTES {
+        return Err(BeadsError::internal(format!(
+            "schema migration receipt exceeds 16 MiB: {}",
+            path.display()
+        )));
+    }
+    let current = secure_file_metadata(path)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != metadata.len()
+        || !same_file_identity(&metadata, &file.metadata()?)
+        || current
+            .as_ref()
+            .is_none_or(|current| !same_file_identity(&metadata, current))
+    {
+        return Err(BeadsError::internal(format!(
+            "schema migration receipt changed while reading {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 fn stable_raw_eq(left: &RawFamilyWitness, right: &RawFamilyWitness) -> bool {
@@ -8078,6 +8488,502 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    mod startup_migration_fence {
+        use super::*;
+        use std::collections::BTreeMap;
+
+        /// These are receipt-classification fixtures, not SQLite recovery
+        /// proofs. Deliberately unreadable main bytes and absent backup files
+        /// detect an accidental engine open or archived-payload scan here.
+        /// The CLI regressions cover real schema-19 WAL crash-state families.
+        struct ReceiptRun {
+            beads_dir: PathBuf,
+            db_path: PathBuf,
+            run_dir: PathBuf,
+            prepared: PreparedMigrationReceipt,
+            logical_after: LogicalDatabaseWitness,
+        }
+
+        impl ReceiptRun {
+            fn new(beads_dir: &Path, db_path: &Path, run_id: &str) -> Self {
+                fs::create_dir_all(beads_dir).unwrap();
+                fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+                if !db_path.exists() {
+                    fs::write(db_path, b"receipt tests must not open SQLite").unwrap();
+                }
+                let forecast: MigrationForecast = serde_json::from_value(serde_json::json!({
+                    "from_version": 19,
+                    "to_version": 19,
+                    "content_hash_rows_rebuilt": 0,
+                    "gate_result_history_created": false,
+                    "post_migration_maintenance": true,
+                }))
+                .unwrap();
+                let logical_before = LogicalDatabaseWitness {
+                    user_version: 19,
+                    integrity_check: "page 54 is never used".to_owned(),
+                    schema_sha256: "1".repeat(64),
+                    contents_sha256: "2".repeat(64),
+                    tables: Vec::new(),
+                };
+                let database_path = db_path.display().to_string();
+                let prepared = PreparedMigrationReceipt {
+                    schema_version: PREPARED_SCHEMA.to_owned(),
+                    run_id: run_id.to_owned(),
+                    plan_token: compute_plan_token(&database_path, &logical_before, &forecast)
+                        .unwrap(),
+                    database_path,
+                    marked_at: "2026-11-07T12:00:00Z".to_owned(),
+                    forecast,
+                    raw_before: raw_family_witness(db_path).unwrap(),
+                    logical_before: logical_before.clone(),
+                };
+                let logical_after = LogicalDatabaseWitness {
+                    integrity_check: "ok".to_owned(),
+                    ..logical_before
+                };
+                let run_dir = migration_runs_root(beads_dir).join(run_id);
+                ensure_new_directory(&run_dir).unwrap();
+                write_json_new(&run_dir.join("prepared.json"), &prepared).unwrap();
+                Self {
+                    beads_dir: beads_dir.to_owned(),
+                    db_path: db_path.to_owned(),
+                    run_dir,
+                    prepared,
+                    logical_after,
+                }
+            }
+
+            fn commit_ready(&self) {
+                persist_commit_ready_marker(
+                    &self.run_dir,
+                    &self.db_path,
+                    &self.logical_after,
+                    ReviewedSchemaMigrationEffectsReceipt {
+                        from_version: 19,
+                        to_version: 19,
+                        content_hash_rows_rebuilt: 0,
+                        gate_result_history_created: false,
+                        prerequisites_column_added: false,
+                        dependency_type_key_added: false,
+                        legacy_v15_tables_converted: false,
+                        schema19_runtime_upgrade: None,
+                        post_migration_maintenance_completed: true,
+                    },
+                )
+                .unwrap();
+            }
+
+            fn applied(&self) -> AppliedMigrationReceipt {
+                let marker: CommitReadyMigrationReceipt =
+                    read_json(&self.run_dir.join("commit-ready.json")).unwrap();
+                let applied = AppliedMigrationReceipt {
+                    schema_version: APPLIED_SCHEMA.to_owned(),
+                    run_id: marker.run_id,
+                    database_path: marker.database_path,
+                    plan_token: marker.plan_token,
+                    prepared_receipt_sha256: marker.prepared_receipt_sha256,
+                    marked_at: marker.marked_at,
+                    forecast: marker.forecast,
+                    effects: marker.effects,
+                    raw_before: marker.raw_before.clone(),
+                    logical_before: marker.logical_before,
+                    raw_after: Some(marker.raw_before),
+                    logical_after: Some(marker.logical_after),
+                    attested: true,
+                    attestation_errors: Vec::new(),
+                    undo_command: format!("br doctor migrate-schema undo {}", self.prepared.run_id),
+                };
+                write_json_new(&self.run_dir.join("applied.json"), &applied).unwrap();
+                applied
+            }
+
+            fn failed(&self, restored: bool) {
+                let failed = FailedMigrationReceipt {
+                    schema_version: FAILED_SCHEMA.to_owned(),
+                    run_id: self.prepared.run_id.clone(),
+                    database_path: self.prepared.database_path.clone(),
+                    plan_token: self.prepared.plan_token.clone(),
+                    marked_at: self.prepared.marked_at.clone(),
+                    error: "interrupted pre-install intent".to_owned(),
+                    failed_stage: None,
+                    raw_before: self.prepared.raw_before.clone(),
+                    logical_before: self.prepared.logical_before.clone(),
+                    raw_observed_after_failure: restored.then(|| self.prepared.raw_before.clone()),
+                    logical_observed_after_failure: restored
+                        .then(|| self.prepared.logical_before.clone()),
+                };
+                write_json_new(&self.run_dir.join("failed.json"), &failed).unwrap();
+            }
+
+            fn undo_prepared(&self, applied: &AppliedMigrationReceipt) -> UndoReceipt {
+                let receipt = UndoReceipt {
+                    schema_version: UNDO_SCHEMA.to_owned(),
+                    run_id: applied.run_id.clone(),
+                    dry_run: false,
+                    database_path: applied.database_path.clone(),
+                    quarantine_path: self
+                        .run_dir
+                        .join("undo-quarantine/undo-receipt-fixture")
+                        .display()
+                        .to_string(),
+                    applied_receipt_sha256: file_sha256(&self.run_dir.join("applied.json"))
+                        .unwrap(),
+                    raw_expected_before: applied.raw_before.clone(),
+                    logical_expected_before: applied.logical_before.clone(),
+                    raw_live_before_undo: applied.raw_after.clone().unwrap(),
+                    logical_live_before_undo: applied.logical_after.clone(),
+                    raw_restored: None,
+                    logical_restored: None,
+                };
+                write_json_new(&self.run_dir.join("undo-prepared.json"), &receipt).unwrap();
+                receipt
+            }
+
+            fn admit(&self) -> Result<()> {
+                refuse_incomplete_database_transition(&self.beads_dir, &self.db_path)
+            }
+
+            fn refused_without_changes(&self) -> String {
+                let before = file_bytes(&self.beads_dir);
+                let error = self
+                    .admit()
+                    .expect_err("unfinished state must fence startup");
+                assert!(matches!(&error, BeadsError::SyncConflict { .. }));
+                assert_eq!(file_bytes(&self.beads_dir), before);
+                let message = error.to_string();
+                assert!(message.contains(&self.prepared.run_id), "{message}");
+                message
+            }
+        }
+
+        fn file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            let mut files = BTreeMap::new();
+            let mut directories = vec![root.to_owned()];
+            while let Some(directory) = directories.pop() {
+                for entry in fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        directories.push(entry.path());
+                    } else {
+                        files.insert(entry.path(), fs::read(entry.path()).unwrap());
+                    }
+                }
+            }
+            files
+        }
+
+        fn fixture() -> (TempDir, ReceiptRun) {
+            let temp = tempfile::tempdir().unwrap();
+            let beads = temp.path().join(".beads");
+            let run = ReceiptRun::new(&beads, &beads.join("beads.db"), "receipt-run");
+            (temp, run)
+        }
+
+        #[test]
+        fn prepared_only_is_safe_but_commit_ready_fences_even_a_missing_main() {
+            let (_temp, run) = fixture();
+            run.admit().unwrap();
+            run.commit_ready();
+            let message = run.refused_without_changes();
+            assert!(message.contains("migrate-schema apply"), "{message}");
+            assert!(message.contains(&run.prepared.plan_token));
+
+            fs::rename(&run.db_path, run.run_dir.join("retained-main.db")).unwrap();
+            assert!(
+                run.refused_without_changes()
+                    .contains("migrate-schema apply")
+            );
+            assert!(
+                !run.db_path.exists(),
+                "admission must never recreate the main"
+            );
+        }
+
+        #[test]
+        fn private_observation_is_noncreating_and_preserves_observation_errors() {
+            let temp = tempfile::tempdir().unwrap();
+            let beads = temp.path().join(".beads");
+            fs::create_dir(&beads).unwrap();
+            let database = beads.join("beads.db");
+            fs::write(&database, b"no engine may open this payload").unwrap();
+            let before = file_bytes(&beads);
+            let result = with_database_transition_observation(&beads, &database, || Ok(42));
+            assert_eq!(result.unwrap(), 42);
+            let error = with_database_transition_observation::<()>(&beads, &database, || {
+                Err(BeadsError::internal("private observation failed"))
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("private observation failed"));
+            assert_eq!(file_bytes(&beads), before);
+            assert!(!beads.join(".br_recovery").exists());
+        }
+
+        #[test]
+        fn private_observation_refuses_pending_state_before_dispatch() {
+            let (_temp, run) = fixture();
+            run.commit_ready();
+            let called = std::cell::Cell::new(false);
+            let before = file_bytes(&run.beads_dir);
+            let error = with_database_transition_observation(&run.beads_dir, &run.db_path, || {
+                called.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(!called.get());
+            assert!(error.to_string().contains(&run.prepared.run_id));
+            assert!(error.to_string().contains("migrate-schema apply"));
+            assert_eq!(file_bytes(&run.beads_dir), before);
+        }
+
+        #[test]
+        fn private_observation_detects_a_whole_apply_and_undo_after_an_absent_root() {
+            let temp = tempfile::tempdir().unwrap();
+            let beads = temp.path().join(".beads");
+            fs::create_dir(&beads).unwrap();
+            let database = beads.join("beads.db");
+            fs::write(&database, b"private observation source").unwrap();
+            let error = with_database_transition_observation(&beads, &database, || {
+                let run = ReceiptRun::new(&beads, &database, "during-observation");
+                run.commit_ready();
+                let applied = run.applied();
+                let mut undo = run.undo_prepared(&applied);
+                undo.raw_restored = Some(undo.raw_expected_before.clone());
+                undo.logical_restored = Some(undo.logical_expected_before.clone());
+                write_json_new(&run.run_dir.join("undone.json"), &undo).unwrap();
+                // Both endpoints are individually safe, but an observation
+                // between the member moves must never escape as a result.
+                run.admit().unwrap();
+                Ok("unqualified intermediate result")
+            })
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("receipts changed during private observation"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn private_observation_binds_removed_runs_and_marker_content() {
+            for change in ["removed-run", "changed-content"] {
+                let (temp, run) = fixture();
+                run.commit_ready();
+                run.applied();
+                let error =
+                    with_database_transition_observation(&run.beads_dir, &run.db_path, || {
+                        if change == "removed-run" {
+                            fs::rename(&run.run_dir, temp.path().join("retained-run")).unwrap();
+                        } else {
+                            // Whitespace changes keep the receipt valid and
+                            // its semantic fields equal, but change its epoch.
+                            let path = run.run_dir.join("applied.json");
+                            let mut file = OpenOptions::new().append(true).open(path).unwrap();
+                            file.write_all(b"\n").unwrap();
+                        }
+                        Ok(())
+                    })
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("receipts changed during private observation"),
+                    "{change}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn private_observation_bounds_receipt_reads_before_hashing() {
+            let (_temp, run) = fixture();
+            let path = run.run_dir.join("applied.json");
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(MAX_RECEIPT_BYTES + 1).unwrap();
+            let error =
+                with_database_transition_observation::<()>(&run.beads_dir, &run.db_path, || {
+                    panic!("oversized receipts must refuse before private capture")
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("exceeds 16 MiB"), "{error}");
+            assert_eq!(fs::metadata(path).unwrap().len(), MAX_RECEIPT_BYTES + 1);
+        }
+
+        #[test]
+        fn exact_restored_failure_allows_retry_and_later_generations() {
+            let (_temp, first) = fixture();
+            first.commit_ready();
+            first.failed(true);
+            first.admit().unwrap();
+            let retry = ReceiptRun::new(&first.beads_dir, &first.db_path, "retry-run");
+            retry.commit_ready();
+            retry.applied();
+            retry.admit().unwrap();
+            // The receipt fence is historical. Its terminal classification
+            // must not rehash today's payload or require archived DB copies.
+            fs::write(&retry.db_path, b"later database generation").unwrap();
+            fs::write(family_component_path(&retry.db_path, "-wal"), b"later WAL").unwrap();
+            retry.admit().unwrap();
+            assert!(!retry.run_dir.join("before").exists());
+        }
+
+        #[test]
+        fn a_failure_without_exact_restoration_remains_fenced() {
+            let (_temp, run) = fixture();
+            run.commit_ready();
+            run.failed(false);
+            assert!(
+                run.refused_without_changes()
+                    .contains("migrate-schema apply")
+            );
+            let failed_path = run.run_dir.join("failed.json");
+            let mut failed: FailedMigrationReceipt = read_json(&failed_path).unwrap();
+            let mut changed = run.prepared.raw_before.clone();
+            changed.components[0].sha256 = Some("3".repeat(64));
+            failed.raw_observed_after_failure = Some(changed);
+            fs::write(&failed_path, serde_json::to_vec(&failed).unwrap()).unwrap();
+            assert!(
+                run.refused_without_changes()
+                    .contains("migrate-schema apply")
+            );
+        }
+
+        #[test]
+        fn completed_undo_supersedes_its_prepared_intent_without_binding_later_writes() {
+            let (_temp, run) = fixture();
+            run.commit_ready();
+            let applied = run.applied();
+            run.admit().unwrap();
+            let mut receipt = run.undo_prepared(&applied);
+            assert!(
+                run.refused_without_changes()
+                    .contains("migrate-schema undo")
+            );
+            receipt.raw_restored = Some(receipt.raw_expected_before.clone());
+            receipt.logical_restored = Some(receipt.logical_expected_before.clone());
+            write_json_new(&run.run_dir.join("undone.json"), &receipt).unwrap();
+            run.admit().unwrap();
+            fs::write(&run.db_path, b"writes after a completed undo").unwrap();
+            run.admit().unwrap();
+
+            // A completion for another quarantine cannot dismiss this intent.
+            receipt.quarantine_path = run
+                .run_dir
+                .join("undo-quarantine/another-generation")
+                .display()
+                .to_string();
+            fs::write(
+                run.run_dir.join("undone.json"),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            assert!(run.refused_without_changes().contains("prepared family"));
+        }
+
+        #[test]
+        fn unattested_apply_requires_undo_even_with_a_valid_receipt_chain() {
+            let (_temp, run) = fixture();
+            run.commit_ready();
+            let mut applied = run.applied();
+            applied.attested = false;
+            applied.attestation_errors = vec!["post-install attestation failed".to_owned()];
+            fs::write(
+                run.run_dir.join("applied.json"),
+                serde_json::to_vec(&applied).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                run.refused_without_changes()
+                    .contains("migrate-schema undo")
+            );
+        }
+
+        #[test]
+        fn malformed_and_mismatched_completion_chains_never_admit_startup() {
+            for damage in [
+                "truncated",
+                "foreign-contract",
+                "missing-parent",
+                "changed-parent",
+            ] {
+                let (_temp, run) = fixture();
+                run.commit_ready();
+                let mut applied = run.applied();
+                match damage {
+                    "truncated" => {
+                        fs::write(run.run_dir.join("applied.json"), b"{\"database_path\":")
+                            .unwrap();
+                    }
+                    "foreign-contract" => {
+                        applied.schema_version =
+                            "br.doctor.schema_migration.applied.v999".to_owned();
+                        fs::write(
+                            run.run_dir.join("applied.json"),
+                            serde_json::to_vec(&applied).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "missing-parent" => {
+                        fs::rename(
+                            run.run_dir.join("prepared.json"),
+                            run.run_dir.join("retained-prepared.json"),
+                        )
+                        .unwrap();
+                    }
+                    "changed-parent" => {
+                        let mut prepared = run.prepared.clone();
+                        prepared.marked_at = "2026-11-08T00:00:00Z".to_owned();
+                        fs::write(
+                            run.run_dir.join("prepared.json"),
+                            serde_json::to_vec(&prepared).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                run.refused_without_changes();
+            }
+        }
+
+        #[test]
+        fn only_the_exact_database_route_is_fenced() {
+            let (temp, run) = fixture();
+            run.commit_ready();
+            let other = run.beads_dir.join("other.db");
+            fs::write(&other, b"another routed database").unwrap();
+            refuse_incomplete_database_transition(&run.beads_dir, &other).unwrap();
+            let equivalent = run.beads_dir.join(".").join("beads.db");
+            assert!(refuse_incomplete_database_transition(&run.beads_dir, &equivalent).is_err());
+
+            let foreign_parent = temp.path().join("foreign-route");
+            let foreign = ReceiptRun::new(
+                &run.beads_dir,
+                &foreign_parent.join("beads.db"),
+                "foreign-run",
+            );
+            foreign.commit_ready();
+            fs::rename(&foreign_parent, temp.path().join("retained-foreign-route")).unwrap();
+            refuse_incomplete_database_transition(&run.beads_dir, &other).unwrap();
+        }
+
+        #[test]
+        fn receipt_route_uses_the_writer_authority_relative_path_identity() {
+            let relative = Path::new("br-receipt-route-identity-test.db");
+            let requested = crate::sync::canonical_database_authority_path(relative).unwrap();
+            assert!(
+                migration_receipt_matches_route(relative.to_str().unwrap(), &requested).unwrap()
+            );
+            assert!(
+                migration_receipt_matches_route(&requested.display().to_string(), &requested)
+                    .unwrap()
+            );
+        }
+    }
 
     #[test]
     fn recovery_556_evidence_follows_nondefault_database_parent() {

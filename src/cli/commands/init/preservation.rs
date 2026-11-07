@@ -1,6 +1,9 @@
 //! Init may create a new database or reuse a current one, never upgrade an old
 //! authoritative tracker through the generic schema initializer.
 
+use crate::cli::commands::doctor_subsystems::schema_migration::{
+    refuse_incomplete_database_transition, with_database_transition_observation,
+};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::franken_sync::Connection;
@@ -23,23 +26,25 @@ fn refusal(db_path: &Path, reason: impl std::fmt::Display) -> BeadsError {
 
 /// Return whether the exact init target already exists, without opening or
 /// locking the original family. The copied WAL determines the effective version.
-pub(super) fn preflight(db_path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(db_path) {
-        Ok(metadata) if metadata.is_file() => {
-            config::with_database_family_snapshot(db_path, inspect_current_snapshot)
-                .map_err(|error| refusal(db_path, error))?;
-            Ok(true)
-        }
-        Ok(_) => Err(refusal(db_path, "the database path is not a regular file")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let warnings = config::missing_database_preservation_warnings(db_path);
-            if !warnings.is_empty() {
-                return Err(refusal(db_path, warnings.join("; ")));
+pub(super) fn preflight(beads_dir: &Path, db_path: &Path) -> Result<bool> {
+    with_database_transition_observation(beads_dir, db_path, || {
+        match fs::symlink_metadata(db_path) {
+            Ok(metadata) if metadata.is_file() => {
+                config::with_database_family_snapshot(db_path, inspect_current_snapshot)
+                    .map_err(|error| refusal(db_path, error))?;
+                Ok(true)
             }
-            Ok(false)
+            Ok(_) => Err(refusal(db_path, "the database path is not a regular file")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let warnings = config::missing_database_preservation_warnings(db_path);
+                if !warnings.is_empty() {
+                    return Err(refusal(db_path, warnings.join("; ")));
+                }
+                Ok(false)
+            }
+            Err(error) => Err(refusal(db_path, error)),
         }
-        Err(error) => Err(refusal(db_path, error)),
-    }
+    })
 }
 
 fn inspect_current_snapshot(path: &Path) -> Result<()> {
@@ -122,7 +127,8 @@ pub(super) fn open_storage(
         ),
     };
     authority.verify_database_authority()?;
-    if preflight(db_path)? != expected_existing {
+    refuse_incomplete_database_transition(beads_dir, db_path)?;
+    if preflight(beads_dir, db_path)? != expected_existing {
         return Err(refusal(
             db_path,
             "the database appeared or disappeared during init admission",
@@ -161,16 +167,68 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn family_bytes(directory: &Path) -> BTreeMap<String, Vec<u8>> {
-        fs::read_dir(directory)
-            .unwrap()
-            .map(|entry| {
-                let entry = entry.unwrap();
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    fs::read(entry.path()).unwrap(),
+        let mut files = BTreeMap::new();
+        let mut pending = vec![directory.to_path_buf()];
+        while let Some(parent) = pending.pop() {
+            for entry in fs::read_dir(parent).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.insert(
+                        path.strip_prefix(directory)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn interrupted_migration_blocks_init_before_reconcile_or_missing_database_install() {
+        for existing in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let beads = root.path().join(".beads");
+            let run = beads.join(".br_recovery/schema-migrations/interrupted-init");
+            fs::create_dir_all(&run).unwrap();
+            let db = beads.join("beads.db");
+            if existing {
+                fs::write(&db, b"retained unreadable main generation").unwrap();
+            }
+            fs::write(
+                run.join("commit-ready.json"),
+                serde_json::to_vec(&serde_json::json!({ "database_path": db })).unwrap(),
+            )
+            .unwrap();
+            let before_preview = family_bytes(&beads);
+            let error = preflight(&beads, &db).unwrap_err();
+            assert!(
+                error.to_string().contains("schema-migration state"),
+                "{error}"
+            );
+            assert_eq!(family_bytes(&beads), before_preview);
+
+            let authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &beads,
+                    &db,
+                    Some(1000),
                 )
-            })
-            .collect()
+                .unwrap(),
+            );
+            let before_open = family_bytes(&beads);
+            let error = open_storage(&beads, &db, existing, Some(&authority), None).unwrap_err();
+            assert!(
+                error.to_string().contains("schema-migration state"),
+                "{error}"
+            );
+            assert_eq!(family_bytes(&beads), before_open);
+            assert_eq!(db.exists(), existing);
+        }
     }
 
     #[test]
@@ -188,7 +246,7 @@ mod tests {
         conn.execute("INSERT INTO export_hashes (rowid, issue_id, content_hash, exported_at) VALUES (83, 'local', X'0102', 'original')")
             .unwrap();
         conn.close().unwrap();
-        assert!(preflight(&db).unwrap());
+        assert!(preflight(&beads, &db).unwrap());
 
         let authority = Arc::new(
             crate::sync::blocking_database_family_write_lock_with_timeout(&beads, &db, None)

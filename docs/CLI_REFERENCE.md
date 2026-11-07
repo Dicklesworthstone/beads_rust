@@ -2939,6 +2939,26 @@ cannot upgrade every alias safely. Inspection uses verified private copies
 while replacement locks are held. `plan` and dry-run `undo` remain observational
 and do not acquire these replacement locks.
 
+An interrupted apply or undo can leave the main file readable before its
+matching sidecars have reached their final locations. Ordinary database
+commands therefore inspect the retained migration receipts before opening,
+repairing, importing into, or initializing that database. An unfinished or
+unverifiable transition refuses with its recovery directory and, when the
+receipt chain is valid, the exact `apply --plan-token` or `undo` command to
+resume. `plan` and `heal --dry-run` use the same check; they cannot declare an
+intermediate family healthy. Plain `doctor` reports
+`db.schema_migration_pending` and skips database engine probes. Explicit
+apply/undo recovery remains available, as do `info` and explicit JSONL-only
+reads for diagnosis.
+
+Completed runs and failures that attest exact restoration of the original
+family permit subsequent ordinary work. Startup checks receipts without
+rehashing archived database payloads. Private read snapshots verify an
+unchanged receipt generation before returning, without creating lock files in
+the original directory. This protection depends on retaining the recovery
+receipts with the tracker; native SQLite clients and older `br` binaries do not
+consult them.
+
 On Linux and macOS, `apply` and non-dry-run `undo` first test the filesystem's
 exchange-rename behavior using temporary locked files beside the database.
 Some shared mounts report a successful exchange while replacing one file

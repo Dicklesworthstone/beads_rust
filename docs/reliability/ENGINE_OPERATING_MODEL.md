@@ -295,6 +295,23 @@ namespace evidence is validated with the engine's parser, leaving the live
 ledger intact. Existing recovery receipts remain the only durable transition
 protocol. Read-only planning and undo previews do not acquire replacement
 exclusion.
+Ordinary startup also checks that the routed database has no unfinished
+replacement in those receipts. A missing completion, an unattested applied
+state or a prepared undo without its verified completion refuses before
+namespace binding, recovery, reconstruction, generic repair or storage access.
+The refusal identifies the explicit apply/undo recovery path. A validated
+completion or a failed run that attests exact raw restoration terminates its
+intent without freezing subsequent tracker writes. Admission validates receipt
+chains, not the archived database payloads.
+Live readers bridge this decision into open with their existing opener lease;
+writers check while holding family authority. Private observational snapshots
+instead validate that the completed receipt generation is unchanged before
+and after capture, so they create no source lock files and refuse even if a
+whole replacement completes during observation. Planning and heal previews use
+that same observation boundary. Plain doctor reports an unfinished transition
+and skips database probes. This fence protects cooperating current clients;
+older binaries, native SQLite clients and copies without the retained recovery
+directory do not consult it.
 Interrupted completion and undo recheck the source proof on private copies of
 the retained family. Historical installed receipts retain their original
 semantics; fresh layout-upgrade plans bind the stronger proof and replace old

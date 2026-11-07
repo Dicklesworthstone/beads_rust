@@ -1,4 +1,7 @@
 use beads_rust::cli::commands;
+use beads_rust::cli::commands::doctor_subsystems::schema_migration::{
+    refuse_incomplete_database_transition, with_database_transition_observation,
+};
 use beads_rust::cli::{Cli, Commands, OutputFormat, command_requests_robot_json};
 use beads_rust::config;
 use beads_rust::logging::init_logging;
@@ -144,6 +147,16 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     let observational_startup = ctx.overrides.read_only_storage
         || matches!(cli.command, Commands::Doctor(_))
         || matches!(&cli.command, Commands::Sync(args) if args.status || (args.reconcile && args.dry_run));
+    if storage_enabled
+        && !matches!(cli.command, Commands::Doctor(_))
+        && !inspects_legacy_database_without_recovery(&cli.command)
+        && let Some((beads_dir, paths)) = ctx.beads_dir.as_deref().zip(ctx.paths.as_ref())
+    {
+        // Give ordinary commands the retained run's recovery instruction
+        // before schema fallback or automatic repair can obscure it. Actual
+        // storage admission repeats this check while retaining its authority.
+        refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
+    }
     let mut startup_recovery_lock = if storage_enabled
         && !observational_startup
         && (command_needs_write_lock
@@ -161,6 +174,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                 ctx.startup_write_lock_timeout(&cli.command),
             )?,
         );
+        refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
         // A WAL shorter than its header holds no frames; set it aside before
         // any index recovery or engine open so it can never wedge startup.
         if let Some(quarantine) =
@@ -196,7 +210,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             || supports_read_only_fast_open(&cli.command))
         && let Some((beads_dir, paths)) = ctx.beads_dir.clone().zip(ctx.paths.clone())
         && let Ok(Some(found)) =
-            stale_schema_version_for_startup(&paths.db_path, observational_startup)
+            stale_schema_version_for_startup(&beads_dir, &paths.db_path, observational_startup)
     {
         let refusal = if observational_startup {
             // Read intent, not fast-open eligibility, protects this boundary.
@@ -212,6 +226,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
                     )?,
                 ),
             };
+            refuse_incomplete_database_transition(&beads_dir, &paths.db_path)?;
             let heal_ctx = commands::doctor_subsystems::schema_heal::HealContext {
                 beads_dir: &beads_dir,
                 cli: &overrides,
@@ -271,7 +286,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         && !inspects_legacy_database_without_recovery(&cli.command)
         && let Some(paths) = ctx.paths.as_ref()
     {
-        match inspect_pending_sync_merge_for_startup(&paths.db_path) {
+        match inspect_pending_sync_merge_for_startup(&paths.beads_dir, &paths.db_path) {
             Ok(Some(state)) => {
                 emit_pending_sync_merge_warning(&state, json_error_mode);
                 pending_merge_warning_emitted = true;
@@ -410,6 +425,14 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     } else {
         None
     };
+    if !matches!(cli.command, Commands::Doctor(_))
+        && write_lock.is_some()
+        && let Some((beads_dir, paths)) = ctx.beads_dir.as_deref().zip(ctx.paths.as_ref())
+    {
+        // Check before the pending-merge probe binds the namespace or any
+        // command can open a writable intermediate database generation.
+        refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
+    }
     // Every non-merge DB-family caller inspects only after startup has obtained
     // its database-family write lock. This prevents a concurrent merge from
     // changing the receipt between the gate decision and storage open. Read
@@ -420,6 +443,7 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     if ctx.is_initialized()
         && ctx.no_db()
         && (no_db_jsonl_write || pending_merge_mutation_gate_required)
+        && !matches!(cli.command, Commands::Doctor(_))
         && let Some(paths) = ctx.paths.as_ref()
     {
         let authority = write_lock.as_ref().ok_or_else(|| BeadsError::SyncConflict {
@@ -1729,10 +1753,18 @@ fn stale_schema_observational_refusal(found: u32) -> BeadsError {
     }
 }
 
-fn stale_schema_version_for_startup(db_path: &Path, observational: bool) -> Result<Option<u32>> {
+fn stale_schema_version_for_startup(
+    beads_dir: &Path,
+    db_path: &Path,
+    observational: bool,
+) -> Result<Option<u32>> {
     if observational {
-        config::stale_schema_version_without_mutation(db_path)
+        with_database_transition_observation(beads_dir, db_path, || {
+            config::stale_schema_version_without_mutation(db_path)
+        })
     } else {
+        let _admission = beads_rust::sync::DatabaseOpenerLease::register(db_path)?;
+        refuse_incomplete_database_transition(beads_dir, db_path)?;
         commands::doctor_subsystems::schema_heal::stale_schema_version(db_path)
     }
 }
@@ -1750,6 +1782,7 @@ fn pending_sync_merge_no_db_refusal_error(
 }
 
 fn inspect_pending_sync_merge_for_startup(
+    beads_dir: &Path,
     db_path: &Path,
 ) -> Result<Option<commands::doctor::PendingSyncMergeState>> {
     // A missing database is the normal pre-import state for a JSONL-only
@@ -1757,10 +1790,12 @@ fn inspect_pending_sync_merge_for_startup(
     // startup inspection must not push such workspaces into degraded
     // read-only mode (#414, #409 cluster A). Doctor still reports the
     // missing database as a finding through its stricter public inspector.
-    match fs::symlink_metadata(db_path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        _ => commands::doctor::inspect_pending_sync_merge_at_path(db_path),
-    }
+    with_database_transition_observation(beads_dir, db_path, || {
+        match fs::symlink_metadata(db_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            _ => commands::doctor::inspect_pending_sync_merge_at_path(db_path),
+        }
+    })
 }
 
 fn inspect_pending_sync_merge_for_startup_under_authority(
@@ -3677,7 +3712,7 @@ mod tests {
         let db_path = temp.path().join("beads.db");
 
         assert!(
-            inspect_pending_sync_merge_for_startup(&db_path)
+            inspect_pending_sync_merge_for_startup(temp.path(), &db_path)
                 .unwrap()
                 .is_none(),
             "a JSONL-only checkout must be allowed to initialize its database"

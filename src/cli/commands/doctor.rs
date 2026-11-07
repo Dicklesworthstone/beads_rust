@@ -9,6 +9,9 @@ use crate::cli::commands::doctor_subsystems::mutate as chokepoint;
 use crate::cli::commands::doctor_subsystems::mutate::{Capabilities, MutateContext, Op};
 use crate::cli::commands::doctor_subsystems::refuse_gates::{self, GateOutcome};
 use crate::cli::commands::doctor_subsystems::run_dir::{self, RunDir};
+use crate::cli::commands::doctor_subsystems::schema_migration::{
+    refuse_incomplete_database_transition, with_database_transition_observation,
+};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::franken_sync::{Connection, Row};
@@ -2247,6 +2250,7 @@ fn acquire_doctor_database_write_authority(
             lock_timeout,
         )?,
     );
+    refuse_incomplete_database_transition(beads_dir, db_path)?;
     write_authority.bind_database_inode_for_mutation()?;
     write_authority.verify_database_authority()?;
     Ok(write_authority)
@@ -13309,6 +13313,7 @@ fn execute_repair_indexes(
     } else if let Some(authority) =
         cli.database_family_write_authority_for(beads_dir, &paths.db_path)
     {
+        refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
         if let Err(err) = authority.verify_database_authority() {
             emit_concurrency_lost(beads_dir, &err, ctx, "--repair-indexes");
             crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
@@ -13324,6 +13329,7 @@ fn execute_repair_indexes(
         }
     };
 
+    refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
     match refuse_gates::run_all(beads_dir, &paths.db_path) {
         GateOutcome::Allow => {}
         GateOutcome::Refuse {
@@ -13844,6 +13850,25 @@ pub(crate) fn observe_check_for_explain(
     }
 }
 
+fn record_migration_transition_refusal(
+    beads_dir: &Path,
+    db_path: &Path,
+    checks: &mut Vec<CheckResult>,
+    error: &BeadsError,
+) {
+    push_check(
+        checks,
+        "db.schema_migration_pending",
+        CheckStatus::Error,
+        Some(error.to_string()),
+        Some(serde_json::json!({
+            "database_path": db_path,
+            "inspected": false,
+            "recovery_receipts": beads_dir.join(".br_recovery/schema-migrations"),
+        })),
+    );
+}
+
 fn collect_doctor_report_with_mode_and_db_override(
     beads_dir: &Path,
     paths: &config::ConfigPaths,
@@ -13852,10 +13877,23 @@ fn collect_doctor_report_with_mode_and_db_override(
     no_db: bool,
 ) -> Result<DoctorRun> {
     let mut checks = Vec::new();
+    let mut migration_transition_clear =
+        match refuse_incomplete_database_transition(beads_dir, &paths.db_path) {
+            Ok(()) => true,
+            Err(error) => {
+                record_migration_transition_refusal(beads_dir, &paths.db_path, &mut checks, &error);
+                false
+            }
+        };
     // Even --no-db inspects pending merge state below. Check namespace
     // evidence before that read-only open can rebind a quiescent generation.
-    let live_database_inspectable =
-        !paths.db_path.exists() || check_namespace_identity(&paths.db_path, &mut checks);
+    let live_database_inspectable = migration_transition_clear
+        && (!paths.db_path.exists() || check_namespace_identity(&paths.db_path, &mut checks));
+    let database_inspection_blocked_by = if migration_transition_clear {
+        "db.namespace_identity"
+    } else {
+        "db.schema_migration_pending"
+    };
     check_merge_artifacts(beads_dir, &paths.jsonl_path, &mut checks)?;
     check_base_jsonl(beads_dir, &mut checks);
     // Pass-5 cycle 10: doctor's own runs dir size (operator-prunable).
@@ -13912,14 +13950,28 @@ fn collect_doctor_report_with_mode_and_db_override(
     // This check still runs in `--no-db` mode because a JSONL-only rewrite
     // could otherwise overwrite the pending merge's expected artifact.
     if live_database_inspectable {
-        check_pending_sync_merge(&paths.db_path, &mut checks);
+        match with_database_transition_observation(beads_dir, &paths.db_path, || {
+            let mut observed = Vec::new();
+            check_pending_sync_merge(&paths.db_path, &mut observed);
+            Ok(observed)
+        }) {
+            Ok(observed) => checks.extend(observed),
+            Err(error) => {
+                record_migration_transition_refusal(beads_dir, &paths.db_path, &mut checks, &error);
+                migration_transition_clear = false;
+            }
+        }
     } else {
         push_check(
             &mut checks,
             "sync.merge_pending",
             CheckStatus::Error,
-            Some("Pending sync-merge state is unknown: live database inspection was skipped to preserve the namespace identity evidence".to_string()),
-            Some(serde_json::json!({ "inspected": false, "blocked_by": "db.namespace_identity" })),
+            Some(format!(
+                "Pending sync-merge state is unknown: database inspection was skipped because {database_inspection_blocked_by} requires explicit recovery"
+            )),
+            Some(
+                serde_json::json!({ "inspected": false, "blocked_by": database_inspection_blocked_by }),
+            ),
         );
     }
 
@@ -13968,15 +14020,31 @@ fn collect_doctor_report_with_mode_and_db_override(
         check_db_bloat_vs_jsonl(&paths.db_path, jsonl_path.as_deref(), &mut checks);
         // Pass-5 cycle 23: selected DB WAL sidecar oversized (checkpoint candidate).
         check_wal_oversized(&paths.db_path, &mut checks);
-        inspect_doctor_database(
-            beads_dir,
-            &paths.db_path,
-            jsonl_path.as_deref(),
-            jsonl_count,
-            mode,
-            live_database_inspectable,
-            &mut checks,
-        );
+        if migration_transition_clear {
+            match with_database_transition_observation(beads_dir, &paths.db_path, || {
+                let mut observed = Vec::new();
+                inspect_doctor_database(
+                    beads_dir,
+                    &paths.db_path,
+                    jsonl_path.as_deref(),
+                    jsonl_count,
+                    mode,
+                    live_database_inspectable,
+                    &mut observed,
+                );
+                Ok(observed)
+            }) {
+                Ok(observed) => checks.extend(observed),
+                Err(error) => {
+                    record_migration_transition_refusal(
+                        beads_dir,
+                        &paths.db_path,
+                        &mut checks,
+                        &error,
+                    );
+                }
+            }
+        }
     }
 
     let classification = classify_doctor_checks(&paths.db_path, &paths.jsonl_path, &checks);
@@ -14388,6 +14456,7 @@ pub(crate) fn execute_unblock(
             if let Some(authority) =
                 cli.database_family_write_authority_for(&beads_dir, &paths.db_path)
             {
+                refuse_incomplete_database_transition(&beads_dir, &paths.db_path)?;
                 authority.verify_database_authority()?;
                 Arc::clone(authority)
             } else {
@@ -14888,6 +14957,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             let write_authority = if let Some(authority) =
                 cli.database_family_write_authority_for(&beads_dir, &paths.db_path)
             {
+                refuse_incomplete_database_transition(&beads_dir, &paths.db_path)?;
                 if let Err(err) = authority.verify_database_authority() {
                     emit_concurrency_lost(&beads_dir, &err, ctx, "doctor undo");
                     crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
@@ -15019,6 +15089,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             if let Some(authority) =
                 cli.database_family_write_authority_for(&beads_dir, &paths.db_path)
             {
+                refuse_incomplete_database_transition(&beads_dir, &paths.db_path)?;
                 // main.rs already serialized us against concurrent writers.
                 // Reuse that exact inode-bound capability; a fresh flock
                 // handle in the same process would deadlock on Linux.
@@ -15045,6 +15116,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 ) {
                     Ok(authority) => {
                         let authority = Arc::new(authority);
+                        refuse_incomplete_database_transition(&beads_dir, &paths.db_path)?;
                         if let Err(err) = authority
                             .bind_database_inode_for_mutation()
                             .and_then(|_| authority.verify_database_authority())
@@ -15063,6 +15135,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         } else {
             None
         };
+
+    if args.repair && !args.robot_triage {
+        // This also covers previews. A migration's retained file transition
+        // must be resolved by its own apply/undo path before generic repair
+        // may classify or alter the exposed database family.
+        refuse_incomplete_database_transition(&beads_dir, &paths.db_path)?;
+    }
 
     // Round-5 fresh-eyes follow-through (`beads_rust-73ux`): the WP1
     // refuse-unsafe gates (schema-version-downgrade,
@@ -15097,7 +15176,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let fixer_filter = FixerFilter::from_args(&args.only, &args.skip);
     let mut current_schema_maintenance_needed = false;
     if args.repair && !args.robot_triage && !resolve_doctor_no_db(&beads_dir, cli) {
-        match current_schema_layout_before_repair(&paths.db_path) {
+        // Keep layout-inspection errors distinct from a rejected observation:
+        // corruption may need another diagnostic, but changing migration
+        // receipts must stop even a dry-run before it publishes a verdict.
+        let inspected = with_database_transition_observation(&beads_dir, &paths.db_path, || {
+            Ok(current_schema_layout_before_repair(&paths.db_path))
+        })?;
+        match inspected {
             Ok(Some(CurrentSchemaRepairInspection::ReviewedUpgrade(upgrade))) => {
                 refuse_doctor_repair_for_runtime_upgrade(
                     &paths.db_path,

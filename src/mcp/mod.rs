@@ -21,6 +21,9 @@ use std::time::UNIX_EPOCH;
 use fastmcp_rust::{McpError, McpErrorCode, McpResult, StdioTransport};
 use serde_json::{Value, json};
 
+use crate::cli::commands::doctor_subsystems::schema_migration::{
+    refuse_incomplete_database_transition, with_database_transition_observation,
+};
 use crate::error::StructuredError;
 use crate::model::Issue;
 use crate::storage::sqlite::PendingSyncMergeInspection;
@@ -362,14 +365,29 @@ pub struct BeadsState {
 impl BeadsState {
     pub(super) fn cached_read_json(&self, key: &str) -> Option<Value> {
         let cache = self.read_snapshot_cache.as_ref()?;
-        let before = self.capture_read_snapshot_witness()?;
-        let value = {
-            let guard = cache.lock().ok()?;
-            guard.get(key, &before)
-        };
-        let after = self.capture_read_snapshot_witness()?;
-
-        if before == after { value } else { None }
+        // A migration can crash without changing the cached payload witness.
+        // Admit cache hits against durable receipts without creating source
+        // lock files; a refused hit falls through to the fenced storage open.
+        let observed = with_database_transition_observation(&self.beads_dir, &self.db_path, || {
+            let value = (|| {
+                let before = self.capture_read_snapshot_witness()?;
+                let value = {
+                    let guard = cache.lock().ok()?;
+                    guard.get(key, &before)
+                };
+                let after = self.capture_read_snapshot_witness()?;
+                if before == after { value } else { None }
+            })();
+            Ok(value)
+        });
+        match observed {
+            Ok(value) => value,
+            Err(error) => {
+                self.clear_read_snapshot_cache();
+                tracing::debug!(%error, "MCP cached read refused by migration admission");
+                None
+            }
+        }
     }
 
     pub(super) fn capture_read_snapshot_witness(&self) -> Option<McpReadSnapshotWitness> {
@@ -434,6 +452,8 @@ impl BeadsState {
         &self,
         write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
     ) -> crate::Result<SqliteStorage> {
+        write_authority.verify_database_authority()?;
+        refuse_incomplete_database_transition(&self.beads_dir, &self.db_path)?;
         if write_authority.bind_database_inode_for_mutation()? {
             write_authority.install_empty_database_replacement_and_bind()?;
         }
@@ -456,7 +476,7 @@ impl BeadsState {
     /// Returns an error if storage cannot be opened.
     pub fn open_read_storage(&self) -> crate::Result<SqliteStorage> {
         let policy = crate::close_policy::load_for_beads_dir(&self.beads_dir)?;
-        let mut storage = config::open_sqlite_storage_read_only(&self.db_path)?;
+        let mut storage = config::open_sqlite_storage_read_only(&self.beads_dir, &self.db_path)?;
         storage.set_workflow_policy(policy.workflow);
         Ok(storage)
     }
@@ -480,6 +500,10 @@ impl BeadsState {
             )
             .map_err(to_mcp)?,
         );
+        write_authority
+            .verify_database_authority()
+            .map_err(to_mcp)?;
+        refuse_incomplete_database_transition(&self.beads_dir, &self.db_path).map_err(to_mcp)?;
 
         // 2. Acquire the sync lock before committing a mutation. MCP writes
         // should not report success when JSONL export is known to be unguarded
@@ -731,6 +755,20 @@ mod tests {
         let mut state = test_state(temp, jsonl_path);
         state.read_snapshot_cache = Some(Mutex::new(McpReadSnapshotCache::default()));
         state
+    }
+
+    fn unverifiable_migration_intent(state: &BeadsState) -> PathBuf {
+        let run = state
+            .beads_dir
+            .join(".br_recovery/schema-migrations/interrupted-mcp");
+        fs::create_dir_all(&run).unwrap();
+        let marker = run.join("commit-ready.json");
+        fs::write(
+            &marker,
+            serde_json::to_vec(&json!({ "database_path": state.db_path })).unwrap(),
+        )
+        .unwrap();
+        marker
     }
 
     #[test]
@@ -1047,6 +1085,103 @@ mod tests {
         fs::write(jsonl_path, "{\"id\":\"br-new\"}\n").unwrap();
 
         assert_eq!(state.cached_read_json("test"), None);
+    }
+
+    #[test]
+    fn read_snapshot_cache_cannot_bypass_an_interrupted_migration() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state_with_read_snapshot(&temp, temp.path().join(".beads/issues.jsonl"));
+        let cached = json!({ "count": 0 });
+        let witness = state.capture_read_snapshot_witness();
+        state.store_read_json_snapshot("test".to_owned(), witness.clone(), &cached);
+        assert_eq!(state.cached_read_json("test"), Some(cached));
+        let marker = unverifiable_migration_intent(&state);
+        assert_eq!(
+            state.capture_read_snapshot_witness(),
+            witness,
+            "receipt publication alone leaves the old cache witness unchanged"
+        );
+        let before = database_family_snapshot(&state.db_path).unwrap();
+        let marker_before = fs::read(&marker).unwrap();
+        let entries = || {
+            let mut names = fs::read_dir(&state.beads_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let entries_before = entries();
+
+        assert_eq!(state.cached_read_json("test"), None);
+        let error = state.open_read_storage().unwrap_err();
+        assert!(
+            error.to_string().contains("schema-migration state"),
+            "{error}"
+        );
+        assert!(
+            state
+                .read_snapshot_cache
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert_eq!(database_family_snapshot(&state.db_path).unwrap(), before);
+        assert_eq!(fs::read(marker).unwrap(), marker_before);
+        assert_eq!(
+            entries(),
+            entries_before,
+            "reads must not create source lock files"
+        );
+    }
+
+    #[test]
+    fn mutation_migration_fence_precedes_pending_inspection_and_missing_database_install() {
+        for existing in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let mut state = test_state(&temp, temp.path().join(".beads/issues.jsonl"));
+            state.db_path = state.beads_dir.join("migration-owned.db");
+            if existing {
+                fs::write(&state.db_path, b"retained unreadable main generation").unwrap();
+            }
+            let marker = unverifiable_migration_intent(&state);
+            let marker_before = fs::read(&marker).unwrap();
+            let before = database_family_snapshot(&state.db_path).unwrap();
+            let called = Cell::new(false);
+            let error = state
+                .with_mutation(|_, _| {
+                    called.set(true);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(!called.get());
+            assert!(error.message.contains("schema-migration state"), "{error}");
+            assert!(!state.beads_dir.join(".sync.lock").exists());
+            assert_eq!(database_family_snapshot(&state.db_path).unwrap(), before);
+
+            let authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &state.beads_dir,
+                    &state.db_path,
+                    Some(1000),
+                )
+                .unwrap(),
+            );
+            let error = state
+                .open_storage_under_write_authority(&authority)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("schema-migration state"),
+                "{error}"
+            );
+            assert_eq!(database_family_snapshot(&state.db_path).unwrap(), before);
+            assert_eq!(fs::read(marker).unwrap(), marker_before);
+            assert_eq!(state.db_path.exists(), existing);
+            assert!(!state.jsonl_path.exists());
+        }
     }
 
     #[test]

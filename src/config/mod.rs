@@ -11,6 +11,9 @@
 
 pub mod routing;
 
+use crate::cli::commands::doctor_subsystems::schema_migration::{
+    refuse_incomplete_database_transition, with_database_transition_observation,
+};
 use crate::error::{BeadsError, Result, ResultExt};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
@@ -868,6 +871,7 @@ fn open_sqlite_storage_with_recovery_after_fast_open_miss(
         .ok_or_else(|| BeadsError::SyncConflict {
             message: "Writable fast-open fallback has no database authority".to_string(),
         })?;
+    refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
     let database_was_missing = effective_authority.bind_database_inode_for_mutation()?;
     // Read-only fast-open commands legitimately skip the startup
     // pending-merge gate, so this writable fallback must re-impose the same
@@ -948,6 +952,10 @@ fn open_sqlite_storage_with_recovery_strategy(
     recovery_strategy: JsonlRecoveryStrategy,
     write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
 ) -> Result<SqliteRecoveryOpenResult> {
+    // A retained migration intent owns the complete original family. A
+    // missing main file or a readable intermediate generation cannot grant
+    // permission to quarantine sidecars or reconstruct it from JSONL.
+    refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
     if !paths.db_path.is_file() {
         if recovery_strategy == JsonlRecoveryStrategy::RebuildFromJsonl {
             require_no_unreadable_orphan_state(beads_dir, &paths.db_path)?;
@@ -1055,6 +1063,7 @@ fn open_when_db_file_is_missing(
     recovery_strategy: JsonlRecoveryStrategy,
     write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
 ) -> Result<SqliteRecoveryOpenResult> {
+    refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
     match recovery_strategy {
         JsonlRecoveryStrategy::RebuildFromJsonl => {
             require_no_unreadable_orphan_state(beads_dir, &paths.db_path)?;
@@ -4092,6 +4101,7 @@ pub fn open_storage(
         &startup.paths.db_path,
         resolved_lock_timeout,
     )?);
+    refuse_incomplete_database_transition(beads_dir, &startup.paths.db_path)?;
     write_authority.bind_database_inode_for_mutation()?;
     let mut open_result = open_sqlite_storage_with_recovery(
         beads_dir,
@@ -5414,15 +5424,23 @@ pub fn open_storage_with_startup_config_under_write_lock(
     Ok(result)
 }
 
-pub(crate) fn open_sqlite_storage_read_only(db_path: &Path) -> Result<SqliteStorage> {
+pub(crate) fn open_sqlite_storage_read_only(
+    beads_dir: &Path,
+    db_path: &Path,
+) -> Result<SqliteStorage> {
     // GH #585: observation is an execution contract, not a fast-path
     // preference. A read-only miss must never authorize migration,
     // namespace repair, default seeding, or reconstruction from JSONL,
     // even when the caller already holds the writer authority.
-    validate_sqlite_storage_read_only(
-        db_path,
-        SqliteStorage::open_current_read_only_snapshot(db_path),
-    )
+    // Bind the private snapshot to an unchanged, completed receipt generation
+    // without creating an opener lock in the original directory. Before/after
+    // checks also catch a whole replacement that completes during capture.
+    with_database_transition_observation(beads_dir, db_path, || {
+        validate_sqlite_storage_read_only(
+            db_path,
+            SqliteStorage::open_current_read_only_snapshot(db_path),
+        )
+    })
 }
 
 /// What to do about a database file that does not exist, which is how every
@@ -5471,6 +5489,7 @@ fn validate_sqlite_storage_read_only(
 }
 
 fn open_strict_sqlite_storage_for_startup(
+    beads_dir: &Path,
     db_path: &Path,
 ) -> Result<(
     SqliteRecoveryOpenResult,
@@ -5478,7 +5497,7 @@ fn open_strict_sqlite_storage_for_startup(
 )> {
     Ok((
         SqliteRecoveryOpenResult {
-            storage: open_sqlite_storage_read_only(db_path)?,
+            storage: open_sqlite_storage_read_only(beads_dir, db_path)?,
             auto_rebuilt: false,
             pending_recovery_backup: None,
             recovered_jsonl: None,
@@ -5499,6 +5518,8 @@ fn open_sqlite_storage_with_preferred_read_only(
     SqliteRecoveryOpenResult,
     Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
 )> {
+    let admission = crate::sync::DatabaseOpenerLease::register(&paths.db_path)?;
+    refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
     match SqliteStorage::open_current_read_only(&paths.db_path) {
         Ok(Some(storage)) if storage.fast_open_runtime_schema_is_compatible() => Ok((
             SqliteRecoveryOpenResult {
@@ -5513,6 +5534,7 @@ fn open_sqlite_storage_with_preferred_read_only(
             // Release the registered read opener before recovery may replace
             // the database or require a sole-opener checkpoint.
             drop(storage);
+            drop(admission);
             open_sqlite_storage_with_recovery_after_fast_open_miss(
                 beads_dir,
                 paths,
@@ -5527,6 +5549,7 @@ fn open_sqlite_storage_with_preferred_read_only(
                 error = %err,
                 "read-only fast open failed; falling back to normal storage open"
             );
+            drop(admission);
             open_sqlite_storage_with_recovery_after_fast_open_miss(
                 beads_dir,
                 paths,
@@ -5550,9 +5573,10 @@ fn open_sqlite_storage_for_startup(
     Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
 )> {
     if options.read_only_storage {
-        return open_strict_sqlite_storage_for_startup(&paths.db_path);
+        return open_strict_sqlite_storage_for_startup(beads_dir, &paths.db_path);
     }
     if options.defer_jsonl_recovery {
+        refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
         let database_was_missing = options
             .write_authority
             .map(|authority| authority.bind_database_inode_for_mutation())
@@ -5588,6 +5612,7 @@ fn open_sqlite_storage_for_startup(
             options,
         )
     } else {
+        refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
         let database_was_missing = options
             .write_authority
             .map(|authority| authority.bind_database_inode_for_mutation())
@@ -12882,7 +12907,7 @@ routing:
             .expect_err("mismatched route");
 
         assert!(error.to_string().contains("routing does not match"));
-        let original = open_sqlite_storage_read_only(&paths.db_path)
+        let original = open_sqlite_storage_read_only(&paths.beads_dir, &paths.db_path)
             .expect("the original database remains readable");
         assert!(original.get_issue("bd-before").unwrap().is_some());
         assert!(!paths.beads_dir.join("another.db").exists());

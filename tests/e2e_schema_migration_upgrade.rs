@@ -431,14 +431,26 @@ fn interrupted_apply_keeps_authority_until_explicit_resume(
     let database = fs::read(db_path).expect("installed database");
     let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
     let wal = fs::read(&wal_path).ok();
+    let interrupted = schema19_tracker_files(db_path.parent().unwrap());
     for (index, command) in ["info", "list", "stats"].into_iter().enumerate() {
         let read = run_br(
             workspace,
             [command, "--json", "--no-auto-import", "--no-auto-flush"],
             &format!("read_during_interrupted_migration_{index}"),
         );
-        assert!(read.status.success(), "{} {}", read.stdout, read.stderr);
+        if command == "info" {
+            assert!(read.status.success(), "{} {}", read.stdout, read.stderr);
+        } else {
+            assert!(!read.status.success(), "{} {}", read.stdout, read.stderr);
+            let refusal = format!("{}{}", read.stdout, read.stderr);
+            assert!(refusal.contains(run_id), "{refusal}");
+            assert!(refusal.contains("migrate-schema apply"), "{refusal}");
+        }
         assert!(!applied_path.exists(), "a read must not finalize recovery");
+        assert_eq!(
+            schema19_tracker_files(db_path.parent().unwrap()),
+            interrupted
+        );
         assert_eq!(fs::read(db_path).unwrap(), database);
         assert_eq!(fs::read(&wal_path).ok(), wal);
         assert_eq!(fs::read(run_dir.join("commit-ready.json")).unwrap(), intent);
@@ -473,6 +485,14 @@ fn interrupted_apply_keeps_authority_until_explicit_resume(
         fs::read(run_dir.join("before/beads.db")).unwrap(),
         original_backup
     );
+    for command in ["list", "stats"] {
+        let read = run_br(
+            workspace,
+            [command, "--json", "--no-auto-import", "--no-auto-flush"],
+            &format!("read_after_explicit_migration_resume_{command}"),
+        );
+        assert!(read.status.success(), "{} {}", read.stdout, read.stderr);
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1921,11 +1941,25 @@ fn schema19_workflows_preinstall_recovery_requires_explicit_retry() {
     assert_eq!(fs::read(&db).unwrap(), source);
     let interrupted = schema19_tracker_files(&workspace.root.join(".beads"));
     for command in ["stats", "info", "list"] {
-        assert_workflow_schema19_read(
-            &workspace,
-            command,
-            &format!("workflow19_preinstall_{command}"),
-        );
+        let label = format!("workflow19_preinstall_{command}");
+        if command == "info" {
+            assert_workflow_schema19_read(&workspace, command, &label);
+        } else {
+            let refused = run_br(
+                &workspace,
+                [command, "--json", "--no-auto-import", "--no-auto-flush"],
+                &label,
+            );
+            assert!(
+                !refused.status.success(),
+                "{} {}",
+                refused.stdout,
+                refused.stderr
+            );
+            let message = format!("{}{}", refused.stdout, refused.stderr);
+            assert!(message.contains(run_id), "{message}");
+            assert!(message.contains("migrate-schema apply"), "{message}");
+        }
         assert_eq!(
             schema19_tracker_files(&workspace.root.join(".beads")),
             interrupted

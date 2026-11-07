@@ -420,6 +420,392 @@ fn generic_repair_restores_current_owned_index_without_jsonl_reconstruction() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+mod incomplete_transitions {
+    use super::{
+        Connection, TableRows, released_schema19_workspace, run_br, schema19_authority_rows,
+        schema19_json, schema19_tracker_files, seed_schema19_database_authority,
+    };
+    use crate::common::cli::BrWorkspace;
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const SENTINEL: &str = "Acknowledged issue title retained only in the original migration WAL";
+    const FAMILY_SUFFIXES: &[&str] = &["", "-wal", "-shm", "-journal"];
+
+    struct AppliedWalFixture {
+        workspace: BrWorkspace,
+        beads: PathBuf,
+        db: PathBuf,
+        run_dir: PathBuf,
+        run_id: String,
+        token: String,
+        source_rows: TableRows,
+        source_files: BTreeMap<PathBuf, Vec<u8>>,
+    }
+
+    impl AppliedWalFixture {
+        fn new(label: &str) -> Self {
+            let workspace = released_schema19_workspace();
+            seed_schema19_database_authority(&workspace);
+            let beads = workspace.root.join(".beads");
+            let db = beads.join("beads.db");
+            let mut connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            connection.execute("PRAGMA journal_mode=WAL").unwrap();
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            connection.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+            let main = fs::read(&db).unwrap();
+            connection
+                .execute_with_params(
+                    "UPDATE issues SET title=? WHERE id='rel19-local'",
+                    &[SENTINEL.into()],
+                )
+                .unwrap();
+            connection.close_without_checkpoint_in_place().unwrap();
+            drop(connection);
+            assert_eq!(fs::read(&db).unwrap(), main);
+            assert!(!contains_sentinel(&main));
+            assert!(contains_sentinel(
+                &fs::read(beads.join("beads.db-wal")).unwrap()
+            ));
+            assert!(
+                !fs::read_to_string(beads.join("issues.jsonl"))
+                    .unwrap()
+                    .contains(SENTINEL)
+            );
+            let source_rows = schema19_authority_rows(&db, None);
+            let source_files = schema19_tracker_files(&beads);
+            let plan = schema19_json(&run_br(
+                &workspace,
+                ["doctor", "migrate-schema", "plan", "--json"],
+                &format!("{label}_plan"),
+            ));
+            let token = plan["plan_token"].as_str().unwrap().to_owned();
+            let applied = schema19_json(&run_br(
+                &workspace,
+                [
+                    "doctor",
+                    "migrate-schema",
+                    "apply",
+                    "--plan-token",
+                    &token,
+                    "--json",
+                ],
+                &format!("{label}_apply"),
+            ));
+            let run_id = applied["run_id"].as_str().unwrap().to_owned();
+            let run_dir = beads.join(".br_recovery/schema-migrations").join(&run_id);
+            for suffix in FAMILY_SUFFIXES {
+                let name = format!("beads.db{suffix}");
+                assert_eq!(
+                    fs::read(run_dir.join("before").join(&name)).ok().as_ref(),
+                    source_files.get(Path::new(&name)),
+                );
+            }
+            assert_eq!(
+                schema19_authority_rows(&db, Some(&source_rows)),
+                source_rows
+            );
+            Self {
+                workspace,
+                beads,
+                db,
+                run_dir,
+                run_id,
+                token,
+                source_rows,
+                source_files,
+            }
+        }
+
+        fn assert_normal_access_after_recovery(&self) {
+            assert_eq!(
+                schema19_authority_rows(&self.db, Some(&self.source_rows)),
+                self.source_rows
+            );
+            schema19_json(&run_br(
+                &self.workspace,
+                ["stats", "--json"],
+                "completed_transition_stats",
+            ));
+            // Completed historical receipts must not bind today's raw file
+            // forever: ordinary acknowledged writes can advance it again.
+            schema19_json(&run_br(
+                &self.workspace,
+                [
+                    "create",
+                    "Work after explicit transition recovery",
+                    "--json",
+                    "--no-auto-import",
+                    "--no-auto-flush",
+                ],
+                "completed_transition_create",
+            ));
+            let list = schema19_json(&run_br(
+                &self.workspace,
+                [
+                    "list",
+                    "--all",
+                    "--json",
+                    "--no-auto-import",
+                    "--no-auto-flush",
+                ],
+                "completed_transition_list",
+            ));
+            assert!(
+                list["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|issue| { issue["id"] == "rel19-local" && issue["title"] == SENTINEL })
+            );
+        }
+    }
+
+    fn contains_sentinel(bytes: &[u8]) -> bool {
+        bytes
+            .windows(SENTINEL.len())
+            .any(|part| part == SENTINEL.as_bytes())
+    }
+
+    fn assert_pending_transition_refuses_ordinary_access(
+        fixture: &AppliedWalFixture,
+        recovery: &str,
+    ) {
+        let interrupted = schema19_tracker_files(&fixture.beads);
+        let commands = [
+            vec!["stats", "--json"],
+            vec!["list", "--all", "--json"],
+            vec![
+                "create",
+                "Must not enter an incomplete database generation",
+                "--json",
+            ],
+            vec!["sync", "--import-only", "--json"],
+            vec!["doctor", "--json"],
+            vec!["doctor", "--repair", "--json"],
+            vec!["--no-db", "doctor", "--repair", "--json"],
+            vec!["doctor", "--repair-indexes", "--json"],
+            vec!["doctor", "migrate-schema", "plan", "--json"],
+            vec!["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+            vec!["doctor", "migrate-schema", "heal", "--json"],
+            vec!["doctor", "migrate-schema", "recover", "--json"],
+        ];
+        for (index, args) in commands.into_iter().enumerate() {
+            let plain_doctor = args == ["doctor", "--json"];
+            let refused = run_br(
+                &fixture.workspace,
+                args,
+                &format!("pending_{recovery}_ordinary_refusal_{index}"),
+            );
+            assert!(
+                !refused.status.success(),
+                "{} {}",
+                refused.stdout,
+                refused.stderr
+            );
+            let message = format!("{}{}", refused.stdout, refused.stderr);
+            assert!(message.contains(&fixture.run_id), "{message}");
+            assert!(
+                message.contains(&format!("migrate-schema {recovery}")),
+                "{message}"
+            );
+            if plain_doctor {
+                let report: Value =
+                    serde_json::from_str(&refused.stdout).expect("whole doctor JSON");
+                assert_eq!(report["ok"], false);
+                let pending = report["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|check| check["name"] == "db.schema_migration_pending")
+                    .expect("plain doctor must explain the incomplete database transition");
+                assert_eq!(pending["status"], "error");
+                assert_eq!(pending["details"]["inspected"], false);
+            }
+            assert_eq!(schema19_tracker_files(&fixture.beads), interrupted);
+        }
+        // These modes intentionally diagnose paths or the explicit JSONL
+        // source. They must stay usable without admitting the SQLite family.
+        for (index, args) in [
+            vec!["info", "--json"],
+            vec!["--no-db", "list", "--all", "--json"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let inspected = run_br(
+                &fixture.workspace,
+                args,
+                &format!("pending_{recovery}_diagnostic_{index}"),
+            );
+            assert!(
+                inspected.status.success(),
+                "{} {}",
+                inspected.stdout,
+                inspected.stderr
+            );
+            assert_eq!(schema19_tracker_files(&fixture.beads), interrupted);
+        }
+    }
+
+    /// Rebuild the persisted pre-exchange boundary from a real run's receipts
+    /// and retained files. This is not a process-kill or power-failure test.
+    #[test]
+    fn pending_apply_preserves_displaced_wal_until_explicit_recovery() {
+        let fixture = AppliedWalFixture::new("pending_apply");
+        let marker = fs::read(fixture.run_dir.join("commit-ready.json")).unwrap();
+        fs::rename(
+            fixture.run_dir.join("applied.json"),
+            fixture.run_dir.join("applied.reconstruction-evidence.json"),
+        )
+        .unwrap();
+        let installed = fixture.run_dir.join("reconstruction-installed-family");
+        fs::create_dir(&installed).unwrap();
+        for suffix in FAMILY_SUFFIXES {
+            let live = fixture.beads.join(format!("beads.db{suffix}"));
+            if live.exists() {
+                fs::rename(&live, installed.join(format!("beads.db{suffix}"))).unwrap();
+            }
+        }
+        let displaced = fixture.run_dir.join("maintenance-displaced");
+        fs::rename(displaced.join("beads.db"), &fixture.db).unwrap();
+        assert_eq!(
+            fs::read(&fixture.db).unwrap(),
+            fixture.source_files[Path::new("beads.db")]
+        );
+        assert!(!contains_sentinel(&fs::read(&fixture.db).unwrap()));
+        assert!(!fixture.beads.join("beads.db-wal").exists());
+        assert!(contains_sentinel(
+            &fs::read(displaced.join("beads.db-wal")).unwrap()
+        ));
+        assert_pending_transition_refuses_ordinary_access(&fixture, "apply");
+
+        let resumed = schema19_json(&run_br(
+            &fixture.workspace,
+            [
+                "--no-db",
+                "doctor",
+                "migrate-schema",
+                "apply",
+                "--plan-token",
+                &fixture.token,
+                "--json",
+            ],
+            "pending_apply_explicit_recovery",
+        ));
+        assert_ne!(resumed["run_id"].as_str().unwrap(), fixture.run_id);
+        let failed: Value =
+            serde_json::from_slice(&fs::read(fixture.run_dir.join("failed.json")).unwrap())
+                .unwrap();
+        assert_eq!(failed["raw_observed_after_failure"], failed["raw_before"]);
+        assert!(!fixture.run_dir.join("applied.json").exists());
+        assert_eq!(
+            fs::read(fixture.run_dir.join("commit-ready.json")).unwrap(),
+            marker
+        );
+        fixture.assert_normal_access_after_recovery();
+    }
+
+    /// Reconstruct an undo after the main has been restored, while its
+    /// receipt-bound WAL/SHM are still in the original recovery bundle.
+    #[test]
+    fn pending_undo_preserves_original_wal_until_explicit_recovery() {
+        let fixture = AppliedWalFixture::new("pending_undo");
+        let mut prepared = schema19_json(&run_br(
+            &fixture.workspace,
+            [
+                "doctor",
+                "migrate-schema",
+                "undo",
+                &fixture.run_id,
+                "--dry-run",
+                "--json",
+            ],
+            "pending_undo_genuine_preview",
+        ));
+        assert_eq!(prepared["dry_run"], true);
+        prepared["dry_run"] = json!(false);
+        let quarantine = PathBuf::from(prepared["quarantine_path"].as_str().unwrap());
+        fs::create_dir_all(&quarantine).unwrap();
+        fs::create_dir(fixture.run_dir.join("undo-restored-candidate")).unwrap();
+        fs::write(
+            fixture.run_dir.join("undo-prepared.json"),
+            serde_json::to_vec_pretty(&prepared).unwrap(),
+        )
+        .unwrap();
+        fs::rename(&fixture.db, quarantine.join("beads.db")).unwrap();
+        fs::copy(fixture.run_dir.join("before/beads.db"), &fixture.db).unwrap();
+        assert_eq!(
+            fs::read(&fixture.db).unwrap(),
+            fixture.source_files[Path::new("beads.db")]
+        );
+        assert!(!contains_sentinel(&fs::read(&fixture.db).unwrap()));
+        assert!(contains_sentinel(
+            &fs::read(fixture.run_dir.join("before/beads.db-wal")).unwrap(),
+        ));
+        assert_pending_transition_refuses_ordinary_access(&fixture, "undo");
+
+        schema19_json(&run_br(
+            &fixture.workspace,
+            [
+                "--no-db",
+                "doctor",
+                "migrate-schema",
+                "undo",
+                &fixture.run_id,
+                "--json",
+            ],
+            "pending_undo_explicit_recovery",
+        ));
+        assert!(fixture.run_dir.join("undone.json").is_file());
+        assert_eq!(
+            schema19_authority_rows(&fixture.db, None),
+            fixture.source_rows
+        );
+        let restored = schema19_tracker_files(&fixture.beads);
+        for name in [
+            "beads.db",
+            "beads.db-wal",
+            "beads.db-shm",
+            "beads.db-journal",
+            "issues.jsonl",
+            "config.yaml",
+            "metadata.json",
+            "policy.yaml",
+        ] {
+            assert_eq!(
+                restored.get(Path::new(name)),
+                fixture.source_files.get(Path::new(name))
+            );
+        }
+        // Undo restores the released layout. Its completed receipt must allow
+        // a fresh explicit upgrade and subsequent ordinary reads and writes.
+        let replanned = schema19_json(&run_br(
+            &fixture.workspace,
+            ["doctor", "migrate-schema", "plan", "--json"],
+            "completed_undo_fresh_plan",
+        ));
+        schema19_json(&run_br(
+            &fixture.workspace,
+            [
+                "doctor",
+                "migrate-schema",
+                "apply",
+                "--plan-token",
+                replanned["plan_token"].as_str().unwrap(),
+                "--json",
+            ],
+            "completed_undo_fresh_apply",
+        ));
+        fixture.assert_normal_access_after_recovery();
+    }
+}
+
 mod application_ids {
     use super::{
         Connection, released_schema19_workspace, run_br, schema19_authority_rows, schema19_json,
@@ -757,18 +1143,17 @@ fn prepared_release_undo_preserves_newer_wal_and_resumes_unchanged_control() {
             assert!(!run_dir.join("undone.json").exists());
             assert_eq!(schema19_tracker_files(&beads), before_resume);
             assert_eq!(schema19_authority_rows(&db, None), rows_before_resume);
-            let list = schema19_json(&run_br(
+            // Newer work is intact in the privately inspected family, but
+            // the unresolved intent must still fence ordinary live opens.
+            let list = run_br(
                 &workspace,
                 ["list", "--all", "--json"],
-                "prepared_undo_newer_work_readable",
-            ));
-            assert!(
-                list["issues"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|issue| issue["title"] == NEW_TITLE)
+                "prepared_undo_newer_work_keeps_recovery_fence",
             );
+            assert!(!list.status.success(), "{} {}", list.stdout, list.stderr);
+            let message = format!("{}{}", list.stdout, list.stderr);
+            assert!(message.contains(run_id), "{message}");
+            assert!(message.contains("migrate-schema undo"), "{message}");
             assert_eq!(schema19_tracker_files(&beads), before_resume);
         } else {
             schema19_json(&resumed);
