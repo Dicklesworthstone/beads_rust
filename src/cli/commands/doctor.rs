@@ -15,7 +15,10 @@ use crate::franken_sync::{Connection, Row};
 use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
 use crate::output::{OutputContext, rich_text_panel};
 use crate::storage::SqliteStorage;
-use crate::storage::schema::{CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS};
+use crate::storage::schema::{
+    CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedRuntimeSchemaUpgrade,
+    reviewed_runtime_schema_upgrade,
+};
 use crate::storage::sqlite::{PendingSyncMergeInspection, database_header_user_version};
 #[cfg(test)]
 use crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY;
@@ -729,6 +732,71 @@ fn emit_refused_unsafe(
             "Refusing {operation}: {reason} (gate={gate_name})"
         ));
     }
+}
+
+/// Recognize only the reviewed release-layout upgrade. An unreadable or
+/// unsupported layout keeps its existing explicit best-effort repair path;
+/// this probe does not authorize that path or replace its other refusal gates.
+/// Private inspection precedes even namespace-sidecar mode repair.
+fn reviewed_runtime_upgrade_before_repair(db_path: &Path) -> Option<ReviewedRuntimeSchemaUpgrade> {
+    if !fs::symlink_metadata(db_path).is_ok_and(|metadata| metadata.is_file()) {
+        return None;
+    }
+    config::with_database_family_snapshot(db_path, |snapshot| {
+        let conn = Connection::open(snapshot.to_string_lossy().into_owned())?;
+        let upgrade = reviewed_runtime_schema_upgrade(&conn);
+        conn.close()?;
+        upgrade
+    })
+    .ok()
+    .flatten()
+}
+
+fn reviewed_runtime_upgrade_in_report(
+    report: &DoctorReport,
+) -> Option<ReviewedRuntimeSchemaUpgrade> {
+    report.checks.iter().find_map(|check| {
+        if check.name != "schema.runtime" || check.status != CheckStatus::Error {
+            return None;
+        }
+        let details = check.details.as_ref()?;
+        if details
+            .get("user_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(19)
+        {
+            return None;
+        }
+        serde_json::from_value::<ReviewedRuntimeSchemaUpgrade>(
+            details.get("schema19_runtime_upgrade")?.clone(),
+        )
+        .ok()
+        .filter(|upgrade| upgrade.jsonl_row_receipts_created || upgrade.closed_by_column_added)
+    })
+}
+
+fn refuse_doctor_repair_for_runtime_upgrade(
+    db_path: &Path,
+    upgrade: ReviewedRuntimeSchemaUpgrade,
+    dry_run: bool,
+    ctx: &OutputContext,
+) -> ! {
+    let reason = "this schema-19 database requires the reviewed v0.7.6 runtime layout upgrade. \
+                  Generic doctor repair cannot preserve all database-only records through \
+                  JSONL reconstruction. Run `br doctor migrate-schema plan --json` to inspect \
+                  the lossless upgrade, then `br doctor migrate-schema heal` or apply the \
+                  reviewed plan token. No repair writes were applied";
+    let evidence = serde_json::json!({
+        "gate": "schema19_runtime_upgrade",
+        "finding": "schema.runtime",
+        "database_path": db_path.display().to_string(),
+        "dry_run": dry_run,
+        "schema19_runtime_upgrade": upgrade,
+        "recommended_fix": "br doctor migrate-schema plan --json",
+        "heal_command": "br doctor migrate-schema heal",
+    });
+    emit_refused_unsafe("--repair", reason, &evidence, ctx);
+    crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
 }
 
 fn refuse_doctor_mutation_if_merge_pending(
@@ -1741,6 +1809,14 @@ fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<Anomal
     match check.name.as_str() {
         "db.exists" if matches!(check.status, CheckStatus::Error) => {
             push_anomaly(anomalies, AnomalyClass::DatabaseMissing);
+        }
+        "schema.runtime" if matches!(check.status, CheckStatus::Error) => {
+            push_anomaly(
+                anomalies,
+                AnomalyClass::SchemaIncompatible {
+                    detail: check_message(check),
+                },
+            );
         }
         "db.open"
         | "schema.tables"
@@ -4984,7 +5060,7 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
         .get(0)
         .and_then(SqliteValue::as_integer);
     if version == Some(i64::from(CURRENT_SCHEMA_VERSION)) {
-        match crate::storage::schema::reviewed_runtime_schema_upgrade(conn) {
+        match reviewed_runtime_schema_upgrade(conn) {
             Ok(None) => push_check(checks, "schema.runtime", CheckStatus::Ok, None, None),
             Ok(Some(upgrade)) => push_check(
                 checks,
@@ -14758,6 +14834,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
+    // A known release-layout mismatch requires the reviewed lossless path.
+    // Refuse before the pending-merge admission gate can repair namespace
+    // modes, and before any generic fixer or repair session is created. The
+    // normal corruption/unknown-layout gates retain their existing behavior.
+    if args.repair
+        && !args.robot_triage
+        && !resolve_doctor_no_db(&beads_dir, cli)
+        && let Some(upgrade) = reviewed_runtime_upgrade_before_repair(&paths.db_path)
+    {
+        refuse_doctor_repair_for_runtime_upgrade(&paths.db_path, upgrade, args.dry_run, ctx);
+    }
+
     if args.repair && !args.dry_run && !args.robot_triage {
         let write_authority = repair_write_authority
             .as_ref()
@@ -14802,6 +14890,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     if args.robot_triage {
         emit_flat_robot_triage(&initial.report);
         return Ok(());
+    }
+
+    // Repeat against the report snapshot before generic repair planning.
+    // The preflight is deliberately a positive-only classifier, so no later
+    // observation of a reviewed upgrade may fall through to JSONL rebuilding.
+    if args.repair
+        && let Some(upgrade) = reviewed_runtime_upgrade_in_report(&initial.report)
+    {
+        refuse_doctor_repair_for_runtime_upgrade(&paths.db_path, upgrade, args.dry_run, ctx);
     }
 
     // An already healthy replacement cannot erase an earlier loss. Refuse
@@ -16040,6 +16137,10 @@ fn repair_dry_run_candidates(
     args: &DoctorArgs,
 ) -> Vec<crate::cli::commands::doctor_subsystems::capabilities_doctor::FixerEntry> {
     use crate::cli::commands::doctor_subsystems::capabilities_doctor::DoctorCapabilities;
+
+    if reviewed_runtime_upgrade_in_report(report).is_some() {
+        return Vec::new();
+    }
 
     let filter = FixerFilter::from_args(&args.only, &args.skip);
     let finding_kind = |name: &str, kind: &str| {
@@ -17605,6 +17706,43 @@ mod tests {
             "expected JSONL parse anomaly: {:?}",
             classification.anomalies
         );
+    }
+
+    #[test]
+    fn runtime_schema_errors_are_unsafe_without_becoming_corruption() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        for message in [
+            "Schema 19 requires the reviewed v0.7.6 runtime layout upgrade",
+            "Schema 19 has an unsupported runtime layout",
+        ] {
+            let mut check = CheckResult {
+                name: "schema.runtime".to_string(),
+                status: CheckStatus::Error,
+                message: Some(message.to_string()),
+                details: None,
+            };
+            let classification =
+                classify_doctor_checks(&db_path, &jsonl_path, std::slice::from_ref(&check));
+            assert_eq!(classification.health, WorkspaceHealth::Unsafe);
+            assert!(!classification.recovery_possible());
+            assert_eq!(
+                classification.anomalies,
+                vec![AnomalyClass::SchemaIncompatible {
+                    detail: message.to_string(),
+                }]
+            );
+            assert_eq!(
+                classification.audit_record("doctor.inspect").anomalies[0].code,
+                "schema_incompatible"
+            );
+
+            check.status = CheckStatus::Ok;
+            let canonical = classify_doctor_checks(&db_path, &jsonl_path, &[check]);
+            assert_eq!(canonical.health, WorkspaceHealth::Healthy);
+            assert!(canonical.anomalies.is_empty());
+        }
     }
 
     #[test]
@@ -26859,6 +26997,68 @@ mod tests {
 
     fn quiet_ctx() -> OutputContext {
         OutputContext::from_output_format(crate::cli::OutputFormat::Json, false, true)
+    }
+
+    #[test]
+    fn reviewed_runtime_upgrade_excludes_every_generic_repair_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let (beads_dir, _, mut report) = make_doctor_fixture(tmp.path());
+        report.checks.push(CheckResult {
+            name: "sqlite.integrity_check".to_string(),
+            status: CheckStatus::Error,
+            message: Some("database disk image is malformed".to_string()),
+            details: None,
+        });
+        let args = DoctorArgs {
+            repair: true,
+            dry_run: true,
+            unsafe_auto_fix: true,
+            ..DoctorArgs::default()
+        };
+        assert!(
+            repair_dry_run_candidates(&beads_dir, &report, &args)
+                .iter()
+                .any(|fixer| fixer.id == "doctor.repair_database_from_jsonl"),
+            "the existing explicit corruption-repair plan remains available"
+        );
+        for (receipts, attribution) in [(true, true), (true, false), (false, true)] {
+            let upgrade = ReviewedRuntimeSchemaUpgrade {
+                jsonl_row_receipts_created: receipts,
+                closed_by_column_added: attribution,
+            };
+            let mut incompatible = report.clone();
+            incompatible.checks.push(CheckResult {
+                name: "schema.runtime".to_string(),
+                status: CheckStatus::Error,
+                message: Some("reviewed schema-19 runtime upgrade required".to_string()),
+                details: Some(serde_json::json!({
+                    "user_version": 19,
+                    "schema19_runtime_upgrade": upgrade,
+                })),
+            });
+            assert_eq!(
+                reviewed_runtime_upgrade_in_report(&incompatible),
+                Some(upgrade)
+            );
+            assert!(
+                repair_dry_run_candidates(&beads_dir, &incompatible, &args).is_empty(),
+                "no generic fixer may precede the reviewed upgrade, even with other findings"
+            );
+        }
+
+        report.checks.push(CheckResult {
+            name: "schema.runtime".to_string(),
+            status: CheckStatus::Error,
+            message: Some("unsupported runtime layout".to_string()),
+            details: Some(serde_json::json!({ "user_version": 19 })),
+        });
+        assert!(reviewed_runtime_upgrade_in_report(&report).is_none());
+        assert!(
+            repair_dry_run_candidates(&beads_dir, &report, &args)
+                .iter()
+                .any(|fixer| fixer.id == "doctor.repair_database_from_jsonl"),
+            "this bounded release-layout gate does not change unknown corruption recovery"
+        );
     }
 
     #[test]

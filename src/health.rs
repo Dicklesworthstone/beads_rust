@@ -53,6 +53,11 @@ pub enum AnomalyClass {
     DatabaseCorrupt {
         detail: String,
     },
+    /// This binary cannot use the observed layout. A reviewed migration or
+    /// compatible binary is required; generic recovery is not authorized.
+    SchemaIncompatible {
+        detail: String,
+    },
     WalCorrupt,
     SidecarMismatch {
         has_wal: bool,
@@ -133,6 +138,7 @@ impl AnomalyClass {
             Self::DatabaseMissing => "database_missing",
             Self::DatabaseNotSqlite => "database_not_sqlite",
             Self::DatabaseCorrupt { .. } => "database_corrupt",
+            Self::SchemaIncompatible { .. } => "schema_incompatible",
             Self::WalCorrupt => "wal_corrupt",
             Self::SidecarMismatch { .. } => "sidecar_mismatch",
             Self::TruncatedWal => "truncated_wal",
@@ -175,6 +181,7 @@ impl AnomalyClass {
 
             Self::JsonlConflictMarkers
             | Self::JsonlParseError { .. }
+            | Self::SchemaIncompatible { .. }
             | Self::PreservationUnverified { .. } => WorkspaceHealth::Unsafe,
 
             Self::SidecarMismatch { .. }
@@ -211,6 +218,7 @@ impl fmt::Display for AnomalyClass {
             Self::DatabaseMissing => f.write_str("database file missing"),
             Self::DatabaseNotSqlite => f.write_str("database file is not SQLite"),
             Self::DatabaseCorrupt { detail } => write!(f, "database corrupt: {detail}"),
+            Self::SchemaIncompatible { detail } => write!(f, "schema incompatible: {detail}"),
             Self::WalCorrupt => f.write_str("WAL file corrupt"),
             Self::SidecarMismatch { has_wal, has_shm } => {
                 write!(f, "sidecar mismatch (WAL={has_wal}, SHM={has_shm})")
@@ -880,6 +888,33 @@ mod tests {
         assert_eq!(entry.code, "write_probe_failed");
         assert_eq!(entry.severity, "recoverable");
         assert!(entry.message.contains("database disk image is malformed"));
+    }
+
+    #[test]
+    fn schema_incompatibility_requires_explicit_migration() {
+        let detail = "schema 19 requires `br doctor migrate-schema plan --json`";
+        let classification = WorkspaceClassification::from_anomalies(vec![
+            AnomalyClass::DatabaseCorrupt {
+                detail: "repairable index diagnostic".to_string(),
+            },
+            AnomalyClass::SchemaIncompatible {
+                detail: detail.to_string(),
+            },
+        ]);
+
+        assert_eq!(classification.health, WorkspaceHealth::Unsafe);
+        assert!(!classification.is_operable());
+        assert!(!classification.needs_recovery());
+        assert!(!classification.recovery_possible());
+        let audit = classification.audit_record("doctor.inspect");
+        assert_eq!(audit.health, "unsafe");
+        let schema = audit
+            .anomalies
+            .iter()
+            .find(|entry| entry.code == "schema_incompatible")
+            .expect("schema incompatibility remains distinct from corruption");
+        assert_eq!(schema.severity, "unsafe");
+        assert!(schema.message.contains(detail));
     }
 
     #[test]

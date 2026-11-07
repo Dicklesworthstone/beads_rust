@@ -324,6 +324,7 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
     ("db.export_hash_cache", "caches_indexes", "warn", true),
     ("schema.tables", "schemas", "error", true),
     ("schema.columns", "schemas", "error", true),
+    ("schema.runtime", "schemas", "error", true),
     ("schema.inspect", "schemas", "error", true),
     ("db.null_defaults", "schemas", "warn", true),
     ("sqlite.integrity_check", "state_files", "error", true),
@@ -660,6 +661,14 @@ fn refuse_gate_fixer_rows() -> &'static [FixerRow] {
             &[],
         ),
         (
+            "refuse_gates.schema19_runtime_upgrade",
+            "schemas",
+            false,
+            false,
+            &["schema.runtime"],
+            &[],
+        ),
+        (
             "refuse_gates.recovery_fingerprint_integrity",
             "state_files",
             false,
@@ -775,6 +784,35 @@ mod tests {
     }
 
     #[test]
+    fn runtime_schema_incompatibility_has_no_generic_rebuild_fixer() {
+        let capabilities = DoctorCapabilities::build();
+        let detector = capabilities
+            .detectors
+            .iter()
+            .find(|entry| entry.id == "schema.runtime")
+            .expect("runtime schema detector is advertised");
+        assert_eq!(detector.subsystem, "schemas");
+        assert_eq!(detector.severity_default, "error");
+        assert!(detector.fast_path);
+
+        let handlers = capabilities
+            .fixers
+            .iter()
+            .filter(|fixer| {
+                fixer
+                    .addressed_findings
+                    .iter()
+                    .any(|finding| finding == "schema.runtime")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0].id, "refuse_gates.schema19_runtime_upgrade");
+        assert!(!handlers[0].auto_fixable);
+        assert!(!handlers[0].mutates);
+        assert!(handlers[0].filter_ids.is_empty());
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn capabilities_detectors_and_fixers_are_populated() {
         // Phase 10 cold-prober finding (`beads_rust-3idn`): a cold
@@ -859,6 +897,7 @@ mod tests {
                 "doctor.repair_database_from_jsonl",
                 "doctor.repair_database_sidecars",
                 "refuse_gates.schema_version_downgrade",
+                "refuse_gates.schema19_runtime_upgrade",
                 "refuse_gates.recovery_fingerprint_integrity",
                 "dependency_unblock",
             ],

@@ -10,7 +10,7 @@ Executable implementation: `src/health.rs`.
 | **Healthy** | All invariants hold | All |
 | **Degraded** | Derived state stale or minor drift | All (with advisory) |
 | **Recoverable** | Primary data intact, DB corrupted | Read-only until recovery |
-| **Unsafe** | Interchange integrity or local-state preservation requires manual intervention | No verified recovery until the underlying shortfall is resolved |
+| **Unsafe** | Schema compatibility, interchange integrity, or local-state preservation requires manual intervention | No verified recovery until the underlying shortfall is resolved |
 
 ## Failure Taxonomy
 
@@ -21,11 +21,22 @@ Executable implementation: `src/health.rs`.
 | `DatabaseMissing` | Recoverable | File stat | Rebuild from JSONL |
 | `DatabaseNotSqlite` | Recoverable | Header check (first 16 bytes) | Rebuild from JSONL |
 | `DatabaseCorrupt` | Recoverable | fsqlite open / integrity_check | Rebuild from JSONL |
+| `SchemaIncompatible` | Unsafe | Doctor `schema.runtime` checks the actual runtime layout | Inspect the reviewed migration or use a binary supporting the layout; no automatic reconstruction |
 | `DuplicateSchemaRows` | Recoverable | sqlite_master GROUP BY HAVING | Rebuild from JSONL |
 | `DuplicateConfigKeys` | Recoverable | Config table duplicate probe | DELETE+INSERT dedup |
 | `DuplicateMetadataKeys` | Recoverable | Metadata table duplicate probe | Harmonize rows on metadata write; doctor rebuild collapses duplicates |
 | `NullInNotNullColumn` | Degraded | Schema-aware NULL scan | Backfill or rebuild |
 | `WriteProbeFailed` | Recoverable | Rollback-only doctor write probe | Rebuild from JSONL before writes continue |
+
+`SchemaIncompatible` has audit code `schema_incompatible`. A schema-version
+number alone does not establish compatibility: v0.7.6 and current builds use
+different layouts while both declare schema 19. Doctor reports the runtime
+layout finding in full and quick inspection and carries it into workspace
+health and reliability evidence. When the reviewed v0.7.6 upgrade is required,
+generic `doctor --repair`, including its dry run, refuses before applying
+fixes or creating a repair session. Use `br doctor migrate-schema plan --json`
+and the reviewed apply/heal path, which preserves database-only records and
+retains the original family for guarded undo.
 
 ### Interchange Data (JSONL)
 
