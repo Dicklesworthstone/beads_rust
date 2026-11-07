@@ -6911,8 +6911,8 @@ fn additive_database_witness(
     let config_rows =
         additive_raw_rows(storage, "SELECT key, value FROM config ORDER BY key, value")?;
     // An interrupted merge must finish against the exact schema and witness
-    // it reviewed. The nullable actor column is installed on the next open;
-    // do not change the legacy row width or digest during recovery.
+    // it reviewed. The nullable actor column requires a separate reviewed
+    // upgrade after recovery; keep the legacy row width and digest until then.
     let close_metadata_sql = if storage.close_metadata_has_closed_by()? {
         "SELECT issue_id, closed_by, closed_by_agent_name, closed_by_harness, closed_by_model, \
          bypassed_policy, bypass_reason, policy_gates_fired, recorded_at \
@@ -20792,8 +20792,48 @@ mod tests {
                 .compare_and_clear_pending_sync_merge_receipt(&receipt)
                 .unwrap();
             assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+            let metadata_after_cleanup = storage
+                .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                .unwrap();
+            let catalog_after_cleanup = storage
+                .execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name")
+                .unwrap();
             drop(storage);
 
+            // Recovery keeps the exact legacy catalog through terminal
+            // cleanup. A later ordinary open must still require the reviewed
+            // layout transition instead of installing it as maintenance.
+            let error = SqliteStorage::open(&database_path).unwrap_err();
+            assert!(error.to_string().contains("explicit reviewed"), "{error}");
+            let conn =
+                crate::franken_sync::Connection::open(database_path.to_string_lossy().into_owned())
+                    .unwrap();
+            assert_eq!(
+                conn.query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                metadata_after_cleanup
+            );
+            assert_eq!(
+                conn.query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name")
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                catalog_after_cleanup
+            );
+            let upgrade = crate::storage::schema::reviewed_runtime_schema_upgrade(&conn)
+                .unwrap()
+                .unwrap();
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            crate::storage::schema::apply_reviewed_runtime_schema_upgrade_in_transaction(
+                &conn, upgrade,
+            )
+            .unwrap();
+            conn.execute("COMMIT").unwrap();
+            conn.close().unwrap();
             let mut storage = SqliteStorage::open(&database_path).unwrap();
             assert!(storage.jsonl_row_receipts_table_exists().unwrap());
             assert!(storage.close_metadata_has_closed_by().unwrap());

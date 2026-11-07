@@ -142,6 +142,17 @@ struct LegacyV15Projection {
     retired_indexes: Vec<String>,
 }
 
+const SCHEMA19_PRESERVATION_PROFILE: &str = "schema19-layout-preservation-v1";
+
+/// Bind original storage values and hidden rowids as well as the layout.
+/// Absent on historical receipts so their token serialization is unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Schema19PreservationProfile {
+    profile: String,
+    source_sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct MigrationForecast {
     from_version: u32,
@@ -163,6 +174,8 @@ pub(super) struct MigrationForecast {
     /// maintenance-only operation or accepting arbitrary runtime repairs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) schema19_runtime_upgrade: Option<ReviewedRuntimeSchemaUpgrade>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema19_preservation: Option<Schema19PreservationProfile>,
     #[serde(default, skip_serializing_if = "is_false")]
     post_migration_maintenance: bool,
 }
@@ -177,7 +190,7 @@ pub(super) struct MigrationPlanReceipt {
     raw_witness: RawFamilyWitness,
     logical_witness: LogicalDatabaseWitness,
     pub(super) forecast: Option<MigrationForecast>,
-    plan_token: Option<String>,
+    pub(super) plan_token: Option<String>,
     apply_command: Option<String>,
     pub(super) note: String,
 }
@@ -421,18 +434,30 @@ fn with_migration_read_snapshot<T>(
 }
 
 pub(super) fn build_observational_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
+    with_observational_plan(db_path, |_, plan| plan)
+}
+
+/// Plan and heal preview inspect the same private generation and return the
+/// real database identity, rather than issuing tokens for a temporary path.
+pub(super) fn with_observational_plan<T>(
+    db_path: &Path,
+    inspect: impl FnOnce(&Path, Result<MigrationPlanReceipt>) -> Result<T>,
+) -> Result<T> {
     with_migration_read_snapshot(db_path, |snapshot, raw| {
-        let mut plan = build_plan(snapshot)?;
-        plan.database_path = db_path.display().to_string();
-        plan.raw_witness = raw.clone();
-        if let Some(forecast) = plan.forecast.as_ref() {
-            let token = compute_plan_token(&plan.database_path, &plan.logical_witness, forecast)?;
-            plan.apply_command = Some(format!(
-                "br doctor migrate-schema apply --plan-token {token}"
-            ));
-            plan.plan_token = Some(token);
-        }
-        Ok(plan)
+        let plan = build_plan(snapshot).and_then(|mut plan| {
+            plan.database_path = db_path.display().to_string();
+            plan.raw_witness = raw.clone();
+            if let Some(forecast) = plan.forecast.as_ref() {
+                let token =
+                    compute_plan_token(&plan.database_path, &plan.logical_witness, forecast)?;
+                plan.apply_command = Some(format!(
+                    "br doctor migrate-schema apply --plan-token {token}"
+                ));
+                plan.plan_token = Some(token);
+            }
+            Ok(plan)
+        });
+        inspect(snapshot, plan)
     })
 }
 
@@ -2812,7 +2837,7 @@ fn recover_engine_admission_with_complete_backup(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
+fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     refuse_non_regular_component(db_path)?;
     let logical_witness = logical_witness(db_path)?;
     let raw_witness = raw_family_witness(db_path)?;
@@ -2835,7 +2860,7 @@ pub(super) fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                     logical_witness.integrity_check
                 )));
             }
-            let forecast = MigrationForecast {
+            let mut forecast = MigrationForecast {
                 from_version: from,
                 to_version: target,
                 content_hash_rows_rebuilt: 0,
@@ -2846,8 +2871,19 @@ pub(super) fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 legacy_v4_conversion: None,
                 content_hash_refresh_profile: None,
                 schema19_runtime_upgrade,
+                schema19_preservation: None,
                 post_migration_maintenance: true,
             };
+            if schema19_runtime_upgrade.is_some() {
+                let preservation = capture_reviewed_state_preservation(db_path, &forecast)?
+                    .ok_or_else(|| {
+                        BeadsError::internal("schema19 plan omitted its preservation witness")
+                    })?;
+                forecast.schema19_preservation = Some(Schema19PreservationProfile {
+                    profile: SCHEMA19_PRESERVATION_PROFILE.to_owned(),
+                    source_sha256: schema19_preservation_digest(&preservation)?,
+                });
+            }
             let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
             return Ok(MigrationPlanReceipt {
                 schema_version: PLAN_SCHEMA.to_string(),
@@ -2865,7 +2901,9 @@ pub(super) fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 note: if schema19_runtime_upgrade.is_some() {
                     "the schema-19 layout requires the reviewed v0.7.6 runtime upgrade. Apply \
                      adds only the forecast receipt table and nullable close attribution column, \
-                     preserves every existing database record and operator schema, and retains \
+                     preserves every existing database record and operator schema. The token \
+                     also binds original storage values, application/operator rowids and sequence \
+                     reservations, so rowid-only changes require a fresh plan. Apply retains \
                      the complete original SQLite family for guarded undo. user_version stays \
                      19; v0.7.6 cannot read the upgraded close_metadata layout. Replacing only \
                      the executable is not a safe downgrade: use this br's receipt-bound undo \
@@ -2893,6 +2931,13 @@ pub(super) fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
             note: "database already has the current canonical schema; no migration is needed"
                 .to_string(),
         });
+    }
+    if from > target {
+        return Err(BeadsError::Config(format!(
+            "database schema {from} is newer than supported schema {target}; this executable \
+             cannot upgrade or heal it. Replacing only the executable is not a safe rollback; \
+             use a supporting release or a verified undo of the complete database family"
+        )));
     }
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
@@ -2944,6 +2989,7 @@ pub(super) fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
         legacy_v4_conversion,
         content_hash_refresh_profile,
         schema19_runtime_upgrade: None,
+        schema19_preservation: None,
         post_migration_maintenance: true,
     };
     let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -3322,6 +3368,7 @@ fn validate_commit_ready_marker(
 ) -> Result<()> {
     validate_raw_family_witness(&marker.raw_before)?;
     hash_refresh::preserves_bookkeeping(&marker.forecast)?;
+    validate_schema19_preservation_profile(&marker.forecast)?;
     let run_id = run_dir
         .file_name()
         .and_then(|value| value.to_str())
@@ -5434,6 +5481,7 @@ fn validate_applied_receipt_for_path(
     run_dir: &Path,
 ) -> Result<()> {
     validate_raw_family_witness(&applied.raw_before)?;
+    validate_schema19_preservation_profile(&applied.forecast)?;
     if let Some(raw_after) = applied.raw_after.as_ref() {
         validate_raw_family_witness(raw_after)?;
     }
@@ -6100,6 +6148,57 @@ fn verify_retained_migration_preservation_at(
     verified
 }
 
+/// The generic v1 logical witness hashes a multiset of visible values. It
+/// cannot detect changed duplicate-config precedence caused only by rowids.
+/// New schema19 plans bind the stronger, existing preservation projection.
+fn schema19_preservation_digest(preservation: &ReviewedStatePreservation) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, SCHEMA19_PRESERVATION_PROFILE.as_bytes());
+    for table in &preservation.tables {
+        if table.candidate.is_some() {
+            return Err(BeadsError::internal(
+                "schema19 layout upgrade cannot transform existing issue values",
+            ));
+        }
+        hash_len_prefixed(&mut hasher, table.name.as_bytes());
+        hash_len_prefixed(&mut hasher, &serde_json::to_vec(&table.columns)?);
+        hash_len_prefixed(&mut hasher, &serde_json::to_vec(&table.projection)?);
+    }
+    for object in &preservation.schema {
+        for value in [
+            &object.object_type,
+            &object.name,
+            &object.table,
+            &object.fingerprint,
+        ] {
+            hash_len_prefixed(&mut hasher, value.as_bytes());
+        }
+    }
+    Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
+fn validate_schema19_preservation_profile(forecast: &MigrationForecast) -> Result<()> {
+    let Some(profile) = &forecast.schema19_preservation else {
+        // Historical receipts retain their exact token and recovery meaning.
+        // Every newly issued layout-upgrade plan supplies this profile, so an
+        // old unexecuted plan cannot match a freshly recomputed apply token.
+        return Ok(());
+    };
+    if forecast.from_version != 19
+        || forecast.to_version != 19
+        || forecast.schema19_runtime_upgrade.is_none()
+        || profile.profile != SCHEMA19_PRESERVATION_PROFILE
+        || !recovery_pruning_hash_is_valid(&profile.source_sha256)
+    {
+        return Err(BeadsError::Config(
+            "schema19 layout preservation profile is invalid; preserve the original database \
+             and inspect the migration receipts before proceeding"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 const LEGACY_V15_PROFILE: &str = "legacy-v15-typed-dependencies-null-dirty-hashes-v1";
 const LEGACY_V15_NEW_TABLES: &[&str] = &[
     "capacity_exemption_history",
@@ -6399,6 +6498,7 @@ fn verify_reviewed_profile(
     forecast: &MigrationForecast,
     project_source: bool,
 ) -> Result<()> {
+    validate_schema19_preservation_profile(forecast)?;
     if let Some(upgrade) = forecast.schema19_runtime_upgrade {
         if forecast.from_version != 19
             || forecast.to_version != 19
@@ -6442,6 +6542,19 @@ fn verify_reviewed_profile(
             }
             Ok(())
         })?;
+        if project_source && let Some(profile) = &forecast.schema19_preservation {
+            let preservation =
+                capture_reviewed_state_preservation(db_path, forecast)?.ok_or_else(|| {
+                    BeadsError::internal("schema19 source preservation witness is absent")
+                })?;
+            if schema19_preservation_digest(&preservation)? != profile.source_sha256 {
+                return Err(BeadsError::Config(
+                    "schema19 source preservation witness changed: authoritative values, rowids, \
+                     sequences, or schema differ from the reviewed plan; preserve the original and re-plan"
+                        .to_owned(),
+                ));
+            }
+        }
     }
     if (forecast.from_version == 4) != forecast.legacy_v4_conversion.is_some()
         || (forecast.legacy_v4_conversion.is_some() && forecast.legacy_v15_conversion.is_some())
@@ -9190,6 +9303,7 @@ mod tests {
             legacy_v4_conversion: None,
             content_hash_refresh_profile: None,
             schema19_runtime_upgrade: None,
+            schema19_preservation: None,
             post_migration_maintenance: true,
         };
         let first = compute_plan_token("db", &logical, &forecast).unwrap();
@@ -9211,6 +9325,52 @@ mod tests {
             compute_plan_token("different-db", &logical, &forecast).unwrap(),
             "the absolute database route remains token-bound"
         );
+    }
+
+    #[test]
+    fn schema19_preservation_profile_keeps_historical_receipt_tokens_and_binds_new_proofs() {
+        let historical = r#"{"from_version":19,"to_version":19,"content_hash_rows_rebuilt":0,"gate_result_history_created":false,"schema19_runtime_upgrade":{"jsonl_row_receipts_created":true,"closed_by_column_added":true},"post_migration_maintenance":true}"#;
+        let mut forecast: MigrationForecast = serde_json::from_str(historical).unwrap();
+        assert_eq!(serde_json::to_string(&forecast).unwrap(), historical);
+        validate_schema19_preservation_profile(&forecast).unwrap();
+        let logical = LogicalDatabaseWitness {
+            user_version: 19,
+            integrity_check: "ok".to_owned(),
+            schema_sha256: "same-schema".to_owned(),
+            contents_sha256: "same-visible-values".to_owned(),
+            tables: Vec::new(),
+        };
+        let historical_token = compute_plan_token("db", &logical, &forecast).unwrap();
+        forecast.schema19_preservation = Some(Schema19PreservationProfile {
+            profile: SCHEMA19_PRESERVATION_PROFILE.to_owned(),
+            source_sha256: "a".repeat(64),
+        });
+        validate_schema19_preservation_profile(&forecast).unwrap();
+        let current_token = compute_plan_token("db", &logical, &forecast).unwrap();
+        assert_ne!(historical_token, current_token);
+        let mut changed = forecast.clone();
+        changed
+            .schema19_preservation
+            .as_mut()
+            .unwrap()
+            .source_sha256 = "b".repeat(64);
+        assert_ne!(
+            current_token,
+            compute_plan_token("db", &logical, &changed).unwrap(),
+            "a preservation-only change must invalidate the token"
+        );
+        for (profile, digest) in [
+            ("unreviewed-profile", "a".repeat(64)),
+            (SCHEMA19_PRESERVATION_PROFILE, "not-a-digest".to_owned()),
+        ] {
+            changed.schema19_preservation = Some(Schema19PreservationProfile {
+                profile: profile.to_owned(),
+                source_sha256: digest,
+            });
+            assert!(validate_schema19_preservation_profile(&changed).is_err());
+        }
+        forecast.schema19_runtime_upgrade = None;
+        assert!(validate_schema19_preservation_profile(&forecast).is_err());
     }
 
     #[test]
@@ -9550,6 +9710,7 @@ mod tests {
             legacy_v4_conversion: None,
             content_hash_refresh_profile: None,
             schema19_runtime_upgrade: None,
+            schema19_preservation: None,
             post_migration_maintenance: false,
         };
         (temp, db_path, forecast)

@@ -313,6 +313,7 @@ mod tests {
             legacy_v4_conversion: Some(projection(&conn, true).unwrap()),
             content_hash_refresh_profile: None,
             schema19_runtime_upgrade: None,
+            schema19_preservation: None,
             post_migration_maintenance: true,
         };
         let token_before = compute_plan_token("/released-schema4.db", &before, &forecast).unwrap();

@@ -43898,6 +43898,36 @@ required_fields:
             storage
                 .delete_metadata(METADATA_SYNC_MERGE_PENDING)
                 .unwrap();
+            let metadata_after_cleanup = storage
+                .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                .unwrap();
+            let error = SqliteStorage::open(&path).unwrap_err();
+            assert!(error.to_string().contains("explicit reviewed"), "{error}");
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                    .unwrap(),
+                metadata_after_cleanup
+            );
+            assert_eq!(storage.execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap(), catalog_before);
+            let upgrade = crate::storage::schema::reviewed_runtime_schema_upgrade(&storage.conn)
+                .unwrap()
+                .unwrap();
+            storage.conn.execute("BEGIN IMMEDIATE").unwrap();
+            crate::storage::schema::apply_reviewed_runtime_schema_upgrade_in_transaction(
+                &storage.conn,
+                upgrade,
+            )
+            .unwrap();
+            storage.conn.execute("COMMIT").unwrap();
+            assert_eq!(connection_user_version(&storage.conn), Some(19));
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                    .unwrap(),
+                metadata_after_cleanup,
+                "the explicit layout transition must not seed or replace metadata"
+            );
         }
         let storage = SqliteStorage::open(&path).unwrap();
         assert!(storage.close_metadata_has_closed_by().unwrap());
@@ -43914,6 +43944,7 @@ required_fields:
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn jsonl_row_receipts_schema_upgrade_waits_for_pending_merge_cleanup() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pending-receipt-schema.db");
@@ -43956,6 +43987,36 @@ required_fields:
             storage
                 .delete_metadata(METADATA_SYNC_MERGE_PENDING)
                 .unwrap();
+            let metadata_after_cleanup = storage
+                .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                .unwrap();
+            let error = SqliteStorage::open(&path).unwrap_err();
+            assert!(error.to_string().contains("explicit reviewed"), "{error}");
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                    .unwrap(),
+                metadata_after_cleanup
+            );
+            assert_eq!(storage.execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap(), catalog_before);
+            let upgrade = crate::storage::schema::reviewed_runtime_schema_upgrade(&storage.conn)
+                .unwrap()
+                .unwrap();
+            storage.conn.execute("BEGIN IMMEDIATE").unwrap();
+            crate::storage::schema::apply_reviewed_runtime_schema_upgrade_in_transaction(
+                &storage.conn,
+                upgrade,
+            )
+            .unwrap();
+            storage.conn.execute("COMMIT").unwrap();
+            assert_eq!(connection_user_version(&storage.conn), Some(19));
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                    .unwrap(),
+                metadata_after_cleanup,
+                "default seeding must wait for a subsequent canonical open"
+            );
         }
         let storage = SqliteStorage::open(&path).unwrap();
         assert!(storage.jsonl_row_receipts_table_exists().unwrap());

@@ -25,6 +25,10 @@
 //!   DB SHA-256 is `b670442544fd842878b54795e3ad1f8cb9cd7347056b74743f172729770d8c03`;
 //!   v0.7.6 stats succeeds and SQLite quick_check is ok. It lacks both
 //!   jsonl_row_receipts and close_metadata.closed_by despite declaring 19.
+//! - `schema19_v076_workflows.db.gz` independently freezes a richer official
+//!   v0.7.6 tracker: four issues including a DB-only ephemeral issue, real
+//!   gate/capacity history, closure attribution, and parallel typed relations.
+//!   The adjacent provenance document records its commands and checksums.
 //!
 //! Each test follows exactly the remediation the SCHEMA_MISMATCH error
 //! prints: plan -> apply -> verify data -> reject stale receipt -> undo ->
@@ -396,9 +400,10 @@ fn engine_rows(db_path: &Path, columns: Option<&TableRows>) -> TableRows {
     result
 }
 
-/// Model termination after installation but before the applied receipt was
-/// published. Keep the completed receipt as test evidence, leave the real
-/// commit-ready intent in place, and require an explicit resume to finish it.
+/// Reconstruct persisted state after installation but before publication of
+/// the applied receipt. This is recovery-state coverage, not a process-kill
+/// test. Retain the completed receipt as evidence, leave the real commit-ready
+/// intent in place, and require an explicit resume to finish it.
 fn interrupted_apply_keeps_authority_until_explicit_resume(
     workspace: &BrWorkspace,
     db_path: &Path,
@@ -1101,6 +1106,9 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
     );
     assert_eq!(plan["forecast"]["schema19_runtime_upgrade"], additions);
     assert_eq!(heal["schema19_runtime_upgrade"], additions);
+    assert_eq!(heal["plan_token"], plan["plan_token"]);
+    assert_eq!(heal["migration_plan"], plan);
+    assert_schema19_preservation_profile(&plan);
     assert_eq!(schema19_tracker_files(&beads), source_files);
     let token = plan["plan_token"].as_str().expect("upgrade token");
     let applied = schema19_json(&run_br(
@@ -1164,6 +1172,7 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
         "release19_current_plan",
     ));
     assert_eq!(current_plan["eligible"], false);
+    assert!(current_plan["forecast"].is_null());
     let current_heal = schema19_json(&run_br(
         &workspace,
         ["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
@@ -1286,6 +1295,7 @@ fn released_schema19_partial_upgrades_only_add_the_missing_structure() {
                 "closed_by_column_added": actor_needed,
             })
         );
+        assert_schema19_preservation_profile(&plan);
         schema19_json(&run_br(
             &workspace,
             [
@@ -1344,6 +1354,578 @@ fn released_schema19_unknown_layouts_refuse_without_a_noop_or_source_mutation() 
             assert_eq!(schema19_tracker_files(&beads), before);
         }
     }
+}
+
+fn assert_schema19_preservation_profile(plan: &Value) {
+    let preservation = &plan["forecast"]["schema19_preservation"];
+    assert_eq!(preservation["profile"], "schema19-layout-preservation-v1");
+    let digest = preservation["source_sha256"].as_str().unwrap();
+    assert_eq!(digest.len(), 64);
+    assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+fn workflow_schema19_workspace() -> BrWorkspace {
+    let workspace = BrWorkspace::new();
+    install_fixture_workspace(
+        &workspace,
+        "schema19_v076_workflows.db.gz",
+        "schema19_v076_workflows_issues.jsonl",
+        "schema19_v076_workflows_config.yaml",
+    );
+    fs::copy(
+        fixture_dir().join("schema19_v076_workflows_policy.yaml"),
+        workspace.root.join(".beads/policy.yaml"),
+    )
+    .unwrap();
+    assert_eq!(
+        header_user_version(&workspace.root.join(".beads/beads.db")),
+        19
+    );
+    workspace
+}
+
+/// The schema and workflow rows come from the release. These supplementary
+/// operator values exercise opaque payloads, duplicate row identity, and
+/// reservations that exceed the largest surviving AUTOINCREMENT row.
+fn seed_workflow_schema19_operator_state(workspace: &BrWorkspace) {
+    edit_schema19_fixture(
+        workspace,
+        &[
+            "INSERT INTO config (key, value) VALUES ('compact_model', 'private-database-model')",
+            "INSERT INTO config (key, value) VALUES ('compact_batch_size', '37')",
+            "INSERT INTO metadata (key, value) VALUES ('operator_checkpoint', 'not in JSONL')",
+            "CREATE TABLE release_operator_records (payload BLOB, amount REAL, note TEXT)",
+            "CREATE INDEX release_operator_payload ON release_operator_records(payload)",
+            "CREATE VIEW release_operator_view AS SELECT payload, note FROM release_operator_records",
+            "INSERT INTO release_operator_records (rowid, payload, amount, note) VALUES (17, X'0001FF007F', 1.25, NULL)",
+            "INSERT INTO release_operator_records (rowid, payload, amount, note) VALUES (91, X'0001FF007F', 1.25, NULL)",
+            "UPDATE dependencies SET thread_id = 'private-thread', created_by = 'private-agent'",
+            "UPDATE child_counters SET last_child = 777",
+            "UPDATE sqlite_sequence SET seq = seq + 10000",
+        ],
+    );
+}
+
+fn workflow_schema19_authority(db: &Path) -> TableRows {
+    let mut rows = schema19_authority_rows(db, None);
+    if rows.contains_key("release_operator_records") {
+        rows.insert(
+            "release_operator_view".to_owned(),
+            (vec!["payload".into(), "note".into()], Vec::new()),
+        );
+        rows = engine_rows(db, Some(&rows));
+    }
+    rows
+}
+
+/// Refused mutations may create coordination files, but must preserve every
+/// durable database component and source artifact, including committed WAL
+/// records that comparing only beads.db would miss.
+fn workflow_schema19_durable_files(
+    workspace: &BrWorkspace,
+) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = schema19_tracker_files(&workspace.root.join(".beads"));
+    files.retain(|path, _| {
+        [
+            "beads.db",
+            "beads.db-wal",
+            "beads.db-journal",
+            "issues.jsonl",
+            "issues.history.jsonl",
+            "metadata.json",
+            "config.yaml",
+            "policy.yaml",
+        ]
+        .iter()
+        .any(|name| path == Path::new(name))
+    });
+    files
+}
+
+fn workflow_schema19_plan(workspace: &BrWorkspace) -> Value {
+    schema19_json(&run_br(
+        workspace,
+        ["doctor", "migrate-schema", "plan", "--json"],
+        "workflow19_plan",
+    ))
+}
+
+fn workflow_schema19_apply(workspace: &BrWorkspace, token: &str) -> Value {
+    schema19_json(&run_br(
+        workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            token,
+            "--json",
+        ],
+        "workflow19_apply",
+    ))
+}
+
+fn assert_workflow_schema19_read(workspace: &BrWorkspace, command: &str, label: &str) {
+    let result = run_br(
+        workspace,
+        [command, "--json", "--no-auto-import", "--no-auto-flush"],
+        label,
+    );
+    if command == "info" {
+        // Generic diagnostics intentionally inspect legacy tables directly.
+        assert_eq!(schema19_json(&result)["issue_count"], 4);
+    } else {
+        assert!(format!("{}{}", result.stdout, result.stderr).contains("migrate-schema"));
+    }
+}
+
+#[test]
+fn schema19_workflows_reads_and_implicit_upgrades_preserve_source() {
+    let workspace = workflow_schema19_workspace();
+    let beads = workspace.root.join(".beads");
+    let source = schema19_tracker_files(&beads);
+    for command in ["stats", "info", "list"] {
+        assert_workflow_schema19_read(&workspace, command, &format!("workflow19_read_{command}"));
+        assert_eq!(schema19_tracker_files(&beads), source);
+    }
+    // A refused writer may initialize a frame-free WAL before the runtime
+    // layout gate. Establish that engine-created sidecar before the writer
+    // assertions, then compare every WAL byte without normalizing frames.
+    let baseline = Connection::open(beads.join("beads.db").to_string_lossy().into_owned()).unwrap();
+    baseline.query("SELECT 1").unwrap();
+    baseline.close().unwrap();
+    assert_eq!(
+        fs::read(beads.join("beads.db")).unwrap(),
+        source[Path::new("beads.db")]
+    );
+    let wal = fs::read(beads.join("beads.db-wal")).expect("engine-created writer baseline WAL");
+    assert!(
+        matches!(wal.len(), 0 | 32),
+        "writer baseline must have no WAL frames"
+    );
+    let durable = workflow_schema19_durable_files(&workspace);
+    for args in [
+        vec!["sync", "--import-only", "--json"],
+        vec!["create", "must not implicitly upgrade", "--json"],
+    ] {
+        let refused = run_br(&workspace, args, "workflow19_implicit_refusal");
+        assert!(
+            !refused.status.success(),
+            "{} {}",
+            refused.stdout,
+            refused.stderr
+        );
+        assert!(format!("{}{}", refused.stdout, refused.stderr).contains("migrate-schema"));
+        assert_eq!(workflow_schema19_durable_files(&workspace), durable);
+    }
+    assert!(!beads.join(".br_recovery/schema-migrations").exists());
+}
+
+#[test]
+fn schema19_workflows_heal_without_jsonl_preserves_history_and_repeats() {
+    let workspace = workflow_schema19_workspace();
+    seed_workflow_schema19_operator_state(&workspace);
+    let db = workspace.root.join(".beads/beads.db");
+    let before = workflow_schema19_authority(&db);
+    for (table, count) in [
+        ("issues", 4),
+        ("events", 23),
+        ("dependencies", 3),
+        ("close_metadata", 1),
+        ("gate_results", 1),
+        ("gate_result_history", 2),
+        ("capacity_exemptions", 1),
+        ("capacity_exemption_history", 2),
+        ("capacity_occupancy", 4),
+    ] {
+        assert_eq!(before[table].1.len(), count, "authentic fixture {table}");
+    }
+    let source = fs::read(&db).unwrap();
+    let jsonl = workspace.root.join(".beads/issues.jsonl");
+    let retained_jsonl = workspace.root.join("retained-release-issues.jsonl");
+    fs::rename(&jsonl, &retained_jsonl).unwrap();
+    let retained_bytes = fs::read(&retained_jsonl).unwrap();
+    assert_eq!(String::from_utf8_lossy(&retained_bytes).lines().count(), 3);
+    let files = schema19_tracker_files(&workspace.root.join(".beads"));
+    let preview = schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+        "workflow19_no_jsonl_preview",
+    ));
+    let plan = workflow_schema19_plan(&workspace);
+    assert_eq!(preview["heal_needed"], true);
+    assert_eq!(preview["migration_eligible"], true);
+    assert_eq!(preview["automatic_heal_allowed"], false);
+    assert_eq!(preview["from_version"], 19);
+    assert_eq!(preview["to_version"], 19);
+    assert_eq!(preview["plan_token"], plan["plan_token"]);
+    assert_eq!(preview["migration_plan"], plan);
+    assert_schema19_preservation_profile(&plan);
+    assert_eq!(
+        schema19_tracker_files(&workspace.root.join(".beads")),
+        files
+    );
+    let healed = schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "heal", "--json"],
+        "workflow19_no_jsonl_heal",
+    ));
+    assert_eq!(healed["action"], "migrated");
+    assert_eq!(healed["from_version"], 19);
+    assert_eq!(healed["to_version"], 19);
+    assert_eq!(header_user_version(&db), 19);
+    assert_eq!(engine_rows(&db, Some(&before)), before);
+    let backup = Path::new(healed["backup"].as_str().unwrap());
+    assert_eq!(fs::read(backup.join("beads.db")).unwrap(), source);
+    assert!(
+        !jsonl.exists(),
+        "heal must not require or create a JSONL export"
+    );
+    assert_eq!(fs::read(&retained_jsonl).unwrap(), retained_bytes);
+    let migrated = workflow_schema19_durable_files(&workspace);
+    let repeated = schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "heal", "--json"],
+        "workflow19_repeat_heal",
+    ));
+    assert_eq!(repeated["heal_needed"], false);
+    assert_eq!(workflow_schema19_durable_files(&workspace), migrated);
+    assert_eq!(fs::read(backup.join("beads.db")).unwrap(), source);
+}
+
+#[test]
+fn schema19_workflows_plan_rejects_rowid_drift_and_pending_merge() {
+    let workspace = workflow_schema19_workspace();
+    seed_workflow_schema19_operator_state(&workspace);
+    let plan = workflow_schema19_plan(&workspace);
+    edit_schema19_fixture(
+        &workspace,
+        &["UPDATE release_operator_records SET rowid = 92 WHERE rowid = 91"],
+    );
+    let drifted = workflow_schema19_durable_files(&workspace);
+    let refused = run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            plan["plan_token"].as_str().unwrap(),
+            "--json",
+        ],
+        "workflow19_rowid_drift",
+    );
+    assert!(
+        !refused.status.success(),
+        "{} {}",
+        refused.stdout,
+        refused.stderr
+    );
+    assert_eq!(workflow_schema19_durable_files(&workspace), drifted);
+    let next = workflow_schema19_plan(&workspace);
+    assert_ne!(next["plan_token"], plan["plan_token"]);
+    assert_ne!(
+        next["forecast"]["schema19_preservation"]["source_sha256"],
+        plan["forecast"]["schema19_preservation"]["source_sha256"]
+    );
+    // Even an empty, malformed pending marker freezes the original catalog.
+    edit_schema19_fixture(
+        &workspace,
+        &["INSERT INTO metadata (key, value) VALUES ('sync_merge_pending_v1', '')"],
+    );
+    let pending = workflow_schema19_durable_files(&workspace);
+    for args in [
+        vec!["doctor", "migrate-schema", "plan", "--json"],
+        vec!["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+        vec!["doctor", "migrate-schema", "heal", "--json"],
+    ] {
+        let refused = run_br(&workspace, args, "workflow19_pending_merge");
+        assert!(
+            !refused.status.success(),
+            "{} {}",
+            refused.stdout,
+            refused.stderr
+        );
+        assert!(format!("{}{}", refused.stdout, refused.stderr).contains("pending"));
+        assert_eq!(workflow_schema19_durable_files(&workspace), pending);
+    }
+}
+
+/// Reconstruct the pre-install boundary from genuine migration receipts and
+/// retained original files. This does not simulate a process or power failure.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn schema19_workflows_preinstall_recovery_requires_explicit_retry() {
+    let workspace = workflow_schema19_workspace();
+    seed_workflow_schema19_operator_state(&workspace);
+    let db = workspace.root.join(".beads/beads.db");
+    let before = workflow_schema19_authority(&db);
+    let source = fs::read(&db).unwrap();
+    let plan = workflow_schema19_plan(&workspace);
+    let token = plan["plan_token"].as_str().unwrap();
+    let applied = workflow_schema19_apply(&workspace, token);
+    let run_id = applied["run_id"].as_str().unwrap();
+    let run_dir = workspace
+        .root
+        .join(".beads/.br_recovery/schema-migrations")
+        .join(run_id);
+    let before_dir = run_dir.join("before");
+    let original = fs::read(before_dir.join("beads.db")).unwrap();
+    assert_eq!(original, source);
+    let intent = fs::read(run_dir.join("commit-ready.json")).unwrap();
+    fs::rename(
+        run_dir.join("applied.json"),
+        run_dir.join("applied.preinstall-test.json"),
+    )
+    .unwrap();
+    let retained = run_dir.join("preinstall-test-retained-install");
+    fs::create_dir(&retained).unwrap();
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let live = PathBuf::from(format!("{}{suffix}", db.display()));
+        if live.exists() {
+            fs::rename(&live, retained.join(format!("beads.db{suffix}"))).unwrap();
+        }
+    }
+    fs::rename(run_dir.join("maintenance-displaced/beads.db"), &db).unwrap();
+    assert_eq!(fs::read(&db).unwrap(), source);
+    let interrupted = schema19_tracker_files(&workspace.root.join(".beads"));
+    for command in ["stats", "info", "list"] {
+        assert_workflow_schema19_read(
+            &workspace,
+            command,
+            &format!("workflow19_preinstall_{command}"),
+        );
+        assert_eq!(
+            schema19_tracker_files(&workspace.root.join(".beads")),
+            interrupted
+        );
+        assert!(!run_dir.join("failed.json").exists());
+        assert!(!run_dir.join("applied.json").exists());
+    }
+    let retried = workflow_schema19_apply(&workspace, token);
+    assert_ne!(retried["run_id"], run_id);
+    let classified: Value =
+        serde_json::from_slice(&fs::read(run_dir.join("failed.json")).unwrap()).unwrap();
+    assert!(
+        classified["error"]
+            .as_str()
+            .unwrap()
+            .contains("before the replacement became live")
+    );
+    assert!(!run_dir.join("applied.json").exists());
+    assert_eq!(header_user_version(&db), 19);
+    assert_eq!(engine_rows(&db, Some(&before)), before);
+    assert_eq!(fs::read(run_dir.join("commit-ready.json")).unwrap(), intent);
+    assert_eq!(fs::read(before_dir.join("beads.db")).unwrap(), original);
+}
+
+#[test]
+fn schema19_workflows_postinstall_resume_repeat_and_guarded_undo() {
+    let workspace = workflow_schema19_workspace();
+    seed_workflow_schema19_operator_state(&workspace);
+    let db = workspace.root.join(".beads/beads.db");
+    let before = workflow_schema19_authority(&db);
+    let source = workflow_schema19_durable_files(&workspace);
+    let plan = workflow_schema19_plan(&workspace);
+    let token = plan["plan_token"].as_str().unwrap();
+    let applied = workflow_schema19_apply(&workspace, token);
+    let run_id = applied["run_id"].as_str().unwrap();
+    interrupted_apply_keeps_authority_until_explicit_resume(
+        &workspace, &db, run_id, token, &before,
+    );
+    assert_eq!(workflow_schema19_plan(&workspace)["eligible"], false);
+    schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "undo", run_id, "--json"],
+        "workflow19_undo",
+    ));
+    assert_eq!(workflow_schema19_durable_files(&workspace), source);
+    assert_eq!(engine_rows(&db, Some(&before)), before);
+    let again = workflow_schema19_plan(&workspace);
+    let reapplied = workflow_schema19_apply(&workspace, again["plan_token"].as_str().unwrap());
+    assert_eq!(engine_rows(&db, Some(&before)), before);
+    schema19_json(&run_br(
+        &workspace,
+        [
+            "update",
+            "release-66o",
+            "--title",
+            "Work performed after the reviewed upgrade",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "workflow19_later_write",
+    ));
+    let changed = workflow_schema19_authority(&db);
+    let changed_files = workflow_schema19_durable_files(&workspace);
+    let refused = run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "undo",
+            reapplied["run_id"].as_str().unwrap(),
+            "--json",
+        ],
+        "workflow19_refuse_destructive_undo",
+    );
+    assert!(
+        !refused.status.success(),
+        "{} {}",
+        refused.stdout,
+        refused.stderr
+    );
+    assert_eq!(workflow_schema19_durable_files(&workspace), changed_files);
+    assert_eq!(workflow_schema19_authority(&db), changed);
+}
+
+#[test]
+fn schema19_workflows_future_version_heal_refuses_without_mutation() {
+    let workspace = workflow_schema19_workspace();
+    edit_schema19_fixture(&workspace, &["PRAGMA user_version = 20"]);
+    let source = workflow_schema19_durable_files(&workspace);
+    for args in [
+        vec!["doctor", "migrate-schema", "plan", "--json"],
+        vec!["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+        vec!["doctor", "migrate-schema", "heal", "--json"],
+    ] {
+        let refused = run_br(&workspace, args, "workflow19_future_refusal");
+        assert!(
+            !refused.status.success(),
+            "{} {}",
+            refused.stdout,
+            refused.stderr
+        );
+        let output: Value = serde_json::from_str(&refused.stdout).unwrap();
+        assert_ne!(output.get("heal_needed"), Some(&Value::Bool(false)));
+        assert!(output.get("plan_token").is_none());
+        assert_eq!(workflow_schema19_durable_files(&workspace), source);
+    }
+}
+
+/// Qualification against the real old executable; no network fetch occurs in
+/// the test. Both database layouts declare 19, so refusal must concern actual
+/// closure-table incompatibility, not a fabricated future-version header.
+#[test]
+#[ignore = "requires BR_V076_BINARY pointing to the checksum-verified official Linux amd64 v0.7.6 release"]
+#[allow(clippy::too_many_lines)]
+fn official_v076_refuses_upgraded_schema19_layout_and_reads_guarded_undo() {
+    use sha2::Digest;
+    use std::fmt::Write as _;
+
+    let binary = std::env::var_os("BR_V076_BINARY").expect("set BR_V076_BINARY");
+    let digest = sha2::Sha256::digest(fs::read(&binary).unwrap());
+    let mut checksum = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut checksum, "{byte:02x}").unwrap();
+    }
+    assert_eq!(
+        checksum,
+        "73cbef7f11680b8349ef5b465d002e404272cc6c06b0f95a86035b488b1844b9"
+    );
+    let version = std::process::Command::new(&binary)
+        .args(["version", "--json"])
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    let identity: Value = serde_json::from_slice(&version.stdout).unwrap();
+    assert_eq!(identity["version"], "0.7.6");
+    assert_eq!(
+        identity["commit"],
+        "ad4212f562ca59864946b8620c1361f0933ee4a8"
+    );
+    let workspace = workflow_schema19_workspace();
+    let beads = workspace.root.join(".beads");
+    let db = workspace.root.join(".beads/beads.db");
+    let run_release_stats = || {
+        // Old executables may create or change sidecars before reporting a
+        // layout refusal. Run them only against disposable family copies;
+        // keep the actual migrated family eligible for guarded undo.
+        let probe = BrWorkspace::new();
+        let probe_beads = probe.root.join(".beads");
+        fs::create_dir(&probe_beads).unwrap();
+        for name in [
+            "beads.db",
+            "beads.db-wal",
+            "beads.db-shm",
+            "beads.db-journal",
+            "issues.jsonl",
+            "config.yaml",
+            "policy.yaml",
+        ] {
+            let original = beads.join(name);
+            if original.is_file() {
+                fs::copy(original, probe_beads.join(name)).unwrap();
+            }
+        }
+        let mut command = std::process::Command::new(&binary);
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("BEADS_") || name.starts_with("BD_") || name.starts_with("BR_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .args(["stats", "--json", "--no-auto-import", "--no-auto-flush"])
+            .current_dir(&probe.root)
+            .env("HOME", &probe.root)
+            .env("BEADS_DIR", &probe_beads)
+            .env("BEADS_DB", probe_beads.join("beads.db"))
+            .env("RUST_LOG", "error")
+            .output()
+            .unwrap()
+    };
+    let original_stats = run_release_stats();
+    assert!(
+        original_stats.status.success(),
+        "{}",
+        String::from_utf8_lossy(&original_stats.stderr)
+    );
+    let source = fs::read(&db).unwrap();
+    let plan = workflow_schema19_plan(&workspace);
+    let applied = workflow_schema19_apply(&workspace, plan["plan_token"].as_str().unwrap());
+    assert_eq!(header_user_version(&db), 19);
+    let migrated = schema19_tracker_files(&beads);
+    let migrated_records = workflow_schema19_authority(&db);
+    let old = run_release_stats();
+    assert!(
+        !old.status.success(),
+        "{}",
+        String::from_utf8_lossy(&old.stdout)
+    );
+    let refusal: Value = serde_json::from_slice(&old.stdout).unwrap();
+    assert_eq!(refusal["error"]["code"], "CONFIG_ERROR");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("close_metadata")
+    );
+    assert_eq!(schema19_tracker_files(&beads), migrated);
+    assert_eq!(workflow_schema19_authority(&db), migrated_records);
+    schema19_json(&run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "undo",
+            applied["run_id"].as_str().unwrap(),
+            "--json",
+        ],
+        "workflow19_downgrade_undo",
+    ));
+    assert_eq!(header_user_version(&db), 19);
+    assert_eq!(fs::read(&db).unwrap(), source);
+    let restored = run_release_stats();
+    assert!(
+        restored.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&restored.stdout),
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    let stats: Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(stats["summary"]["total_issues"], 4);
 }
 
 #[test]

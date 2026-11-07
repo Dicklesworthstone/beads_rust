@@ -861,6 +861,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     validate_schema_version_for_mutation(conn, "schema application")?;
     refuse_persistent_triggers(conn, "schema application")?;
     refuse_schema_repair_during_pending_merge(conn)?;
+    refuse_implicit_runtime_schema_upgrade(conn, "schema application")?;
 
     // Detect a truly fresh (empty) database before any DDL runs.
     // On a fresh DB, SCHEMA_SQL creates everything at the current version,
@@ -1216,6 +1217,7 @@ pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     validate_schema_version_for_mutation(conn, "runtime schema repair")?;
     refuse_persistent_triggers(conn, "runtime schema repair")?;
     refuse_schema_repair_during_pending_merge(conn)?;
+    refuse_implicit_runtime_schema_upgrade(conn, "runtime schema repair")?;
 
     // The table layouts are already safe to operate on, so we can skip the
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
@@ -4176,6 +4178,28 @@ pub(crate) fn reviewed_runtime_schema_upgrade(
     }))
 }
 
+/// Ordinary startup and general maintenance must not consume the reviewed
+/// schema-19 transition before the operator has a preservation receipt.
+fn refuse_implicit_runtime_schema_upgrade(conn: &Connection, operation: &str) -> Result<()> {
+    // Attest before diagnosing the supported upgrade: a missing addition
+    // combined with unrelated drift must remain a refusal, not a repair.
+    if current_schema_version_declared(conn)
+        && table_exists(conn, "issues")
+        && (!table_exists(conn, "jsonl_row_receipts")
+            || !column_exists(conn, "close_metadata", "closed_by"))
+        && reviewed_runtime_schema_upgrade(conn)?.is_some()
+    {
+        return Err(BeadsError::Config(format!(
+            "{operation} refused: schema 19 requires the explicit reviewed v0.7.6 runtime \
+             layout upgrade; run `br doctor migrate-schema plan --json` and review its \
+             preservation and downgrade guarantees before applying it"
+        )));
+    }
+    // A fresh bootstrap or the intentional in-transaction table reset has no
+    // issues table yet. Its schema creation is not an existing-layout upgrade.
+    Ok(())
+}
+
 /// Apply exactly the inspected schema-19 additions in the caller's transaction.
 /// The caller owns the write authority and commits or rolls back the candidate.
 pub(crate) fn apply_reviewed_runtime_schema_upgrade_in_transaction(
@@ -4528,6 +4552,7 @@ pub(crate) fn record_runtime_schema_witness(conn: &Connection, attested_cookie: 
 /// This handles upgrades for tables that may have been created with older schemas.
 #[allow(clippy::too_many_lines)]
 fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
+    refuse_implicit_runtime_schema_upgrade(conn, "general schema maintenance")?;
     // Migration: ensure blocked_issues_cache has the canonical derived-cache
     // schema, including NOT NULL payload columns. Older br/bd paths could
     // leave a nullable blocked_by column with stale NULL cache rows.
@@ -5813,7 +5838,11 @@ mod tests {
              ('bd-legacy-close', 'updated', 'unrelated-editor');",
         ).unwrap();
         assert!(!runtime_schema_compatible(&conn));
-        apply_schema(&conn).unwrap();
+        assert!(apply_schema(&conn).is_err());
+        let upgrade = reviewed_runtime_schema_upgrade(&conn).unwrap().unwrap();
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, upgrade).unwrap();
+        conn.execute("COMMIT").unwrap();
         assert!(runtime_schema_compatible(&conn));
         let row = conn.query_row(
             "SELECT closed_by, closed_by_agent_name, bypassed_policy, bypass_reason, recorded_at \
@@ -8934,11 +8963,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn reviewed_schema19_runtime_upgrade_is_observational_and_additive() {
         for (receipts_present, attribution_present) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
-            let (_temp, conn) = runtime_upgrade_fixture(receipts_present, attribution_present);
+            let (temp, conn) = runtime_upgrade_fixture(receipts_present, attribution_present);
             conn.execute("INSERT INTO issues (id, title) VALUES ('br-old', 'Release issue')")
                 .unwrap();
             conn.execute(
@@ -8978,6 +9008,27 @@ mod tests {
             };
             assert_eq!(inspected, Some(expected));
             assert!(!runtime_schema_compatible(&conn));
+            for error in [
+                crate::storage::SqliteStorage::open(&temp.path().join("beads.db")).unwrap_err(),
+                apply_schema(&conn).unwrap_err(),
+                apply_runtime_compatible_schema(&conn).unwrap_err(),
+                run_migrations_atomic(&conn, 19, 19).unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("explicit reviewed"), "{error}");
+            }
+            assert_eq!(
+                format!("{:?}", conn.query("SELECT * FROM sqlite_schema").unwrap()),
+                schema_before,
+                "ordinary open and maintenance must not install the additions"
+            );
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    conn.query("SELECT rowid, issue_id, bypass_reason FROM close_metadata")
+                        .unwrap()
+                ),
+                rows_before,
+            );
             conn.execute("BEGIN IMMEDIATE").unwrap();
             apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, expected).unwrap();
             conn.execute("COMMIT").unwrap();
@@ -9018,6 +9069,69 @@ mod tests {
                     "migration must not invent export receipts"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn reviewed_schema19_runtime_upgrade_rolls_back_and_retries_atomically() {
+        for (receipts_present, attribution_present) in
+            [(false, false), (true, false), (false, true)]
+        {
+            let (_temp, conn) = runtime_upgrade_fixture(receipts_present, attribution_present);
+            conn.execute("INSERT INTO issues (id, title) VALUES ('br-original', 'Original')")
+                .unwrap();
+            conn.execute("INSERT INTO close_metadata (rowid, issue_id, bypass_reason) VALUES (47, 'br-original', X'00ff')").unwrap();
+            if attribution_present {
+                conn.execute("UPDATE close_metadata SET closed_by = 'original actor'")
+                    .unwrap();
+            }
+            if receipts_present {
+                conn.execute("INSERT INTO jsonl_row_receipts (rowid, issue_id, row_hash) VALUES (53, 'br-original', 'original receipt')").unwrap();
+            }
+            let before = format!(
+                "{:?} {:?}",
+                conn.query("SELECT * FROM sqlite_schema ORDER BY type, name")
+                    .unwrap(),
+                conn.query("SELECT rowid, * FROM close_metadata ORDER BY rowid")
+                    .unwrap(),
+            );
+            let upgrade = reviewed_runtime_schema_upgrade(&conn).unwrap().unwrap();
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, upgrade).unwrap();
+            assert!(runtime_schema_compatible(&conn));
+            conn.execute("ROLLBACK").unwrap();
+            assert_eq!(
+                format!(
+                    "{:?} {:?}",
+                    conn.query("SELECT * FROM sqlite_schema ORDER BY type, name")
+                        .unwrap(),
+                    conn.query("SELECT rowid, * FROM close_metadata ORDER BY rowid")
+                        .unwrap(),
+                ),
+                before,
+                "rollback must restore the original catalog and closure row width"
+            );
+            assert_eq!(connection_user_version(&conn).unwrap(), 19);
+            assert_eq!(
+                reviewed_runtime_schema_upgrade(&conn).unwrap(),
+                Some(upgrade)
+            );
+            if receipts_present {
+                let row = conn
+                    .query_row("SELECT rowid, row_hash FROM jsonl_row_receipts")
+                    .unwrap();
+                assert_eq!(row.get(0), Some(&SqliteValue::Integer(53)));
+                assert_eq!(
+                    row.get(1).and_then(SqliteValue::as_text),
+                    Some("original receipt")
+                );
+            }
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, upgrade).unwrap();
+            conn.execute("COMMIT").unwrap();
+            assert!(runtime_schema_compatible(&conn));
+            assert!(reviewed_runtime_schema_upgrade(&conn).unwrap().is_none());
+            assert_eq!(connection_user_version(&conn).unwrap(), 19);
         }
     }
 

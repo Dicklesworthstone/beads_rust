@@ -1,0 +1,17 @@
+workflow:
+  statuses: [open, in_progress, closed]
+  gates:
+    'open -> in_progress':
+      require_all: [ci_green]
+  capacity:
+    statuses:
+      in_progress:
+        hard: 1
+    exemptions:
+      providers: [operator]
+close_policy:
+  require_close_reason:
+    enabled: true
+    min_length: 200
+  attribution:
+    tier: capture

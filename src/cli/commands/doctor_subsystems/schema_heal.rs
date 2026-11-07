@@ -1335,24 +1335,35 @@ fn reviewed_migration_action(from_version: u32, to_version: u32) -> String {
 fn emit_migration_dry_run_without_audit(
     from_version: u32,
     error: &BeadsError,
+    plan: Option<&super::schema_migration::MigrationPlanReceipt>,
+    migration_error: Option<&BeadsError>,
     json: bool,
 ) -> Result<()> {
-    let action = reviewed_migration_action(from_version, current_version());
-    let note = "No migration was run. The JSONL rebuild audit failed; a reviewed migration \
-                can still be attempted without it. JSONL reconstruction remains refused. \
-                Use `br doctor migrate-schema plan` to inspect the \
-                migration's own checks.";
+    let eligible = plan.is_some_and(|plan| plan.eligible);
+    let action = migration_error.map_or_else(
+        || reviewed_migration_action(from_version, current_version()),
+        |error| format!("refuse migration: {error}"),
+    );
+    let note = "No migration was run. The JSONL rebuild audit failed; migration eligibility \
+                comes from the shared schema planner and does not depend on issue replay. \
+                JSONL reconstruction remains refused.";
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "dry_run": true,
+                "heal_needed": true,
                 "audit": null,
                 "audit_error": error.to_string(),
                 "from_version": from_version,
                 "to_version": current_version(),
-                "automatic_heal_allowed": true,
+                "automatic_heal_allowed": eligible
+                    && REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from_version),
                 "automatic_rebuild_allowed": false,
+                "migration_eligible": eligible,
+                "plan_token": plan.and_then(|plan| plan.plan_token.as_deref()),
+                "migration_plan": plan,
+                "migration_error": migration_error.map(ToString::to_string),
                 "planned_action": action,
                 "note": note,
             }))?
@@ -1366,7 +1377,7 @@ fn emit_migration_dry_run_without_audit(
 }
 
 /// Human-readable `heal --dry-run` report.
-fn print_dry_run_audit(audit: &StaleSchemaAudit, action: &str) {
+fn print_dry_run_audit(audit: &StaleSchemaAudit, action: &str, migration_eligible: bool) {
     println!(
         "Database schema {} (this br uses {}); {} issue(s) in the database, {} in the JSONL.",
         audit.from_version, audit.to_version, audit.db_issue_count, audit.jsonl_issue_count
@@ -1385,7 +1396,11 @@ fn print_dry_run_audit(audit: &StaleSchemaAudit, action: &str) {
                 audit.orphan_summary()
             );
         }
-        if audit.automatic_heal_allowed() {
+        if !migration_eligible {
+            println!(
+                "The schema planner refused migration; the original database remains authoritative."
+            );
+        } else if audit.automatic_heal_allowed() {
             println!(
                 "A mutating command may attempt a reviewed lossless migration. \
                  Read commands never upgrade the database."
@@ -1478,14 +1493,15 @@ pub(super) fn execute_heal_preview(
         Err(error) => return Err(BeadsError::Io(error)),
         Ok(_) => {}
     }
-    config::with_database_family_snapshot(&paths.db_path, |snapshot| {
+    super::schema_migration::with_observational_plan(&paths.db_path, |snapshot, inspected| {
         let Some(from_version) = stale_schema_version(snapshot)? else {
-            let plan = super::schema_migration::build_plan(snapshot)?;
+            let plan = inspected?;
             if !plan.eligible {
                 return emit_not_needed(args.json);
             }
             let upgrade = plan
                 .forecast
+                .as_ref()
                 .and_then(|forecast| forecast.schema19_runtime_upgrade);
             let action = if upgrade.is_some() {
                 "reviewed schema-19 runtime layout upgrade with complete database preservation"
@@ -1502,6 +1518,8 @@ pub(super) fn execute_heal_preview(
                         "from_version": plan.from_version,
                         "to_version": plan.to_version,
                         "migration_eligible": true,
+                        "plan_token": plan.plan_token,
+                        "migration_plan": &plan,
                         "schema19_runtime_upgrade": upgrade,
                         "automatic_heal_allowed": false,
                         "automatic_rebuild_allowed": false,
@@ -1514,6 +1532,11 @@ pub(super) fn execute_heal_preview(
                 println!("{}", plan.note);
             }
             return Ok(());
+        };
+        let (plan, migration_error) = match inspected {
+            Ok(plan) if !plan.eligible => return emit_not_needed(args.json),
+            Ok(plan) => (Some(plan), None),
+            Err(error) => (None, Some(error)),
         };
         let audited = (|| {
             let source = match std::fs::symlink_metadata(&paths.jsonl_path) {
@@ -1528,18 +1551,35 @@ pub(super) fn execute_heal_preview(
         let mut audit = match audited {
             Ok(audit) => audit,
             Err(error) if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from_version) => {
-                return emit_migration_dry_run_without_audit(from_version, &error, args.json);
+                return emit_migration_dry_run_without_audit(
+                    from_version,
+                    &error,
+                    plan.as_ref(),
+                    migration_error.as_ref(),
+                    args.json,
+                );
             }
             Err(error) => return Err(error),
         };
         audit.from_version = from_version;
-        let action = planned_action(&audit, args.discard_db_only);
+        let eligible = plan.as_ref().is_some_and(|plan| plan.eligible);
+        let action = migration_error.as_ref().map_or_else(
+            || planned_action(&audit, args.discard_db_only),
+            |error| format!("refuse migration: {error}"),
+        );
         if args.json {
             let payload = serde_json::json!({
                 "dry_run": true,
+                "heal_needed": true,
+                "from_version": from_version,
+                "to_version": current_version(),
                 "audit": audit,
-                "automatic_heal_allowed": audit.automatic_heal_allowed(),
+                "automatic_heal_allowed": eligible && audit.automatic_heal_allowed(),
                 "automatic_rebuild_allowed": false,
+                "migration_eligible": eligible,
+                "plan_token": plan.as_ref().and_then(|plan| plan.plan_token.as_deref()),
+                "migration_plan": plan,
+                "migration_error": migration_error.map(|error| error.to_string()),
                 "planned_action": action,
             });
             println!(
@@ -1547,7 +1587,7 @@ pub(super) fn execute_heal_preview(
                 serde_json::to_string_pretty(&payload).map_err(BeadsError::Json)?
             );
         } else {
-            print_dry_run_audit(&audit, &action);
+            print_dry_run_audit(&audit, &action, eligible);
         }
         Ok(())
     })
@@ -1615,7 +1655,7 @@ mod tests {
         assert!(audit.automatic_heal_allowed());
         // Even --discard-db-only cannot invent a trustworthy rebuild source.
         assert!(require_replay_payload_coverage(&audit, true).is_err());
-        audit.from_version = 4;
+        audit.from_version = 7;
         assert!(!audit.automatic_heal_allowed());
     }
 
@@ -2015,7 +2055,7 @@ mod tests {
 
         audit.from_version = REVIEWED_MIGRATION_SOURCE_VERSIONS[0];
         assert!(audit.automatic_heal_allowed(), "the migration keeps them");
-        audit.from_version = 4;
+        audit.from_version = 7;
         assert!(!audit.automatic_heal_allowed(), "a rebuild would drop them");
         assert!(
             refusal_error(&audit)

@@ -1,0 +1,3 @@
+compact_model: release-private-model
+compact_batch_size: 37
+compaction_enabled: false

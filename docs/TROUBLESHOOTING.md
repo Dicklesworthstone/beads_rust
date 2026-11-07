@@ -72,7 +72,8 @@ preserve evidence rather than guessing.
 
 | Failure class | Symptom signature | Likely root cause | Observability surface | Data-loss risk | Desired system response |
 |---------------|-------------------|-------------------|-----------------------|----------------|-------------------------|
-| Older database schema | Read commands warn that they are using a JSONL view, or refuse a storage open; writes report an unsupported or refused migration | Workspace last used with an earlier br release | `br info --json --no-auto-import --no-auto-flush`, `br doctor migrate-schema audit --json`, migration plan | High if JSONL is mistaken for a complete backup | Keep the original database active. Apply only an eligible reviewed migration; missing paths and failed preservation checks refuse without reconstructing from JSONL |
+| Older database schema | Read commands warn that they are using a JSONL view, or refuse a storage open; writes report an unsupported or refused migration | Workspace last used with an earlier br release | `br info --json --no-auto-import --no-auto-flush`, `br doctor migrate-schema heal --dry-run --json`, migration plan | High if JSONL is mistaken for a complete backup | Keep the original database active. Apply only an eligible reviewed migration; missing paths and failed preservation checks refuse without reconstructing from JSONL |
+| v0.7.6 schema-19 layout regression (#596) | Reads refuse an incompatible runtime layout even though the release and main both report schema 19 | Main added indexed JSONL receipts and nullable close attribution without changing `user_version`; the former heal probe checked only that version | `br doctor --json`, `br doctor migrate-schema plan --json`, `br doctor migrate-schema heal --dry-run --json` | High if JSONL replay is used as a substitute for preserving database-only state | Require the explicit reviewed layout upgrade; preserve raw records and the complete original family, and use guarded undo for a compatible rollback |
 | Missing SQLite family with valid JSONL | `beads.db` is absent but `issues.jsonl` still exists | Workspace copied without DB, manual deletion, interrupted cleanup, sidecar-only residue | Startup refusal, `br doctor`, `.beads/` directory listing | Depends on whether surviving sidecars or other evidence contain additional committed state | Reads must not create a database. Use `--no-db` for an intentional JSONL-only view; inspect surviving evidence before any authorized recovery |
 | Not-a-database / short-read DB file | Open fails with corruption-style errors such as `NotADatabase` or `ShortRead` | Truncated file, wrong file copied into `beads.db`, interrupted filesystem write | Startup error, `br doctor`, verbose logs, `src/config/mod.rs` recovery path | High when database-only state cannot be inspected | Reads refuse and leave the family unchanged. Preserve the whole family before explicit recovery; valid JSONL alone does not prove that events or configuration can be discarded |
 | Malformed schema / duplicate schema entries / index mismatch | DB opens or probes with messages like `malformed database schema`, `table ... already exists`, `index ... already exists`, or `missing from index` | Corrupt schema pages, failed migration-like writes, damaged catalog/index state | Startup probe, `br doctor`, recovery warnings, integrity checks | Medium to high | Refuse writable fallback from an ordinary read. Diagnose the original family and require a repair that retains authoritative records in the active database |
@@ -85,7 +86,7 @@ capacity records, allocation reservations, or operator extensions. Keeping those
 records only in `.br_recovery` removes them from normal operations and is a
 preservation failure ([#585](https://github.com/Dicklesworthstone/beads_rust/issues/585)).
 
-Start with `br doctor migrate-schema audit --json` and
+Start with `br doctor migrate-schema heal --dry-run --json` and
 `br doctor migrate-schema plan --json`. If the plan is eligible, review it before
 running `br doctor migrate-schema apply --plan-token <TOKEN>`. An ineligible plan
 requires a supporting migration or operator-led recovery that preserves the
@@ -798,28 +799,95 @@ sidecars, JSONL, and recovery evidence intact.
 
 ---
 
-### "Schema version mismatch: expected 5, found 3"
+### "Schema version mismatch" or incompatible runtime layout
 
-**Error Code:** `SCHEMA_MISMATCH` (exit code 2)
+**Error Code:** `SCHEMA_MISMATCH` (exit code 2), or `CONFIG_ERROR` (exit code 7)
+for an incompatible layout.
 
-**Cause:** Database was created with older/newer br version.
+**Cause:** The executable does not support the database's version or actual
+table layout. Matching version stamps do not prove compatibility.
 
 **Solutions:**
+
 ```bash
 # Check br version
 br version
 
-# Classify the workspace and projected repair
+# Inspect without changing the original tracker
 br doctor --json
-br doctor --repair --dry-run --json
+br doctor migrate-schema plan --json > migration-plan.json
+br doctor migrate-schema heal --dry-run --json
 
-# Use the supported migration path if available
-br upgrade --migrate-db
+# Review the eligible plan and apply its exact token
+br doctor migrate-schema apply \
+  --plan-token "$(jq -r .plan_token migration-plan.json)" \
+  --json > migration-applied.json
 
 # Otherwise preserve evidence and escalate with the doctor output
 br where --json
 br config list -v
 ```
+
+**v0.7.6 and schema 19 (#596).** Official v0.7.6 creates a schema-19 database
+without `jsonl_row_receipts` or `close_metadata.closed_by`. Main added these
+structures in
+[`6b8fd6c9`](https://github.com/Dicklesworthstone/beads_rust/commit/6b8fd6c90d1ac2cc746f2dc07e14aa2a11ae8d03)
+and
+[`dc46e68b`](https://github.com/Dicklesworthstone/beads_rust/commit/dc46e68bf77d0582cb3fcd8f0908319a98a9bc16)
+without changing the version. Earlier healing incorrectly treated version
+equality as a no-op. The reviewed transition identifies those layout changes
+independently and keeps `user_version` at 19.
+
+Plan and heal preview now inspect the same database generation and report the
+same migration eligibility and token. Ordinary reads never perform the
+upgrade, and ordinary writes, including `sync --import-only`, refuse to install
+these additions. Use the explicit plan/apply lifecycle above, or
+`br doctor migrate-schema heal --json` after reviewing the preview. A failed
+supplementary JSONL audit does not invalidate an eligible raw-record migration.
+
+The migration preserves database-only event history, configuration, metadata,
+workflow and capacity records, relations, dirty/export bookkeeping, and
+operator tables. It checks raw values and storage classes, row multiplicities,
+application/operator table hidden row IDs, sequence names/high-water values,
+and admitted schema. New plans bind these checks in
+`forecast.schema19_preservation`, using profile
+`schema19-layout-preservation-v1` and `source_sha256`. A change confined to
+application row IDs invalidates the token. Existing closure attribution and
+receipts remain exact; absent structures are added with unknown closers as
+NULL and no invented receipts. JSONL and configuration files stay unchanged.
+
+The complete original DB, WAL, SHM and rollback journal remain in the reported
+recovery bundle. Pending merge metadata, even empty or malformed, refuses the
+layout transition until the merge is completed or diagnosed against its
+original schema. Do not delete the metadata to make migration eligible.
+Unrecognized layouts and failed preservation checks require diagnosis.
+
+After success, a fresh plan reports no work for the healthy canonical layout;
+a consumed token refuses. The same token can resume an interrupted run after
+the recovery protocol verifies its live and retained generations. New plans
+carry the stronger source proof; earlier installed receipts retain their
+original semantics for guarded recovery and undo.
+
+**Replacing only the executable is not a safe downgrade.** The upgraded
+layout is incompatible with v0.7.6 despite the unchanged version. Preview and
+run the receipt's guarded undo before subsequent changes:
+
+```bash
+br doctor migrate-schema undo \
+  "$(jq -r .run_id migration-applied.json)" --dry-run --json
+br doctor migrate-schema undo \
+  "$(jq -r .run_id migration-applied.json)" --json
+```
+
+Undo refuses to discard later work and restores the actual original layout.
+A source already modified by an earlier main build may itself be incompatible
+with v0.7.6; undo does not promise otherwise. Choose the executable for that
+restored layout. An older executable may create or change database sidecars
+during startup even when its command then refuses the layout. Probe compatibility
+only on a disposable copy of the complete family, never on the live upgraded
+tracker; return to the older binary after the guarded restore. See the
+[migration contract](CLI_REFERENCE.md#reviewed-schema-migration)
+for preservation and recovery details.
 
 ---
 

@@ -3722,28 +3722,27 @@ pub struct DoctorMigrateSchemaArgs {
 pub enum DoctorMigrateSchemaCommand {
     /// Back up the complete family and recover engine read admission without changing schema.
     Recover(DoctorMigrateSchemaRecoverArgs),
-    /// Inspect the live database and emit a token bound to its exact file-family state.
+    /// Inspect the database and emit a token bound to its logical state and reviewed layout.
     Plan(DoctorMigrateSchemaPlanArgs),
     /// Apply the reviewed migration only when the live state still matches a plan token.
     Apply(DoctorMigrateSchemaApplyArgs),
     /// Restore the exact pre-migration database family from a completed run.
     Undo(DoctorMigrateSchemaUndoArgs),
-    /// Upgrade a database left on an older schema (any version, including the
-    /// unversioned schema 0 of early br and Go bd), keeping a backup.
+    /// Inspect and explicitly apply a reviewed database or runtime-layout upgrade.
     ///
-    /// Schemas 13-18 use the reviewed lossless migration. Refused or unavailable
-    /// migrations leave the original database in place: JSONL reconstruction
-    /// cannot guarantee complete preservation through concurrent access or an
-    /// interrupted replay. Ordinary read commands never upgrade or rebuild
-    /// databases. Use --dry-run to inspect the preservation audit.
+    /// Reviewed source schemas 4 and 13-18 have versioned migrations. Schema 19
+    /// has a separate reviewed v0.7.6 layout transition that requires explicit
+    /// apply or heal. Refused or unavailable migrations preserve the original;
+    /// JSONL cannot reconstruct all authoritative records. Use --dry-run to
+    /// inspect the shared migration plan and supplementary preservation audit.
     Heal(DoctorMigrateSchemaHealArgs),
 }
 
 /// Arguments for `br doctor migrate-schema heal`.
 #[derive(Args, Debug, Clone, Default)]
 pub struct DoctorMigrateSchemaHealArgs {
-    /// Print the audit (database-only issues and the planned action) without
-    /// changing anything.
+    /// Print migration eligibility, the plan token and supplementary preservation
+    /// audit without changing the tracker.
     #[arg(long)]
     pub dry_run: bool,
 

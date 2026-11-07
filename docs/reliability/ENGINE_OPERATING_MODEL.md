@@ -184,6 +184,53 @@ earlier protected freshness/pending-merge reprobe also retains authority
 because its verdict authorizes the subsequent import; the post-startup
 handoff does not change that decision protocol.
 
+### Runtime layout identity and explicit upgrades (#596)
+
+The SQLite version, runtime table layout and integrity result are separate
+checks. Official v0.7.6 used `user_version = 19` before main introduced
+`jsonl_row_receipts` in
+[`6b8fd6c9`](https://github.com/Dicklesworthstone/beads_rust/commit/6b8fd6c90d1ac2cc746f2dc07e14aa2a11ae8d03)
+and `close_metadata.closed_by` in
+[`dc46e68b`](https://github.com/Dicklesworthstone/beads_rust/commit/dc46e68bf77d0582cb3fcd8f0908319a98a9bc16).
+Neither change advanced the version. Readers required the newer layout while
+the old heal probe accepted version equality, producing the contradictory
+diagnostics in #596.
+
+The reviewed schema-19 transition identifies those two additions independently
+of `user_version`. It admits only the exact released or partially extended
+layout and changes only the missing structures. Ordinary reads do not upgrade
+the database; ordinary writes, including import-only sync, refuse this layout
+transition and direct the operator to explicit planning. `plan` and
+`heal --dry-run` share one private-snapshot inspection and token; explicit
+`apply` or `heal` installs the verified candidate. Pending merge metadata
+freezes the source catalog and refuses the transition.
+
+New plans include `forecast.schema19_preservation` with profile
+`schema19-layout-preservation-v1` and `source_sha256`. The digest binds raw
+source values and storage classes, multiplicities, application/operator table
+hidden row IDs, sequence names/high-water values, and admitted operator schema.
+SQLite's sequence catalog's own row IDs are not application identities.
+The candidate must preserve that authority, pass fresh-connection integrity
+checks and have the expected target layout. Existing closing actors and
+receipt rows remain exact; a newly added actor is NULL and a new receipt table
+is empty. History, configuration, workflow records and relations stay in active
+storage; JSONL remains unchanged.
+
+The recovery protocol retains the exact DB, WAL, SHM and rollback journal.
+Interrupted completion and undo recheck the source proof on private copies of
+the retained family. Historical installed receipts retain their original
+semantics; fresh layout-upgrade plans bind the stronger proof and replace old
+uninstalled tokens. Guarded undo refuses subsequent state changes and restores
+the actual source layout. The integer version remains 19, and a binary swap
+alone is unsafe: v0.7.6 cannot read the extended close-metadata layout. A source
+already extended by an earlier main build remains extended after undo, so the
+restored generation still needs a compatible executable.
+An older binary's refused command is not guaranteed to be observational:
+startup may create or change sidecars before reporting incompatibility.
+Compatibility probes therefore run only on disposable complete-family copies.
+The live generation returns to an older binary after guarded restoration of
+its compatible source layout.
+
 ### Explicit trusted Unix group sharing (#533)
 
 The default namespace-sidecar policy is single-UID ownership. A setgid tracker

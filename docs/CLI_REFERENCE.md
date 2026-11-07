@@ -2680,12 +2680,16 @@ unreviewed core columns, constraints, indexes, or reserved destination tables
 stop the command. Unsupported versions, including 0 and 7, remain refused. A
 refused migration never falls through to automatic JSONL reconstruction, and
 the error preserves its specific refusal reason.
+The schema-19 runtime-layout transition described below requires an explicit
+`migrate-schema apply` or `heal`. Ordinary writes, including
+`sync --import-only`, refuse a database that needs that transition and name
+the inspection command; they do not install its missing structures.
 
 Inspect the available migration and stale-schema audit with:
 
 ```bash
 br doctor migrate-schema plan --json       # reviewed lossless migration
-br doctor migrate-schema heal --dry-run    # inspect explicit heal safety
+br doctor migrate-schema heal --dry-run --json  # inspect explicit heal safety
 ```
 
 `plan`, `heal --dry-run`, and `undo --dry-run` use verified private snapshots
@@ -2696,36 +2700,91 @@ checks under exclusive write authority.
 
 **v0.7.6 schema-19 layout upgrade.** A database can declare schema 19 while
 still lacking the indexed JSONL receipt table and durable close attribution.
+Main introduced those requirements in
+[`6b8fd6c9`](https://github.com/Dicklesworthstone/beads_rust/commit/6b8fd6c90d1ac2cc746f2dc07e14aa2a11ae8d03)
+(`jsonl_row_receipts`) and
+[`dc46e68b`](https://github.com/Dicklesworthstone/beads_rust/commit/dc46e68bf77d0582cb3fcd8f0908319a98a9bc16)
+(`close_metadata.closed_by`) without changing `user_version`. The old heal
+probe compared only the version, while ordinary readers and migration planning
+checked the runtime layout. That produced the read refusal and contradictory
+`heal_needed: false` reported in
+[#596](https://github.com/Dicklesworthstone/beads_rust/issues/596).
+
 `doctor --json` reports this as `schema.runtime`; `plan` and `heal --dry-run`
 inspect the actual layout rather than treating the version stamp as proof that
 no work is needed. The reviewed plan exposes
 `forecast.schema19_runtime_upgrade.jsonl_row_receipts_created` and
 `closed_by_column_added`. It accepts only those two known additive differences,
 including a database where one addition is already present. Unrelated layout
-differences are refused, and a pending sync merge must finish against its
-original schema before an upgrade can proceed.
+differences are refused before a token is issued. Pending merge metadata also
+refuses the transition, including an empty or malformed receipt. Preserve the
+database family and complete or diagnose the pending merge against its
+original schema with a compatible binary; deleting its metadata does not
+resolve the merge.
 
 Apply the plan token using the lifecycle below, or run
 `br doctor migrate-schema heal` to plan and apply the same reviewed upgrade.
 The migrator constructs and verifies a private candidate before installing it.
-Every existing source column, raw value, row multiplicity, hidden row ID,
-sequence reservation, and operator schema must survive. New receipts start
-empty and historical `closed_by` values start `NULL`; no audit actor is guessed
-and no issue is reconstructed from JSONL. JSONL and configuration files remain
-untouched.
+Every existing source column, raw value and storage class, row multiplicity,
+application/operator table hidden row ID, sequence name/high-water value, and
+admitted operator schema must survive. SQLite's sequence catalog's own internal
+row IDs are not application identities. New receipts start empty and newly
+added `closed_by` values start `NULL`; existing receipt rows and known closing
+actors remain exact. Event history, configuration and metadata, workflow and
+capacity records, relations, dirty/export bookkeeping, child allocation
+reservations and extension-table records remain in active storage. No audit
+actor is guessed and no issue is reconstructed from JSONL. JSONL and
+configuration files remain untouched.
+
+New schema-19 layout plans also include `forecast.schema19_preservation`:
+
+```json
+{
+  "profile": "schema19-layout-preservation-v1",
+  "source_sha256": "<digest of the complete source preservation witness>"
+}
+```
+
+This versioned proof binds the original records, application/operator row IDs,
+sequence reservations and admitted schema into the plan token. A rowid-only
+change that alters duplicate configuration or metadata precedence therefore
+invalidates the reviewed plan. Apply verifies the proof before building and
+installing the candidate; interrupted completion and undo verify it against a
+private copy of the retained source family. Earlier installed receipts retain
+their original token and preservation semantics for guarded recovery and undo.
+An earlier uninstalled layout-upgrade plan must be regenerated to obtain the
+new source proof.
 
 This transition leaves `PRAGMA user_version` at 19, but the upgraded
 `close_metadata` layout is incompatible with v0.7.6. **An executable-only
 downgrade is unsafe.** Keep the full recovery bundle. The upgraded binary's
 receipt-bound `undo` restores the original database family only while the
-applied state is unchanged; it refuses to discard subsequent writes. Otherwise,
-restore the complete pre-upgrade database family through a separately reviewed
-recovery, accounting for any later work.
+applied state is unchanged; it refuses to discard subsequent writes. Undo
+restores the actual source layout. If an earlier main build had already added
+`closed_by`, that source was already incompatible with v0.7.6; undo does not
+turn it into a v0.7.6 database. Use a binary compatible with the restored layout.
+Otherwise, restore the complete pre-upgrade database family through a
+separately reviewed recovery, accounting for any later work.
+Do not test an older executable against the live upgraded database: even a
+command that refuses the layout can create or change database sidecars during
+startup. Any compatibility probe must use a disposable copy of the complete
+family. Return to the older executable only after the guarded restore and
+after verifying that it supports the restored source layout.
+
+After a successful upgrade, a fresh plan and heal preview report no work for
+the healthy canonical layout. Reusing the completed run's token refuses and
+asks for a new plan. If installation was interrupted, applying the same token
+uses the existing recovery protocol to identify the live generation, retain
+the original family and complete or refuse the run safely.
 
 `heal` attempts the same reviewed migration and refuses if that migration is
-unavailable or fails. Its dry-run audit identifies state that JSONL cannot
-represent: event history, configuration and metadata, unknown tables or
-columns, and database-only issues and relations. Even an issue-only source
+unavailable or fails. Its dry run uses the same private database snapshot,
+eligibility checks and plan token as `plan`, including actual runtime shape
+and integrity. A healthy canonical layout is a no-op, repairable current-schema
+integrity diagnostics can require explicit maintenance, and an unknown layout
+or unsupported future version is refused. Its supplementary audit identifies
+state that JSONL cannot represent: event history, configuration and metadata,
+unknown tables or columns, and database-only issues and relations. Even an issue-only source
 cannot authorize live reconstruction: the former rebuild-and-replay path
 could leave partially restored active state after an interruption. Until a
 reviewed migration with a crash-safe installer exists for that source schema,
@@ -2735,6 +2794,10 @@ complete database family and use a compatible release to inspect it. A
 retained backup is recovery evidence, not permission to remove authoritative
 records from active storage. Explicit corruption recovery and migration
 recover/undo retain their separate safety checks and backup protocols.
+
+A failed JSONL audit does not make an eligible raw-record migration unavailable:
+the dry run reports its planner result and audit error separately. An audit
+cannot turn a refused migration into an eligible one.
 
 The explicit receipt-bound lifecycle is available for supported older versions
 and the reviewed schema-19 layout transition:
