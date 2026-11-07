@@ -5353,6 +5353,19 @@ fn install_undo_restored_main_resuming(
             "schema-migration undo receipts must witness both main database files",
         ));
     }
+    // An interrupted undo releases its writer authority. New committed work
+    // can then change only the WAL, leaving the applied main byte-identical.
+    // Admit the entire sidecar state before exchanging or retaining a main:
+    // discovering that drift afterward would leave the restored schema paired
+    // with a newer applied-generation WAL. The same classification below also
+    // admits sidecars already quarantined or restored by a partial undo.
+    for component in applied
+        .components
+        .iter()
+        .filter(|component| !component.suffix.is_empty())
+    {
+        undo_component_requires_quarantine(db_path, quarantine_dir, component, restored)?;
+    }
     let quarantined_main = backup_component_path(quarantine_dir, db_path, "")?;
     let live_metadata = secure_file_metadata(db_path)?
         .ok_or_else(|| BeadsError::internal("schema-migration undo found no live main database"))?;
@@ -7466,6 +7479,67 @@ fn stable_raw_eq(left: &RawFamilyWitness, right: &RawFamilyWitness) -> bool {
             .filter(|component| component.suffix != "-shm"))
 }
 
+/// Observe one undo component without moving it. `true` means the live bytes
+/// are still the receipt-bound applied component and must be quarantined;
+/// `false` means quarantine/restoration has already accounted for them.
+/// Both pre-exchange admission and the mutation loop use these exact rules.
+fn undo_component_requires_quarantine(
+    db_path: &Path,
+    quarantine_dir: &Path,
+    component: &RawComponentWitness,
+    restored: &RawFamilyWitness,
+) -> Result<bool> {
+    let source = family_component_path(db_path, &component.suffix);
+    let destination = backup_component_path(quarantine_dir, db_path, &component.suffix)?;
+    let source_metadata = secure_file_metadata(&source)?;
+    let destination_metadata = secure_file_metadata(&destination)?;
+
+    if component.present {
+        if let Some(metadata) = destination_metadata {
+            verify_component_bytes(&destination, &metadata, component)?;
+            if let Some(source_metadata) = source_metadata {
+                let restored_component = component_for_suffix(restored, &component.suffix)?;
+                if !restored_component.present {
+                    return Err(BeadsError::internal(format!(
+                        "schema migration undo found both quarantined and unexpected live \
+                         copies for {}",
+                        source.display()
+                    )));
+                }
+                verify_component_bytes(&source, &source_metadata, restored_component)?;
+            }
+            return Ok(false);
+        }
+        let source_metadata = source_metadata.ok_or_else(|| {
+            BeadsError::internal(format!(
+                "schema migration undo cannot resume because both live and quarantined \
+                 applied components are missing for {}",
+                source.display()
+            ))
+        })?;
+        verify_component_bytes(&source, &source_metadata, component)?;
+        return Ok(true);
+    }
+
+    if destination_metadata.is_some() {
+        return Err(BeadsError::internal(format!(
+            "schema migration undo quarantine contains an unexpected component {}",
+            destination.display()
+        )));
+    }
+    if let Some(source_metadata) = source_metadata {
+        let restored_component = component_for_suffix(restored, &component.suffix)?;
+        if !restored_component.present {
+            return Err(BeadsError::internal(format!(
+                "schema migration undo found an unexpected live component {}",
+                source.display()
+            )));
+        }
+        verify_component_bytes(&source, &source_metadata, restored_component)?;
+    }
+    Ok(false)
+}
+
 fn quarantine_live_family_resuming(
     db_path: &Path,
     quarantine_dir: &Path,
@@ -7473,63 +7547,20 @@ fn quarantine_live_family_resuming(
     restored: &RawFamilyWitness,
 ) -> Result<()> {
     for component in &applied.components {
-        let source = family_component_path(db_path, &component.suffix);
-        let destination = backup_component_path(quarantine_dir, db_path, &component.suffix)?;
-        let source_metadata = secure_file_metadata(&source)?;
-        let destination_metadata = secure_file_metadata(&destination)?;
-
-        if component.present {
-            if let Some(metadata) = destination_metadata {
-                verify_component_bytes(&destination, &metadata, component)?;
-                if let Some(source_metadata) = source_metadata {
-                    let restored_component = component_for_suffix(restored, &component.suffix)?;
-                    if !restored_component.present {
-                        return Err(BeadsError::internal(format!(
-                            "schema migration undo found both quarantined and unexpected live \
-                             copies for {}",
-                            source.display()
-                        )));
-                    }
-                    verify_component_bytes(&source, &source_metadata, restored_component)?;
-                }
-                continue;
-            }
-            let source_metadata = source_metadata.ok_or_else(|| {
-                BeadsError::internal(format!(
-                    "schema migration undo cannot resume because both live and quarantined \
-                     applied components are missing for {}",
-                    source.display()
-                ))
-            })?;
-            verify_component_bytes(&source, &source_metadata, component)?;
-            rename_path_no_replace(&source, &destination)?;
-            let quarantined_metadata = secure_file_metadata(&destination)?.ok_or_else(|| {
-                BeadsError::internal(format!(
-                    "schema migration undo component disappeared after quarantine: {}",
-                    destination.display()
-                ))
-            })?;
-            verify_component_bytes(&destination, &quarantined_metadata, component)?;
-            set_file_permissions(&destination, None)?;
+        if !undo_component_requires_quarantine(db_path, quarantine_dir, component, restored)? {
             continue;
         }
-
-        if destination_metadata.is_some() {
-            return Err(BeadsError::internal(format!(
-                "schema migration undo quarantine contains an unexpected component {}",
+        let source = family_component_path(db_path, &component.suffix);
+        let destination = backup_component_path(quarantine_dir, db_path, &component.suffix)?;
+        rename_path_no_replace(&source, &destination)?;
+        let quarantined_metadata = secure_file_metadata(&destination)?.ok_or_else(|| {
+            BeadsError::internal(format!(
+                "schema migration undo component disappeared after quarantine: {}",
                 destination.display()
-            )));
-        }
-        if let Some(source_metadata) = source_metadata {
-            let restored_component = component_for_suffix(restored, &component.suffix)?;
-            if !restored_component.present {
-                return Err(BeadsError::internal(format!(
-                    "schema migration undo found an unexpected live component {}",
-                    source.display()
-                )));
-            }
-            verify_component_bytes(&source, &source_metadata, restored_component)?;
-        }
+            ))
+        })?;
+        verify_component_bytes(&destination, &quarantined_metadata, component)?;
+        set_file_permissions(&destination, None)?;
     }
     if let Some(parent) = db_path.parent() {
         sync_directory(parent)?;
@@ -12040,6 +12071,250 @@ mod tests {
                 .user_version,
             crate::storage::schema::CURRENT_SCHEMA_VERSION as u32
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::type_complexity,
+        reason = "the explicit partial-undo state table keeps accepted and refused byte layouts reviewable together"
+    )]
+    fn undo_component_admission_preserves_partial_quarantine_and_restore_states() {
+        let applied_bytes: &[u8] = b"receipt-bound applied sidecar";
+        let original_bytes: &[u8] = b"receipt-bound original sidecar";
+        let newer_bytes: &[u8] = b"newer unreviewed sidecar";
+        let cases: &[(&str, bool, bool, Option<&[u8]>, Option<&[u8]>, Option<bool>)] = &[
+            (
+                "awaiting quarantine",
+                true,
+                true,
+                Some(applied_bytes),
+                None,
+                Some(true),
+            ),
+            (
+                "quarantined",
+                true,
+                true,
+                None,
+                Some(applied_bytes),
+                Some(false),
+            ),
+            (
+                "restored",
+                true,
+                true,
+                Some(original_bytes),
+                Some(applied_bytes),
+                Some(false),
+            ),
+            (
+                "quarantined without original",
+                true,
+                false,
+                None,
+                Some(applied_bytes),
+                Some(false),
+            ),
+            (
+                "absent in both generations",
+                false,
+                false,
+                None,
+                None,
+                Some(false),
+            ),
+            (
+                "original awaits restoration",
+                false,
+                true,
+                None,
+                None,
+                Some(false),
+            ),
+            (
+                "restored original-only sidecar",
+                false,
+                true,
+                Some(original_bytes),
+                None,
+                Some(false),
+            ),
+            ("lost applied sidecar", true, true, None, None, None),
+            (
+                "newer live sidecar",
+                true,
+                true,
+                Some(newer_bytes),
+                None,
+                None,
+            ),
+            (
+                "newer live after quarantine",
+                true,
+                true,
+                Some(newer_bytes),
+                Some(applied_bytes),
+                None,
+            ),
+            (
+                "unrecognized quarantine",
+                true,
+                true,
+                Some(original_bytes),
+                Some(newer_bytes),
+                None,
+            ),
+            (
+                "original without retained applied",
+                true,
+                true,
+                Some(original_bytes),
+                None,
+                None,
+            ),
+            (
+                "unexpected duplicate applied",
+                true,
+                true,
+                Some(applied_bytes),
+                Some(applied_bytes),
+                None,
+            ),
+            (
+                "live sidecar should be absent",
+                true,
+                false,
+                Some(newer_bytes),
+                Some(applied_bytes),
+                None,
+            ),
+            (
+                "unexpected live component",
+                false,
+                false,
+                Some(newer_bytes),
+                None,
+                None,
+            ),
+            (
+                "unexpected quarantine component",
+                false,
+                true,
+                Some(original_bytes),
+                Some(applied_bytes),
+                None,
+            ),
+        ];
+        for &(name, had_applied, had_original, live_bytes, retained_bytes, expected) in cases {
+            let temp = TempDir::new().unwrap();
+            let applied_dir = temp.path().join("applied");
+            let original_dir = temp.path().join("original");
+            let live_dir = temp.path().join("live");
+            let quarantine = temp.path().join("quarantine");
+            for directory in [&applied_dir, &original_dir, &live_dir, &quarantine] {
+                fs::create_dir(directory).unwrap();
+            }
+            let applied_path = applied_dir.join("beads.db");
+            let original_path = original_dir.join("beads.db");
+            let live_path = live_dir.join("beads.db");
+            fs::write(&applied_path, b"applied main").unwrap();
+            fs::write(&original_path, b"original main").unwrap();
+            fs::write(&live_path, b"live main must remain untouched").unwrap();
+            for (path, bytes) in [
+                (&applied_path, had_applied.then_some(applied_bytes)),
+                (&original_path, had_original.then_some(original_bytes)),
+                (&live_path, live_bytes),
+            ] {
+                if let Some(bytes) = bytes {
+                    fs::write(family_component_path(path, "-wal"), bytes).unwrap();
+                }
+            }
+            if let Some(bytes) = retained_bytes {
+                fs::write(quarantine.join("beads.db-wal"), bytes).unwrap();
+            }
+            let applied = raw_family_witness(&applied_path).unwrap();
+            let original = raw_family_witness(&original_path).unwrap();
+            let live_before = raw_family_witness(&live_path).unwrap();
+            let quarantine_before = raw_family_witness(&quarantine.join("beads.db")).unwrap();
+            let observed = undo_component_requires_quarantine(
+                &live_path,
+                &quarantine,
+                component_for_suffix(&applied, "-wal").unwrap(),
+                &original,
+            );
+            assert_eq!(
+                observed.as_ref().ok().copied(),
+                expected,
+                "{name}: {observed:?}"
+            );
+            assert_eq!(
+                raw_family_witness(&live_path).unwrap(),
+                live_before,
+                "{name}"
+            );
+            assert_eq!(
+                raw_family_witness(&quarantine.join("beads.db")).unwrap(),
+                quarantine_before,
+                "{name}: admission must not move or overwrite evidence"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    fn resumed_undo_refuses_sidecar_drift_before_staging_or_exchanging_main() {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let (_temp, migration) = reviewed_v14_migration_context();
+            let run_dir = migration.beads_dir.join("undo-sidecar-admission");
+            let before_dir = run_dir.join("before");
+            let quarantine = run_dir.join("quarantine");
+            let candidate_dir = run_dir.join("candidate");
+            for directory in [&before_dir, &quarantine, &candidate_dir] {
+                ensure_new_directory(directory).unwrap();
+            }
+            let original = raw_family_witness(&migration.db_path).unwrap();
+            copy_family_to_backup(&migration.db_path, &before_dir, &original).unwrap();
+            // This test exercises the byte-level undo install protocol. The
+            // immutable source is a real database; distinct applied bytes let
+            // us prove the original main was never exchanged on refusal.
+            fs::write(&migration.db_path, b"receipt-bound applied main").unwrap();
+            let applied = raw_family_witness(&migration.db_path).unwrap();
+            fs::write(
+                family_component_path(&migration.db_path, suffix),
+                b"newer sidecar outside the prepared undo receipt",
+            )
+            .unwrap();
+            let before_refusal = raw_family_witness(&migration.db_path).unwrap();
+            let staged = candidate_dir.join("beads.db");
+
+            let error = install_undo_restored_main_resuming(
+                &migration.db_path,
+                &before_dir,
+                &staged,
+                &quarantine,
+                &applied,
+                &original,
+                &migration.write_authority,
+            )
+            .expect_err("every unreviewed sidecar must refuse before changing the main");
+            assert!(error.to_string().contains(suffix), "{suffix}: {error}");
+            assert_eq!(
+                raw_family_witness(&migration.db_path).unwrap(),
+                before_refusal,
+                "{suffix}: refusal must preserve the entire newer family"
+            );
+            assert!(!staged.exists(), "{suffix}: no restore may be staged");
+            assert!(
+                !quarantine.join("beads.db").exists(),
+                "{suffix}: no main may be displaced"
+            );
+            verify_backup_family(&migration.db_path, &before_dir, &original).unwrap();
+            migration
+                .write_authority
+                .verify_database_authority()
+                .unwrap();
+        }
     }
 
     #[test]
