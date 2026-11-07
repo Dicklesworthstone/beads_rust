@@ -76,10 +76,14 @@ apply, reconstructed interruption states, undo, and repeat apply. The direct
 `heal` case withholds the JSONL file entirely. Existing release-fixture tests
 cover the three combinations with missing runtime additions and the fully
 upgraded no-op layout. New plans bind `schema19_preservation` with profile
-`schema19-layout-preservation-v2` and a source digest covering row identity as
-well as exact stored values and operator schema. Rowid-only edits and changes
-between distinct non-UTF-8 TEXT payloads must invalidate the plan. The raw-TEXT
-regression also checks refusal of undo after newer database-only edits.
+`schema19-layout-preservation-v3` and a source digest covering row identity as
+well as exact stored values and operator schema, including identifier quoting.
+Rowid-only edits, changes between distinct non-UTF-8 TEXT payloads, and
+quoted-versus-bare view expressions must invalidate the plan. The raw-TEXT and
+view regressions also check refusal of undo after newer database-only edits.
+Duplicate effective sequence names refuse before planning or installation:
+their row order can affect future ID allocation despite identical multisets
+of sequence names and reservations.
 
 The interruption cases reconstruct two persisted boundaries from a genuine
 completed migration and retain all displaced test artifacts: installation

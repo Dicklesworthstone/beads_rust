@@ -130,7 +130,12 @@ struct ReviewedSchemaObjectPreservation {
     object_type: String,
     name: String,
     table: String,
+    /// Historical v1/v2 profile encoding; never reinterpret installed receipts.
     fingerprint: String,
+    /// Live comparisons also retain quotation kind. An unresolved SQLite
+    /// double-quoted identifier can be a string, even when its spelling could
+    /// otherwise be emitted bare. Removing those quotes can change semantics.
+    quoted_fingerprint: String,
 }
 
 #[derive(Debug)]
@@ -157,7 +162,8 @@ struct LegacyV15Projection {
 }
 
 const LEGACY_SCHEMA19_PRESERVATION_PROFILE: &str = "schema19-layout-preservation-v1";
-const SCHEMA19_PRESERVATION_PROFILE: &str = "schema19-layout-preservation-v2";
+const PREVIOUS_SCHEMA19_PRESERVATION_PROFILE: &str = "schema19-layout-preservation-v2";
+const SCHEMA19_PRESERVATION_PROFILE: &str = "schema19-layout-preservation-v3";
 
 #[derive(Clone, Copy)]
 enum PreservationTextEncoding {
@@ -6705,14 +6711,26 @@ fn reviewed_schema_objects(
             // same-name operator DDL is never exempted.
             continue;
         }
-        let fingerprint = if project_close_metadata_addition
-            && object_type == "table" && table == "close_metadata"
-        {
-            legacy_close_metadata_schema_fingerprint(&sql)?
+        let projects_close_metadata = project_close_metadata_addition
+            && object_type == "table"
+            && table == "close_metadata";
+        let fingerprint = if projects_close_metadata {
+            legacy_close_metadata_schema_fingerprint(&sql, false)?
         } else {
             ddl_token_fingerprint(&sql, true)
         };
-        objects.push(ReviewedSchemaObjectPreservation { object_type, name, table, fingerprint });
+        let quoted_fingerprint = if projects_close_metadata {
+            legacy_close_metadata_schema_fingerprint(&sql, true)?
+        } else {
+            quoted_ddl_fingerprint(&sql)
+        };
+        objects.push(ReviewedSchemaObjectPreservation {
+            object_type,
+            name,
+            table,
+            fingerprint,
+            quoted_fingerprint,
+        });
     }
     Ok(objects)
 }
@@ -6844,7 +6862,10 @@ fn verify_retained_migration_preservation_at(
 /// The generic v1 logical witness hashes a multiset of visible values. It
 /// cannot detect changed duplicate-config precedence caused only by rowids.
 /// Schema19 v2 plans also distinguish raw TEXT payloads with the same lossy
-/// UTF-8 view. The profile name binds that encoding into the existing token.
+/// UTF-8 view. V3 additionally retains identifier quotation kind and bytes,
+/// including lowercase double-quoted tokens that SQLite can treat as strings.
+/// Historical v1/v2 digests keep their exact schema encoding; the separate
+/// live source/candidate comparison always requires both fingerprints.
 fn schema19_preservation_digest(
     preservation: &ReviewedStatePreservation,
     profile: &str,
@@ -6862,11 +6883,16 @@ fn schema19_preservation_digest(
         hash_len_prefixed(&mut hasher, &serde_json::to_vec(&table.projection)?);
     }
     for object in &preservation.schema {
+        let fingerprint = if profile == SCHEMA19_PRESERVATION_PROFILE {
+            &object.quoted_fingerprint
+        } else {
+            &object.fingerprint
+        };
         for value in [
             &object.object_type,
             &object.name,
             &object.table,
-            &object.fingerprint,
+            fingerprint,
         ] {
             hash_len_prefixed(&mut hasher, value.as_bytes());
         }
@@ -6886,7 +6912,9 @@ fn validate_schema19_preservation_profile(forecast: &MigrationForecast) -> Resul
         || forecast.schema19_runtime_upgrade.is_none()
         || !matches!(
             profile.profile.as_str(),
-            LEGACY_SCHEMA19_PRESERVATION_PROFILE | SCHEMA19_PRESERVATION_PROFILE
+            LEGACY_SCHEMA19_PRESERVATION_PROFILE
+                | PREVIOUS_SCHEMA19_PRESERVATION_PROFILE
+                | SCHEMA19_PRESERVATION_PROFILE
         )
         || !recovery_pruning_hash_is_valid(&profile.source_sha256)
     {
@@ -6909,8 +6937,27 @@ const LEGACY_V15_NEW_TABLES: &[&str] = &[
 
 fn legacy_projection_rowid(conn: &Connection, table: &str) -> Result<Option<&'static str>> {
     if table == "sqlite_sequence" {
-        // Sequence identity is its table name and high-water value. Engine
-        // allocation of the sequence catalog's own rowids is not user data.
+        // A name/high-water multiset preserves sequence authority only when
+        // every effective name is unique. Duplicate entries make the next
+        // AUTOINCREMENT value depend on their row order, which this projection
+        // deliberately omits. Match the engine's ASCII-folded TEXT cache keys
+        // as well as SQLite's exact names; non-TEXT names are not cache keys.
+        // This admission check changes no historical receipt hash bytes for
+        // unambiguous catalogs and applies to source, candidate, and undo proofs.
+        let mut names = std::collections::BTreeSet::new();
+        for row in conn.query("SELECT name FROM main.sqlite_sequence")? {
+            if let Some(name) = row.get(0).and_then(SqliteValue::as_text)
+                && !names.insert(name.to_ascii_lowercase())
+            {
+                return Err(BeadsError::Config(
+                    "reviewed migration preservation refused: sqlite_sequence contains duplicate \
+                     sequence names; row order can change future AUTOINCREMENT values, so the \
+                     rowid-free preservation proof is insufficient. Preserve the original \
+                     database and recovery files; this state requires a reviewed sequence repair"
+                        .to_owned(),
+                ));
+            }
+        }
         return Ok(None);
     }
     let escaped = table.replace('\'', "''");
@@ -7062,14 +7109,20 @@ fn rows_projection_with_text_encoding(
 /// Remove only the reviewed nullable-column addition from the candidate's
 /// declaration. Every existing column, constraint, and table option remains
 /// in the DDL witness, and row projection separately requires a NULL closer.
-fn legacy_close_metadata_schema_fingerprint(sql: &str) -> Result<String> {
-    let mut tokens = ddl_tokens(sql, true);
+fn legacy_close_metadata_schema_fingerprint(sql: &str, preserve_quoting: bool) -> Result<String> {
+    let mut tokens = ddl_tokens(sql, true, preserve_quoting);
+    let closed_by_names = [
+        "closed_by".to_owned(),
+        quoted_identifier_token('"', "closed_by"),
+        quoted_identifier_token('`', "closed_by"),
+        quoted_identifier_token('[', "closed_by"),
+    ];
     let mut depth = 0_usize;
     let mut addition = None;
     for (index, token) in tokens.iter().enumerate() {
         let previous = index.checked_sub(1).and_then(|index| tokens.get(index));
         if depth == 1
-            && token == "closed_by"
+            && closed_by_names.contains(token)
             && previous.is_some_and(|token| matches!(token.as_str(), "(" | ","))
         {
             let delimiter = tokens.get(index + 2).map(String::as_str);
@@ -7144,7 +7197,7 @@ fn legacy_preserved_schema_witness(
             && object_type == "table"
             && table == "close_metadata"
         {
-            legacy_close_metadata_schema_fingerprint(sql)?
+            legacy_close_metadata_schema_fingerprint(sql, false)?
         } else {
             ddl_token_fingerprint(sql, true)
         };
@@ -7284,7 +7337,9 @@ fn verify_reviewed_profile(
         if project_source && let Some(profile) = &forecast.schema19_preservation {
             let text_encoding = match profile.profile.as_str() {
                 LEGACY_SCHEMA19_PRESERVATION_PROFILE => PreservationTextEncoding::LegacyLossyUtf8,
-                SCHEMA19_PRESERVATION_PROFILE => PreservationTextEncoding::ExactBytes,
+                PREVIOUS_SCHEMA19_PRESERVATION_PROFILE | SCHEMA19_PRESERVATION_PROFILE => {
+                    PreservationTextEncoding::ExactBytes
+                }
                 _ => {
                     return Err(BeadsError::internal(
                         "unvalidated schema19 preservation profile",
@@ -7622,22 +7677,29 @@ fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-/// Token fingerprint of a DDL statement for the schema witness. FrankenSQLite
-/// re-serializes `sqlite_master` text when it rebuilds a database (`VACUUM
-/// INTO`): comments stripped, whitespace collapsed to one line, keyword case
-/// and identifier quoting normalized, predicates re-parenthesized. None of
-/// that changes what the schema means, so the witness hashes the statement's
-/// tokens with comments, whitespace, parentheses, identifier quotes, and case
-/// outside string literals removed. Source and candidate then agree exactly
-/// when their normalized tokens agree (beads_rust-891u). Reviewed raw-state
-/// preservation checks keep parentheses and identifiers needing quotation:
-/// accepting only that stronger equality avoids hiding expression grouping
-/// or identifier changes behind the old layout-maintenance normalization.
+/// Historical DDL fingerprint, originally normalized to tolerate engine
+/// rebuilds that reserialized `sqlite_master` text (beads_rust-891u). This
+/// removes comments, whitespace, parentheses, identifier quotes, and case
+/// outside string literals. Preserve its encoding for existing receipts:
+/// grouping and quoting can change semantics, so new preservation proofs
+/// additionally require [`quoted_ddl_fingerprint`].
 fn ddl_token_fingerprint(sql: &str, preserve_grouping: bool) -> String {
-    ddl_tokens(sql, preserve_grouping).join(" ")
+    ddl_tokens(sql, preserve_grouping, false).join(" ")
 }
 
-fn ddl_tokens(sql: &str, preserve_grouping: bool) -> Vec<String> {
+/// A conservative schema witness: keep grouping, quotation delimiters and
+/// exact quoted bytes. SQLite can interpret `"missing"` as a string when it
+/// cannot resolve that name; bare, backtick and bracket spellings do not have
+/// that fallback. No identifier resolution or DDL rewriting belongs here.
+fn quoted_ddl_fingerprint(sql: &str) -> String {
+    ddl_tokens(sql, true, true).join(" ")
+}
+
+fn quoted_identifier_token(delimiter: char, identifier: &str) -> String {
+    format!("quoted:{delimiter}:{}", hex_digest(identifier.as_bytes()))
+}
+
+fn ddl_tokens(sql: &str, preserve_grouping: bool, preserve_quoting: bool) -> Vec<String> {
     fn flush(word: &mut String, tokens: &mut Vec<String>) {
         if !word.is_empty() {
             tokens.push(word.to_ascii_lowercase());
@@ -7702,12 +7764,13 @@ fn ddl_tokens(sql: &str, preserve_grouping: bool) -> Vec<String> {
                         identifier.push(inner);
                     }
                 }
-                // Use the same identifier classification as VACUUM's SQL
-                // serializer. Reserved words and numeric-looking names must
-                // retain their quoting: "null" is a column, not NULL. Keep
-                // case too: SQLite can interpret an unknown double-quoted
-                // name as a string literal, whose case changes its meaning.
-                if fsqlite_ast::quote_ident_if_needed(&identifier) == identifier {
+                // Preserve the old classifier only for historical profile
+                // digests. Every live comparison retains quotation kind even
+                // for ordinary lowercase names, because DQS string fallback
+                // makes a bare spelling semantically different.
+                if preserve_quoting {
+                    tokens.push(quoted_identifier_token(c, &identifier));
+                } else if fsqlite_ast::quote_ident_if_needed(&identifier) == identifier {
                     tokens.push(identifier);
                 } else {
                     tokens.push(format!("quoted:{}", hex_digest(identifier.as_bytes())));
@@ -10176,6 +10239,7 @@ mod tests {
                       recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, \
                       FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE)";
         let expected = ddl_token_fingerprint(source, true);
+        let quoted_expected = quoted_ddl_fingerprint(source);
         for candidate in [
             "CREATE TABLE close_metadata (issue_id TEXT PRIMARY KEY, \
              recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, closed_by TEXT, \
@@ -10186,8 +10250,12 @@ mod tests {
              \"closed_by\" TEXT /* historical actor stays unknown */)",
         ] {
             assert_eq!(
-                legacy_close_metadata_schema_fingerprint(candidate).unwrap(),
+                legacy_close_metadata_schema_fingerprint(candidate, false).unwrap(),
                 expected
+            );
+            assert_eq!(
+                legacy_close_metadata_schema_fingerprint(candidate, true).unwrap(),
+                quoted_expected
             );
         }
         for declaration in [
@@ -10198,9 +10266,14 @@ mod tests {
             "closed_by TEXT CHECK (closed_by <> '')",
         ] {
             let candidate = format!("CREATE TABLE close_metadata (issue_id TEXT, {declaration})");
-            assert!(legacy_close_metadata_schema_fingerprint(&candidate).is_err());
+            for preserve_quoting in [false, true] {
+                assert!(
+                    legacy_close_metadata_schema_fingerprint(&candidate, preserve_quoting).is_err()
+                );
+            }
         }
-        assert!(legacy_close_metadata_schema_fingerprint(source).is_err());
+        assert!(legacy_close_metadata_schema_fingerprint(source, false).is_err());
+        assert!(legacy_close_metadata_schema_fingerprint(source, true).is_err());
         for changed in [
             source.replace("issue_id TEXT PRIMARY KEY", "issue_id TEXT"),
             source.replace("ON DELETE CASCADE", "ON DELETE RESTRICT"),
@@ -10212,9 +10285,14 @@ mod tests {
                 1,
             );
             assert_ne!(
-                legacy_close_metadata_schema_fingerprint(&candidate).unwrap(),
+                legacy_close_metadata_schema_fingerprint(&candidate, false).unwrap(),
                 expected,
                 "the reviewed actor addition must not hide another DDL change"
+            );
+            assert_ne!(
+                legacy_close_metadata_schema_fingerprint(&candidate, true).unwrap(),
+                quoted_expected,
+                "quotation-aware projection must retain every original declaration"
             );
         }
     }
@@ -10263,6 +10341,45 @@ mod tests {
             ddl_token_fingerprint("create table operator ([a b] text)", true),
             "equivalent quoting and keyword case can still be reserialized"
         );
+    }
+
+    #[test]
+    fn quoted_schema_fingerprint_keeps_double_quoted_string_fallback_distinct() {
+        let quoted = "CREATE VIEW operator_view AS SELECT \"missing\" AS value";
+        for changed in [
+            "CREATE VIEW operator_view AS SELECT missing AS value",
+            "CREATE VIEW operator_view AS SELECT `missing` AS value",
+            "CREATE VIEW operator_view AS SELECT [missing] AS value",
+        ] {
+            for preserve_grouping in [false, true] {
+                assert_eq!(
+                    ddl_token_fingerprint(quoted, preserve_grouping),
+                    ddl_token_fingerprint(changed, preserve_grouping),
+                    "negative control: historical profiles collapse this semantic distinction"
+                );
+            }
+            assert_ne!(
+                quoted_ddl_fingerprint(quoted),
+                quoted_ddl_fingerprint(changed)
+            );
+        }
+        assert_eq!(
+            quoted_ddl_fingerprint(quoted),
+            quoted_ddl_fingerprint(
+                "create view operator_view AS /* preserve the token */ SELECT \"missing\" as value;"
+            ),
+            "irrelevant whitespace, keyword case and comments remain harmless"
+        );
+        for changed in [
+            "CREATE VIEW operator_view AS SELECT \"Missing\" AS value",
+            "CREATE VIEW operator_view AS SELECT 'missing' AS value",
+            "CREATE VIEW operator_view AS SELECT \"mis\"\"sing\" AS value",
+        ] {
+            assert_ne!(
+                quoted_ddl_fingerprint(quoted),
+                quoted_ddl_fingerprint(changed)
+            );
+        }
     }
 
     #[test]
@@ -10687,21 +10804,26 @@ mod tests {
         validate_schema19_preservation_profile(&forecast).unwrap();
         let current_token = compute_plan_token("db", &logical, &forecast).unwrap();
         assert_ne!(historical_token, current_token);
-        let mut legacy_profile = forecast.clone();
-        legacy_profile
-            .schema19_preservation
-            .as_mut()
-            .unwrap()
-            .profile = LEGACY_SCHEMA19_PRESERVATION_PROFILE.to_owned();
-        validate_schema19_preservation_profile(&legacy_profile).unwrap();
-        let serialized = serde_json::to_string(&legacy_profile).unwrap();
-        let restored: MigrationForecast = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(serde_json::to_string(&restored).unwrap(), serialized);
-        assert_ne!(
-            compute_plan_token("db", &logical, &legacy_profile).unwrap(),
-            current_token,
-            "the byte-exact profile must not reuse a lossy v1 plan token"
-        );
+        for profile in [
+            LEGACY_SCHEMA19_PRESERVATION_PROFILE,
+            PREVIOUS_SCHEMA19_PRESERVATION_PROFILE,
+        ] {
+            let mut legacy_profile = forecast.clone();
+            legacy_profile
+                .schema19_preservation
+                .as_mut()
+                .unwrap()
+                .profile = profile.to_owned();
+            validate_schema19_preservation_profile(&legacy_profile).unwrap();
+            let serialized = serde_json::to_string(&legacy_profile).unwrap();
+            let restored: MigrationForecast = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(serde_json::to_string(&restored).unwrap(), serialized);
+            assert_ne!(
+                compute_plan_token("db", &logical, &legacy_profile).unwrap(),
+                current_token,
+                "quotation-aware plans must not reuse a historical profile's token"
+            );
+        }
         let mut changed = forecast.clone();
         changed
             .schema19_preservation
@@ -10725,6 +10847,55 @@ mod tests {
         }
         forecast.schema19_runtime_upgrade = None;
         assert!(validate_schema19_preservation_profile(&forecast).is_err());
+    }
+
+    #[test]
+    fn schema19_quote_profile_keeps_frozen_v1_and_v2_schema_digests() {
+        let sql = "CREATE VIEW operator_view AS SELECT \"missing\" AS value";
+        let mut proof = ReviewedStatePreservation {
+            application_id: 0,
+            tables: Vec::new(),
+            schema: vec![ReviewedSchemaObjectPreservation {
+                object_type: "view".to_owned(),
+                name: "operator_view".to_owned(),
+                table: "operator_view".to_owned(),
+                fingerprint: ddl_token_fingerprint(sql, true),
+                quoted_fingerprint: quoted_ddl_fingerprint(sql),
+            }],
+            added_empty_sequences: Vec::new(),
+            close_metadata_column_added: false,
+        };
+        let historical = [
+            (
+                LEGACY_SCHEMA19_PRESERVATION_PROFILE,
+                "0ac4b89febf8f8452cd6af085fdb23d915920e81717b174312e63824499595c3",
+            ),
+            (
+                PREVIOUS_SCHEMA19_PRESERVATION_PROFILE,
+                "d3bc53a571d49c88a389d300009c24bf3ea045f974b733fccf7008e47e1954d3",
+            ),
+        ];
+        for (profile, digest) in historical {
+            assert_eq!(
+                schema19_preservation_digest(&proof, profile).unwrap(),
+                digest
+            );
+        }
+        let current = schema19_preservation_digest(&proof, SCHEMA19_PRESERVATION_PROFILE).unwrap();
+        proof.schema[0].quoted_fingerprint =
+            quoted_ddl_fingerprint("CREATE VIEW operator_view AS SELECT missing AS value");
+        for (profile, digest) in historical {
+            assert_eq!(
+                schema19_preservation_digest(&proof, profile).unwrap(),
+                digest,
+                "historical profiles keep their original encoding"
+            );
+        }
+        assert_ne!(
+            schema19_preservation_digest(&proof, SCHEMA19_PRESERVATION_PROFILE).unwrap(),
+            current,
+            "new plans bind the quotation distinction in their source proof"
+        );
     }
 
     #[test]
@@ -11072,6 +11243,138 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_preservation_refuses_duplicate_sequence_authority() {
+        for (name, sequence) in [("events", 900), ("events", 50), ("EVENTS", 900)] {
+            let (_temp, db_path, forecast) = preservation_fixture();
+            let proof = capture_reviewed_state_preservation(&db_path, &forecast).unwrap();
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute_with_params(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
+                &[name.into(), sequence.into()],
+            )
+            .unwrap();
+            close_connection(conn).unwrap();
+            let original = fs::read(&db_path).unwrap();
+
+            for encoding in [
+                PreservationTextEncoding::LegacyLossyUtf8,
+                PreservationTextEncoding::ExactBytes,
+            ] {
+                let error = capture_reviewed_state_preservation_with_text_encoding(
+                    &db_path, &forecast, encoding,
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("duplicate sequence names"),
+                    "{name}: {error}"
+                );
+            }
+            for candidate in [false, true] {
+                let error = verify_reviewed_state_preservation(&db_path, proof.as_ref(), candidate)
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("duplicate sequence names"),
+                    "{name}: {error}"
+                );
+            }
+            assert_eq!(fs::read(&db_path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn duplicate_sequence_row_order_changes_allocation_but_not_multiset_witnesses() {
+        let mut observations = Vec::new();
+        for (first, second) in [(100, 200), (200, 100)] {
+            let (_temp, db_path, forecast) = preservation_fixture();
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            conn.execute_with_params(
+                "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'events'",
+                &[first.into()],
+            )
+            .unwrap();
+            conn.execute_with_params(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('events', ?1)",
+                &[second.into()],
+            )
+            .unwrap();
+            close_connection(conn).unwrap();
+
+            let error = capture_reviewed_state_preservation(&db_path, &forecast).unwrap_err();
+            assert!(error.to_string().contains("duplicate sequence names"));
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let rows = conn
+                .query("SELECT name, seq FROM sqlite_sequence ORDER BY rowid")
+                .unwrap()
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>();
+            let historical = legacy_rows_projection("sqlite_sequence", false, &rows).unwrap();
+            let exact = reviewed_rows_projection("sqlite_sequence", false, &rows).unwrap();
+            conn.execute("INSERT INTO events (payload) VALUES ('allocation probe')")
+                .unwrap();
+            let allocated = conn
+                .query_row("SELECT MAX(id) FROM events")
+                .unwrap()
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .unwrap();
+            close_connection(conn).unwrap();
+            observations.push((rows, historical, exact, allocated));
+        }
+
+        assert_ne!(observations[0].0, observations[1].0);
+        assert_eq!(observations[0].1, observations[1].1);
+        assert_eq!(observations[0].2, observations[1].2);
+        assert_ne!(
+            observations[0].3, observations[1].3,
+            "equal rowid-free witnesses must not authorize a sequence-order-dependent upgrade"
+        );
+    }
+
+    #[test]
+    fn reviewed_preservation_keeps_unique_sequence_receipt_projections() {
+        let (_temp, db_path, forecast) = preservation_fixture();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('operator_reserved', 901)")
+            .unwrap();
+        let rows = conn
+            .query("SELECT name, seq FROM sqlite_sequence ORDER BY rowid")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        let historical = legacy_rows_projection("sqlite_sequence", false, &rows).unwrap();
+        let exact = reviewed_rows_projection("sqlite_sequence", false, &rows).unwrap();
+        close_connection(conn).unwrap();
+        let proof = capture_reviewed_state_preservation(&db_path, &forecast).unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("UPDATE sqlite_sequence SET rowid = rowid + 100")
+            .unwrap();
+        assert_eq!(
+            legacy_table_projection(&conn, "sqlite_sequence", false, false).unwrap(),
+            historical,
+            "historical receipts must retain their rowid-free sequence serialization"
+        );
+        assert_eq!(
+            reviewed_table_projection(
+                &conn,
+                "sqlite_sequence",
+                &["name".to_owned(), "seq".to_owned()],
+                &[],
+                PreservationTextEncoding::ExactBytes,
+            )
+            .unwrap(),
+            exact,
+            "unique sequence names need no new preservation profile"
+        );
+        close_connection(conn).unwrap();
+        for candidate in [false, true] {
+            verify_reviewed_state_preservation(&db_path, proof.as_ref(), candidate).unwrap();
+        }
+    }
+
+    #[test]
     fn reviewed_preservation_rejects_database_only_value_and_rowid_loss() {
         for (table, sql, only_rowid_changed) in [
             ("config", "UPDATE config SET rowid=81 WHERE rowid=8", true),
@@ -11381,6 +11684,96 @@ mod tests {
             error.to_string().contains("table issues changed"),
             "{error}"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn schema19_historical_profiles_refuse_quote_only_retained_schema_drift() {
+        const QUOTED_VIEW: &str = "CREATE VIEW operator_view AS SELECT \"missing\" AS value";
+        const BARE_VIEW: &str = "CREATE VIEW operator_view AS SELECT missing AS value";
+        for (profile, encoding) in [
+            (
+                LEGACY_SCHEMA19_PRESERVATION_PROFILE,
+                PreservationTextEncoding::LegacyLossyUtf8,
+            ),
+            (
+                PREVIOUS_SCHEMA19_PRESERVATION_PROFILE,
+                PreservationTextEncoding::ExactBytes,
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db = temp.path().join("beads.db");
+            let fixture = include_bytes!(
+                "../../../../tests/fixtures/schema_migration/schema19_v076_release.db.gz"
+            );
+            let mut released = Vec::new();
+            flate2::read::GzDecoder::new(&fixture[..])
+                .read_to_end(&mut released)
+                .unwrap();
+            fs::write(&db, released).unwrap();
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute(QUOTED_VIEW).unwrap();
+            close_connection(conn).unwrap();
+            let plan = build_plan(&db).unwrap();
+            let current = plan.forecast.as_ref().unwrap();
+            let mut historical = current.clone();
+            let proof =
+                capture_reviewed_state_preservation_with_text_encoding(&db, &historical, encoding)
+                    .unwrap()
+                    .unwrap();
+            historical.schema19_preservation = Some(Schema19PreservationProfile {
+                profile: profile.to_owned(),
+                source_sha256: schema19_preservation_digest(&proof, profile).unwrap(),
+            });
+            verify_reviewed_profile(&db, &historical, true).unwrap();
+
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute("DROP VIEW operator_view").unwrap();
+            conn.execute(BARE_VIEW).unwrap();
+            close_connection(conn).unwrap();
+            assert_eq!(logical_witness(&db).unwrap(), plan.logical_witness);
+            verify_reviewed_profile(&db, &historical, true)
+                .expect("historical digest compatibility is not a live preservation proof");
+            assert!(verify_reviewed_profile(&db, current, true).is_err());
+            assert_ne!(build_plan(&db).unwrap().plan_token, plan.plan_token);
+            let error = verify_reviewed_state_preservation(&db, Some(&proof), false)
+                .expect_err("the live source proof must retain identifier quotation");
+            assert!(error.to_string().contains("view operator_view changed"));
+
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute("DROP VIEW operator_view").unwrap();
+            conn.execute(QUOTED_VIEW).unwrap();
+            close_connection(conn).unwrap();
+            assert_eq!(build_plan(&db).unwrap().plan_token, plan.plan_token);
+            let run_dir = temp.path().join("retained-historical-profile");
+            let before_dir = run_dir.join("before");
+            ensure_new_directory(&run_dir).unwrap();
+            ensure_new_directory(&before_dir).unwrap();
+            let original = raw_family_witness(&db).unwrap();
+            copy_family_to_backup(&db, &before_dir, &original).unwrap();
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            apply_reviewed_runtime_schema_upgrade_in_transaction(
+                &conn,
+                historical.schema19_runtime_upgrade.unwrap(),
+            )
+            .unwrap();
+            conn.execute("COMMIT").unwrap();
+            close_connection(conn).unwrap();
+            verify_retained_migration_preservation(&db, &run_dir, &original, &historical)
+                .expect("unchanged installed v1/v2 upgrades remain verifiable");
+
+            let installed = logical_witness(&db).unwrap();
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            conn.execute("DROP VIEW operator_view").unwrap();
+            conn.execute(BARE_VIEW).unwrap();
+            close_connection(conn).unwrap();
+            assert_eq!(logical_witness(&db).unwrap(), installed);
+            let error =
+                verify_retained_migration_preservation(&db, &run_dir, &original, &historical)
+                    .expect_err("old receipts must not authorize discarding later operator DDL");
+            assert!(error.to_string().contains("view operator_view changed"));
+        }
     }
 
     #[test]

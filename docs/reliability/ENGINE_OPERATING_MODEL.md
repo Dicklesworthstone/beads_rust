@@ -261,13 +261,17 @@ The reset recreates the data tables while retaining config, metadata and JSONL
 row receipts, and verifies the resulting runtime layout before returning.
 
 New plans include `forecast.schema19_preservation` with profile
-`schema19-layout-preservation-v2` and `source_sha256`. The digest binds exact
+`schema19-layout-preservation-v3` and `source_sha256`. The digest binds exact
 source values and storage classes, including non-UTF-8 SQLite TEXT bytes,
 multiplicities, application/operator table
-hidden row IDs, sequence names/high-water values, and admitted operator schema.
-SQLite's sequence catalog's own row IDs are not application identities.
-Historical v1 profile digests keep their original encoding for receipt
-verification; retained-source comparisons still require exact TEXT bytes.
+hidden row IDs, sequence names/high-water values, and admitted operator schema,
+including identifier quotation kind and bytes. Quoted and bare SQL tokens can
+have different meanings, including SQLite's double-quoted-string fallback.
+Sequence catalog row IDs are omitted only after rejecting duplicate effective
+TEXT names, including ASCII case collisions; otherwise row order can change
+future allocation. Historical v1/v2 profile digests keep their original
+encoding for receipt verification; retained-source comparisons still require
+exact TEXT bytes and the stricter schema fingerprint.
 Every new migration forecast separately binds SQLite's persistent
 `application_id`, read through the engine so committed WAL metadata is
 included. Source, candidate and installed-state checks preserve it. Old

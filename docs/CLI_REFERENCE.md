@@ -2785,7 +2785,13 @@ The migrator constructs and verifies a private candidate before installing it.
 Every existing source column, raw value and storage class, row multiplicity,
 application/operator table hidden row ID, sequence name/high-water value, and
 admitted operator schema must survive. SQLite's sequence catalog's own internal
-row IDs are not application identities. New receipts start empty and newly
+row IDs are not application identities when each sequence name is unambiguous.
+Duplicate `sqlite_sequence` names, including names differing only in ASCII
+case, refuse migration before a plan token is issued: their row order can
+change future ID allocation, so a rowid-independent preservation proof is
+insufficient. Keep the original database and resolve that allocation state
+explicitly; the migrator does not discard or merge sequence reservations.
+New receipts start empty and newly
 added `closed_by` values start `NULL`; existing receipt rows and known closing
 actors remain exact. Event history, configuration and metadata, workflow and
 capacity records, relations, dirty/export bookkeeping, child allocation
@@ -2797,7 +2803,7 @@ New schema-19 layout plans also include `forecast.schema19_preservation`:
 
 ```json
 {
-  "profile": "schema19-layout-preservation-v2",
+  "profile": "schema19-layout-preservation-v3",
   "source_sha256": "<digest of the complete source preservation witness>"
 }
 ```
@@ -2807,10 +2813,14 @@ sequence reservations and admitted schema into the plan token. SQLite TEXT
 uses its exact stored bytes, including invalid UTF-8. Distinct byte payloads
 with the same replacement-character display and rowid-only changes that alter
 duplicate configuration or metadata precedence invalidate the reviewed plan.
+Schema fingerprints also retain identifier quoting: changing an operator
+view's `SELECT "missing"` into `SELECT missing` can change a string literal
+into a missing-column error and therefore requires a fresh plan.
 Apply verifies the proof before building and
 installing the candidate; interrupted completion and undo verify it against a
 private copy of the retained source family. Earlier installed receipts retain
-their original token and preservation semantics for guarded recovery and undo.
+their original v1/v2 token encodings for guarded recovery and undo, with the
+same stricter live schema comparison before restoring any database files.
 An earlier uninstalled layout-upgrade plan must be regenerated to obtain the
 new source proof.
 

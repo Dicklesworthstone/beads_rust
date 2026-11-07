@@ -1383,7 +1383,7 @@ fn released_schema19_unknown_layouts_refuse_without_a_noop_or_source_mutation() 
 
 fn assert_schema19_preservation_profile(plan: &Value) {
     let preservation = &plan["forecast"]["schema19_preservation"];
-    assert_eq!(preservation["profile"], "schema19-layout-preservation-v2");
+    assert_eq!(preservation["profile"], "schema19-layout-preservation-v3");
     let digest = preservation["source_sha256"].as_str().unwrap();
     assert_eq!(digest.len(), 64);
     assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -1740,6 +1740,143 @@ fn schema19_workflows_heal_without_jsonl_preserves_history_and_repeats() {
     assert_eq!(repeated["heal_needed"], false);
     assert_eq!(workflow_schema19_durable_files(&workspace), migrated);
     assert_eq!(fs::read(backup.join("beads.db")).unwrap(), source);
+}
+
+#[test]
+fn schema19_workflows_duplicate_sequences_refuse_before_migration() {
+    let workspace = workflow_schema19_workspace();
+    let beads = workspace.root.join(".beads");
+    let db = beads.join("beads.db");
+    // The unchanged release fixture is eligible. Duplicate sequence rows are
+    // a separate, ambiguous source state, despite integrity_check remaining ok.
+    let plan = workflow_schema19_plan(&workspace);
+    assert_eq!(plan["eligible"], true);
+    edit_schema19_fixture(
+        &workspace,
+        &["INSERT INTO sqlite_sequence (name, seq) VALUES ('events', 50000)"],
+    );
+    let original_rows = workflow_schema19_authority(&db);
+    let original_files = schema19_tracker_files(&beads);
+    for args in [
+        vec!["doctor", "migrate-schema", "plan", "--json"],
+        vec!["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+    ] {
+        let refused = run_br(&workspace, args, "workflow19_duplicate_sequences_preview");
+        assert!(!refused.status.success(), "{}", refused.stdout);
+        let error: Value = serde_json::from_str(&refused.stdout).unwrap();
+        assert_eq!(error["error"]["code"], "CONFIG_ERROR");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("sqlite_sequence")
+        );
+        assert!(error.get("plan_token").is_none());
+        assert_eq!(schema19_tracker_files(&beads), original_files);
+    }
+    let durable_files = workflow_schema19_durable_files(&workspace);
+    for args in [
+        vec![
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            plan["plan_token"].as_str().unwrap(),
+            "--json",
+        ],
+        vec!["doctor", "migrate-schema", "heal", "--json"],
+    ] {
+        let refused = run_br(&workspace, args, "workflow19_duplicate_sequences_write");
+        assert!(!refused.status.success(), "{}", refused.stdout);
+        assert!(format!("{}{}", refused.stdout, refused.stderr).contains("sqlite_sequence"));
+        assert_eq!(workflow_schema19_durable_files(&workspace), durable_files);
+        assert_eq!(workflow_schema19_authority(&db), original_rows);
+        assert!(
+            !beads.join(".br_recovery/schema-migrations").exists(),
+            "ambiguous allocation authority must refuse before creating a migration run"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn schema19_quoted_view_changes_stale_plans_and_refuse_undo() {
+    let workspace = workflow_schema19_workspace();
+    let db = workspace.root.join(".beads/beads.db");
+    let quoted = r#"CREATE VIEW operator_quote_view AS SELECT "retained" AS value"#;
+    let bare = "CREATE VIEW operator_quote_view AS SELECT retained AS value";
+    // SQLite's double-quoted-string fallback makes the first a literal and
+    // the second an unresolved column. Equal quote-stripped DDL fingerprints
+    // cannot prove that the operator's schema is unchanged.
+    edit_schema19_fixture(&workspace, &[quoted]);
+    let original = workflow_schema19_plan(&workspace);
+    edit_schema19_fixture(&workspace, &["DROP VIEW operator_quote_view", bare]);
+    let changed = workflow_schema19_plan(&workspace);
+    assert_eq!(original["logical_witness"], changed["logical_witness"]);
+    assert_ne!(original["plan_token"], changed["plan_token"]);
+    assert_ne!(
+        original["forecast"]["schema19_preservation"]["source_sha256"],
+        changed["forecast"]["schema19_preservation"]["source_sha256"]
+    );
+    let changed_files = workflow_schema19_durable_files(&workspace);
+    let refused = run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            original["plan_token"].as_str().unwrap(),
+            "--json",
+        ],
+        "workflow19_quoted_view_stale_plan",
+    );
+    assert!(!refused.status.success(), "{}", refused.stdout);
+    assert!(format!("{}{}", refused.stdout, refused.stderr).contains("stale"));
+    assert_eq!(workflow_schema19_durable_files(&workspace), changed_files);
+
+    edit_schema19_fixture(&workspace, &["DROP VIEW operator_quote_view", quoted]);
+    let plan = workflow_schema19_plan(&workspace);
+    let original_rows = workflow_schema19_authority(&db);
+    let applied = workflow_schema19_apply(&workspace, plan["plan_token"].as_str().unwrap());
+    assert_eq!(
+        schema19_authority_rows(&db, Some(&original_rows)),
+        original_rows
+    );
+    edit_schema19_fixture(&workspace, &["DROP VIEW operator_quote_view", bare]);
+    let changed_files = workflow_schema19_durable_files(&workspace);
+    let changed_rows = workflow_schema19_authority(&db);
+    for dry_run in [true, false] {
+        let mut args = vec![
+            "doctor",
+            "migrate-schema",
+            "undo",
+            applied["run_id"].as_str().unwrap(),
+            "--json",
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let refused = run_br(&workspace, args, "workflow19_quoted_view_changed_undo");
+        assert!(!refused.status.success(), "{}", refused.stdout);
+        assert!(
+            format!("{}{}", refused.stdout, refused.stderr)
+                .contains("live database has changed since run"),
+            "{} {}",
+            refused.stdout,
+            refused.stderr
+        );
+        assert_eq!(workflow_schema19_durable_files(&workspace), changed_files);
+        assert_eq!(workflow_schema19_authority(&db), changed_rows);
+        assert!(
+            !workspace
+                .root
+                .join(".beads/.br_recovery/schema-migrations")
+                .join(applied["run_id"].as_str().unwrap())
+                .join("undo-prepared.json")
+                .exists()
+        );
+    }
 }
 
 #[test]
