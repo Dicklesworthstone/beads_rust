@@ -2714,6 +2714,29 @@ derived `blocked_cache_state` metadata stale in the same transaction, preserving
 the marker rows and their row IDs, including duplicates. Reads then compute
 blocking from the authoritative relations without repopulating the cache.
 Index-only restoration leaves the marker and other records intact.
+
+Generic `doctor --repair` uses the same layout admission before starting a
+repair session. A readable, unsupported current layout returns the structured
+`schema_current_layout_unsupported` refusal, including in dry-run mode. The
+`--unsafe-auto-fix`, `--only`, `--skip`, and repeated-repair options do not bypass
+this boundary. A failed storage open or an empty history snapshot is not proof
+that the source contains no database-only state.
+
+For a positively admitted missing-index or derived-cache layout,
+`doctor --repair --dry-run` advertises
+`doctor.repair_current_schema_maintenance`. Actual repair runs the dedicated
+maintenance transaction, rechecks the resulting layout, and finishes with a
+fresh diagnostic report. Other findings remain for separate diagnosis; this
+invocation performs no JSONL reconstruction or additional fixers.
+Its filter ID is `fm-schemas-current-runtime-maintenance`. Excluding this fixer,
+failing maintenance, or failing to verify its result stops repair with the
+`schema_current_maintenance_required` refusal; these outcomes never authorize
+JSONL reconstruction. Catalog-read failures remain distinct
+from positive evidence of an unsupported layout and follow the separate
+corruption-recovery gates. A positively identified pending sync merge also
+refuses generic repair previews; dry run never proposes fixers while that
+receipt owns the database.
+
 Fresh initialization and the intentional data reset used by force import are
 separate paths. A reset validates the intact runtime layout inside its write
 transaction before dropping any data tables. Foreign keys from retained tables

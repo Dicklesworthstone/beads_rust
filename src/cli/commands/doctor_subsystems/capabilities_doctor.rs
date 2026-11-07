@@ -573,6 +573,14 @@ const fn early_chokepoint_fixer_rows() -> &'static [FixerRow] {
 fn legacy_fixer_rows() -> &'static [FixerRow] {
     &[
         (
+            "doctor.repair_current_schema_maintenance",
+            "schemas",
+            true,
+            false,
+            &["schema.runtime"],
+            &["fm-schemas-current-runtime-maintenance"],
+        ),
+        (
             "doctor.repair_recoverable_db_state",
             "caches_indexes",
             true,
@@ -662,6 +670,22 @@ fn refuse_gate_fixer_rows() -> &'static [FixerRow] {
         ),
         (
             "refuse_gates.schema19_runtime_upgrade",
+            "schemas",
+            false,
+            false,
+            &["schema.runtime"],
+            &[],
+        ),
+        (
+            "refuse_gates.schema_current_layout_unsupported",
+            "schemas",
+            false,
+            false,
+            &["schema.runtime"],
+            &[],
+        ),
+        (
+            "refuse_gates.schema_current_maintenance_required",
             "schemas",
             false,
             false,
@@ -805,11 +829,28 @@ mod tests {
                     .any(|finding| finding == "schema.runtime")
             })
             .collect::<Vec<_>>();
-        assert_eq!(handlers.len(), 1);
-        assert_eq!(handlers[0].id, "refuse_gates.schema19_runtime_upgrade");
-        assert!(!handlers[0].auto_fixable);
-        assert!(!handlers[0].mutates);
-        assert!(handlers[0].filter_ids.is_empty());
+        assert_eq!(
+            handlers
+                .iter()
+                .map(|fixer| fixer.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "doctor.repair_current_schema_maintenance",
+                "refuse_gates.schema19_runtime_upgrade",
+                "refuse_gates.schema_current_layout_unsupported",
+                "refuse_gates.schema_current_maintenance_required",
+            ],
+        );
+        assert!(handlers[0].auto_fixable);
+        assert_eq!(
+            handlers[0].filter_ids,
+            vec!["fm-schemas-current-runtime-maintenance"],
+        );
+        for gate in &handlers[1..] {
+            assert!(!gate.auto_fixable);
+            assert!(!gate.mutates);
+            assert!(gate.filter_ids.is_empty());
+        }
     }
 
     #[test]
@@ -890,6 +931,7 @@ mod tests {
                 "doctor.dependencies_orphan_prune",
                 "doctor.wal_checkpoint_truncate",
                 "doctor.null_defaults_backfill",
+                "doctor.repair_current_schema_maintenance",
                 "doctor.repair_recoverable_db_state",
                 "doctor.repair_partial_indexes",
                 "doctor.repair_via_vacuum",
@@ -898,6 +940,8 @@ mod tests {
                 "doctor.repair_database_sidecars",
                 "refuse_gates.schema_version_downgrade",
                 "refuse_gates.schema19_runtime_upgrade",
+                "refuse_gates.schema_current_layout_unsupported",
+                "refuse_gates.schema_current_maintenance_required",
                 "refuse_gates.recovery_fingerprint_integrity",
                 "dependency_unblock",
             ],

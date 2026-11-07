@@ -6,15 +6,16 @@
   `Missing tables: blocked_issues_cache`. This is the structural twin of the
   FTS-missing false-negative bug (br-#152) — the detector must surface the
   finding, not spuriously OK.
-- **Repair contract**: `--repair` reapplies the canonical schema via the
-  JSONL→DB rebuild path (which itself calls `apply_schema` → `CREATE TABLE
-  IF NOT EXISTS blocked_issues_cache` + the cache index). The fixer never
-  DROPs.
-- **Round-trip**: PARTIAL — DDL recreation routes via the rebuild path that
-  predates full WP3/WP4 chokepoint coverage. `undo latest` may report
-  `restored: 0` for the structural recreation; the fixture asserts the DB is
-  still queryable post-undo.
+- **Repair contract**: For an otherwise admitted current-version layout,
+  `--repair` uses `fm-schemas-current-runtime-maintenance` to recreate the
+  derived cache and its index in place, inside the dedicated maintenance
+  transaction, and mark the cache stale. The invocation reports remaining
+  findings and ends without JSONL reconstruction or additional fixers.
+- **Round-trip scope**: The repair is recorded in the doctor's reversible
+  session. This fixture checks only that the main database still exists
+  after best-effort undo; it does not assert byte-for-byte family restoration
+  or cache repopulation.
 - **Expected exit codes**:
     - detect: 1 (error present)
-    - repair: 0 or 2 (rebuild_applied)
-    - undo: 0
+    - repair: 0 or 2 (maintenance complete; other findings may remain)
+    - undo: best-effort; the fixture checks that the database remains present

@@ -53,6 +53,7 @@ invocation (env override or flag) to pin the finding/check contract;
 | fm-permissions-recovery-dir-not-writable | recovery_dir_not_writable | detect |
 | fm-routes_external-route-target-missing | routes_target_missing, routes_jsonl_corrupt | detect |
 | fm-routes_external-routes-jsonl-corrupt | routes_jsonl_corrupt | detect |
+| fm-schemas-current-runtime-maintenance | blocked_cache_table_missing | detect: `schema.runtime` identifies admitted index/cache maintenance; repair terminates after that transaction and observational reinspection, without JSONL reconstruction |
 | fm-schemas-issue-column-order-divergence | — | exception: only emitted via the `schema.inspect` inspection-error path (schema checks failed to RUN, not a detected column-order divergence); no deterministic real-world plant reaches it without first tripping db.open/schema.tables instead |
 | fm-schemas-missing-required-column | schemas_missing_required_column, empty_database_with_jsonl | detect |
 | fm-schemas-missing-required-table | schemas_missing_required_table, blocked_cache_table_missing, empty_database_with_jsonl | detect |

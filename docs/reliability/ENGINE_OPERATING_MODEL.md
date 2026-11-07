@@ -219,6 +219,25 @@ layout admission, permitted DDL and the complete runtime postcondition.
 Failures trigger rollback; a rollback failure explicitly reports that the
 transaction state is unknown.
 
+Doctor uses the same read-only admission boundary before generic repair.
+Its private-source preflight, report evidence and repair-candidate gates
+distinguish the reviewed release upgrade, current or admitted maintenance
+layouts, and positively unsupported current layouts. An unsupported layout
+refuses before fixer dispatch or repair-session creation; dry runs, filters
+and unsafe auto-fix cannot bypass that refusal. In particular, a failed
+`SqliteStorage::open` cannot make an empty authority snapshot evidence that
+JSONL reconstruction preserves the source. Catalog and schema-PRAGMA read
+errors remain inspection failures rather than successful compatibility
+findings. Application-row corruption is a separate question: it cannot erase
+known unsupported schema evidence, while a fully current layout retains its
+existing corruption-recovery path. A positive maintenance-required finding
+takes the dedicated current-schema maintenance route, with admission repeated
+inside its write transaction. The invocation ends after observational
+reinspection and reports any remaining findings; it does not proceed to a
+JSONL-rebuild fallback. Maintenance failures also stop repair rather than
+authorizing reconstruction. Dry runs describe that same narrow action without
+applying it.
+
 Admitted current-version maintenance restores owned DDL without replaying
 legacy row normalizers or globally retiring historical index names. Missing
 `config` and `metadata` indexes never justify copying those tables, so their

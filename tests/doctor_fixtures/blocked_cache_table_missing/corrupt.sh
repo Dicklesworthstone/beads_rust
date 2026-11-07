@@ -5,8 +5,10 @@
 # Drops the `blocked_issues_cache` table and its index — the structural twin
 # of the FTS-missing false-negative (br-#152). The doctor's `schema.tables`
 # check goes to `error` because `blocked_issues_cache` is in the required-
-# tables list. `--repair` reapplies the canonical schema (CREATE TABLE IF
-# NOT EXISTS) via the JSONL-rebuild path, restoring the table and its index.
+# tables list. For an otherwise admitted current layout, `--repair` uses
+# dedicated transactional maintenance to recreate the cache and its index in
+# place and mark it stale. That invocation ends after reporting remaining
+# findings; it does not proceed to JSONL reconstruction or other fixers.
 
 set -euo pipefail
 target_dir="${1:?usage: corrupt.sh <target_dir>}"
@@ -28,8 +30,8 @@ b_id=$(echo "$ids" | sed -n 2p)
 "$tool_bin" dep add "$a_id" "$b_id" --type blocks >/dev/null 2>&1 || true
 "$tool_bin" sync --flush-only >/dev/null 2>&1 || true
 
-# Drop the cache table and its index. Test harness DROPs; the fixer never
-# DROPs anything.
+# The test harness removes the derived cache and its index. The narrow
+# maintenance fixer recreates both in place.
 printf '%s\n' \
   "DROP INDEX IF EXISTS idx_blocked_cache_blocked_at;" \
   "DROP TABLE IF EXISTS blocked_issues_cache;" \

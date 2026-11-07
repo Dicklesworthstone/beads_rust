@@ -255,6 +255,17 @@ pub(crate) struct ReviewedRuntimeSchemaUpgrade {
     pub closed_by_column_added: bool,
 }
 
+/// Read-only layout evidence for generic doctor repair. A failed inspection
+/// is returned separately and never means that a layout is compatible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CurrentSchemaRepairInspection {
+    NotCurrent,
+    Compatible,
+    ReviewedUpgrade(ReviewedRuntimeSchemaUpgrade),
+    MaintenanceRequired,
+    Unsupported { reason: String },
+}
+
 /// The complete SQL schema for the beads database.
 /// Schema matches classic bd (Go) for interoperability.
 pub const SCHEMA_SQL: &str = r"
@@ -1246,7 +1257,7 @@ pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
 /// Hold the writer transaction from admission through the final runtime
 /// attestation. Current layouts must never reach legacy table projections,
 /// data normalizers or global index retirement, even after concurrent DDL.
-fn maintain_current_schema_atomic(conn: &Connection, operation: &str) -> Result<()> {
+pub(crate) fn maintain_current_schema_atomic(conn: &Connection, operation: &str) -> Result<()> {
     // BEGIN failure leaves any caller-owned transaction untouched. Reset has
     // its own explicitly guarded path inside its existing write transaction.
     conn.execute("BEGIN IMMEDIATE")?;
@@ -4495,6 +4506,139 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         conn,
         has_pending_sync_merge_metadata(conn).unwrap_or(false),
     )
+}
+
+/// Distinguish readable, unsupported current layouts from damaged database
+/// pages. Generic JSONL recovery must not erase a schema it can inspect but
+/// cannot preserve. This uses the same manifests as ordinary maintenance;
+/// successful inspection does not authorize any write or bypass other gates.
+/// The caller must use an isolated snapshot or an existing read transaction.
+pub(crate) fn inspect_current_schema_for_repair(
+    conn: &Connection,
+) -> Result<CurrentSchemaRepairInspection> {
+    let version = connection_user_version(conn)?;
+    if version != current_schema_version_u32()? {
+        return Ok(CurrentSchemaRepairInspection::NotCurrent);
+    }
+    let cookie = runtime_schema_cookie(conn)?;
+    // The shape predicates deliberately return false on query errors. Prove
+    // their catalog/PRAGMA inputs readable before treating false as evidence
+    // of an unsupported declaration. Application rows need not be readable:
+    // unrelated page damage cannot authorize dropping a known extra column.
+    let has_triggers = inspect_runtime_schema_metadata(conn)?;
+    let inspection = if has_triggers {
+        CurrentSchemaRepairInspection::Unsupported {
+            reason: "persistent triggers are outside the reviewed runtime and maintenance layouts"
+                .to_owned(),
+        }
+    } else {
+        match reviewed_runtime_schema_upgrade(conn) {
+            Ok(None) => CurrentSchemaRepairInspection::Compatible,
+            Ok(Some(upgrade)) => CurrentSchemaRepairInspection::ReviewedUpgrade(upgrade),
+            Err(error)
+                if runtime_schema_compatible_with_release_additions(conn, true)
+                    && (jsonl_row_receipts_schema_canonical(conn)
+                        || runtime_schema_name_absent(conn, "jsonl_row_receipts")) =>
+            {
+                // The known released layout may be frozen by a pending merge.
+                // Its existing durable admission gate owns that refusal; it
+                // is not evidence of an unknown authoritative declaration.
+                return Err(error);
+            }
+            Err(_) => match attest_current_schema_maintenance(conn, "doctor repair inspection") {
+                Ok(cache_recreated) => {
+                    if cache_recreated && table_exists(conn, "blocked_issues_cache") {
+                        match refuse_external_references_to_tables(
+                            conn,
+                            "doctor repair inspection",
+                            &["blocked_issues_cache"],
+                        ) {
+                            Ok(()) => CurrentSchemaRepairInspection::MaintenanceRequired,
+                            Err(BeadsError::Config(reason)) => {
+                                CurrentSchemaRepairInspection::Unsupported { reason }
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        CurrentSchemaRepairInspection::MaintenanceRequired
+                    }
+                }
+                Err(BeadsError::Config(reason)) => {
+                    CurrentSchemaRepairInspection::Unsupported { reason }
+                }
+                Err(error) => return Err(error),
+            },
+        }
+    };
+    if runtime_schema_cookie(conn)? != cookie || connection_user_version(conn)? != version {
+        return Err(BeadsError::SyncConflict {
+            message: "database schema changed during the read-only repair inspection".to_owned(),
+        });
+    }
+    Ok(inspection)
+}
+
+/// Read every kind of schema input consumed by the layout predicates with
+/// error propagation. No data-table scan, integrity verdict, or canonical
+/// schema manifest is duplicated here. The returned flag records triggers.
+fn inspect_runtime_schema_metadata(conn: &Connection) -> Result<bool> {
+    let objects = conn.query(
+        "SELECT type, name, tbl_name, sql FROM main.sqlite_schema ORDER BY type, name",
+    )?;
+    conn.query("PRAGMA main.table_list")?;
+    let mut names = std::collections::BTreeSet::new();
+    let mut has_triggers = false;
+    for object in objects {
+        let kind = object
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| BeadsError::internal("schema object type is not text"))?;
+        let name = object
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| BeadsError::internal("schema object name is not text"))?;
+        // Trigger names have a separate namespace from tables and indexes.
+        if !names.insert((kind == "trigger", name.to_ascii_lowercase())) {
+            return Err(BeadsError::internal(format!(
+                "schema catalog contains duplicate object name {name}; layout classification is unavailable"
+            )));
+        }
+        if object.get(2).and_then(SqliteValue::as_text).is_none() {
+            return Err(BeadsError::internal("schema object table name is not text"));
+        }
+        if object
+            .get(3)
+            .is_none_or(|sql| !matches!(sql, SqliteValue::Text(_) | SqliteValue::Null))
+        {
+            return Err(BeadsError::internal("schema object SQL is neither text nor NULL"));
+        }
+        let escaped = name.replace('\'', "''");
+        match kind {
+            "table" => {
+                conn.query(&format!("PRAGMA main.table_xinfo('{escaped}')"))?;
+                conn.query(&format!("PRAGMA main.foreign_key_list('{escaped}')"))?;
+                for index in conn.query(&format!("PRAGMA main.index_list('{escaped}')"))? {
+                    let index_name = index
+                        .get(1)
+                        .and_then(SqliteValue::as_text)
+                        .ok_or_else(|| BeadsError::internal("schema index name is not text"))?;
+                    let escaped_index = index_name.replace('\'', "''");
+                    conn.query(&format!("PRAGMA main.index_xinfo('{escaped_index}')"))?;
+                }
+            }
+            "index" => {
+                conn.query(&format!("PRAGMA main.index_xinfo('{escaped}')"))?;
+            }
+            "trigger" => has_triggers = true,
+            "view" => {}
+            _ => {
+                return Err(BeadsError::internal(format!(
+                    "schema object {name} has unknown kind {kind}"
+                )));
+            }
+        }
+    }
+    Ok(has_triggers)
 }
 
 /// Inspect the complete current-version runtime contract without changing it.
@@ -9684,6 +9828,99 @@ mod tests {
         }
         conn.execute("PRAGMA user_version = 19").unwrap();
         (temp, conn)
+    }
+
+    #[test]
+    fn repair_layout_inspection_distinguishes_current_upgrade_and_maintenance() {
+        for (receipts, attribution) in [(false, false), (true, false), (false, true)] {
+            let (_temp, conn) = runtime_upgrade_fixture(receipts, attribution);
+            let before = legacy_v15_test_state(&conn);
+            assert_eq!(
+                inspect_current_schema_for_repair(&conn).unwrap(),
+                CurrentSchemaRepairInspection::ReviewedUpgrade(ReviewedRuntimeSchemaUpgrade {
+                    jsonl_row_receipts_created: !receipts,
+                    closed_by_column_added: !attribution,
+                })
+            );
+            assert_eq!(legacy_v15_test_state(&conn), before);
+        }
+
+        for drift in [
+            "DROP INDEX idx_config_key",
+            "DROP TABLE blocked_issues_cache",
+            "DROP TABLE blocked_issues_cache; \
+             CREATE TABLE blocked_issues_cache (issue_id TEXT PRIMARY KEY, blocked_by TEXT, blocked_at DATETIME)",
+            "CREATE TABLE operator_cache_reference (issue_id TEXT REFERENCES blocked_issues_cache(issue_id)); \
+             DROP INDEX idx_blocked_cache_blocked_at",
+        ] {
+            let (_temp, conn) = runtime_upgrade_fixture(true, true);
+            assert_eq!(
+                inspect_current_schema_for_repair(&conn).unwrap(),
+                CurrentSchemaRepairInspection::Compatible
+            );
+            execute_batch(&conn, drift).unwrap();
+            let before = legacy_v15_test_state(&conn);
+            assert_eq!(
+                inspect_current_schema_for_repair(&conn).unwrap(),
+                CurrentSchemaRepairInspection::MaintenanceRequired,
+                "{drift}"
+            );
+            assert_eq!(legacy_v15_test_state(&conn), before, "{drift}");
+            maintain_current_schema_atomic(&conn, "inspection test maintenance").unwrap();
+            assert_eq!(
+                inspect_current_schema_for_repair(&conn).unwrap(),
+                CurrentSchemaRepairInspection::Compatible,
+                "{drift}"
+            );
+        }
+    }
+
+    #[test]
+    fn repair_layout_inspection_preserves_positive_unknown_layout_evidence() {
+        for drift in [
+            "ALTER TABLE issues ADD COLUMN operator_payload BLOB; \
+             UPDATE issues SET operator_payload = X'ff0080'",
+            "ALTER TABLE capacity_occupancy ADD COLUMN operator_payload BLOB",
+            "DROP TABLE labels",
+            "DROP TABLE blocked_issues_cache; \
+             CREATE TABLE blocked_issues_cache (issue_id TEXT PRIMARY KEY, blocked_by TEXT, blocked_at DATETIME); \
+             CREATE TABLE operator_cache_reference (issue_id TEXT REFERENCES \"BLOCKED_ISSUES_CACHE\"(issue_id) ON DELETE CASCADE)",
+            // SQLite gives triggers a separate namespace: sharing a table's
+            // name must not turn positive trigger evidence into a query error.
+            "CREATE TRIGGER issues AFTER INSERT ON events BEGIN SELECT 1; END",
+        ] {
+            let (_temp, conn) = runtime_upgrade_fixture(true, true);
+            conn.execute("INSERT INTO issues (rowid, id, title) VALUES (41, 'br-private', 'Database-only issue')")
+                .unwrap();
+            if drift.starts_with("CREATE TRIGGER") {
+                conn.execute(drift).unwrap();
+            } else {
+                execute_batch(&conn, drift).unwrap();
+            }
+            let before = legacy_v15_test_state(&conn);
+            assert!(
+                matches!(
+                    inspect_current_schema_for_repair(&conn).unwrap(),
+                    CurrentSchemaRepairInspection::Unsupported { .. }
+                ),
+                "{drift}"
+            );
+            assert_eq!(legacy_v15_test_state(&conn), before, "{drift}");
+        }
+    }
+
+    #[test]
+    fn repair_layout_inspection_preserves_pending_release_admission_errors() {
+        let (_temp, conn) = runtime_upgrade_fixture(false, false);
+        conn.execute_with_params(
+            "INSERT INTO metadata (rowid, key, value) VALUES (91, ?, '')",
+            &[SqliteValue::from(crate::sync::METADATA_SYNC_MERGE_PENDING)],
+        )
+        .unwrap();
+        let before = legacy_v15_test_state(&conn);
+        let error = inspect_current_schema_for_repair(&conn).unwrap_err();
+        assert!(error.to_string().contains("sync merge is pending"), "{error}");
+        assert_eq!(legacy_v15_test_state(&conn), before);
     }
 
     #[test]

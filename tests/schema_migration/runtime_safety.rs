@@ -1,10 +1,12 @@
 //! Release-layout incompatibility must never authorize generic reconstruction.
 
 use super::{
-    released_schema19_workspace, run_br, schema19_authority_rows, schema19_json,
-    schema19_tracker_files, seed_schema19_database_authority,
+    TableRows, edit_schema19_fixture, engine_rows, header_user_version, released_schema19_workspace,
+    run_br, schema19_authority_rows, schema19_json, schema19_tracker_files,
+    seed_schema19_database_authority, seed_workflow_schema19_operator_state,
+    workflow_schema19_authority, workflow_schema19_durable_files, workflow_schema19_workspace,
 };
-use crate::common::cli::run_br_with_env;
+use crate::common::cli::{BrWorkspace, run_br_with_env};
 use beads_rust::franken_sync::Connection;
 use serde_json::{Value, json};
 use std::fs;
@@ -111,6 +113,324 @@ fn generic_repair_refuses_release_upgrade_before_any_rebuild_or_session() {
     assert_eq!(plan["eligible"], true);
     assert_eq!(plan["forecast"]["schema19_runtime_upgrade"], additions);
     assert_eq!(schema19_tracker_files(&beads), before);
+}
+
+fn current_release_workflow_workspace() -> BrWorkspace {
+    let workspace = workflow_schema19_workspace();
+    seed_workflow_schema19_operator_state(&workspace);
+    // Start with the real release database and install exactly the two known
+    // additions. The unsupported-layout tests must not pass only because the
+    // older, missing-additions gate already refuses this source.
+    edit_schema19_fixture(
+        &workspace,
+        &[
+            "ALTER TABLE close_metadata ADD COLUMN closed_by TEXT",
+            "UPDATE close_metadata SET closed_by = 'preserved close actor'",
+            "CREATE TABLE jsonl_row_receipts (issue_id TEXT PRIMARY KEY, row_hash TEXT NOT NULL)",
+            "INSERT INTO jsonl_row_receipts (rowid, issue_id, row_hash) VALUES (77, 'release-66o', 'preserved receipt')",
+            "INSERT INTO config (rowid, key, value) VALUES (101, 'operator_duplicate', 'older'), (207, 'operator_duplicate', 'newer')",
+            "INSERT INTO metadata (rowid, key, value) VALUES (173, 'operator_duplicate', 'older'), (277, 'operator_duplicate', 'newer')",
+            "UPDATE issues SET rowid = 4096 WHERE id = 'release-9sp'",
+        ],
+    );
+    workspace
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn generic_repair_refuses_readable_unreviewed_current_layout_before_any_mutation() {
+    const GATE: &str = "schema_current_layout_unsupported";
+    let variants: &[&[&str]] = &[
+        &[],
+        &["--dry-run"],
+        &["--unsafe-auto-fix"],
+        &["--dry-run", "--unsafe-auto-fix"],
+        &["--only", "fm-schemas-missing-required-column"],
+        &["--skip", "fm-schemas-missing-required-column"],
+        &["--allow-repeated-repair"],
+    ];
+    for table in ["issues", "config", "metadata"] {
+        let workspace = current_release_workflow_workspace();
+        edit_schema19_fixture(
+            &workspace,
+            &[
+                &format!("ALTER TABLE {table} ADD COLUMN operator_payload BLOB"),
+                &format!("UPDATE {table} SET operator_payload = X'0001FF007F'"),
+            ],
+        );
+        let beads = workspace.root.join(".beads");
+        let db = beads.join("beads.db");
+        assert_eq!(header_user_version(&db), 19);
+        let rows = workflow_schema19_authority(&db);
+        let (columns, records) = &rows[table];
+        let payload = columns
+            .iter()
+            .position(|column| column == "operator_payload")
+            .expect("opaque authoritative column is present");
+        assert!(!records.is_empty());
+        assert!(
+            records
+                .iter()
+                .all(|row| row[payload] == "blob [0, 1, 255, 0, 127]")
+        );
+        assert_eq!(rows["issues"].1.len(), 4);
+        assert_eq!(rows["events"].1.len(), 23);
+        assert_eq!(rows["close_metadata"].1.len(), 1);
+        assert_eq!(rows["jsonl_row_receipts"].1.len(), 1);
+        assert_eq!(rows["gate_result_history"].1.len(), 2);
+        assert_eq!(rows["capacity_exemption_history"].1.len(), 2);
+        assert_eq!(
+            fs::read_to_string(beads.join("issues.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            3,
+            "the JSONL cannot recreate every release database record"
+        );
+
+        // Pre-create only the normal authority files. The guard must inspect
+        // a private family snapshot before opening or repairing the source.
+        let authority =
+            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                &beads,
+                &db,
+                Some(1000),
+            )
+            .unwrap();
+        authority.bind_database_inode_for_mutation().unwrap();
+        drop(authority);
+        let before = schema19_tracker_files(&beads);
+        let runs = workspace.root.join("repair-run-artifacts");
+        for (index, extra) in variants.iter().enumerate() {
+            let mut args = vec!["doctor", "--repair", "--json"];
+            args.extend_from_slice(extra);
+            let refused = run_br_with_env(
+                &workspace,
+                args,
+                [("BR_DOCTOR_RUNS_DIR", runs.as_os_str())],
+                &format!("unreviewed_{table}_generic_repair_{index}"),
+            );
+            // A partial-repair failure after installing a JSONL replacement
+            // is still data loss. Check authority before trusting its exit.
+            assert_eq!(
+                workflow_schema19_authority(&db),
+                rows,
+                "{table}: {extra:?}"
+            );
+            assert!(
+                schema19_tracker_files(&beads) == before,
+                "{table}: {extra:?} changed tracker files: {} {}",
+                refused.stdout,
+                refused.stderr
+            );
+            assert_eq!(
+                refused.status.code(),
+                Some(4),
+                "{} {}",
+                refused.stdout,
+                refused.stderr
+            );
+            let report: Value =
+                serde_json::from_str(&refused.stdout).expect("whole refusal JSON");
+            assert_eq!(report["ok"], false);
+            assert_eq!(report["code"], "refused_unsafe");
+            assert_eq!(report["gate"], GATE);
+            assert_eq!(report["evidence"]["gate"], GATE);
+            assert_eq!(report["evidence"]["finding"], "schema.runtime");
+            assert_eq!(report["evidence"]["user_version"], 19);
+            assert_eq!(report["evidence"]["runtime_compatible"], false);
+            assert_eq!(
+                report["evidence"]["layout_classification"],
+                "unsupported_current_layout"
+            );
+            assert_eq!(
+                report["evidence"]["dry_run"],
+                extra.contains(&"--dry-run")
+            );
+            assert_eq!(report["recovery_audit"]["outcome"], "refused");
+            assert!(report["recovery_audit"].get("applied_actions").is_none());
+            assert!(
+                !runs.exists(),
+                "refusal must precede repair-session creation"
+            );
+            assert!(!workspace.root.join(".doctor").exists());
+            assert!(!beads.join(".br_recovery").exists());
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn generic_repair_restores_current_owned_index_without_jsonl_reconstruction() {
+    const MAINTENANCE: &str = "fm-schemas-current-runtime-maintenance";
+    for (label, selected) in [("default", false), ("selected", true)] {
+        let workspace = current_release_workflow_workspace();
+        edit_schema19_fixture(&workspace, &["DROP INDEX idx_config_key"]);
+        let beads = workspace.root.join(".beads");
+        let db = beads.join("beads.db");
+        let rows = workflow_schema19_authority(&db);
+        let catalog_columns = TableRows::from([(
+            "sqlite_schema".to_owned(),
+            (
+                ["type", "name", "tbl_name", "rootpage", "sql"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                Vec::new(),
+            ),
+        )]);
+        let catalog = engine_rows(&db, Some(&catalog_columns));
+        let authority =
+            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                &beads,
+                &db,
+                Some(1000),
+            )
+            .unwrap();
+        authority.bind_database_inode_for_mutation().unwrap();
+        drop(authority);
+        let before_preview = schema19_tracker_files(&beads);
+        let runs = workspace.root.join("repair-run-artifacts");
+        let mut preview_args = vec!["doctor", "--repair", "--dry-run", "--json"];
+        if selected {
+            preview_args.extend_from_slice(&["--only", MAINTENANCE]);
+        }
+        let preview = run_br_with_env(
+            &workspace,
+            preview_args,
+            [("BR_DOCTOR_RUNS_DIR", runs.as_os_str())],
+            &format!("current_index_repair_{label}_preview"),
+        );
+        let preview = schema19_json(&preview);
+        assert_eq!(preview["schema"], "br.doctor.repair-plan.v1");
+        let candidates = preview["candidate_repairs"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1, "{preview}");
+        assert_eq!(
+            candidates[0]["id"],
+            "doctor.repair_current_schema_maintenance"
+        );
+        let runtime = preview["report"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "schema.runtime")
+            .unwrap();
+        assert_eq!(
+            runtime["details"]["layout_classification"],
+            "current_maintenance_required"
+        );
+        assert_eq!(schema19_tracker_files(&beads), before_preview);
+        assert!(!runs.exists());
+
+        if !selected {
+            let skipped = run_br_with_env(
+                &workspace,
+                ["doctor", "--repair", "--skip", MAINTENANCE, "--json"],
+                [("BR_DOCTOR_RUNS_DIR", runs.as_os_str())],
+                "current_index_repair_skip_refusal",
+            );
+            assert_eq!(schema19_tracker_files(&beads), before_preview);
+            assert_eq!(workflow_schema19_authority(&db), rows);
+            assert_eq!(
+                skipped.status.code(),
+                Some(4),
+                "{} {}",
+                skipped.stdout,
+                skipped.stderr
+            );
+            let refusal: Value =
+                serde_json::from_str(&skipped.stdout).expect("whole skip refusal JSON");
+            assert_eq!(refusal["code"], "refused_unsafe");
+            assert_eq!(refusal["gate"], "schema_current_maintenance_required");
+            assert!(!runs.exists());
+            assert!(!workspace.root.join(".doctor").exists());
+            assert!(!beads.join(".br_recovery").exists());
+        }
+
+        let mut source_artifacts = workflow_schema19_durable_files(&workspace);
+        for name in ["beads.db", "beads.db-wal", "beads.db-journal"] {
+            source_artifacts.remove(Path::new(name));
+        }
+        let mut apply_args = vec!["doctor", "--repair", "--json"];
+        if selected {
+            apply_args.extend_from_slice(&["--only", MAINTENANCE]);
+        }
+        let repaired = run_br_with_env(
+            &workspace,
+            apply_args,
+            [("BR_DOCTOR_RUNS_DIR", runs.as_os_str())],
+            &format!("current_index_repair_{label}_apply"),
+        );
+        assert_eq!(workflow_schema19_authority(&db), rows);
+        let mut repaired_catalog = engine_rows(&db, Some(&catalog_columns));
+        let indexes = &mut repaired_catalog.get_mut("sqlite_schema").unwrap().1;
+        let restored = indexes
+            .iter()
+            .find(|row| row[1] == "text Some(\"idx_config_key\")")
+            .expect("the missing owned index must actually be recreated");
+        assert_eq!(restored[0], "text Some(\"index\")");
+        assert_eq!(restored[2], "text Some(\"config\")");
+        indexes.retain(|row| row[1] != "text Some(\"idx_config_key\")");
+        assert_eq!(
+            repaired_catalog, catalog,
+            "only the missing index may change the catalog"
+        );
+        let mut after_artifacts = workflow_schema19_durable_files(&workspace);
+        for name in ["beads.db", "beads.db-wal", "beads.db-journal"] {
+            after_artifacts.remove(Path::new(name));
+        }
+        assert_eq!(after_artifacts, source_artifacts);
+        assert_eq!(header_user_version(&db), 19);
+        assert!(!beads.join(".br_recovery").exists());
+
+        // Unrelated findings in this deliberately rich tracker may remain.
+        // Maintenance must finish without another fixer or JSONL replacement.
+        let report: Value = serde_json::from_str(&repaired.stdout).unwrap_or_else(|error| {
+            panic!(
+                "whole repair JSON: {error}: {} {}",
+                repaired.stdout, repaired.stderr
+            )
+        });
+        assert_eq!(report["repaired"], true, "{report}");
+        assert_eq!(report["current_schema_maintenance_verified"], true);
+        assert_eq!(
+            report["recovery_audit"]["phase"],
+            "doctor.current_schema_maintenance"
+        );
+        assert_eq!(
+            report["recovery_audit"]["action"],
+            "doctor.repair_current_schema_maintenance"
+        );
+        let actions = report["recovery_audit"]["applied_actions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(actions.as_slice(), &[json!("current_schema_maintenance")]);
+        assert!(report["recovery_audit"].get("imported").is_none());
+
+        // Repeat only the selected maintenance. Remaining, unrelated findings
+        // do not authorize new work during this idempotence check.
+        let repeated_source = workflow_schema19_durable_files(&workspace);
+        let repeated = run_br_with_env(
+            &workspace,
+            ["doctor", "--repair", "--only", MAINTENANCE, "--json"],
+            [("BR_DOCTOR_RUNS_DIR", runs.as_os_str())],
+            &format!("current_index_repair_{label}_repeat"),
+        );
+        assert_eq!(
+            workflow_schema19_durable_files(&workspace),
+            repeated_source
+        );
+        assert_eq!(workflow_schema19_authority(&db), rows);
+        let repeated: Value =
+            serde_json::from_str(&repeated.stdout).expect("whole repeat JSON");
+        assert_eq!(repeated["repaired"], false);
+        assert!(
+            repeated["recovery_audit"]["applied_actions"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+        assert!(!beads.join(".br_recovery").exists());
+    }
 }
 
 /// Reconstruct a persisted undo intent, then commit newer work only to its

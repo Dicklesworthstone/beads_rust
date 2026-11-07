@@ -871,6 +871,20 @@ authoritative tables, or unrecognized indexes. A missing current-version
 and use the diagnostic commands above; a reviewed decision must account for
 the unsupported state before any replacement.
 
+Generic `br doctor --repair` also refuses an unsupported current-version
+layout when its schema metadata can be read. The refusal precedes fixer
+dispatch and repair-session creation, including dry runs, fixer filters and
+`--unsafe-auto-fix`. A failed storage open cannot turn unknown columns or
+workflow records into permission to reconstruct the tracker from JSONL.
+Preserve the database family and diagnose the reported layout difference;
+unrelated row corruption does not authorize discarding recognized extra state.
+For missing owned indexes and the narrowly admitted cache layouts below,
+doctor uses dedicated transactional maintenance and reports the remaining
+findings. That invocation does not continue into JSONL reconstruction, even
+if another diagnostic still reports an error. If maintenance cannot complete,
+the command stops; failure does not authorize replacement either. A dry run
+identifies the same narrow maintenance path without applying it.
+
 An otherwise admitted layout may restore missing br-owned indexes in place,
 with admission, repair and the final layout check in one write transaction.
 This preserves existing configuration and metadata rows, their row IDs, and

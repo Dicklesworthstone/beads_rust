@@ -16,8 +16,8 @@ use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassificatio
 use crate::output::{OutputContext, rich_text_panel};
 use crate::storage::SqliteStorage;
 use crate::storage::schema::{
-    CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedRuntimeSchemaUpgrade,
-    reviewed_runtime_schema_upgrade,
+    CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS, CurrentSchemaRepairInspection,
+    ReviewedRuntimeSchemaUpgrade, inspect_current_schema_for_repair, maintain_current_schema_atomic,
 };
 use crate::storage::sqlite::{PendingSyncMergeInspection, database_header_user_version};
 #[cfg(test)]
@@ -446,6 +446,7 @@ const FM_SQLITE_PAGE_MALFORMED: &str = "fm-state_files-sqlite-page-malformed";
 const FM_WAL_SHM_SIDECAR_ORPHAN: &str = "fm-state_files-wal-shm-sidecar-orphan";
 const FM_MISSING_REQUIRED_TABLE: &str = "fm-schemas-missing-required-table";
 const FM_MISSING_REQUIRED_COLUMN: &str = "fm-schemas-missing-required-column";
+const FM_CURRENT_SCHEMA_MAINTENANCE: &str = "fm-schemas-current-runtime-maintenance";
 const JSONL_REBUILD_FILTERED_REASON: &str =
     "JSONL rebuild filtered out by --only/--skip (no rebuild-addressed FM allowed)";
 
@@ -734,22 +735,31 @@ fn emit_refused_unsafe(
     }
 }
 
-/// Recognize only the reviewed release-layout upgrade. An unreadable or
-/// unsupported layout keeps its existing explicit best-effort repair path;
-/// this probe does not authorize that path or replace its other refusal gates.
-/// Private inspection precedes even namespace-sidecar mode repair.
-fn reviewed_runtime_upgrade_before_repair(db_path: &Path) -> Option<ReviewedRuntimeSchemaUpgrade> {
-    if !fs::symlink_metadata(db_path).is_ok_and(|metadata| metadata.is_file()) {
-        return None;
+/// Inspect layout evidence on a private copy before even namespace-sidecar
+/// mode repair. Unsupported readable declarations are not corruption. A
+/// failed inspection remains an error, not a compatible-layout verdict or
+/// authorization to rebuild; the separate recovery gates still apply.
+fn current_schema_layout_before_repair(
+    db_path: &Path,
+) -> Result<Option<CurrentSchemaRepairInspection>> {
+    let metadata = match fs::symlink_metadata(db_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
     }
     config::with_database_family_snapshot(db_path, |snapshot| {
         let conn = Connection::open(snapshot.to_string_lossy().into_owned())?;
-        let upgrade = reviewed_runtime_schema_upgrade(&conn);
-        conn.close()?;
-        upgrade
+        let inspection = inspect_current_schema_for_repair(&conn);
+        if let Err(error) = conn.close() {
+            // A private-copy close failure cannot erase positive evidence
+            // that the source contains an unsupported authoritative layout.
+            tracing::debug!(%error, "doctor layout inspection snapshot close failed");
+        }
+        inspection.map(Some)
     })
-    .ok()
-    .flatten()
 }
 
 fn reviewed_runtime_upgrade_in_report(
@@ -773,6 +783,169 @@ fn reviewed_runtime_upgrade_in_report(
         .ok()
         .filter(|upgrade| upgrade.jsonl_row_receipts_created || upgrade.closed_by_column_added)
     })
+}
+
+fn unsupported_current_layout_in_report(report: &DoctorReport) -> Option<&str> {
+    report.checks.iter().find_map(|check| {
+        if check.name != "schema.runtime" || check.status != CheckStatus::Error {
+            return None;
+        }
+        let details = check.details.as_ref()?;
+        if details.get("user_version").and_then(serde_json::Value::as_i64)
+            != Some(i64::from(CURRENT_SCHEMA_VERSION))
+            || details
+                .get("layout_classification")
+                .and_then(serde_json::Value::as_str)
+                != Some("unsupported_current_layout")
+        {
+            return None;
+        }
+        Some(
+            details
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the readable current layout is outside the reviewed maintenance profiles"),
+        )
+    })
+}
+
+/// Presence is a positive read-only observation; an unknown pending state
+/// remains an inspection error and is not reinterpreted as absence.
+fn pending_sync_merge_in_report(report: &DoctorReport) -> Option<&serde_json::Value> {
+    report.checks.iter().find_map(|check| {
+        if check.name != "sync.merge_pending" {
+            return None;
+        }
+        let details = check.details.as_ref()?;
+        (details.get("pending").and_then(serde_json::Value::as_bool) == Some(true))
+            .then_some(details)
+    })
+}
+
+fn report_requires_current_schema_maintenance(report: &DoctorReport) -> bool {
+    report.checks.iter().any(|check| {
+        check.name == "schema.runtime"
+            && check.status == CheckStatus::Error
+            && check.details.as_ref().is_some_and(|details| {
+                details.get("user_version").and_then(serde_json::Value::as_i64)
+                    == Some(i64::from(CURRENT_SCHEMA_VERSION))
+                    && details
+                        .get("layout_classification")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("current_maintenance_required")
+            })
+    })
+}
+
+fn refuse_doctor_repair_for_current_maintenance(
+    db_path: &Path,
+    reason: &str,
+    maintenance_attempted: bool,
+    dry_run: bool,
+    ctx: &OutputContext,
+) -> ! {
+    let message = format!(
+        "current-schema maintenance could not be completed and verified: {reason}. \
+         This does not authorize replacing authoritative database records from JSONL. \
+         Preserve the original database and resolve the maintenance failure; no JSONL \
+         reconstruction was applied"
+    );
+    let evidence = serde_json::json!({
+        "gate": "schema_current_maintenance_required",
+        "finding": "schema.runtime",
+        "database_path": db_path.display().to_string(),
+        "dry_run": dry_run,
+        "user_version": CURRENT_SCHEMA_VERSION,
+        "layout_classification": "current_maintenance_required",
+        "reason": reason,
+        "maintenance_attempted": maintenance_attempted,
+    });
+    emit_refused_unsafe("--repair", &message, &evidence, ctx);
+    crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
+}
+
+fn repair_current_schema_under_write_authority(
+    db_path: &Path,
+    lock_timeout_ms: Option<u64>,
+    session: &mut DoctorRepairSession,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+) -> Result<()> {
+    write_authority.verify_database_authority()?;
+    let family_paths = existing_sqlite_family_paths_for_legacy_op(db_path);
+    let path_refs: Vec<&Path> = family_paths.iter().map(PathBuf::as_path).collect();
+    session
+        .record_legacy_mutation_result(
+            "doctor.repair_current_schema_maintenance",
+            &path_refs,
+            || {
+                write_authority.verify_database_authority()?;
+                let _opener_lease = crate::sync::DatabaseOpenerLease::register(db_path)?;
+                let mut conn = Connection::open(db_path.to_string_lossy().into_owned())?;
+                conn.execute("PRAGMA wal_autocheckpoint=0")?;
+                let timeout_ms =
+                    lock_timeout_ms.unwrap_or_else(crate::sync::default_write_lock_timeout_ms);
+                conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
+                // The dedicated transaction rechecks version, pending merge,
+                // triggers, exact declarations and incoming cache references.
+                // It writes no metadata defaults or runtime witness.
+                let maintenance =
+                    maintain_current_schema_atomic(&conn, "doctor current-schema maintenance");
+                let close = conn.close_without_checkpoint_in_place();
+                maintenance?;
+                close?;
+                write_authority.verify_database_authority()?;
+                Ok(())
+            },
+        )?
+        .ok_or_else(|| {
+            BeadsError::internal("current-schema maintenance was skipped by its repair session")
+        })
+}
+
+fn verify_current_schema_maintenance_completed(db_path: &Path) -> Result<()> {
+    match current_schema_layout_before_repair(db_path)? {
+        Some(CurrentSchemaRepairInspection::Compatible) => Ok(()),
+        Some(CurrentSchemaRepairInspection::Unsupported { reason }) => {
+            Err(BeadsError::Config(reason))
+        }
+        Some(CurrentSchemaRepairInspection::MaintenanceRequired) => Err(BeadsError::Config(
+            "the database still requires current-schema maintenance".to_owned(),
+        )),
+        Some(CurrentSchemaRepairInspection::ReviewedUpgrade(_)) => Err(BeadsError::Config(
+            "the database now requires a separately reviewed release-layout upgrade".to_owned(),
+        )),
+        Some(CurrentSchemaRepairInspection::NotCurrent) | None => Err(BeadsError::Config(
+            "the database is absent or no longer declares the inspected current schema".to_owned(),
+        )),
+    }
+}
+
+fn refuse_doctor_repair_for_unsupported_current_layout(
+    db_path: &Path,
+    layout_reason: &str,
+    dry_run: bool,
+    ctx: &OutputContext,
+) -> ! {
+    let reason = format!(
+        "this database declares schema {CURRENT_SCHEMA_VERSION}, but its readable runtime \
+         layout is unsupported: {layout_reason}. Generic doctor repair cannot preserve \
+         this database's authoritative records through JSONL reconstruction. Preserve the \
+         original database and use a binary or reviewed migration supporting its layout. \
+         No repair writes were applied"
+    );
+    let evidence = serde_json::json!({
+        "gate": "schema_current_layout_unsupported",
+        "finding": "schema.runtime",
+        "database_path": db_path.display().to_string(),
+        "dry_run": dry_run,
+        "user_version": CURRENT_SCHEMA_VERSION,
+        "runtime_compatible": false,
+        "layout_classification": "unsupported_current_layout",
+        "reason": layout_reason,
+        "recommended_fix": "Preserve the original database and use a binary or reviewed migration supporting its layout",
+    });
+    emit_refused_unsafe("--repair", &reason, &evidence, ctx);
+    crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
 }
 
 fn refuse_doctor_repair_for_runtime_upgrade(
@@ -1103,6 +1276,7 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     // schemas
     ("schema.tables", FM_MISSING_REQUIRED_TABLE),
     ("schema.columns", FM_MISSING_REQUIRED_COLUMN),
+    ("schema.runtime", FM_CURRENT_SCHEMA_MAINTENANCE),
     ("schema.inspect", "fm-schemas-issue-column-order-divergence"),
     // configs
     ("beads_dir", "fm-configs-metadata-json-stale"),
@@ -3834,6 +4008,39 @@ fn build_issue_write_probe_check(
     }
 }
 
+/// Repeat layout admission at the reconstruction boundary, including direct
+/// callers that do not pass through CLI dispatch. A failed metadata inspection
+/// does not prove compatibility; it leaves the separately authorized corrupt
+/// database recovery path and all of its other preconditions unchanged.
+fn refuse_known_current_layout_jsonl_rebuild(db_path: &Path) -> Result<()> {
+    let reason = match current_schema_layout_before_repair(db_path) {
+        Ok(Some(CurrentSchemaRepairInspection::Unsupported { reason })) => Some(reason),
+        Ok(Some(CurrentSchemaRepairInspection::ReviewedUpgrade(_))) => Some(
+            "the source requires the explicit reviewed release-layout upgrade".to_owned(),
+        ),
+        Ok(Some(CurrentSchemaRepairInspection::MaintenanceRequired)) => Some(
+            "the source requires dedicated current-schema index or derived-cache maintenance"
+                .to_owned(),
+        ),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "JSONL recovery could not classify source layout; no compatibility inferred"
+            );
+            None
+        }
+    };
+    if let Some(reason) = reason {
+        return Err(BeadsError::Config(format!(
+            "Refusing JSONL reconstruction of a readable current-schema source: {reason}. \
+             Preserve the original database; generic reconstruction cannot preserve its \
+             authoritative state"
+        )));
+    }
+    Ok(())
+}
+
 fn repair_database_from_jsonl(
     beads_dir: &Path,
     db_path: &Path,
@@ -3842,6 +4049,7 @@ fn repair_database_from_jsonl(
     show_progress: bool,
     session: Option<&mut DoctorRepairSession>,
 ) -> Result<DoctorRepairResult> {
+    refuse_known_current_layout_jsonl_rebuild(db_path)?;
     let jsonl_authority =
         blocking_jsonl_family_write_lock_with_timeout(jsonl_path, cli.lock_timeout)?;
     jsonl_authority.verify_jsonl_authority()?;
@@ -5052,17 +5260,18 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
         );
     }
 
-    // A current user_version is not sufficient: v0.7.6 and newer builds
-    // shipped distinct schema-19 layouts. Use the same strict classifier as
-    // migration planning and explicit healing, on this inspection snapshot.
+    // Version equality does not establish compatibility. Share the same
+    // release-layout and narrow-maintenance classifiers as repair preflight.
     let version = conn
         .query_row("PRAGMA user_version")?
         .get(0)
         .and_then(SqliteValue::as_integer);
     if version == Some(i64::from(CURRENT_SCHEMA_VERSION)) {
-        match reviewed_runtime_schema_upgrade(conn) {
-            Ok(None) => push_check(checks, "schema.runtime", CheckStatus::Ok, None, None),
-            Ok(Some(upgrade)) => push_check(
+        match inspect_current_schema_for_repair(conn) {
+            Ok(CurrentSchemaRepairInspection::Compatible) => {
+                push_check(checks, "schema.runtime", CheckStatus::Ok, None, None);
+            }
+            Ok(CurrentSchemaRepairInspection::ReviewedUpgrade(upgrade)) => push_check(
                 checks,
                 "schema.runtime",
                 CheckStatus::Error,
@@ -5076,6 +5285,41 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
                     "downgrade": "v0.7.6 cannot read the upgraded close_metadata layout; retain the complete recovery bundle and use guarded undo before further writes",
                 })),
             ),
+            Ok(CurrentSchemaRepairInspection::MaintenanceRequired) => push_check(
+                checks,
+                "schema.runtime",
+                CheckStatus::Error,
+                Some("Current schema requires reviewed index or derived-cache maintenance".to_owned()),
+                Some(serde_json::json!({
+                    "user_version": version,
+                    "runtime_compatible": false,
+                    "layout_classification": "current_maintenance_required",
+                    "recommended_fix": "br doctor --repair --only fm-schemas-current-runtime-maintenance",
+                })),
+            ),
+            Ok(CurrentSchemaRepairInspection::Unsupported { reason }) => push_check(
+                checks,
+                "schema.runtime",
+                CheckStatus::Error,
+                Some(reason.clone()),
+                Some(serde_json::json!({
+                    "user_version": version,
+                    "runtime_compatible": false,
+                    "layout_classification": "unsupported_current_layout",
+                    "reason": reason,
+                    "recommended_fix": "Preserve the original database and use a binary or reviewed migration supporting its layout",
+                })),
+            ),
+            Ok(CurrentSchemaRepairInspection::NotCurrent) => push_check(
+                checks,
+                "schema.runtime",
+                CheckStatus::Error,
+                Some("Database version changed during runtime-layout inspection".to_owned()),
+                Some(serde_json::json!({
+                    "user_version": version,
+                    "layout_classification": "inspection_failed",
+                })),
+            ),
             Err(error) => push_check(
                 checks,
                 "schema.runtime",
@@ -5084,6 +5328,7 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
                 Some(serde_json::json!({
                     "user_version": version,
                     "runtime_compatible": false,
+                    "layout_classification": "inspection_failed",
                     "recommended_fix": "br doctor migrate-schema plan --json",
                 })),
             ),
@@ -14834,16 +15079,47 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
-    // A known release-layout mismatch requires the reviewed lossless path.
-    // Refuse before the pending-merge admission gate can repair namespace
-    // modes, and before any generic fixer or repair session is created. The
-    // normal corruption/unknown-layout gates retain their existing behavior.
+    // Readable current layouts cannot become JSONL-reconstruction candidates
+    // just because the storage opener refuses them. Inspect before namespace
+    // repair, session creation, or any fixer. Inspection failures remain
+    // distinct from positive compatibility and leave corruption's other
+    // explicit recovery gates in charge.
+    let fixer_filter = FixerFilter::from_args(&args.only, &args.skip);
+    let mut current_schema_maintenance_needed = false;
     if args.repair
         && !args.robot_triage
         && !resolve_doctor_no_db(&beads_dir, cli)
-        && let Some(upgrade) = reviewed_runtime_upgrade_before_repair(&paths.db_path)
     {
-        refuse_doctor_repair_for_runtime_upgrade(&paths.db_path, upgrade, args.dry_run, ctx);
+        match current_schema_layout_before_repair(&paths.db_path) {
+            Ok(Some(CurrentSchemaRepairInspection::ReviewedUpgrade(upgrade))) => {
+                refuse_doctor_repair_for_runtime_upgrade(&paths.db_path, upgrade, args.dry_run, ctx);
+            }
+            Ok(Some(CurrentSchemaRepairInspection::Unsupported { reason })) => {
+                refuse_doctor_repair_for_unsupported_current_layout(
+                    &paths.db_path,
+                    &reason,
+                    args.dry_run,
+                    ctx,
+                );
+            }
+            Ok(Some(CurrentSchemaRepairInspection::MaintenanceRequired)) => {
+                if !fixer_filter.allows(FM_CURRENT_SCHEMA_MAINTENANCE) {
+                    refuse_doctor_repair_for_current_maintenance(
+                        &paths.db_path,
+                        "the dedicated maintenance action is excluded by --only/--skip",
+                        false,
+                        args.dry_run,
+                        ctx,
+                    );
+                }
+                current_schema_maintenance_needed = true;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                %error,
+                "doctor preflight could not classify runtime layout; no compatibility inferred"
+            ),
+        }
     }
 
     if args.repair && !args.dry_run && !args.robot_triage {
@@ -14892,13 +15168,54 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
+    // A pending merge freezes generic repair planning as well as writes.
+    // Reuse only positive presence from the read-only report; failed pending
+    // inspection must not be mistaken for either compatibility or absence.
+    if args.repair
+        && args.dry_run
+        && let Some(pending) = pending_sync_merge_in_report(&initial.report)
+    {
+        let reason = "a sync merge is pending; only br sync --merge may reconcile its original state before generic doctor repair can be planned. No repair writes were applied";
+        let evidence = serde_json::json!({
+            "gate": "sync.merge_pending",
+            "finding": "sync.merge_pending",
+            "pending": true,
+            "state": pending.get("state"),
+            "database_path": paths.db_path.display().to_string(),
+            "dry_run": true,
+            "remediation": "Run br sync --merge, verify that it clears the pending receipt, then rerun the requested doctor operation.",
+        });
+        emit_refused_unsafe("--repair --dry-run", reason, &evidence, ctx);
+        crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
+    }
+
     // Repeat against the report snapshot before generic repair planning.
-    // The preflight is deliberately a positive-only classifier, so no later
-    // observation of a reviewed upgrade may fall through to JSONL rebuilding.
     if args.repair
         && let Some(upgrade) = reviewed_runtime_upgrade_in_report(&initial.report)
     {
         refuse_doctor_repair_for_runtime_upgrade(&paths.db_path, upgrade, args.dry_run, ctx);
+    }
+
+    if args.repair {
+        if let Some(reason) = unsupported_current_layout_in_report(&initial.report) {
+            refuse_doctor_repair_for_unsupported_current_layout(
+                &paths.db_path,
+                reason,
+                args.dry_run,
+                ctx,
+            );
+        }
+        let maintenance_in_report = report_requires_current_schema_maintenance(&initial.report);
+        if current_schema_maintenance_needed && !maintenance_in_report {
+            refuse_doctor_repair_for_current_maintenance(
+                &paths.db_path,
+                "the later report could not confirm the previously inspected maintenance profile",
+                false,
+                args.dry_run,
+                ctx,
+            );
+        }
+        current_schema_maintenance_needed |= maintenance_in_report;
     }
 
     // An already healthy replacement cannot erase an earlier loss. Refuse
@@ -14942,6 +15259,19 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
+    if args.repair
+        && current_schema_maintenance_needed
+        && !fixer_filter.allows(FM_CURRENT_SCHEMA_MAINTENANCE)
+    {
+        refuse_doctor_repair_for_current_maintenance(
+            &paths.db_path,
+            "the dedicated maintenance action is excluded by --only/--skip",
+            false,
+            args.dry_run,
+            ctx,
+        );
+    }
+
     // Planning must stop before creating a repair session or invoking any
     // fixer. Even chokepointed dry-runs previously acquired database/JSONL
     // writer locks, created a missing database, or reached a write probe while
@@ -14976,10 +15306,85 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         None
     };
 
-    // Pass-5 cycle 1: per-FM filter built from --only/--skip flags.
-    // The 5 chokepointed fixers below consult the filter; legacy
-    // repair_* paths run unconditionally for now.
-    let fixer_filter = FixerFilter::from_args(&args.only, &args.skip);
+    // The inspected maintenance profile is the entire scope of this repair
+    // invocation. A successful narrow fix cannot authorize a later JSONL
+    // replacement for unrelated findings, nor can failure authorize fallback.
+    if args.repair && current_schema_maintenance_needed {
+        let authority = repair_write_authority.as_ref().ok_or_else(|| {
+            BeadsError::internal("current-schema repair has no database-family write authority")
+        })?;
+        let repair_session = session.as_mut().ok_or_else(|| {
+            BeadsError::internal("current-schema repair has no repair session")
+        })?;
+        if let Err(error) = repair_current_schema_under_write_authority(
+            &paths.db_path,
+            cli.lock_timeout,
+            repair_session,
+            authority,
+        ) {
+            refuse_doctor_repair_for_current_maintenance(
+                &paths.db_path,
+                &error.to_string(),
+                true,
+                false,
+                ctx,
+            );
+        }
+        if let Err(error) = verify_current_schema_maintenance_completed(&paths.db_path) {
+            refuse_doctor_repair_for_current_maintenance(
+                &paths.db_path,
+                &error.to_string(),
+                true,
+                false,
+                ctx,
+            );
+        }
+        let after_maintenance = match collect_report(DoctorInspectionMode::Full) {
+            Ok(report) => report,
+            Err(error) => refuse_doctor_repair_for_current_maintenance(
+                &paths.db_path,
+                &format!("post-maintenance report is unavailable: {error}"),
+                true,
+                false,
+                ctx,
+            ),
+        };
+        let verified = repair_report_verified(&after_maintenance.report);
+        let message = "Restored admitted current-schema indexes or derived cache without JSONL reconstruction. This invocation performed only that maintenance; remaining findings require separate diagnosis.";
+        let recovery_audit = RecoveryAuditRecord {
+            phase: "doctor.current_schema_maintenance".to_owned(),
+            action: "doctor.repair_current_schema_maintenance".to_owned(),
+            outcome: if verified { "verified" } else { "verification_failed" }.to_owned(),
+            reason: (!verified).then(|| {
+                "Current-schema maintenance passed, but other doctor findings remain".to_owned()
+            }),
+            applied_actions: vec!["current_schema_maintenance".to_owned()],
+            quarantined_artifacts: Vec::new(),
+            verified_backups: Vec::new(),
+            imported: None,
+            skipped: None,
+            fk_violations_cleaned: None,
+        };
+        emit_recovery_audit_record(&recovery_audit);
+        if ctx.is_json() {
+            ctx.json(&serde_json::json!({
+                "report": initial.report,
+                "repaired": true,
+                "current_schema_maintenance_verified": true,
+                "post_repair": after_maintenance.report,
+                "verified": verified,
+                "recovery_audit": recovery_audit,
+                "message": message,
+            }));
+        } else {
+            ctx.info(message);
+            print_report(&after_maintenance.report, ctx)?;
+        }
+        if !verified {
+            crate::shutdown::exit_process(DoctorExitCode::FixPartial.as_i32());
+        }
+        return Ok(());
+    }
 
     // Auto-fix root .gitignore if --repair is passed and the warning is present.
     let gitignore_repaired =
@@ -16138,11 +16543,22 @@ fn repair_dry_run_candidates(
 ) -> Vec<crate::cli::commands::doctor_subsystems::capabilities_doctor::FixerEntry> {
     use crate::cli::commands::doctor_subsystems::capabilities_doctor::DoctorCapabilities;
 
-    if reviewed_runtime_upgrade_in_report(report).is_some() {
+    if reviewed_runtime_upgrade_in_report(report).is_some()
+        || unsupported_current_layout_in_report(report).is_some()
+        || pending_sync_merge_in_report(report).is_some()
+    {
         return Vec::new();
     }
 
     let filter = FixerFilter::from_args(&args.only, &args.skip);
+    if report_requires_current_schema_maintenance(report) {
+        return DoctorCapabilities::build()
+            .fixers
+            .into_iter()
+            .filter(|fixer| fixer.id == "doctor.repair_current_schema_maintenance")
+            .filter(|fixer| fixer.filter_ids.iter().any(|id| filter.allows(id)))
+            .collect();
+    }
     let finding_kind = |name: &str, kind: &str| {
         report.checks.iter().any(|check| {
             check.name == name
@@ -16165,6 +16581,7 @@ fn repair_dry_run_candidates(
                 check.status == CheckStatus::Warn && fixer.addressed_findings.contains(&check.name)
             });
             match fixer.id.as_str() {
+                "doctor.repair_current_schema_maintenance" => false,
                 "doctor.repair_recoverable_db_state" => filter_allows_recoverable_db_state_repair(
                     &filter,
                     report_has_blocked_cache_rebuild_finding(report),
@@ -27049,16 +27466,184 @@ mod tests {
         report.checks.push(CheckResult {
             name: "schema.runtime".to_string(),
             status: CheckStatus::Error,
-            message: Some("unsupported runtime layout".to_string()),
-            details: Some(serde_json::json!({ "user_version": 19 })),
+            message: Some("runtime layout inspection failed".to_string()),
+            details: Some(serde_json::json!({
+                "user_version": 19,
+                "layout_classification": "inspection_failed",
+            })),
         });
         assert!(reviewed_runtime_upgrade_in_report(&report).is_none());
         assert!(
             repair_dry_run_candidates(&beads_dir, &report, &args)
                 .iter()
                 .any(|fixer| fixer.id == "doctor.repair_database_from_jsonl"),
-            "this bounded release-layout gate does not change unknown corruption recovery"
+            "a failed inspection is not positive unsupported-layout evidence"
         );
+    }
+
+    #[test]
+    fn current_layout_repair_candidates_are_narrow_and_respect_filters() {
+        let tmp = TempDir::new().unwrap();
+        let (beads_dir, _, mut report) = make_doctor_fixture(tmp.path());
+        report.checks.push(CheckResult {
+            name: "sqlite.integrity_check".to_owned(),
+            status: CheckStatus::Error,
+            message: Some("database disk image is malformed".to_owned()),
+            details: None,
+        });
+        let args = DoctorArgs {
+            repair: true,
+            dry_run: true,
+            unsafe_auto_fix: true,
+            ..DoctorArgs::default()
+        };
+        report.checks.push(CheckResult {
+            name: "schema.runtime".to_owned(),
+            status: CheckStatus::Error,
+            message: Some("extra authoritative issue column".to_owned()),
+            details: Some(serde_json::json!({
+                "user_version": CURRENT_SCHEMA_VERSION,
+                "runtime_compatible": false,
+                "layout_classification": "unsupported_current_layout",
+                "reason": "extra authoritative issue column",
+            })),
+        });
+        assert_eq!(
+            unsupported_current_layout_in_report(&report),
+            Some("extra authoritative issue column")
+        );
+        assert!(
+            repair_dry_run_candidates(&beads_dir, &report, &args).is_empty(),
+            "positive unknown-layout evidence overrides unrelated corruption and unsafe-auto-fix"
+        );
+
+        let current = report.checks.last_mut().unwrap();
+        current.message = Some("missing owned index".to_owned());
+        current.details = Some(serde_json::json!({
+            "user_version": CURRENT_SCHEMA_VERSION,
+            "runtime_compatible": false,
+            "layout_classification": "current_maintenance_required",
+        }));
+        assert!(unsupported_current_layout_in_report(&report).is_none());
+        assert!(report_requires_current_schema_maintenance(&report));
+        let candidates = repair_dry_run_candidates(&beads_dir, &report, &args);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "doctor.repair_current_schema_maintenance");
+
+        for (only, skip) in [
+            (vec![FM_JSONL_ROW_COUNT_MISMATCH.to_owned()], Vec::new()),
+            (Vec::new(), vec![FM_CURRENT_SCHEMA_MAINTENANCE.to_owned()]),
+            (
+                vec![FM_CURRENT_SCHEMA_MAINTENANCE.to_owned()],
+                vec![FM_CURRENT_SCHEMA_MAINTENANCE.to_owned()],
+            ),
+        ] {
+            let filtered = DoctorArgs {
+                repair: true,
+                dry_run: true,
+                unsafe_auto_fix: true,
+                only,
+                skip,
+                ..DoctorArgs::default()
+            };
+            assert!(
+                repair_dry_run_candidates(&beads_dir, &report, &filtered).is_empty(),
+                "excluding safe maintenance must not select JSONL reconstruction"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_merge_repair_preview_requires_positive_presence_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let (beads_dir, _, mut report) = make_doctor_fixture(tmp.path());
+        report.checks.push(CheckResult {
+            name: "sqlite.integrity_check".to_owned(),
+            status: CheckStatus::Error,
+            message: Some("database disk image is malformed".to_owned()),
+            details: None,
+        });
+        let args = DoctorArgs {
+            repair: true,
+            dry_run: true,
+            unsafe_auto_fix: true,
+            ..DoctorArgs::default()
+        };
+        for condition in ["valid", "legacy", "malformed"] {
+            let mut pending = report.clone();
+            pending.checks.push(CheckResult {
+                name: "sync.merge_pending".to_owned(),
+                status: CheckStatus::Error,
+                message: Some("merge is pending".to_owned()),
+                details: Some(serde_json::json!({
+                    "pending": true,
+                    "state": { "condition": condition },
+                })),
+            });
+            assert!(pending_sync_merge_in_report(&pending).is_some());
+            assert!(
+                repair_dry_run_candidates(&beads_dir, &pending, &args).is_empty(),
+                "{condition}: a frozen source cannot advertise JSONL reconstruction"
+            );
+        }
+        report.checks.push(CheckResult {
+            name: "sync.merge_pending".to_owned(),
+            status: CheckStatus::Error,
+            message: Some("could not inspect pending state".to_owned()),
+            details: Some(serde_json::json!({ "pending": "unknown" })),
+        });
+        assert!(pending_sync_merge_in_report(&report).is_none());
+        assert!(
+            repair_dry_run_candidates(&beads_dir, &report, &args)
+                .iter()
+                .any(|fixer| fixer.id == "doctor.repair_database_from_jsonl"),
+            "failed pending inspection remains separate from positive presence"
+        );
+    }
+
+    #[test]
+    fn jsonl_rebuild_boundary_refuses_known_current_layouts_without_writes() {
+        for drift in [
+            "DROP INDEX idx_config_key",
+            "ALTER TABLE issues ADD COLUMN operator_payload BLOB",
+            "DROP TABLE jsonl_row_receipts",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("beads.db");
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            crate::storage::schema::apply_schema(&conn).unwrap();
+            conn.execute(drift).unwrap();
+            conn.close().unwrap();
+            let family_bytes = || {
+                existing_sqlite_family_paths_for_legacy_op(&db_path)
+                    .into_iter()
+                    .map(|path| {
+                        let bytes = fs::read(&path).unwrap();
+                        (path, bytes)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = family_bytes();
+            let error = refuse_known_current_layout_jsonl_rebuild(&db_path).unwrap_err();
+            assert!(
+                error.to_string().contains("Refusing JSONL reconstruction"),
+                "{drift}: {error}"
+            );
+            assert_eq!(family_bytes(), before, "{drift}");
+        }
+    }
+
+    #[test]
+    fn unreadable_layout_probe_is_an_error_without_an_unsupported_verdict() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let bytes = b"not a SQLite database";
+        fs::write(&db_path, bytes).unwrap();
+        assert!(current_schema_layout_before_repair(&db_path).is_err());
+        // This guard abstains; it does not perform reconstruction or replace
+        // any of the existing explicit corruption-recovery preconditions.
+        assert!(refuse_known_current_layout_jsonl_rebuild(&db_path).is_ok());
+        assert_eq!(fs::read(&db_path).unwrap(), bytes);
     }
 
     #[test]
