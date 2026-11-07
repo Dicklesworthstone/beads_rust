@@ -1524,6 +1524,130 @@ fn schema19_workflows_reads_and_implicit_upgrades_preserve_source() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn schema19_workflows_unreviewed_core_layouts_refuse_without_losing_columns() {
+    // Both reviewed additions are already present. Each core-table extension
+    // must independently refuse ordinary startup instead of reaching the
+    // generic rebuild, which cannot preserve unknown columns or rowids.
+    for table in ["issues", "config", "metadata"] {
+        let workspace = workflow_schema19_workspace();
+        seed_workflow_schema19_operator_state(&workspace);
+        edit_schema19_fixture(
+            &workspace,
+            &[
+                "ALTER TABLE close_metadata ADD COLUMN closed_by TEXT",
+                "UPDATE close_metadata SET closed_by = 'retained close actor'",
+                "CREATE TABLE jsonl_row_receipts (issue_id TEXT PRIMARY KEY, row_hash TEXT NOT NULL)",
+                "INSERT INTO jsonl_row_receipts VALUES ('release-66o', 'retained receipt')",
+                "INSERT INTO config (rowid, key, value) VALUES (101, 'operator_duplicate', 'older'), (207, 'operator_duplicate', 'newer')",
+                "INSERT INTO metadata (rowid, key, value) VALUES (173, 'operator_duplicate', 'older'), (277, 'operator_duplicate', 'newer')",
+                "UPDATE issues SET rowid = 4096 WHERE id = 'release-9sp'",
+                &format!("ALTER TABLE {table} ADD COLUMN operator_payload BLOB"),
+                &format!("UPDATE {table} SET operator_payload = X'0001FF007F'"),
+            ],
+        );
+        let beads = workspace.root.join(".beads");
+        let db = beads.join("beads.db");
+        let before = workflow_schema19_authority(&db);
+        let (columns, rows) = &before[table];
+        let payload = columns
+            .iter()
+            .position(|column| column == "operator_payload")
+            .expect("populated opaque core-table column");
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row[payload] == "blob [0, 1, 255, 0, 127]")
+        );
+        assert!(
+            before["issues"]
+                .1
+                .iter()
+                .any(|row| row[0] == "integer 4096")
+        );
+        assert!(before["config"].1.iter().any(|row| row[0] == "integer 207"));
+        assert!(
+            before["metadata"]
+                .1
+                .iter()
+                .any(|row| row[0] == "integer 277")
+        );
+        assert_eq!(header_user_version(&db), 19);
+
+        let source = schema19_tracker_files(&beads);
+        for args in [
+            vec!["doctor", "migrate-schema", "plan", "--json"],
+            vec!["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+        ] {
+            let refused = run_br(&workspace, args, &format!("workflow19_{table}_inspect"));
+            assert!(
+                !refused.status.success(),
+                "{} {}",
+                refused.stdout,
+                refused.stderr
+            );
+            let output: Value = serde_json::from_str(&refused.stdout).expect("structured refusal");
+            assert_eq!(output["error"]["code"], "CONFIG_ERROR");
+            assert_ne!(output.get("heal_needed"), Some(&Value::Bool(false)));
+            assert!(output.get("plan_token").is_none());
+            assert_eq!(schema19_tracker_files(&beads), source);
+            assert_eq!(workflow_schema19_authority(&db), before);
+        }
+
+        // Establish the engine's frame-free WAL before testing refused
+        // writers; all subsequent durable bytes, including this WAL, must
+        // remain exact. Coordination files are not authoritative records.
+        let baseline = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        baseline.query("SELECT 1").unwrap();
+        baseline.close().unwrap();
+        assert_eq!(fs::read(&db).unwrap(), source[Path::new("beads.db")]);
+        let wal = fs::read(beads.join("beads.db-wal")).expect("writer baseline WAL");
+        assert!(matches!(wal.len(), 0 | 32), "baseline WAL contains frames");
+        let durable = workflow_schema19_durable_files(&workspace);
+        for args in [
+            vec!["sync", "--import-only", "--json"],
+            vec!["create", "must preserve unknown core columns", "--json"],
+        ] {
+            let refused = run_br(&workspace, args, &format!("workflow19_{table}_writer"));
+            assert!(
+                !refused.status.success(),
+                "{} {}",
+                refused.stdout,
+                refused.stderr
+            );
+            let output: Value = serde_json::from_str(&refused.stdout).expect("structured refusal");
+            assert!(matches!(
+                output["error"]["code"].as_str(),
+                Some("CONFIG_ERROR" | "SCHEMA_MISMATCH")
+            ));
+            assert!(
+                output["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("schema"),
+                "unexpected refusal: {output}"
+            );
+            assert_eq!(workflow_schema19_durable_files(&workspace), durable);
+            assert_eq!(workflow_schema19_authority(&db), before);
+        }
+        let error = beads_rust::storage::SqliteStorage::open(&db)
+            .expect_err("ordinary storage open must refuse an unreviewed current layout");
+        assert!(
+            matches!(&error, beads_rust::BeadsError::Config(_)),
+            "{error}"
+        );
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("schema"),
+            "{error}"
+        );
+        assert_eq!(workflow_schema19_durable_files(&workspace), durable);
+        assert_eq!(workflow_schema19_authority(&db), before);
+        assert!(!beads.join(".br_recovery/schema-migrations").exists());
+    }
+}
+
+#[test]
 fn schema19_workflows_heal_without_jsonl_preserves_history_and_repeats() {
     let workspace = workflow_schema19_workspace();
     seed_workflow_schema19_operator_state(&workspace);

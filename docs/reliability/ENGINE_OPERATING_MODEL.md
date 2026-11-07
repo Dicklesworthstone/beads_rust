@@ -205,6 +205,42 @@ transition and direct the operator to explicit planning. `plan` and
 `apply` or `heal` installs the verified candidate. Pending merge metadata
 freezes the source catalog and refuses the transition.
 
+Current-version startup also attests every authoritative core and workflow
+table before general schema maintenance. The admission separates table
+declarations from index availability: existing columns, defaults, key and
+constraint semantics must be canonical; absent owned indexes are permitted
+only when their database-wide names are unoccupied. Extra columns, unknown
+index definitions and missing authoritative tables refuse before DDL. A
+database declaring the current version with no `issues` table cannot enter
+the fresh-bootstrap path.
+The current-version path bypasses both historical migration bundles. It holds
+one `BEGIN IMMEDIATE` transaction across repeated version, pending-merge and
+layout admission, permitted DDL and the complete runtime postcondition.
+Failures trigger rollback; a rollback failure explicitly reports that the
+transaction state is unknown.
+
+Admitted current-version maintenance restores owned DDL without replaying
+legacy row normalizers or globally retiring historical index names. Missing
+`config` and `metadata` indexes never justify copying those tables, so their
+existing raw rows and hidden row IDs retain duplicate-key precedence. The
+derived blocked cache is the narrow exception: its exact known nullable
+three-column layout or absence can be repaired; opaque extensions cannot be
+discarded. Before replacing a legacy cache, the repair refuses foreign keys
+from other tables into it, regardless of whether FK enforcement is enabled.
+Only a recreated cache invalidates the derived `blocked_cache_state` metadata
+inside that transaction. Existing marker rows, including duplicates, become
+stale without changing their row IDs or multiplicity; a missing marker is
+inserted. All other metadata stays intact. Read paths then derive blocking in
+memory until a writer refreshes the cache; missing-index-only restoration does
+not change any marker or cache rows.
+
+An intentional force-import data reset has a separate entry point that attests
+the intact current layout before the first DROP in the caller's write
+transaction. It also refuses incoming foreign keys from tables outside its
+reset set, preventing cascade deletion or nulling of retained operator rows.
+The reset recreates the data tables while retaining config, metadata and JSONL
+row receipts, and verifies the resulting runtime layout before returning.
+
 New plans include `forecast.schema19_preservation` with profile
 `schema19-layout-preservation-v1` and `source_sha256`. The digest binds raw
 source values and storage classes, multiplicities, application/operator table

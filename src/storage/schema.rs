@@ -859,6 +859,10 @@ pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {
 /// Returns an error if the SQL execution fails or pragmas cannot be set.
 pub fn apply_schema(conn: &Connection) -> Result<()> {
     validate_schema_version_for_mutation(conn, "schema application")?;
+    if connection_user_version(conn)? == current_schema_version_u32()? {
+        maintain_current_schema_atomic(conn, "schema application")?;
+        return apply_runtime_pragmas(conn);
+    }
     refuse_persistent_triggers(conn, "schema application")?;
     refuse_schema_repair_during_pending_merge(conn)?;
     refuse_implicit_runtime_schema_upgrade(conn, "schema application")?;
@@ -1160,6 +1164,11 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
             "schema migrate refused — source schema {from} is newer than supported version {supported_target}"
         )));
     }
+    if from == supported_target {
+        // Current-version maintenance has its own transaction and never
+        // stamps a version or enters the historical migration engine.
+        return maintain_current_schema_atomic(conn, "schema migration");
+    }
     refuse_persistent_triggers(conn, "schema migration")?;
     if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         let marked_at = Utc::now().to_rfc3339();
@@ -1215,6 +1224,10 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
 
 pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     validate_schema_version_for_mutation(conn, "runtime schema repair")?;
+    if connection_user_version(conn)? == current_schema_version_u32()? {
+        maintain_current_schema_atomic(conn, "runtime schema repair")?;
+        return apply_runtime_pragmas(conn);
+    }
     refuse_persistent_triggers(conn, "runtime schema repair")?;
     refuse_schema_repair_during_pending_merge(conn)?;
     refuse_implicit_runtime_schema_upgrade(conn, "runtime schema repair")?;
@@ -1227,6 +1240,157 @@ pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
         .map_err(BeadsError::Database)?;
     apply_runtime_pragmas(conn)?;
+    Ok(())
+}
+
+/// Hold the writer transaction from admission through the final runtime
+/// attestation. Current layouts must never reach legacy table projections,
+/// data normalizers or global index retirement, even after concurrent DDL.
+fn maintain_current_schema_atomic(conn: &Connection, operation: &str) -> Result<()> {
+    // BEGIN failure leaves any caller-owned transaction untouched. Reset has
+    // its own explicitly guarded path inside its existing write transaction.
+    conn.execute("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        maintain_current_schema_in_transaction(conn, operation)?;
+        conn.execute("COMMIT")?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match conn.execute("ROLLBACK") {
+            Ok(_) => Err(error),
+            Err(rollback_error) => Err(BeadsError::WithContext {
+                context: format!(
+                    "{operation} rollback failed; transaction state is unknown: {rollback_error}"
+                ),
+                source: Box::new(error),
+            }),
+        },
+    }
+}
+
+fn maintain_current_schema_in_transaction(conn: &Connection, operation: &str) -> Result<()> {
+    let version = connection_user_version(conn)?;
+    if version != current_schema_version_u32()? {
+        return Err(BeadsError::Config(format!(
+            "{operation} refused: expected current schema {CURRENT_SCHEMA_VERSION}, observed \
+             {version} inside the maintenance transaction"
+        )));
+    }
+    refuse_persistent_triggers(conn, operation)?;
+    refuse_schema_repair_during_pending_merge(conn)?;
+    refuse_implicit_runtime_schema_upgrade(conn, operation)?;
+    let cache_recreated = attest_current_schema_maintenance(conn, operation)?;
+
+    // Admission permits only a canonical cache, the exact nullable legacy
+    // cache, or absence. Missing indexes on a canonical cache require no DROP.
+    if table_exists(conn, "blocked_issues_cache") && cache_recreated {
+        refuse_external_references_to_tables(conn, operation, &["blocked_issues_cache"])?;
+        conn.execute("DROP TABLE main.blocked_issues_cache")?;
+    }
+    execute_batch(conn, SCHEMA_SQL)?;
+    if cache_recreated {
+        // Existing fresh markers must not make the new empty cache suppress
+        // blockers that remain present in the authoritative dependency graph.
+        super::SqliteStorage::mark_blocked_cache_stale_in_tx(conn)?;
+    }
+    if !runtime_schema_compatible_with_release_additions(conn, false) {
+        return Err(BeadsError::Config(format!(
+            "{operation} post-check failed: the maintained runtime layout is not canonical"
+        )));
+    }
+    Ok(())
+}
+
+/// Replacing a parent table can cascade-delete or null operator records even
+/// though its own declaration is canonical. With foreign keys disabled it
+/// can instead leave dangling references, so refuse independently of that
+/// connection setting. Internal relationships within an explicit reset set
+/// are allowed because both sides are deliberately reset together.
+fn refuse_external_references_to_tables(
+    conn: &Connection,
+    operation: &str,
+    replaced_tables: &[&str],
+) -> Result<()> {
+    for table in conn.query("SELECT name FROM main.sqlite_schema WHERE type = 'table' ORDER BY name")? {
+        let name = table
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| BeadsError::internal("schema table name is not text"))?;
+        if replaced_tables.iter().any(|table| name.eq_ignore_ascii_case(table)) {
+            continue;
+        }
+        let escaped = name.replace('\'', "''");
+        for foreign_key in conn.query(&format!("PRAGMA main.foreign_key_list('{escaped}')"))? {
+            let parent = foreign_key
+                .get(2)
+                .and_then(SqliteValue::as_text)
+                .ok_or_else(|| BeadsError::internal("foreign-key parent table name is not text"))?;
+            if replaced_tables.iter().any(|table| parent.eq_ignore_ascii_case(table)) {
+                return Err(BeadsError::Config(format!(
+                    "{operation} refused: table {name} has a foreign key referencing {parent}; \
+                     replacing that parent could change authoritative records outside the \
+                     replacement set. Preserve those records and resolve the relationship explicitly"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recreate data tables only after attesting the intact source inside the
+/// caller's write transaction. The ordinary repair entry points must never
+/// infer this intentional reset from an absent `issues` table.
+pub(super) fn reset_data_tables_in_transaction(conn: &Connection) -> Result<()> {
+    const RESET_TABLES: &[&str] = &[
+        "blocked_issues_cache",
+        "export_hashes",
+        "dirty_issues",
+        "child_counters",
+        "events",
+        "comments",
+        "labels",
+        "dependencies",
+        "gate_result_history",
+        "gate_results",
+        "capacity_exemption_history",
+        "capacity_exemptions",
+        "capacity_occupancy",
+        "close_metadata",
+        "issues",
+    ];
+    if !conn.as_async().in_transaction() {
+        return Err(BeadsError::internal(
+            "data table reset requires the caller's write transaction",
+        ));
+    }
+    refuse_persistent_triggers(conn, "data table reset")?;
+    refuse_schema_repair_during_pending_merge(conn)?;
+    refuse_implicit_runtime_schema_upgrade(conn, "data table reset")?;
+    if !runtime_schema_compatible_with_release_additions(conn, false) {
+        return Err(BeadsError::Config(
+            "data table reset refused: the current runtime layout must be canonical before \
+             any tables are dropped; preserve the source database and resolve its schema first"
+                .to_owned(),
+        ));
+    }
+    refuse_external_references_to_tables(conn, "data table reset", RESET_TABLES)?;
+    for table in RESET_TABLES {
+        conn.execute(&format!(
+            "DROP TABLE IF EXISTS main.{}",
+            quote_sql_identifier(table)
+        ))?;
+    }
+    // Config, metadata and JSONL row receipts retain their exact tables and
+    // rows. Only this explicit reset may recreate authoritative tables; the
+    // ordinary current-version maintenance admission requires their presence.
+    execute_batch(conn, SCHEMA_SQL)?;
+    if !runtime_schema_compatible_with_release_additions(conn, false) {
+        return Err(BeadsError::Config(
+            "data table reset post-check failed: the recreated runtime layout is not canonical"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1275,6 +1439,7 @@ pub(crate) fn table_exists(conn: &Connection, table: &str) -> bool {
     conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
 }
 
+#[cfg(test)]
 fn index_exists(conn: &Connection, index: &str) -> bool {
     let escaped_index = index.replace('\'', "''");
     let sql = format!("SELECT 1 FROM sqlite_master WHERE type='index' AND name='{escaped_index}'");
@@ -2644,9 +2809,17 @@ fn auxiliary_runtime_table_canonical(
     columns: &[AuxiliaryRuntimeColumn],
     indexes: &[ExpectedRuntimeIndex],
 ) -> bool {
+    auxiliary_runtime_table_declaration_canonical(conn, table, columns)
+        && auxiliary_runtime_indexes_canonical(conn, table, indexes)
+}
+
+fn auxiliary_runtime_table_declaration_canonical(
+    conn: &Connection,
+    table: &str,
+    columns: &[AuxiliaryRuntimeColumn],
+) -> bool {
     auxiliary_runtime_columns_canonical(conn, table, columns)
         && auxiliary_runtime_issue_foreign_key_canonical(conn, table)
-        && auxiliary_runtime_indexes_canonical(conn, table, indexes)
         && auxiliary_runtime_primary_key_shape_canonical(conn, table, columns)
         && runtime_table_options_canonical(conn, table)
         && table_check_constraints_canonical(conn, table, &[])
@@ -2838,6 +3011,178 @@ fn core_runtime_table_declaration_canonical(
         "DIAG core_runtime_table_declaration_canonical table={table} cols={cols} fks={fks} pk={pk} opts={opts} checks={checks} clauses={clauses} ai={ai} uniq={uniq}"
     );
     cols && fks && pk && opts && checks && clauses && ai && uniq
+}
+
+/// Current-version maintenance may restore missing owned indexes, but cannot
+/// project authoritative tables into a different layout. In particular, an
+/// extra column must never become permission to rebuild `issues` or KV tables.
+/// Returns whether the derived cache needs recreation, only after positively
+/// identifying its canonical, exact nullable legacy, or absent declaration.
+/// The caller already holds the writer transaction and verified the version.
+#[allow(clippy::too_many_lines)]
+fn attest_current_schema_maintenance(conn: &Connection, operation: &str) -> Result<bool> {
+    let gate_history_indexes: Vec<_> = GATE_RESULT_HISTORY_INDEXES
+        .iter()
+        .map(|&(name, columns)| runtime_index(name, columns, false, false))
+        .collect();
+    for (table, columns, indexes) in [
+        ("issues", ISSUES_RUNTIME_COLUMNS, ISSUES_RUNTIME_INDEXES),
+        (
+            "dependencies",
+            DEPENDENCIES_RUNTIME_COLUMNS,
+            DEPENDENCIES_RUNTIME_INDEXES,
+        ),
+        ("labels", LABELS_RUNTIME_COLUMNS, LABELS_RUNTIME_INDEXES),
+        (
+            "comments",
+            COMMENTS_RUNTIME_COLUMNS,
+            COMMENTS_RUNTIME_INDEXES,
+        ),
+        ("events", EVENTS_RUNTIME_COLUMNS, EVENTS_RUNTIME_INDEXES),
+        (
+            "gate_result_history",
+            GATE_RESULT_HISTORY_COLUMNS,
+            gate_history_indexes.as_slice(),
+        ),
+        ("config", CONFIG_RUNTIME_COLUMNS, CONFIG_RUNTIME_INDEXES),
+        (
+            "metadata",
+            METADATA_RUNTIME_COLUMNS,
+            METADATA_RUNTIME_INDEXES,
+        ),
+        (
+            "dirty_issues",
+            DIRTY_ISSUES_RUNTIME_COLUMNS,
+            DIRTY_ISSUES_RUNTIME_INDEXES,
+        ),
+        ("export_hashes", EXPORT_HASHES_RUNTIME_COLUMNS, &[][..]),
+        ("child_counters", CHILD_COUNTERS_RUNTIME_COLUMNS, &[][..]),
+        (
+            "jsonl_row_receipts",
+            JSONL_ROW_RECEIPTS_RUNTIME_COLUMNS,
+            &[][..],
+        ),
+    ] {
+        let references: &[&str] = match table {
+            "issues" | "config" | "metadata" | "jsonl_row_receipts" => &[],
+            "child_counters" => &["parent_id"],
+            _ => &["issue_id"],
+        };
+        let declaration_ok = core_runtime_table_declaration_canonical(
+            conn,
+            table,
+            columns,
+            references,
+            matches!(table, "issues" | "gate_result_history"),
+            matches!(table, "comments" | "events" | "gate_result_history").then_some("id"),
+            matches!(table, "config" | "metadata"),
+        ) && (table != "issues" || issues_required_checks_canonical(conn));
+        if !declaration_ok || !current_maintenance_indexes_repairable(conn, table, indexes) {
+            return Err(BeadsError::Config(format!(
+                "{operation} refused: schema {CURRENT_SCHEMA_VERSION} has an unreviewed \
+                 layout for core table {table}; ordinary maintenance cannot recreate or \
+                 rebuild authoritative tables. Preserve the original database and resolve \
+                 its columns, constraints, or operator indexes explicitly"
+            )));
+        }
+    }
+
+    for (table, columns, indexes) in [
+        ("close_metadata", CLOSE_METADATA_COLUMNS, CLOSE_METADATA_INDEXES),
+        ("gate_results", GATE_RESULTS_COLUMNS, GATE_RESULTS_INDEXES),
+        (
+            "capacity_exemptions",
+            CAPACITY_EXEMPTION_COLUMNS,
+            CAPACITY_EXEMPTION_INDEXES,
+        ),
+        (
+            "capacity_exemption_history",
+            CAPACITY_EXEMPTION_HISTORY_COLUMNS,
+            CAPACITY_EXEMPTION_HISTORY_INDEXES,
+        ),
+        (
+            "capacity_occupancy",
+            CAPACITY_OCCUPANCY_COLUMNS,
+            CAPACITY_OCCUPANCY_INDEXES,
+        ),
+    ] {
+        if !auxiliary_runtime_table_declaration_canonical(conn, table, columns)
+            || (table == "capacity_exemption_history"
+                && !table_declares_autoincrement_primary_key(conn, table, "id"))
+            || !current_maintenance_indexes_repairable(conn, table, indexes)
+        {
+            return Err(BeadsError::Config(format!(
+                "{operation} refused: schema {CURRENT_SCHEMA_VERSION} has an unreviewed \
+                 layout for workflow table {table}; ordinary maintenance cannot invent \
+                 or replace authoritative workflow records. Preserve the original database \
+                 and resolve its columns, constraints, or operator indexes explicitly"
+            )));
+        }
+    }
+
+    // This derived cache has one supported legacy repair shape. Refuse opaque
+    // added columns or other unknown declarations even here: calling a table
+    // a cache does not authorize discarding an operator's extensions.
+    let cache_columns = [
+        schema_column("issue_id", "TEXT", false, None, 1),
+        schema_column("blocked_by", "TEXT", false, None, 0),
+        schema_column("blocked_at", "DATETIME", false, None, 0),
+    ];
+    let canonical_cache = core_runtime_table_declaration_canonical(
+        conn,
+        "blocked_issues_cache",
+        BLOCKED_CACHE_RUNTIME_COLUMNS,
+        &["issue_id"],
+        false,
+        None,
+        false,
+    );
+    let cache_declaration_ok = canonical_cache
+        || runtime_schema_name_absent(conn, "blocked_issues_cache")
+        || core_runtime_table_declaration_canonical(
+            conn,
+            "blocked_issues_cache",
+            &cache_columns,
+            &[],
+            false,
+            None,
+            false,
+        );
+    if !cache_declaration_ok
+        || !current_maintenance_indexes_repairable(
+            conn,
+            "blocked_issues_cache",
+            BLOCKED_CACHE_RUNTIME_INDEXES,
+        )
+    {
+        return Err(BeadsError::Config(format!(
+            "{operation} refused: schema {CURRENT_SCHEMA_VERSION} has an unreviewed layout \
+             for blocked_issues_cache; preserve its unknown columns and schema objects \
+             instead of replacing the table"
+        )));
+    }
+    Ok(!canonical_cache)
+}
+
+fn current_maintenance_indexes_repairable(
+    conn: &Connection,
+    table: &str,
+    indexes: &[ExpectedRuntimeIndex],
+) -> bool {
+    reviewed_source_indexes_canonical(conn, table, indexes)
+        && indexes.iter().all(|index| {
+            // SQLite index names are database-wide. An absent table-local
+            // index may be an occupied name on an operator table, which
+            // CREATE INDEX IF NOT EXISTS would silently leave untouched.
+            runtime_schema_name_absent(conn, index.name)
+                || conn
+                    .query_with_params(
+                        "SELECT 1 FROM main.sqlite_schema WHERE type = 'index' \
+                         AND name = ? AND tbl_name = ?",
+                        &[SqliteValue::from(index.name), SqliteValue::from(table)],
+                    )
+                    .is_ok_and(|rows| rows.len() == 1)
+        })
 }
 
 /// Refuse historical core-table layouts the reviewed migration cannot preserve.
@@ -3953,14 +4298,11 @@ fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
     })
 }
 
-fn kv_table_needs_canonical_rebuild(conn: &Connection, table: &str, expected_index: &str) -> bool {
-    // Use PRAGMA table_info for the existence check instead of sqlite_master,
-    // which can return inconsistent results in fsqlite.
-    let table_has_rows = conn
-        .query(&format!("PRAGMA table_info('{table}')"))
-        .is_ok_and(|rows| !rows.is_empty());
-    table_has_rows
-        && (!index_exists(conn, expected_index) || kv_table_uses_primary_key(conn, table))
+fn kv_table_needs_canonical_rebuild(conn: &Connection, table: &str) -> bool {
+    // A missing non-unique accelerator needs only CREATE INDEX. Rebuilding a
+    // canonical KV table would renumber sparse rowids and change duplicate-key
+    // precedence, even though its key/value payloads appear unchanged.
+    kv_table_uses_primary_key(conn, table)
 }
 
 fn rebuild_kv_table_without_unique(conn: &Connection, table: &str) -> Result<()> {
@@ -4010,10 +4352,10 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
     // Legacy schemas used PRIMARY KEY on config/metadata key columns.
     // Rebuild to plain key-value tables so standard sqlite integrity checks
     // are not tripped by unsupported unique-index maintenance behavior.
-    if kv_table_needs_canonical_rebuild(conn, "config", "idx_config_key") {
+    if kv_table_needs_canonical_rebuild(conn, "config") {
         rebuild_kv_table_without_unique(conn, "config")?;
     }
-    if kv_table_needs_canonical_rebuild(conn, "metadata", "idx_metadata_key") {
+    if kv_table_needs_canonical_rebuild(conn, "metadata") {
         rebuild_kv_table_without_unique(conn, "metadata")?;
     }
 
@@ -4195,8 +4537,8 @@ fn refuse_implicit_runtime_schema_upgrade(conn: &Connection, operation: &str) ->
              preservation and downgrade guarantees before applying it"
         )));
     }
-    // A fresh bootstrap or the intentional in-transaction table reset has no
-    // issues table yet. Its schema creation is not an existing-layout upgrade.
+    // Bootstrap at version zero is handled separately. A current-version
+    // missing core table still fails the maintenance admission that follows.
     Ok(())
 }
 
@@ -4375,11 +4717,10 @@ fn runtime_schema_compatible_with_release_additions(
         GATE_RESULTS_INDEXES,
     );
     let gate_history_ok = attest_gate_result_history_schema(conn).is_ok();
-    // v16/v17 capacity tables (#384). Checking them here means a database
-    // stamped at the current version but missing these tables (e.g. one
-    // produced by a pre-#398 reviewed migration, which never created them)
-    // is healed by `apply_schema` on the next open instead of failing at
-    // runtime with "no such table".
+    // v16/v17 capacity tables (#384) remain authoritative even when an older
+    // migration stamped the current version without creating them. A missing
+    // table invalidates runtime admission; ordinary startup cannot recreate
+    // unknown history merely because the version number matches.
     let capacity_exemptions_ok = capacity_exemptions_schema_canonical(conn);
     let capacity_occupancy_ok = capacity_occupancy_schema_canonical(conn);
     let capacity_ok = capacity_exemptions_ok && capacity_occupancy_ok;
@@ -4552,6 +4893,10 @@ pub(crate) fn record_runtime_schema_witness(conn: &Connection, attested_cookie: 
 /// This handles upgrades for tables that may have been created with older schemas.
 #[allow(clippy::too_many_lines)]
 fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
+    if connection_user_version(conn)? == current_schema_version_u32()? {
+        return maintain_current_schema_atomic(conn, "general schema maintenance");
+    }
+    refuse_schema_repair_during_pending_merge(conn)?;
     refuse_implicit_runtime_schema_upgrade(conn, "general schema maintenance")?;
     // Migration: ensure blocked_issues_cache has the canonical derived-cache
     // schema, including NOT NULL payload columns. Older br/bd paths could
@@ -8942,6 +9287,354 @@ mod tests {
         );
     }
 
+    fn current_schema_table_records(
+        conn: &Connection,
+    ) -> Vec<(String, Vec<Vec<SqliteValue>>)> {
+        conn.query("SELECT name FROM main.sqlite_schema WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let name = row.get(0).and_then(SqliteValue::as_text).unwrap().to_owned();
+                let records = conn
+                    .query(&format!(
+                        "SELECT rowid, * FROM main.{} ORDER BY rowid",
+                        quote_sql_identifier(&name)
+                    ))
+                    .unwrap()
+                    .iter()
+                    .map(|record| record.values().to_vec())
+                    .collect();
+                (name, records)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn current_schema_index_repair_preserves_raw_rows_and_operator_schema() {
+        for repair in [
+            apply_schema as fn(&Connection) -> Result<()>,
+            apply_runtime_compatible_schema,
+            |conn| run_migrations_atomic(conn, 19, 19),
+        ] {
+            let (_temp, conn) = runtime_upgrade_fixture(true, true);
+            execute_batch(
+                &conn,
+                "INSERT INTO issues (rowid, id, title, notes, compaction_level) \
+                 VALUES (41, 'br-preserve', 'Preserve rows', X'00ff7f', NULL);
+                 INSERT INTO config (rowid, key, value) VALUES \
+                 (17, 'duplicate', X'80ff00'), (91, 'duplicate', 'latest config');
+                 INSERT INTO metadata (rowid, key, value) VALUES \
+                 (23, 'duplicate', X'ff0001'), (89, 'duplicate', 'latest metadata'), \
+                 (97, 'blocked_cache_state', '');
+                 INSERT INTO events (id, issue_id, event_type, actor, comment) \
+                 VALUES (205, 'br-preserve', 'updated', 'auditor', X'ff0080');
+                 UPDATE sqlite_sequence SET seq = 701 WHERE name = 'events';
+                 INSERT INTO close_metadata (rowid, issue_id, closed_by, bypass_reason) \
+                 VALUES (55, 'br-preserve', 'recorded actor', X'0080ff');
+                 INSERT INTO jsonl_row_receipts (rowid, issue_id, row_hash) \
+                 VALUES (77, 'br-preserve', 'existing receipt');
+                 INSERT INTO blocked_issues_cache (rowid, issue_id, blocked_by) \
+                 VALUES (31, 'br-preserve', '[]');
+                 CREATE TABLE operator_records (
+                     id INTEGER PRIMARY KEY, payload BLOB,
+                     cache_issue TEXT REFERENCES \"BLOCKED_ISSUES_CACHE\"(issue_id) ON DELETE CASCADE
+                 );
+                 INSERT INTO operator_records (id, payload, cache_issue) \
+                 VALUES (301, X'00ff0080', 'br-preserve');
+                 CREATE INDEX idx_dependencies_issue_id ON operator_records(id);
+                 DROP INDEX idx_config_key;
+                 DROP INDEX idx_metadata_key;
+                 DROP INDEX idx_issues_status;
+                 DROP INDEX idx_gate_result_history_issue;
+                 DROP INDEX idx_capacity_occupancy_actor;
+                 DROP INDEX idx_blocked_cache_blocked_at;",
+            )
+            .unwrap();
+            let records = current_schema_table_records(&conn);
+            let non_index_schema = format!(
+                "{:?}",
+                conn.query(
+                    "SELECT type, name, tbl_name, rootpage, sql FROM main.sqlite_schema \
+                     WHERE type != 'index' ORDER BY type, name"
+                )
+                .unwrap()
+            );
+            let operator_index = format!(
+                "{:?}",
+                conn.query("SELECT * FROM main.sqlite_schema WHERE name = 'idx_dependencies_issue_id'")
+                    .unwrap()
+            );
+            assert!(!runtime_schema_compatible(&conn));
+
+            let (result, statements) =
+                crate::franken_sync::statement_log::capture(|| repair(&conn));
+            result.unwrap();
+            let begin = statements.iter().position(|sql| sql == "BEGIN IMMEDIATE").unwrap();
+            let commit = statements.iter().position(|sql| sql == "COMMIT").unwrap();
+            for (index, sql) in statements.iter().enumerate() {
+                if sql.contains("CREATE INDEX") || sql.contains("CREATE TABLE") {
+                    assert!(begin < index && index < commit, "DDL outside transaction: {sql}");
+                }
+                assert!(!sql.contains("issues_rebuild_tmp"), "legacy projection: {sql}");
+                assert!(!sql.starts_with("DROP TABLE"), "index repair dropped a table: {sql}");
+                assert!(!sql.starts_with("UPDATE "), "index repair changed rows: {sql}");
+            }
+            assert!(!conn.as_async().in_transaction());
+
+            assert_eq!(current_schema_table_records(&conn), records);
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    conn.query(
+                        "SELECT type, name, tbl_name, rootpage, sql FROM main.sqlite_schema \
+                         WHERE type != 'index' ORDER BY type, name"
+                    )
+                    .unwrap()
+                ),
+                non_index_schema
+            );
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    conn.query("SELECT * FROM main.sqlite_schema WHERE name = 'idx_dependencies_issue_id'")
+                        .unwrap()
+                ),
+                operator_index,
+                "current maintenance must not retire an operator's legacy-named index"
+            );
+            for (table, expected) in [
+                ("config", "latest config"),
+                ("metadata", "latest metadata"),
+            ] {
+                let latest = conn
+                    .query_row(&format!(
+                        "SELECT value FROM {table} WHERE key = 'duplicate' ORDER BY rowid DESC LIMIT 1"
+                    ))
+                    .unwrap();
+                assert_eq!(latest.get(0).and_then(SqliteValue::as_text), Some(expected));
+            }
+            assert_eq!(
+                conn.query_row("SELECT compaction_level FROM issues WHERE id = 'br-preserve'")
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Null)
+            );
+            assert!(runtime_schema_compatible(&conn));
+            assert_eq!(connection_user_version(&conn).unwrap(), 19);
+        }
+    }
+
+    #[test]
+    fn current_schema_maintenance_refuses_unknown_layouts_before_writes() {
+        for drift in [
+            "ALTER TABLE issues ADD COLUMN operator_payload BLOB; \
+             UPDATE issues SET operator_payload = X'00ff80'",
+            "ALTER TABLE blocked_issues_cache ADD COLUMN operator_payload BLOB; \
+             INSERT INTO blocked_issues_cache (issue_id, blocked_by, operator_payload) \
+             VALUES ('br-preserve', '[]', X'00ff80')",
+            "ALTER TABLE capacity_occupancy ADD COLUMN operator_payload BLOB; \
+             INSERT INTO capacity_occupancy (issue_id, operator_payload) \
+             VALUES ('br-preserve', X'00ff80')",
+            "DROP TABLE issues",
+            "DROP TABLE labels",
+            "DROP TABLE capacity_exemption_history",
+            "DROP INDEX idx_config_key; \
+             CREATE TABLE operator_records (payload BLOB); \
+             INSERT INTO operator_records VALUES (X'80ff00'); \
+             CREATE INDEX idx_config_key ON operator_records(payload)",
+        ] {
+            let (temp, conn) = runtime_upgrade_fixture(true, true);
+            execute_batch(
+                &conn,
+                "INSERT INTO issues (rowid, id, title, compaction_level) \
+                 VALUES (41, 'br-preserve', 'Preserve unknown state', NULL);
+                 INSERT INTO config (rowid, key, value) VALUES (17, 'opaque', X'80ff00');
+                 INSERT INTO metadata (rowid, key, value) VALUES (91, 'opaque', X'00ff80');",
+            )
+            .unwrap();
+            execute_batch(&conn, drift).unwrap();
+            let before = legacy_v15_test_state(&conn);
+            for repair in [
+                apply_schema as fn(&Connection) -> Result<()>,
+                apply_runtime_compatible_schema,
+                |conn| run_migrations_atomic(conn, 19, 19),
+            ] {
+                let error = repair(&conn).unwrap_err();
+                assert!(error.to_string().contains("schema"), "{drift}: {error}");
+                assert_eq!(legacy_v15_test_state(&conn), before, "{drift}");
+            }
+            let error = crate::storage::SqliteStorage::open(&temp.path().join("beads.db"))
+                .unwrap_err();
+            assert!(error.to_string().contains("schema"), "{drift}: {error}");
+            assert_eq!(legacy_v15_test_state(&conn), before, "{drift}");
+        }
+    }
+
+    #[test]
+    fn current_schema_cache_repair_refuses_incoming_foreign_keys() {
+        for action in ["CASCADE", "SET NULL"] {
+            for foreign_keys in [false, true] {
+                let (_temp, conn) = runtime_upgrade_fixture(true, true);
+                execute_batch(
+                    &conn,
+                    &format!(
+                        r#"
+                        INSERT INTO issues (id, title) VALUES ('br-cache', 'Cache parent');
+                        DROP TABLE blocked_issues_cache;
+                        CREATE TABLE blocked_issues_cache (
+                            issue_id TEXT PRIMARY KEY, blocked_by TEXT, blocked_at DATETIME
+                        );
+                        INSERT INTO blocked_issues_cache (rowid, issue_id, blocked_by)
+                        VALUES (71, 'br-cache', NULL);
+                        CREATE TABLE "operator'cache" (
+                            cache_issue TEXT REFERENCES "BLOCKED_ISSUES_CACHE"(issue_id)
+                                ON DELETE {action},
+                            payload BLOB
+                        );
+                        INSERT INTO "operator'cache" (rowid, cache_issue, payload)
+                        VALUES (901, 'br-cache', X'00ff80');
+                        DROP INDEX idx_config_key;
+                        "#
+                    ),
+                )
+                .unwrap();
+                conn.execute(if foreign_keys {
+                    "PRAGMA foreign_keys = ON"
+                } else {
+                    "PRAGMA foreign_keys = OFF"
+                })
+                .unwrap();
+                let before = legacy_v15_test_state(&conn);
+                for repair in [
+                    apply_schema as fn(&Connection) -> Result<()>,
+                    apply_runtime_compatible_schema,
+                    |conn| run_migrations_atomic(conn, 19, 19),
+                ] {
+                    let (result, statements) =
+                        crate::franken_sync::statement_log::capture(|| repair(&conn));
+                    let error = result.unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .contains("foreign key referencing blocked_issues_cache"),
+                        "{error}"
+                    );
+                    assert_eq!(legacy_v15_test_state(&conn), before);
+                    assert!(!conn.as_async().in_transaction());
+                    assert!(
+                        statements.iter().all(|sql| {
+                            !sql.starts_with("DROP ")
+                                && !sql.starts_with("UPDATE ")
+                                && !sql.starts_with("INSERT ")
+                                && !sql.contains("CREATE INDEX")
+                                && !sql.contains("CREATE TABLE")
+                        }),
+                        "refusal must precede even unrelated index repair: {statements:?}"
+                    );
+                }
+                assert_eq!(
+                    conn.query_row("PRAGMA foreign_keys")
+                        .unwrap()
+                        .get(0)
+                        .and_then(SqliteValue::as_integer),
+                    Some(i64::from(foreign_keys))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_schema_maintenance_rolls_back_prior_ddl_and_retries() {
+        let (_temp, conn) = runtime_upgrade_fixture(true, true);
+        execute_batch(
+            &conn,
+            "DROP INDEX idx_issues_external_ref_unique;
+             INSERT INTO issues (id, title, external_ref, compaction_level) VALUES \
+             ('br-first', 'First', 'duplicate-ref', NULL), \
+             ('br-second', 'Second', 'duplicate-ref', NULL);
+             INSERT INTO metadata (rowid, key, value) VALUES (91, 'blocked_cache_state', '');
+             DROP TABLE blocked_issues_cache;
+             CREATE TABLE blocked_issues_cache (
+                 issue_id TEXT PRIMARY KEY, blocked_by TEXT, blocked_at DATETIME
+             );
+             INSERT INTO blocked_issues_cache (rowid, issue_id, blocked_by) \
+             VALUES (71, 'br-first', NULL);
+             DROP INDEX idx_issues_status;",
+        )
+        .unwrap();
+        let before = legacy_v15_test_state(&conn);
+        let (result, statements) =
+            crate::franken_sync::statement_log::capture(|| apply_schema(&conn));
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("unique"),
+            "{error}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|sql| sql == "DROP TABLE main.blocked_issues_cache")
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|sql| sql.contains("CREATE INDEX IF NOT EXISTS idx_issues_status"))
+        );
+        assert!(statements.iter().any(|sql| sql == "ROLLBACK"));
+        assert!(!conn.as_async().in_transaction());
+        assert_eq!(legacy_v15_test_state(&conn), before);
+
+        // Resolve the actual conflicting data explicitly, then retry the
+        // same maintenance operation and prove an additional retry is inert.
+        conn.execute("UPDATE issues SET external_ref = NULL WHERE id = 'br-second'")
+            .unwrap();
+        apply_schema(&conn).unwrap();
+        assert!(runtime_schema_compatible(&conn));
+        assert_eq!(
+            conn.query_row("SELECT value FROM metadata WHERE rowid = 91")
+                .unwrap()
+                .get(0)
+                .and_then(SqliteValue::as_text),
+            Some("stale")
+        );
+        let repaired = legacy_v15_test_state(&conn);
+        apply_schema(&conn).unwrap();
+        assert_eq!(legacy_v15_test_state(&conn), repaired);
+    }
+
+    #[test]
+    fn current_schema_maintenance_begin_failure_preserves_callers_transaction() {
+        let (_temp, conn) = runtime_upgrade_fixture(true, true);
+        conn.execute("DROP INDEX idx_labels_label").unwrap();
+        let original = legacy_v15_test_state(&conn);
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        conn.execute(
+            "INSERT INTO metadata (rowid, key, value) VALUES (91, 'caller-write', X'00ff80')",
+        )
+        .unwrap();
+        let caller_state = legacy_v15_test_state(&conn);
+        for repair in [
+            apply_schema as fn(&Connection) -> Result<()>,
+            apply_runtime_compatible_schema,
+            |conn| run_migrations_atomic(conn, 19, 19),
+        ] {
+            let (result, statements) =
+                crate::franken_sync::statement_log::capture(|| repair(&conn));
+            assert!(result.is_err());
+            assert!(conn.as_async().in_transaction());
+            assert_eq!(legacy_v15_test_state(&conn), caller_state);
+            assert!(
+                statements
+                    .iter()
+                    .all(|sql| sql != "COMMIT" && sql != "ROLLBACK")
+            );
+        }
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(legacy_v15_test_state(&conn), original);
+    }
+
     fn runtime_upgrade_fixture(
         receipts_present: bool,
         attribution_present: bool,
@@ -9226,7 +9919,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_schema_contract_rejects_and_heals_incomplete_capacity_table() {
+    fn test_runtime_schema_contract_refuses_implicit_capacity_layout_repair() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("incomplete_capacity_occupancy.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
@@ -9274,12 +9967,19 @@ mod tests {
             "an incomplete runtime contract must never mint a durable witness"
         );
 
-        apply_schema(&conn).expect("heal additive capacity column");
-        assert!(column_exists(&conn, "capacity_occupancy", "agent_name"));
-        assert!(runtime_schema_compatible(&conn));
+        let before = legacy_v15_test_state(&conn);
+        let error = apply_schema(&conn)
+            .expect_err("a current version stamp cannot authorize a workflow layout change");
+        assert!(
+            error.to_string().contains("workflow table capacity_occupancy"),
+            "{error}"
+        );
+        assert_eq!(legacy_v15_test_state(&conn), before);
+        assert!(!column_exists(&conn, "capacity_occupancy", "agent_name"));
+        assert!(!runtime_schema_compatible(&conn));
         let preserved = conn
             .query_row_with_params(
-                "SELECT actor, harness, session, agent_name FROM capacity_occupancy WHERE issue_id = ?",
+                "SELECT actor, harness, session FROM capacity_occupancy WHERE issue_id = ?",
                 &[SqliteValue::from("capacity-fixture")],
             )
             .expect("query preserved occupancy row");
@@ -9295,16 +9995,8 @@ mod tests {
             preserved.get(2).and_then(SqliteValue::as_text),
             Some("session-a")
         );
-        assert_eq!(
-            preserved.get(3).and_then(SqliteValue::as_text),
-            None,
-            "the additive nullable column must not fabricate agent attribution"
-        );
-
-        let repaired_cookie =
-            attest_runtime_schema_cookie(&conn).expect("attest repaired capacity table");
-        record_runtime_schema_witness(&conn, repaired_cookie).expect("record repaired witness");
-        assert!(runtime_schema_witness_matches(&conn));
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
+        assert!(!runtime_schema_witness_matches(&conn));
     }
 
     #[test]
@@ -9343,7 +10035,7 @@ mod tests {
         let error = apply_schema(&conn)
             .expect_err("repair must not invent a historical occupancy timestamp");
         assert!(
-            error.to_string().contains("required column 'recorded_at'"),
+            error.to_string().contains("workflow table capacity_occupancy"),
             "unexpected repair error: {error}"
         );
         assert!(
@@ -9393,7 +10085,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("column constraints or issue cascade are not canonical"),
+                .contains("workflow table capacity_occupancy"),
             "unexpected repair error: {error}"
         );
         assert!(attest_runtime_schema_cookie(&conn).is_err());
@@ -10462,7 +11154,8 @@ mod tests {
         record_runtime_schema_witness(&conn, attested_cookie).expect("record witness");
         assert!(runtime_schema_witness_matches(&conn));
 
-        conn.execute("DROP TABLE labels").expect("damage schema");
+        conn.execute("DROP INDEX idx_labels_label")
+            .expect("remove a repairable owned index");
         record_runtime_schema_witness(&conn, attested_cookie)
             .expect("record only the previously attested generation");
         assert!(

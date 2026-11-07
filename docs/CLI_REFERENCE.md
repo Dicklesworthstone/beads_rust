@@ -2685,6 +2685,40 @@ The schema-19 runtime-layout transition described below requires an explicit
 `sync --import-only`, refuse a database that needs that transition and name
 the inspection command; they do not install its missing structures.
 
+**Current-version maintenance also requires an admitted layout.** A database
+already containing both schema-19 additions does not authorize generic table
+reconstruction. Before ordinary schema maintenance, br checks the declared
+columns, constraints, primary and foreign keys, and existing indexes of its
+core and workflow tables. Extra authoritative columns, changed constraints,
+missing authoritative tables, and unknown index definitions refuse before
+schema changes. A missing `issues` table in a database declaring the current
+version is not treated as a fresh tracker. Preserve the original family and
+resolve the unsupported layout explicitly; JSONL import cannot decide which
+database-only fields or history may be discarded.
+Admission, permitted DDL and the final runtime-layout check share one write
+transaction. The version, pending-merge ownership and layout are checked again
+after acquiring that transaction, so an earlier inspection cannot authorize
+changes to a different source.
+
+Missing br-owned indexes remain repairable when the table declarations and
+every present index have the expected semantics and the missing names are
+unoccupied elsewhere in the database. Index restoration keeps the existing
+tables and rows in place, including sparse `config`/`metadata` row IDs and
+duplicate-key precedence. It does not replay historical value normalization
+or retire an operator's index merely because it uses an old br index name.
+The derived blocked-cache exception admits only its known three-column
+nullable legacy layout or an absent cache; unknown extensions remain refused.
+Replacing the legacy cache also refuses foreign keys from other tables that
+could lose records when their parent is dropped. Recreating a cache marks its
+derived `blocked_cache_state` metadata stale in the same transaction, preserving
+the marker rows and their row IDs, including duplicates. Reads then compute
+blocking from the authoritative relations without repopulating the cache.
+Index-only restoration leaves the marker and other records intact.
+Fresh initialization and the intentional data reset used by force import are
+separate paths. A reset validates the intact runtime layout inside its write
+transaction before dropping any data tables. Foreign keys from retained tables
+into the reset set refuse instead of cascading changes into retained records.
+
 Inspect the available migration and stale-schema audit with:
 
 ```bash

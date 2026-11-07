@@ -862,6 +862,30 @@ layout transition until the merge is completed or diagnosed against its
 original schema. Do not delete the metadata to make migration eligible.
 Unrecognized layouts and failed preservation checks require diagnosis.
 
+**Ordinary maintenance refuses other current-version layout differences.**
+Even when both schema-19 additions are present, ordinary writes cannot rebuild a
+core or workflow table with extra columns, changed constraints, missing
+authoritative tables, or unrecognized indexes. A missing current-version
+`issues` table is not a new empty tracker. Keep the original database family
+and use the diagnostic commands above; a reviewed decision must account for
+the unsupported state before any replacement.
+
+An otherwise admitted layout may restore missing br-owned indexes in place,
+with admission, repair and the final layout check in one write transaction.
+This preserves existing configuration and metadata rows, their row IDs, and
+duplicate-key precedence. A required index name occupied on another table
+refuses instead of altering that operator's object. Current-version index
+restoration does not normalize stored issue values or remove legacy-named
+operator indexes. The known nullable blocked-cache layout can still be
+repaired, but an unfamiliar cache column or constraint is not permission to
+discard it. A foreign key from another table into the cache prevents its
+replacement. When the cache is recreated, its derived freshness marker becomes
+stale across duplicate marker rows, so reads compute blocking from the retained
+dependencies instead of treating the new empty cache as complete. Marker row
+IDs and unrelated metadata remain intact. An intentional data reset likewise
+refuses foreign keys from retained tables into the reset set before dropping
+any table.
+
 After success, a fresh plan reports no work for the healthy canonical layout;
 a consumed token refuses. The same token can resume an interrupted run after
 the recovery protocol verifies its live and retained generations. New plans

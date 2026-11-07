@@ -2824,6 +2824,28 @@ impl SqliteStorage {
         self.set_metadata(BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)
     }
 
+    /// Invalidate a recreated cache inside schema maintenance's transaction.
+    /// Duplicate rows and their rowids remain intact. Defensively invalidate
+    /// storage-NULL markers as well, instead of leaving them apparently fresh.
+    pub(super) fn mark_blocked_cache_stale_in_tx(conn: &Connection) -> Result<()> {
+        let updated = conn.execute_with_params(
+            "UPDATE metadata SET value = ? WHERE key = ? AND (value IS NULL OR value != ?)",
+            &[
+                SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
+                SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
+                SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
+            ],
+        )?;
+        if updated == 0 && !Self::metadata_key_exists(conn, BLOCKED_CACHE_STATE_KEY)? {
+            Self::insert_metadata_default_if_missing(
+                conn,
+                BLOCKED_CACHE_STATE_KEY,
+                BLOCKED_CACHE_STATE_STALE,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_blocked_cache_fresh(&self) -> Result<bool> {
         if !self.blocked_cache_marked_stale()? {
             return Ok(false);
@@ -3391,32 +3413,10 @@ impl SqliteStorage {
     }
 
     fn reset_data_tables_in_tx(&self) -> Result<()> {
-        use crate::storage::schema::execute_batch;
-        execute_batch(
-            &self.conn,
-            r"
-            DROP TABLE IF EXISTS blocked_issues_cache;
-            DROP TABLE IF EXISTS export_hashes;
-            DROP TABLE IF EXISTS dirty_issues;
-            DROP TABLE IF EXISTS child_counters;
-            DROP TABLE IF EXISTS events;
-            DROP TABLE IF EXISTS comments;
-            DROP TABLE IF EXISTS labels;
-            DROP TABLE IF EXISTS dependencies;
-            DROP TABLE IF EXISTS gate_result_history;
-            DROP TABLE IF EXISTS gate_results;
-            DROP TABLE IF EXISTS capacity_exemption_history;
-            DROP TABLE IF EXISTS capacity_exemptions;
-            DROP TABLE IF EXISTS capacity_occupancy;
-            DROP TABLE IF EXISTS close_metadata;
-            DROP TABLE IF EXISTS issues;
-            ",
-        )?;
-        // Recreate with full schema (config/metadata already exist, IF NOT EXISTS is safe).
-        // Use apply_runtime_compatible_schema rather than apply_schema because we are
-        // mid-session: the connection is already open with correct pragmas and we only
-        // need to restore the DDL without re-running heavier first-open migrations.
-        apply_runtime_compatible_schema(&self.conn)?;
+        // The source is attested before the first DROP inside this same
+        // transaction. Only that explicit reset may initialize the temporarily
+        // absent data tables; ordinary startup cannot infer the same authority.
+        crate::storage::schema::reset_data_tables_in_transaction(&self.conn)?;
         let attested_cookie = attest_runtime_schema_cookie(&self.conn)?;
         if let Err(error) = record_runtime_schema_witness(&self.conn, attested_cookie) {
             tracing::debug!(
@@ -36199,6 +36199,117 @@ required_fields:
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_open_repaired_blocked_cache_invalidates_fresh_marker_without_losing_dependencies() {
+        for nullable_cache in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let db_path = temp.path().join("beads.db");
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            let now = Utc::now();
+            for (id, title) in [("bd-cache-parent", "Blocker"), ("bd-cache-child", "Blocked")] {
+                storage
+                    .create_issue(
+                        &make_issue(id, title, Status::Open, 2, None, now, None),
+                        "tester",
+                    )
+                    .unwrap();
+            }
+            storage
+                .add_dependency("bd-cache-child", "bd-cache-parent", "blocks", "tester")
+                .unwrap();
+            storage.rebuild_blocked_cache(true).unwrap();
+            assert!(!storage.blocked_cache_marked_stale().unwrap());
+            execute_batch(
+                &storage.conn,
+                "INSERT INTO metadata (rowid, key, value) VALUES \
+                 (901, 'blocked_cache_state', ''), (997, 'blocked_cache_state', ''), \
+                 (1109, 'operator-cache-note', X'00ff80');
+                 DROP TABLE blocked_issues_cache;",
+            )
+            .unwrap();
+            if nullable_cache {
+                execute_batch(
+                    &storage.conn,
+                    "CREATE TABLE blocked_issues_cache (
+                        issue_id TEXT PRIMARY KEY,
+                        blocked_by TEXT,
+                        blocked_at DATETIME
+                     );
+                     INSERT INTO blocked_issues_cache (issue_id) VALUES ('bd-cache-child');",
+                )
+                .unwrap();
+            }
+            let authority_rows = |conn: &Connection| {
+                [
+                    "SELECT rowid, * FROM issues ORDER BY rowid",
+                    "SELECT rowid, * FROM dependencies ORDER BY rowid",
+                    "SELECT rowid, * FROM events ORDER BY rowid",
+                    "SELECT rowid, * FROM metadata WHERE key NOT IN \
+                     ('blocked_cache_state', 'runtime_schema_witness_v1') ORDER BY rowid",
+                ]
+                .map(|query| {
+                    conn.query(query)
+                        .unwrap()
+                        .iter()
+                        .map(|row| row.values().to_vec())
+                        .collect::<Vec<_>>()
+                })
+            };
+            let marker_rows = |conn: &Connection| {
+                conn.query(
+                    "SELECT rowid FROM metadata WHERE key = 'blocked_cache_state' ORDER BY rowid",
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
+            };
+            let before = authority_rows(&storage.conn);
+            let marker_rowids = marker_rows(&storage.conn);
+            drop(storage);
+
+            let reopened = SqliteStorage::open(&db_path).unwrap();
+            assert!(reopened.blocked_cache_marked_stale().unwrap());
+            assert_eq!(authority_rows(&reopened.conn), before);
+            assert_eq!(marker_rows(&reopened.conn), marker_rowids);
+            assert!(
+                reopened
+                    .conn
+                    .query("SELECT value FROM metadata WHERE key = 'blocked_cache_state'")
+                    .unwrap()
+                    .iter()
+                    .all(|row| {
+                        row.get(0).and_then(SqliteValue::as_text)
+                            == Some(BLOCKED_CACHE_STATE_STALE)
+                    }),
+                "every duplicate marker must become stale"
+            );
+            assert_eq!(
+                reopened.get_blocked_ids().unwrap(),
+                HashSet::from(["bd-cache-child".to_owned()]),
+                "a repaired empty cache must not erase the blocking edge (nullable={nullable_cache})"
+            );
+            let ready: HashSet<_> = reopened
+                .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Priority)
+                .unwrap()
+                .into_iter()
+                .map(|issue| issue.id)
+                .collect();
+            assert_eq!(ready, HashSet::from(["bd-cache-parent".to_owned()]));
+            assert!(reopened.blocked_cache_marked_stale().unwrap());
+            assert!(
+                reopened
+                    .conn
+                    .query("SELECT issue_id FROM blocked_issues_cache")
+                    .unwrap()
+                    .is_empty(),
+                "read queries compute blocking in memory without repopulating the cache"
+            );
+            assert_eq!(authority_rows(&reopened.conn), before);
+        }
+    }
+
+    #[test]
     fn test_get_blocked_ids_and_is_blocked_fall_back_when_cache_table_missing() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let blocker = make_issue("bd-b1", "Blocker", Status::Open, 2, None, Utc::now(), None);
@@ -39188,7 +39299,7 @@ required_fields:
     }
 
     #[test]
-    fn test_open_repairs_current_version_legacy_kv_primary_key_tables() {
+    fn test_open_refuses_current_version_legacy_kv_primary_key_tables_without_writes() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("legacy_kv_primary_keys.db");
 
@@ -39208,7 +39319,7 @@ required_fields:
                 .unwrap();
             storage
                 .conn
-                .execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'legacy')")
+                .execute("INSERT INTO config (rowid, key, value) VALUES (17, 'issue_prefix', 'legacy')")
                 .unwrap();
 
             storage
@@ -39222,51 +39333,35 @@ required_fields:
                 .unwrap();
             storage
                 .conn
-                .execute("INSERT INTO metadata (key, value) VALUES ('project', 'legacy-project')")
+                .execute("INSERT INTO metadata (rowid, key, value) VALUES (91, 'project', X'00ff80')")
                 .unwrap();
         }
 
-        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let snapshot = || {
+            [
+                "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name",
+                "SELECT rowid, key, value FROM config ORDER BY rowid",
+                "SELECT rowid, key, value FROM metadata ORDER BY rowid",
+            ]
+            .map(|query| {
+                conn.query(query)
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = snapshot();
+        let error = SqliteStorage::open(&db_path).unwrap_err();
+        assert!(error.to_string().contains("core table config"), "{error}");
+        assert_eq!(snapshot(), before);
         assert_eq!(
-            reopened.get_config("issue_prefix").unwrap(),
-            Some("legacy".to_string())
-        );
-        assert_eq!(
-            reopened.get_metadata("project").unwrap(),
-            Some("legacy-project".to_string())
-        );
-
-        // Use PRAGMA table_info to verify the repair (sqlite_master can
-        // return inconsistent results in fsqlite).
-        // Check that the `key` column no longer has pk flag set.
-        let config_has_pk = reopened
-            .conn
-            .query("PRAGMA table_info('config')")
-            .unwrap()
-            .iter()
-            .any(|row| {
-                let col_name = row.get(1).and_then(SqliteValue::as_text);
-                let pk_flag = row.get(5).and_then(SqliteValue::as_integer).unwrap_or(0);
-                col_name == Some("key") && pk_flag > 0
-            });
-        let metadata_has_pk = reopened
-            .conn
-            .query("PRAGMA table_info('metadata')")
-            .unwrap()
-            .iter()
-            .any(|row| {
-                let col_name = row.get(1).and_then(SqliteValue::as_text);
-                let pk_flag = row.get(5).and_then(SqliteValue::as_integer).unwrap_or(0);
-                col_name == Some("key") && pk_flag > 0
-            });
-
-        assert!(
-            !config_has_pk,
-            "legacy config primary key should be rebuilt to the canonical shape"
-        );
-        assert!(
-            !metadata_has_pk,
-            "legacy metadata primary key should be rebuilt to the canonical shape"
+            conn.query_row("PRAGMA user_version")
+                .unwrap()
+                .get(0)
+                .and_then(SqliteValue::as_integer),
+            Some(i64::from(CURRENT_SCHEMA_VERSION))
         );
     }
 
@@ -43374,6 +43469,93 @@ required_fields:
         let issue2 = make_issue("test-2", "Issue 2", Status::Open, 2, None, t1, None);
         storage.create_issue(&issue2, "tester").unwrap();
         assert!(storage.get_issue("test-2").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_reset_data_tables_refuses_unknown_or_pending_layout_before_dropping_rows() {
+        for (drift, pending) in [
+            (
+                "ALTER TABLE issues ADD COLUMN operator_payload BLOB; \
+                 UPDATE issues SET operator_payload = X'00ff80'",
+                false,
+            ),
+            ("DROP TABLE jsonl_row_receipts", true),
+            (
+                "CREATE TABLE \"operator'reset\" (
+                     parent TEXT REFERENCES \"ISSUES\"(id) ON DELETE CASCADE, payload BLOB
+                 );
+                 INSERT INTO \"operator'reset\" (rowid, parent, payload) \
+                 VALUES (901, 'br-reset-source', X'00ff80')",
+                false,
+            ),
+            (
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) \
+                 VALUES ('br-reset-source', '[]');
+                 CREATE TABLE \"operator'reset\" (
+                     parent TEXT REFERENCES \"BLOCKED_ISSUES_CACHE\"(issue_id) \
+                         ON DELETE SET NULL, payload BLOB
+                 );
+                 INSERT INTO \"operator'reset\" (rowid, parent, payload) \
+                 VALUES (901, 'br-reset-source', X'00ff80')",
+                false,
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let mut storage = SqliteStorage::open(&temp.path().join("beads.db")).unwrap();
+            let issue = make_issue(
+                "br-reset-source",
+                "Preserve the reset source",
+                Status::Open,
+                2,
+                None,
+                Utc.with_ymd_and_hms(2026, 11, 7, 0, 0, 0).unwrap(),
+                None,
+            );
+            storage.create_issue(&issue, "original actor").unwrap();
+            storage.set_config("operator-setting", "keep").unwrap();
+            execute_batch(&storage.conn, drift).unwrap();
+            if pending {
+                storage
+                    .conn
+                    .execute_with_params(
+                        "INSERT INTO metadata (key, value) VALUES (?, '')",
+                        &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING)],
+                    )
+                    .unwrap();
+            }
+            let snapshot = |storage: &SqliteStorage| {
+                let mut state = format!(
+                    "{:?}",
+                    storage
+                        .execute_raw_query(
+                            "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name"
+                        )
+                        .unwrap()
+                );
+                for row in storage
+                    .execute_raw_query(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+                    )
+                    .unwrap()
+                {
+                    let name = row[0].as_text().unwrap().replace('"', "\"\"");
+                    state.push_str(&format!(
+                        "{:?}",
+                        storage
+                            .execute_raw_query(&format!(
+                                "SELECT rowid, * FROM \"{name}\" ORDER BY rowid"
+                            ))
+                            .unwrap()
+                    ));
+                }
+                state
+            };
+            let before = snapshot(&storage);
+            storage
+                .reset_data_tables()
+                .expect_err("reset must attest the intact source before dropping data tables");
+            assert_eq!(snapshot(&storage), before, "{drift}");
+        }
     }
 
     #[test]
