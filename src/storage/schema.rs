@@ -4096,7 +4096,7 @@ pub(crate) fn has_pending_sync_merge_metadata(conn: &Connection) -> Result<bool>
         .is_empty())
 }
 
-fn refuse_schema_repair_during_pending_merge(conn: &Connection) -> Result<()> {
+pub(crate) fn refuse_schema_repair_during_pending_merge(conn: &Connection) -> Result<()> {
     if has_pending_sync_merge_metadata(conn)? {
         return Err(BeadsError::SyncConflict {
             message: "Cannot repair the database schema while a sync merge is pending; resume `br sync --merge` against its original schema first".to_string(),

@@ -45,13 +45,16 @@ use crate::storage::schema::{
     ReviewedSchemaMigrationEffects, apply_reviewed_legacy_v15_core_conversion_in_transaction,
     apply_reviewed_runtime_schema_upgrade_in_transaction,
     attest_reviewed_migration_source_core_tables, is_reviewed_dependency_retired_index,
-    is_reviewed_migration_managed_index, reviewed_runtime_schema_upgrade,
-    run_reviewed_schema_migration_steps_in_transaction, runtime_schema_compatible,
+    is_reviewed_migration_managed_index, refuse_schema_repair_during_pending_merge,
+    reviewed_runtime_schema_upgrade, run_reviewed_schema_migration_steps_in_transaction,
+    runtime_schema_compatible,
 };
 use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
 
 mod hash_refresh;
 mod legacy_v4;
+#[cfg(test)]
+mod pending_merge_tests;
 use legacy_v4::LegacyV4Projection;
 
 const PLAN_SCHEMA: &str = "br.doctor.schema_migration.plan.v1";
@@ -2848,18 +2851,27 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
 
     if from == target {
         let conn = open_read_only(db_path)?;
-        let upgrade = reviewed_runtime_schema_upgrade(&conn);
+        let upgrade = reviewed_runtime_schema_upgrade(&conn).and_then(|upgrade| {
+            if upgrade.is_some() || !integrity_clean {
+                if !integrity_clean
+                    && !integrity_check_is_repairable(&logical_witness.integrity_check)
+                {
+                    return Err(BeadsError::internal(format!(
+                        "database declares the current schema version but its integrity diagnostics \
+                         are not eligible for reviewed page-layout maintenance: {:?}",
+                        logical_witness.integrity_check
+                    )));
+                }
+                // A pending merge binds raw schema SQL and root pages. Even
+                // same-version page maintenance changes that authority.
+                // A clean current layout can still return a read-only no-op.
+                refuse_schema_repair_during_pending_merge(&conn)?;
+            }
+            Ok(upgrade)
+        });
         close_connection(conn)?;
         let schema19_runtime_upgrade = upgrade?;
         if schema19_runtime_upgrade.is_some() || !integrity_clean {
-            if !integrity_clean && !integrity_check_is_repairable(&logical_witness.integrity_check)
-            {
-                return Err(BeadsError::internal(format!(
-                    "database declares the current schema version but its integrity diagnostics \
-                     are not eligible for reviewed page-layout maintenance: {:?}",
-                    logical_witness.integrity_check
-                )));
-            }
             let mut forecast = MigrationForecast {
                 from_version: from,
                 to_version: target,
@@ -2957,6 +2969,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     }
 
     let conn = open_read_only(db_path)?;
+    refuse_schema_repair_during_pending_merge(&conn)?;
     require_source_tables(&conn, from)?;
     let legacy_v15 = attest_reviewed_migration_source_core_tables(&conn)?;
     let legacy_v15_conversion = legacy_v15
@@ -3938,10 +3951,17 @@ fn vacuum_candidate_from_private_source(
     let private_source = backup_component_path(&private_source_dir, &retained_source, "")?;
     let source_conn = Connection::open(private_source.to_string_lossy().into_owned())?;
     let escaped_path = candidate_path.to_string_lossy().replace('\'', "''");
-    let candidate_result = source_conn
-        .execute(&format!("VACUUM INTO '{escaped_path}'"))
-        .map(|_| ())
-        .map_err(BeadsError::Database);
+    let candidate_result = (|| {
+        // Repeat write admission on the verified private source, before any
+        // candidate is created. This also protects old prepared receipts and
+        // the equal-version maintenance branch, which performs no schema DDL
+        // but can relocate root pages and reserialize pending-merge witnesses.
+        refuse_schema_repair_during_pending_merge(&source_conn)?;
+        source_conn
+            .execute(&format!("VACUUM INTO '{escaped_path}'"))
+            .map(|_| ())
+            .map_err(BeadsError::Database)
+    })();
     let close_result = close_connection(source_conn);
     match (candidate_result, close_result) {
         (Err(error), _) | (Ok(()), Err(error)) => Err(error),
