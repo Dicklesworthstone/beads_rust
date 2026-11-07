@@ -587,6 +587,19 @@ otherwise specify the type to preserve the other relationships.
 Existing trackers need an explicit `br doctor migrate-schema plan` and reviewed
 `apply` to reach schema 19. The migration supports canonical schemas 13–18 and
 one strictly checked legacy schema-15 layout, preserving parallel typed edges.
+Databases created by **v0.7.6 already declare schema 19** but need a separate
+runtime layout upgrade for `jsonl_row_receipts` and `close_metadata.closed_by`.
+`br doctor migrate-schema plan --json` reports the exact additions under
+`forecast.schema19_runtime_upgrade`; apply its reviewed token, or run
+`br doctor migrate-schema heal`. `heal --dry-run` and `doctor --json` recognize
+the same layout. Reads never perform the upgrade, and migration preserves
+issues, typed dependencies, audit history, configuration, and other database-only
+records without replaying JSONL.
+
+The integer schema version remains 19 across this layout transition. **Replacing
+the executable with v0.7.6 is not a safe downgrade.** Retain the complete recovery
+bundle; use the upgraded binary's receipt-bound `undo` before further writes,
+or restore the complete pre-upgrade database family.
 See the [migration reference](docs/CLI_REFERENCE.md#doctor) for eligibility and undo.
 
 ### Labels

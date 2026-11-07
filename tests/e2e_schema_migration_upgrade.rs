@@ -14,6 +14,17 @@
 //! - `tests/fixtures/schema_migration/schema16_v0219_release.db.gz` was
 //!   created the same way by the actual released `br 0.2.19` binary
 //!   (linux_x86_64 GitHub release asset), which stamps schema 16.
+//! - `schema19_v076_release.db.gz` was created by the official v0.7.6
+//!   `br-0.7.6-linux_amd64.tar.gz` asset (SHA-256
+//!   `56baae2df5e7cc6f6537e05fd5f560192a9d5ceb02659c61b10b9610b45eb3ef`),
+//!   tag `0cef79b3b35479d9c2a7bf4c7b762b781344bddf`. Real init/create,
+//!   typed dep add, label add, comments add, close/reopen, config set and
+//!   sync --flush-only commands produced three issues, two differently typed
+//!   edges on the same pair, audit history, and a policy-governed close.
+//!   No main-binary schema or fabricated user_version was used. The frozen
+//!   DB SHA-256 is `b670442544fd842878b54795e3ad1f8cb9cd7347056b74743f172729770d8c03`;
+//!   v0.7.6 stats succeeds and SQLite quick_check is ok. It lacks both
+//!   jsonl_row_receipts and close_metadata.closed_by despite declaring 19.
 //!
 //! Each test follows exactly the remediation the SCHEMA_MISMATCH error
 //! prints: plan -> apply -> verify data -> reject stale receipt -> undo ->
@@ -847,6 +858,492 @@ fn e2e_migrate_schema_upgrades_real_schema16_database() {
         16,
         3,
     );
+}
+
+fn released_schema19_workspace() -> BrWorkspace {
+    let workspace = BrWorkspace::new();
+    install_fixture_workspace(
+        &workspace,
+        "schema19_v076_release.db.gz",
+        "schema19_v076_issues.jsonl",
+        "schema19_v076_config.yaml",
+    );
+    workspace
+}
+
+fn edit_schema19_fixture(workspace: &BrWorkspace, statements: &[&str]) {
+    let db = workspace.root.join(".beads/beads.db");
+    let connection = Connection::open(db.to_string_lossy().into_owned()).expect("open fixture");
+    for sql in statements {
+        connection.execute(sql).expect("seed release fixture");
+    }
+    connection.close().expect("close release fixture");
+}
+
+/// Enrich the released layout with DB-only authority; the frozen fixture
+/// itself remains a real release product. These records cannot be recovered
+/// by importing its three-issue JSONL, even if issue counts happen to match.
+fn seed_schema19_database_authority(workspace: &BrWorkspace) {
+    edit_schema19_fixture(
+        workspace,
+        &[
+            "INSERT INTO issues (id, title, created_at, updated_at) VALUES \
+             ('rel19-local', 'Database-only issue', '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z')",
+            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES ('rel19-local', '2026-11-01T00:00:00Z')",
+            "INSERT INTO events (id, issue_id, event_type, actor, old_value, new_value, comment, agent_name, harness, model) \
+             VALUES (73, 'rel19-local', 'created', 'local-actor', NULL, 'database-only value', 'local audit', 'local-agent', 'local-harness', 'local-model')",
+            "INSERT INTO comments (id, issue_id, author, text) VALUES (41, 'rel19-local', 'local-actor', 'Database-only comment')",
+            "INSERT INTO config (key, value) VALUES ('compact_batch_size', '37'), ('compact_model', 'preserved-model'), ('compaction_enabled', 'false')",
+            "INSERT INTO config (rowid, key, value) VALUES (101, 'operator_duplicate', 'older'), (207, 'operator_duplicate', 'newer')",
+            "INSERT INTO metadata (rowid, key, value) VALUES (173, 'operator_checkpoint', 'not a derived cache')",
+            "INSERT INTO child_counters (parent_id, last_child) VALUES ('rel19-local', 47)",
+            "UPDATE dependencies SET thread_id = 'database-only-thread', created_by = 'database-only-agent'",
+            "UPDATE close_metadata SET closed_by_agent_name = 'retained-agent', closed_by_harness = 'retained-harness', \
+             closed_by_model = 'retained-model', bypass_reason = 'retained audit detail'",
+            "INSERT INTO gate_results (issue_id, gate, provider, passed, note, recorded_by) \
+             VALUES ('rel19-local', 'tests', 'ci', 1, 'database-only gate', 'local-actor')",
+            "INSERT INTO gate_result_history (id, issue_id, from_status, to_status, status_revision, gate, provider, passed, note, recorded_by) \
+             VALUES (29, 'rel19-local', 'open', 'closed', 0, 'tests', 'ci', 1, 'database-only history', 'local-actor')",
+            "INSERT INTO capacity_exemptions (issue_id, capacity_kind, capacity_name, provider, reason, granted_by) \
+             VALUES ('rel19-local', 'status', 'review', 'operator', 'preserve exemption', 'local-actor')",
+            "INSERT INTO capacity_exemption_history (id, issue_id, capacity_kind, capacity_name, action, provider, reason, actor) \
+             VALUES (31, 'rel19-local', 'status', 'review', 'grant', 'operator', 'preserve exemption history', 'local-actor')",
+            "INSERT INTO capacity_occupancy (issue_id, actor, agent_name, harness, session) \
+             VALUES ('rel19-local', 'local-actor', 'local-agent', 'local-harness', 'local-session')",
+            "CREATE TABLE operator_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL, payload BLOB NOT NULL)",
+            "CREATE INDEX operator_notes_lookup ON operator_notes(note)",
+            "INSERT INTO operator_notes VALUES (12, 'custom durable state', X'0001FF007F')",
+            "UPDATE sqlite_sequence SET seq = 91 WHERE name = 'operator_notes'",
+        ],
+    );
+}
+
+fn schema19_tracker_files(directory: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut directories = vec![directory.to_path_buf()];
+    while let Some(current) = directories.pop() {
+        for entry in fs::read_dir(current).expect("read tracker directory") {
+            let path = entry.expect("tracker entry").path();
+            if path.is_dir() {
+                directories.push(path);
+            } else {
+                files.insert(
+                    path.strip_prefix(directory).unwrap().to_path_buf(),
+                    fs::read(path).expect("read tracker file"),
+                );
+            }
+        }
+    }
+    files
+}
+
+/// Include hidden rowids and AUTOINCREMENT high-water marks, not just values
+/// projected through br's model. Duplicate config precedence depends on rowid.
+fn schema19_authority_rows(db: &Path, original: Option<&TableRows>) -> TableRows {
+    if let Some(original) = original {
+        return engine_rows(db, Some(original));
+    }
+    let mut columns = engine_rows(db, None);
+    for (names, _) in columns.values_mut() {
+        names.insert(0, "_rowid_".to_owned());
+    }
+    columns.insert(
+        "sqlite_sequence".to_owned(),
+        (vec!["name".to_owned(), "seq".to_owned()], Vec::new()),
+    );
+    engine_rows(db, Some(&columns))
+}
+
+/// VACUUM may normalize DDL whitespace, quoting and parentheses. Inspect the
+/// operator's actual column/index constraints and exercise their behavior on
+/// a disposable copy instead of treating SQL formatting as authoritative.
+fn schema19_operator_shape(
+    db: &Path,
+) -> std::collections::BTreeMap<&'static str, Vec<Vec<SqliteValue>>> {
+    let scratch = tempfile::tempdir().expect("operator schema scratch");
+    let copy = scratch.path().join("copy.db");
+    fs::copy(db, &copy).expect("copy database");
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    if wal.is_file() {
+        fs::copy(wal, scratch.path().join("copy.db-wal")).expect("copy WAL");
+    }
+    let connection = Connection::open(copy.to_string_lossy().into_owned()).expect("open copy");
+    let shape = [
+        ("columns", "PRAGMA table_info('operator_notes')"),
+        ("foreign_keys", "PRAGMA foreign_key_list('operator_notes')"),
+        ("indexes", "PRAGMA index_list('operator_notes')"),
+        ("index_keys", "PRAGMA index_xinfo('operator_notes_lookup')"),
+    ]
+    .into_iter()
+    .map(|(name, sql)| {
+        let rows = connection
+            .query(sql)
+            .expect("operator schema query")
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect();
+        (name, rows)
+    })
+    .collect();
+    connection
+        .execute("INSERT INTO operator_notes (note, payload) VALUES ('next reservation', X'01')")
+        .expect("operator table remains writable");
+    let next_id = connection
+        .query("SELECT id FROM operator_notes WHERE note = 'next reservation'")
+        .expect("read next reserved id");
+    assert_eq!(next_id[0].get(0), Some(&SqliteValue::Integer(92)));
+    for sql in [
+        "INSERT INTO operator_notes (note, payload) VALUES (NULL, X'01')",
+        "INSERT INTO operator_notes (note, payload) VALUES ('missing payload', NULL)",
+        "INSERT INTO operator_notes VALUES (12, 'duplicate primary key', X'01')",
+    ] {
+        assert!(
+            connection.execute(sql).is_err(),
+            "operator constraint lost: {sql}"
+        );
+    }
+    connection.close().expect("close operator schema copy");
+    shape
+}
+
+fn schema19_json(run: &BrRun) -> Value {
+    assert!(run.status.success(), "{} {}", run.stdout, run.stderr);
+    serde_json::from_str(&run.stdout).expect("complete stdout must be JSON")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn released_schema19_plan_apply_undo_preserves_every_original_value() {
+    let workspace = released_schema19_workspace();
+    let beads = workspace.root.join(".beads");
+    let db = beads.join("beads.db");
+    let released = engine_rows(&db, None);
+    assert_eq!(header_user_version(&db), 19);
+    assert_eq!(released["issues"].1.len(), 3);
+    assert_eq!(released["dependencies"].1.len(), 2);
+    assert_eq!(released["close_metadata"].1.len(), 1);
+    assert!(!released.contains_key("jsonl_row_receipts"));
+    assert!(
+        !released["close_metadata"]
+            .0
+            .iter()
+            .any(|name| name == "closed_by")
+    );
+    seed_schema19_database_authority(&workspace);
+    let before = schema19_authority_rows(&db, None);
+    let operator_shape = schema19_operator_shape(&db);
+    let source_files = schema19_tracker_files(&beads);
+    let catalog_columns = TableRows::from([(
+        "sqlite_master".to_owned(),
+        (
+            vec!["type".to_owned(), "name".to_owned(), "tbl_name".to_owned()],
+            Vec::new(),
+        ),
+    )]);
+    let catalog_before = engine_rows(&db, Some(&catalog_columns));
+
+    let stats = run_br(&workspace, ["stats", "--json"], "release19_stats_before");
+    assert!(!stats.status.success(), "{}", stats.stdout);
+    assert!(format!("{}{}", stats.stdout, stats.stderr).contains("migrate-schema"));
+    assert_eq!(schema19_tracker_files(&beads), source_files);
+    let additions = serde_json::json!({
+        "jsonl_row_receipts_created": true,
+        "closed_by_column_added": true,
+    });
+    let doctor = run_br(&workspace, ["doctor", "--json"], "release19_doctor");
+    assert!(!doctor.status.success(), "{}", doctor.stdout);
+    let inspection: Value = serde_json::from_str(&doctor.stdout).expect("doctor JSON");
+    let runtime = inspection["checks"]
+        .as_array()
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check["name"] == "schema.runtime")
+        })
+        .expect("doctor must diagnose the current-version layout");
+    assert_eq!(runtime["status"], "error");
+    assert_eq!(runtime["details"]["schema19_runtime_upgrade"], additions);
+    assert!(
+        runtime["details"]["downgrade"]
+            .as_str()
+            .is_some_and(|note| note.contains("v0.7.6"))
+    );
+    assert_eq!(schema19_tracker_files(&beads), source_files);
+
+    let heal = schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+        "release19_heal_preview",
+    ));
+    assert_eq!(heal["heal_needed"], true);
+    assert_eq!(heal["migration_eligible"], true);
+    assert_eq!(heal["from_version"], 19);
+    assert_eq!(heal["to_version"], 19);
+    assert!(
+        heal["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("not a safe downgrade"))
+    );
+    assert_eq!(schema19_tracker_files(&beads), source_files);
+
+    let plan = schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "plan", "--json"],
+        "release19_plan",
+    ));
+    assert_eq!(plan["eligible"], true);
+    assert_eq!(plan["from_version"], 19);
+    assert_eq!(plan["to_version"], 19);
+    assert!(
+        plan["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("v0.7.6") && note.contains("not a safe downgrade"))
+    );
+    assert_eq!(plan["forecast"]["schema19_runtime_upgrade"], additions);
+    assert_eq!(heal["schema19_runtime_upgrade"], additions);
+    assert_eq!(schema19_tracker_files(&beads), source_files);
+    let token = plan["plan_token"].as_str().expect("upgrade token");
+    let applied = schema19_json(&run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            token,
+            "--json",
+        ],
+        "release19_apply",
+    ));
+    assert_eq!(applied["effects"]["schema19_runtime_upgrade"], additions);
+    assert_eq!(header_user_version(&db), 19);
+    assert_eq!(schema19_authority_rows(&db, Some(&before)), before);
+    assert_eq!(schema19_operator_shape(&db), operator_shape);
+    let catalog_after = engine_rows(&db, Some(&catalog_columns));
+    for row in &catalog_before["sqlite_master"].1 {
+        // Existing schema object names, types and ownership must survive.
+        // Engine-normalized SQL spelling is checked semantically above.
+        assert!(
+            catalog_after["sqlite_master"].1.contains(row),
+            "schema object changed: {row:?}"
+        );
+    }
+    for name in ["issues.jsonl", "config.yaml"] {
+        assert_eq!(
+            fs::read(beads.join(name)).unwrap(),
+            source_files[Path::new(name)]
+        );
+    }
+    let after = engine_rows(&db, None);
+    assert!(after["jsonl_row_receipts"].1.is_empty());
+    let closed_by = after["close_metadata"]
+        .0
+        .iter()
+        .position(|name| name == "closed_by")
+        .unwrap();
+    assert!(
+        after["close_metadata"]
+            .1
+            .iter()
+            .all(|row| row[closed_by] == "NULL")
+    );
+
+    let after_files = schema19_tracker_files(&beads);
+    let stats = schema19_json(&run_br(
+        &workspace,
+        ["stats", "--json"],
+        "release19_stats_after",
+    ));
+    assert_eq!(
+        stats["summary"]["total_issues"], 4,
+        "DB-only issue must remain visible"
+    );
+    let current_plan = schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "plan", "--json"],
+        "release19_current_plan",
+    ));
+    assert_eq!(current_plan["eligible"], false);
+    let current_heal = schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+        "release19_current_heal",
+    ));
+    assert_eq!(current_heal["heal_needed"], false);
+    assert_eq!(schema19_tracker_files(&beads), after_files);
+    let stale = run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            token,
+            "--json",
+        ],
+        "release19_stale_apply",
+    );
+    assert!(!stale.status.success(), "{}", stale.stdout);
+    assert_eq!(schema19_authority_rows(&db, Some(&before)), before);
+
+    let run_id = applied["run_id"].as_str().expect("migration run id");
+    // The same-version profile must survive the existing crash/resume
+    // protocol, including its retained-source and new-column proofs.
+    interrupted_apply_keeps_authority_until_explicit_resume(
+        &workspace, &db, run_id, token, &before,
+    );
+    schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "undo", run_id, "--json"],
+        "release19_undo",
+    ));
+    let restored = schema19_tracker_files(&beads);
+    for name in [
+        "beads.db",
+        "beads.db-wal",
+        "beads.db-shm",
+        "beads.db-journal",
+        "issues.jsonl",
+        "config.yaml",
+    ] {
+        assert_eq!(
+            restored.get(Path::new(name)),
+            source_files.get(Path::new(name)),
+            "undo changed {name}"
+        );
+    }
+    assert_eq!(schema19_authority_rows(&db, None), before);
+    let again = schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "plan", "--json"],
+        "release19_plan_after_undo",
+    ));
+    assert_eq!(again["eligible"], true);
+    assert_eq!(again["forecast"]["schema19_runtime_upgrade"], additions);
+}
+
+#[test]
+fn released_schema19_explicit_heal_preserves_database_only_authority() {
+    let workspace = released_schema19_workspace();
+    seed_schema19_database_authority(&workspace);
+    let db = workspace.root.join(".beads/beads.db");
+    let before = schema19_authority_rows(&db, None);
+    let jsonl = fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap();
+    let healed = schema19_json(&run_br(
+        &workspace,
+        ["doctor", "migrate-schema", "heal", "--json"],
+        "release19_heal",
+    ));
+    assert_eq!(healed["action"], "migrated");
+    assert_eq!(schema19_authority_rows(&db, Some(&before)), before);
+    assert_eq!(
+        fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
+        jsonl
+    );
+    let stats = schema19_json(&run_br(
+        &workspace,
+        ["stats", "--json"],
+        "release19_healed_stats",
+    ));
+    assert_eq!(stats["summary"]["total_issues"], 4);
+}
+
+#[test]
+fn released_schema19_partial_upgrades_only_add_the_missing_structure() {
+    for (name, statements, receipts_needed, actor_needed) in [
+        (
+            "actor_present",
+            vec![
+                "ALTER TABLE close_metadata ADD COLUMN closed_by TEXT",
+                "UPDATE close_metadata SET closed_by = 'existing close actor'",
+            ],
+            true,
+            false,
+        ),
+        (
+            "receipts_present",
+            vec![
+                "CREATE TABLE jsonl_row_receipts (issue_id TEXT PRIMARY KEY, row_hash TEXT NOT NULL)",
+                "INSERT INTO jsonl_row_receipts VALUES ('rel19-jzj', 'retained row receipt')",
+            ],
+            false,
+            true,
+        ),
+    ] {
+        let workspace = released_schema19_workspace();
+        edit_schema19_fixture(&workspace, &statements);
+        let db = workspace.root.join(".beads/beads.db");
+        let before = schema19_authority_rows(&db, None);
+        let plan = schema19_json(&run_br(
+            &workspace,
+            ["doctor", "migrate-schema", "plan", "--json"],
+            &format!("release19_{name}_plan"),
+        ));
+        assert_eq!(
+            plan["forecast"]["schema19_runtime_upgrade"],
+            serde_json::json!({
+                "jsonl_row_receipts_created": receipts_needed,
+                "closed_by_column_added": actor_needed,
+            })
+        );
+        schema19_json(&run_br(
+            &workspace,
+            [
+                "doctor",
+                "migrate-schema",
+                "apply",
+                "--plan-token",
+                plan["plan_token"].as_str().unwrap(),
+                "--json",
+            ],
+            &format!("release19_{name}_apply"),
+        ));
+        assert_eq!(schema19_authority_rows(&db, Some(&before)), before);
+    }
+}
+
+#[test]
+fn released_schema19_unknown_layouts_refuse_without_a_noop_or_source_mutation() {
+    for (name, sql) in [
+        (
+            "unknown_close_column",
+            "ALTER TABLE close_metadata ADD COLUMN operator_extra TEXT",
+        ),
+        (
+            "malformed_receipts",
+            "CREATE TABLE jsonl_row_receipts (issue_id TEXT PRIMARY KEY, row_hash BLOB NOT NULL)",
+        ),
+        (
+            "unknown_core_column",
+            "ALTER TABLE issues ADD COLUMN operator_extra TEXT",
+        ),
+    ] {
+        let workspace = released_schema19_workspace();
+        edit_schema19_fixture(&workspace, &[sql]);
+        let beads = workspace.root.join(".beads");
+        let before = schema19_tracker_files(&beads);
+        for args in [
+            vec!["doctor", "migrate-schema", "plan", "--json"],
+            vec!["doctor", "migrate-schema", "heal", "--dry-run", "--json"],
+        ] {
+            let run = run_br(&workspace, args, &format!("release19_{name}_refusal"));
+            let output: Value = serde_json::from_str(&run.stdout).expect("structured refusal");
+            assert!(!run.status.success(), "unknown layout accepted: {output}");
+            assert_eq!(output["error"]["code"], "CONFIG_ERROR");
+            assert!(
+                !output
+                    .get("heal_needed")
+                    .is_some_and(|needed| needed == false)
+            );
+            assert!(
+                !output
+                    .get("migration_eligible")
+                    .is_some_and(|eligible| eligible == true)
+            );
+            assert!(output.get("plan_token").is_none());
+            assert_eq!(schema19_tracker_files(&beads), before);
+        }
+    }
 }
 
 #[test]

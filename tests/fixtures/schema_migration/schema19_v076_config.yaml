@@ -1,0 +1,3 @@
+compact_batch_size: 37
+compact_model: preserved-release-model
+compaction_enabled: false

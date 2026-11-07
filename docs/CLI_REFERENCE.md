@@ -2694,6 +2694,34 @@ bound to the original database path and state. Previewing undo still validates
 the receipt, backup, and preservation proofs; actual apply or undo repeats its
 checks under exclusive write authority.
 
+**v0.7.6 schema-19 layout upgrade.** A database can declare schema 19 while
+still lacking the indexed JSONL receipt table and durable close attribution.
+`doctor --json` reports this as `schema.runtime`; `plan` and `heal --dry-run`
+inspect the actual layout rather than treating the version stamp as proof that
+no work is needed. The reviewed plan exposes
+`forecast.schema19_runtime_upgrade.jsonl_row_receipts_created` and
+`closed_by_column_added`. It accepts only those two known additive differences,
+including a database where one addition is already present. Unrelated layout
+differences are refused, and a pending sync merge must finish against its
+original schema before an upgrade can proceed.
+
+Apply the plan token using the lifecycle below, or run
+`br doctor migrate-schema heal` to plan and apply the same reviewed upgrade.
+The migrator constructs and verifies a private candidate before installing it.
+Every existing source column, raw value, row multiplicity, hidden row ID,
+sequence reservation, and operator schema must survive. New receipts start
+empty and historical `closed_by` values start `NULL`; no audit actor is guessed
+and no issue is reconstructed from JSONL. JSONL and configuration files remain
+untouched.
+
+This transition leaves `PRAGMA user_version` at 19, but the upgraded
+`close_metadata` layout is incompatible with v0.7.6. **An executable-only
+downgrade is unsafe.** Keep the full recovery bundle. The upgraded binary's
+receipt-bound `undo` restores the original database family only while the
+applied state is unchanged; it refuses to discard subsequent writes. Otherwise,
+restore the complete pre-upgrade database family through a separately reviewed
+recovery, accounting for any later work.
+
 `heal` attempts the same reviewed migration and refuses if that migration is
 unavailable or fails. Its dry-run audit identifies state that JSONL cannot
 represent: event history, configuration and metadata, unknown tables or
@@ -2708,8 +2736,8 @@ retained backup is recovery evidence, not permission to remove authoritative
 records from active storage. Explicit corruption recovery and migration
 recover/undo retain their separate safety checks and backup protocols.
 
-The explicit receipt-bound lifecycle remains available for supported older
-versions:
+The explicit receipt-bound lifecycle is available for supported older versions
+and the reviewed schema-19 layout transition:
 
 ```bash
 # Read-only inspection. Save and review the complete JSON receipt.
