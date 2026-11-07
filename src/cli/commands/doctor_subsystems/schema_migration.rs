@@ -126,6 +126,7 @@ struct ReviewedSchemaObjectPreservation {
 
 #[derive(Debug)]
 struct ReviewedStatePreservation {
+    application_id: i64,
     tables: Vec<ReviewedTablePreservation>,
     schema: Vec<ReviewedSchemaObjectPreservation>,
     added_empty_sequences: Vec<String>,
@@ -189,6 +190,11 @@ pub(super) struct MigrationForecast {
     pub(super) schema19_runtime_upgrade: Option<ReviewedRuntimeSchemaUpgrade>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     schema19_preservation: Option<Schema19PreservationProfile>,
+    /// Persistent operator metadata lives in SQLite's header rather than a
+    /// table. Keep historical receipt serialization intact while binding every
+    /// new plan to the committed value, including a value held only in WAL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    application_id: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     post_migration_maintenance: bool,
 }
@@ -2923,10 +2929,10 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 // A clean current layout can still return a read-only no-op.
                 refuse_schema_repair_during_pending_merge(&conn)?;
             }
-            Ok(upgrade)
+            Ok((upgrade, query_application_id(&conn)?))
         });
         close_connection(conn)?;
-        let schema19_runtime_upgrade = upgrade?;
+        let (schema19_runtime_upgrade, application_id) = upgrade?;
         if schema19_runtime_upgrade.is_some() || !integrity_clean {
             let mut forecast = MigrationForecast {
                 from_version: from,
@@ -2940,6 +2946,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 content_hash_refresh_profile: None,
                 schema19_runtime_upgrade,
                 schema19_preservation: None,
+                application_id: Some(application_id),
                 post_migration_maintenance: true,
             };
             if schema19_runtime_upgrade.is_some() {
@@ -3040,6 +3047,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     let content_hash_refresh_profile = hash_refresh::plan_profile(&conn, from)?;
     let issue_count = query_count(&conn, "SELECT COUNT(*) FROM issues")?;
     let gate_result_history_created = !named_table_exists(&conn, "gate_result_history")?;
+    let application_id = query_application_id(&conn)?;
     close_connection(conn)?;
 
     let forecast = MigrationForecast {
@@ -3062,6 +3070,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
         content_hash_refresh_profile,
         schema19_runtime_upgrade: None,
         schema19_preservation: None,
+        application_id: Some(application_id),
         post_migration_maintenance: true,
     };
     let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -5310,6 +5319,12 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
             &applied_receipt_sha256,
             &applied,
         )?;
+        verify_prepared_undo_preservation(
+            &migration.db_path,
+            &run_dir,
+            &receipt,
+            &applied.forecast,
+        )?;
         receipt
     } else {
         let (logical_live, projection_unchanged) =
@@ -5853,6 +5868,84 @@ fn validate_prepared_undo_receipt(
     Ok(())
 }
 
+/// Recheck historical undo intents against their retained source, even when
+/// an interrupted exchange split the applied family across recovery names.
+/// Only receipt-matching bytes enter the private family; no retained or live
+/// file is opened by the engine or changed while reconstructing this proof.
+fn verify_prepared_undo_preservation(
+    db_path: &Path,
+    run_dir: &Path,
+    receipt: &UndoReceipt,
+    forecast: &MigrationForecast,
+) -> Result<()> {
+    validate_raw_family_witness(&receipt.raw_expected_before)?;
+    validate_raw_family_witness(&receipt.raw_live_before_undo)?;
+    if !component_for_suffix(&receipt.raw_live_before_undo, "")?.present {
+        return Err(BeadsError::internal(
+            "prepared schema-migration undo omits its applied main database",
+        ));
+    }
+    let quarantine = validate_quarantine_path(receipt, run_dir)?;
+    let candidate = run_dir.join("undo-restored-candidate");
+    let private = tempfile::Builder::new()
+        .prefix("br-prepared-undo-proof-")
+        .tempdir()?;
+    let private_main = backup_component_path(private.path(), db_path, "")?;
+    for component in receipt
+        .raw_live_before_undo
+        .components
+        .iter()
+        .filter(|component| component.present)
+    {
+        let mut locations = vec![
+            family_component_path(db_path, &component.suffix),
+            backup_component_path(&quarantine, db_path, &component.suffix)?,
+        ];
+        if component.suffix.is_empty() {
+            locations.push(backup_component_path(&candidate, db_path, "")?);
+        }
+        let mut retained = None;
+        for location in locations {
+            let Some(metadata) = secure_file_metadata(&location)? else {
+                continue;
+            };
+            if component_bytes_match(&location, &metadata, component)? {
+                retained = Some(location);
+                break;
+            }
+        }
+        let retained = retained.ok_or_else(|| {
+            BeadsError::internal(format!(
+                "schema migration run {} cannot verify prepared undo: receipt-bound applied \
+                 component {:?} is missing or changed in its live and recovery locations; \
+                 preserve all database and recovery files",
+                receipt.run_id, component.suffix,
+            ))
+        })?;
+        let destination = backup_component_path(private.path(), db_path, &component.suffix)?;
+        copy_regular_file_new(&retained, &destination, None)?;
+    }
+    // A pathname or payload may change between selection and copying. Verify
+    // the entire assembled generation before trusting it as engine input.
+    verify_backup_family(&private_main, private.path(), &receipt.raw_live_before_undo)?;
+    if let Some(expected) = receipt.logical_live_before_undo.as_ref()
+        && &logical_witness(&private_main)? != expected
+    {
+        return Err(BeadsError::internal(format!(
+            "schema migration run {} prepared undo applied family does not match its \
+             recorded logical state; preserve all database and recovery files",
+            receipt.run_id,
+        )));
+    }
+    verify_retained_migration_preservation_at(
+        &private_main,
+        run_dir,
+        &receipt.raw_expected_before,
+        forecast,
+        None,
+    )
+}
+
 fn require_unchanged_applied_state(
     applied: &AppliedMigrationReceipt,
     raw_live: &RawFamilyWitness,
@@ -5945,6 +6038,27 @@ fn query_user_version(conn: &Connection) -> Result<u32> {
         .and_then(SqliteValue::as_integer)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| BeadsError::internal("PRAGMA user_version was not a nonnegative u32"))
+}
+
+fn query_application_id(conn: &Connection) -> Result<i64> {
+    // Read through the engine's committed snapshot: offset 68 of the main
+    // file alone may be stale when the newest page 1 is still in the WAL.
+    conn.query_row("PRAGMA main.application_id")?
+        .get(0)
+        .and_then(SqliteValue::as_integer)
+        .ok_or_else(|| BeadsError::internal("PRAGMA application_id was not an integer"))
+}
+
+fn require_preserved_application_id(conn: &Connection, expected: i64) -> Result<()> {
+    let observed = query_application_id(conn)?;
+    if observed != expected {
+        return Err(BeadsError::Config(format!(
+            "reviewed migration preservation refused: database application_id changed \
+             (expected {expected}, observed {observed}); preserve the original database and \
+             newer operator metadata instead of installing or restoring a different value"
+        )));
+    }
+    Ok(())
 }
 
 fn named_table_exists(conn: &Connection, table: &str) -> Result<bool> {
@@ -6109,6 +6223,7 @@ fn capture_reviewed_state_preservation_with_text_encoding(
             }
         }
         Ok(Some(ReviewedStatePreservation {
+            application_id: query_application_id(conn)?,
             tables,
             schema: reviewed_schema_objects(conn, false)?,
             added_empty_sequences,
@@ -6223,6 +6338,7 @@ fn verify_reviewed_state_preservation(
         return Ok(());
     };
     with_preservation_snapshot(db_path, |conn| {
+        require_preserved_application_id(conn, expected.application_id)?;
         for table in &expected.tables {
             let sequences = if candidate {
                 expected.added_empty_sequences.as_slice()
@@ -6301,12 +6417,6 @@ fn verify_retained_migration_preservation_at(
     if forecast.schema19_runtime_upgrade.is_some() {
         verify_reviewed_profile(db_path, forecast, false)?;
     }
-    if forecast.from_version == 4
-        || forecast.legacy_v15_conversion.is_some()
-        || forecast.legacy_v4_conversion.is_some()
-    {
-        return verify_reviewed_profile(db_path, forecast, false);
-    }
     let before_dir = run_dir.join("before");
     verify_backup_family(db_path, &before_dir, raw_before)?;
     let mut builder = tempfile::Builder::new();
@@ -6319,6 +6429,21 @@ fn verify_retained_migration_preservation_at(
     copy_family_to_backup(&retained_source, private.path(), raw_before)?;
     verify_backup_family(&retained_source, private.path(), raw_before)?;
     let private_source = backup_component_path(private.path(), db_path, "")?;
+    // Historical receipts did not record this header metadata. Reconstruct
+    // its authority from the verified original family even for specialized
+    // v4/v15 profiles, whose row projections cannot detect a header-only edit.
+    let source_application_id = with_preservation_snapshot(&private_source, query_application_id)?;
+    with_preservation_snapshot(db_path, |conn| {
+        require_preserved_application_id(conn, source_application_id)
+    })?;
+    if forecast.from_version == 4
+        || forecast.legacy_v15_conversion.is_some()
+        || forecast.legacy_v4_conversion.is_some()
+    {
+        let verified = verify_reviewed_profile(db_path, forecast, false);
+        verify_backup_family(db_path, &before_dir, raw_before)?;
+        return verified;
+    }
     if forecast.schema19_runtime_upgrade.is_some() {
         verify_reviewed_profile(&private_source, forecast, true)?;
     }
@@ -6720,6 +6845,11 @@ fn verify_reviewed_profile(
     project_source: bool,
 ) -> Result<()> {
     validate_schema19_preservation_profile(forecast)?;
+    if let Some(expected) = forecast.application_id {
+        with_preservation_snapshot(db_path, |conn| {
+            require_preserved_application_id(conn, expected)
+        })?;
+    }
     if let Some(upgrade) = forecast.schema19_runtime_upgrade {
         if forecast.from_version != 19
             || forecast.to_version != 19
@@ -9570,6 +9700,7 @@ mod tests {
             content_hash_refresh_profile: None,
             schema19_runtime_upgrade: None,
             schema19_preservation: None,
+            application_id: None,
             post_migration_maintenance: true,
         };
         let first = compute_plan_token("db", &logical, &forecast).unwrap();
@@ -9590,6 +9721,42 @@ mod tests {
             first,
             compute_plan_token("different-db", &logical, &forecast).unwrap(),
             "the absolute database route remains token-bound"
+        );
+    }
+
+    #[test]
+    fn application_id_plan_binding_preserves_historical_receipt_serialization() {
+        let historical = r#"{"from_version":14,"to_version":19,"content_hash_rows_rebuilt":0,"gate_result_history_created":true,"post_migration_maintenance":true}"#;
+        let mut forecast: MigrationForecast = serde_json::from_str(historical).unwrap();
+        assert_eq!(forecast.application_id, None);
+        assert_eq!(serde_json::to_string(&forecast).unwrap(), historical);
+        let logical = LogicalDatabaseWitness {
+            user_version: 14,
+            integrity_check: "ok".to_owned(),
+            schema_sha256: "unchanged-schema".to_owned(),
+            contents_sha256: "unchanged-rows".to_owned(),
+            tables: Vec::new(),
+        };
+        let historical_token = compute_plan_token("db", &logical, &forecast).unwrap();
+        let mut tokens = std::collections::BTreeSet::new();
+        for application_id in [0, 123_456_789, 987_654_321, i64::from(i32::MAX)] {
+            forecast.application_id = Some(application_id);
+            let token = compute_plan_token("db", &logical, &forecast).unwrap();
+            assert_ne!(token, historical_token);
+            assert!(
+                tokens.insert(token),
+                "header-only changes must stale the plan"
+            );
+            let encoded = serde_json::to_string(&forecast).unwrap();
+            let restored: MigrationForecast = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(restored, forecast);
+        }
+        forecast.application_id = None;
+        assert_eq!(serde_json::to_string(&forecast).unwrap(), historical);
+        assert_eq!(
+            compute_plan_token("db", &logical, &forecast).unwrap(),
+            historical_token,
+            "already-installed historical receipts keep their original token"
         );
     }
 
@@ -9992,6 +10159,7 @@ mod tests {
             content_hash_refresh_profile: None,
             schema19_runtime_upgrade: None,
             schema19_preservation: None,
+            application_id: None,
             post_migration_maintenance: false,
         };
         (temp, db_path, forecast)
@@ -10053,6 +10221,46 @@ mod tests {
                 "{sql}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn reviewed_preservation_rejects_application_id_drift_with_identical_rows() {
+        let (_temp, db_path, mut forecast) = preservation_fixture();
+        let original = 123_456_789;
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(&format!("PRAGMA application_id = {original}"))
+            .unwrap();
+        close_connection(conn).unwrap();
+        forecast.application_id = Some(original);
+        let proof = capture_reviewed_state_preservation(&db_path, &forecast).unwrap();
+        let logical = logical_witness(&db_path).unwrap();
+        verify_reviewed_profile(&db_path, &forecast, true).unwrap();
+        verify_reviewed_state_preservation(&db_path, proof.as_ref(), true).unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA application_id = 987654321").unwrap();
+        close_connection(conn).unwrap();
+        assert_eq!(logical_witness(&db_path).unwrap(), logical);
+        for candidate in [false, true] {
+            let error = verify_reviewed_state_preservation(&db_path, proof.as_ref(), candidate)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("application_id changed"),
+                "{error}"
+            );
+            let error = verify_reviewed_profile(&db_path, &forecast, !candidate).unwrap_err();
+            assert!(
+                error.to_string().contains("application_id changed"),
+                "{error}"
+            );
+        }
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(&format!("PRAGMA application_id = {original}"))
+            .unwrap();
+        close_connection(conn).unwrap();
+        verify_reviewed_profile(&db_path, &forecast, false).unwrap();
+        verify_reviewed_state_preservation(&db_path, proof.as_ref(), true).unwrap();
     }
 
     #[test]
@@ -12736,6 +12944,276 @@ mod tests {
                 .write_authority
                 .verify_database_authority()
                 .unwrap();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    mod prepared_undo_preservation {
+        use super::*;
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::MetadataExt;
+
+        struct Fixture {
+            _temp: TempDir,
+            migration: MigrationContext,
+            run_dir: PathBuf,
+            applied: AppliedMigrationReceipt,
+            receipt: UndoReceipt,
+            historical_forecast: MigrationForecast,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let (temp, migration) =
+                    reviewed_v14_migration_context_with_database_name("custom.tracker.sqlite");
+                let plan = build_plan(&migration.db_path).unwrap();
+                execute_apply(
+                    &DoctorMigrateSchemaApplyArgs {
+                        plan_token: plan.plan_token.unwrap(),
+                        json: false,
+                    },
+                    &migration,
+                )
+                .unwrap();
+                let run_dir = fs::read_dir(migration_runs_root(&migration.beads_dir))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let applied_path = run_dir.join("applied.json");
+                let applied: AppliedMigrationReceipt = read_json(&applied_path).unwrap();
+
+                // Retain real WAL frames and SHM without changing the applied
+                // logical state, so partial moves must reconstruct a family.
+                let mut connection =
+                    Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+                connection.execute("PRAGMA journal_mode=WAL").unwrap();
+                connection.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+                connection
+                    .execute("UPDATE issues SET title='Temporary WAL proof state'")
+                    .unwrap();
+                connection
+                    .execute("UPDATE issues SET title='Schema rehearsal'")
+                    .unwrap();
+                connection.close_without_checkpoint_in_place().unwrap();
+                drop(connection);
+                let logical = with_migration_read_snapshot(&migration.db_path, |snapshot, _| {
+                    logical_witness(snapshot)
+                })
+                .unwrap();
+                assert_eq!(Some(&logical), applied.logical_after.as_ref());
+                let raw = raw_family_witness(&migration.db_path).unwrap();
+                for suffix in ["-wal", "-shm"] {
+                    assert!(component_for_suffix(&raw, suffix).unwrap().present);
+                }
+                assert!(component_for_suffix(&raw, "-wal").unwrap().length.unwrap() > 32);
+                let receipt = UndoReceipt {
+                    schema_version: UNDO_SCHEMA.to_owned(),
+                    run_id: applied.run_id.clone(),
+                    dry_run: false,
+                    database_path: migration.db_path.display().to_string(),
+                    quarantine_path: run_dir
+                        .join("undo-quarantine/undo-preservation-fixture")
+                        .display()
+                        .to_string(),
+                    applied_receipt_sha256: file_sha256(&applied_path).unwrap(),
+                    raw_expected_before: applied.raw_before.clone(),
+                    logical_expected_before: applied.logical_before.clone(),
+                    raw_live_before_undo: raw,
+                    logical_live_before_undo: Some(logical),
+                    raw_restored: None,
+                    logical_restored: None,
+                };
+                let mut historical_forecast = applied.forecast.clone();
+                historical_forecast.application_id = None;
+                Self {
+                    _temp: temp,
+                    migration,
+                    run_dir,
+                    applied,
+                    receipt,
+                    historical_forecast,
+                }
+            }
+
+            fn files(&self) -> BTreeMap<PathBuf, (u64, u64, Vec<u8>)> {
+                let mut files = BTreeMap::new();
+                let mut directories = vec![self.migration.beads_dir.clone()];
+                while let Some(directory) = directories.pop() {
+                    for entry in fs::read_dir(directory).unwrap() {
+                        let path = entry.unwrap().path();
+                        let metadata = fs::symlink_metadata(&path).unwrap();
+                        if metadata.is_dir() {
+                            directories.push(path);
+                        } else {
+                            assert!(metadata.is_file());
+                            let bytes = fs::read(&path).unwrap();
+                            files.insert(path, (metadata.dev(), metadata.ino(), bytes));
+                        }
+                    }
+                }
+                files
+            }
+
+            fn verify(&self) -> Result<()> {
+                let before = self.files();
+                let result = verify_prepared_undo_preservation(
+                    &self.migration.db_path,
+                    &self.run_dir,
+                    &self.receipt,
+                    &self.historical_forecast,
+                );
+                assert_eq!(
+                    self.files(),
+                    before,
+                    "proof must preserve every original file"
+                );
+                result
+            }
+        }
+
+        #[test]
+        fn prepared_undo_reconstructs_each_partial_applied_family() {
+            let fixture = Fixture::new();
+            fixture.verify().unwrap();
+            let db = &fixture.migration.db_path;
+            let quarantine = validate_quarantine_path(&fixture.receipt, &fixture.run_dir).unwrap();
+            ensure_new_directory(&quarantine).unwrap();
+            let candidate_dir = fixture.run_dir.join("undo-restored-candidate");
+            ensure_new_directory(&candidate_dir).unwrap();
+            let candidate = backup_component_path(&candidate_dir, db, "").unwrap();
+            let before_dir = fixture.run_dir.join("before");
+            let before_main = backup_component_path(&before_dir, db, "").unwrap();
+            copy_regular_file_new(&before_main, &candidate, None).unwrap();
+
+            // Immediately after exchange the applied main still occupies the
+            // candidate name, while both applied sidecars retain live names.
+            exchange_database_paths(&candidate, db).unwrap();
+            fixture.verify().unwrap();
+            rename_path_no_replace(
+                &candidate,
+                &backup_component_path(&quarantine, db, "").unwrap(),
+            )
+            .unwrap();
+            fixture.verify().unwrap();
+            for component in fixture
+                .receipt
+                .raw_live_before_undo
+                .components
+                .iter()
+                .filter(|component| component.present && !component.suffix.is_empty())
+            {
+                rename_path_no_replace(
+                    &family_component_path(db, &component.suffix),
+                    &backup_component_path(&quarantine, db, &component.suffix).unwrap(),
+                )
+                .unwrap();
+                fixture.verify().unwrap();
+            }
+            restore_backup_family_resuming(db, &before_dir, &fixture.applied.raw_before).unwrap();
+            fixture.verify().unwrap();
+        }
+
+        #[test]
+        fn prepared_undo_requires_every_receipt_bound_component() {
+            let mut fixture = Fixture::new();
+            let db = fixture.migration.db_path.clone();
+            // Also require an explicitly witnessed cold rollback journal.
+            fs::write(family_component_path(&db, "-journal"), b"").unwrap();
+            fixture.receipt.raw_live_before_undo = raw_family_witness(&db).unwrap();
+            for suffix in FAMILY_SUFFIXES {
+                let live = family_component_path(&db, suffix);
+                let retained = fixture.run_dir.join(format!("unbound-component{suffix}"));
+                rename_path_no_replace(&live, &retained).unwrap();
+                let missing = fixture
+                    .verify()
+                    .expect_err("every present component is required");
+                assert!(
+                    missing
+                        .to_string()
+                        .contains("receipt-bound applied component")
+                );
+
+                fs::write(&live, b"bytes outside the prepared undo receipt").unwrap();
+                let changed = fixture
+                    .verify()
+                    .expect_err("unreviewed bytes are not proof");
+                assert!(
+                    changed
+                        .to_string()
+                        .contains("receipt-bound applied component")
+                );
+                let mismatch = fixture
+                    .run_dir
+                    .join(format!("mismatched-component{suffix}"));
+                rename_path_no_replace(&live, &mismatch).unwrap();
+                rename_path_no_replace(&retained, &live).unwrap();
+            }
+        }
+
+        #[test]
+        fn prepared_undo_rechecks_the_recorded_applied_logical_state() {
+            let mut fixture = Fixture::new();
+            fixture
+                .receipt
+                .logical_live_before_undo
+                .as_mut()
+                .unwrap()
+                .contents_sha256 = "0".repeat(64);
+            let error = fixture
+                .verify()
+                .expect_err("raw bytes cannot excuse a false logical proof");
+            assert!(
+                error.to_string().contains("recorded logical state"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn historical_prepared_undo_refuses_a_changed_application_id() {
+            let mut fixture = Fixture::new();
+            fixture.verify().unwrap();
+            let connection =
+                Connection::open(fixture.migration.db_path.to_string_lossy().into_owned()).unwrap();
+            connection
+                .execute("PRAGMA application_id = 987654321")
+                .unwrap();
+            close_connection(connection).unwrap();
+            let logical =
+                with_migration_read_snapshot(&fixture.migration.db_path, |snapshot, _| {
+                    logical_witness(snapshot)
+                })
+                .unwrap();
+            assert_eq!(
+                Some(&logical),
+                fixture.applied.logical_after.as_ref(),
+                "the historical generic witness does not include application_id"
+            );
+            fixture.receipt.raw_live_before_undo =
+                raw_family_witness(&fixture.migration.db_path).unwrap();
+            fixture.receipt.logical_live_before_undo = Some(logical);
+            let args = DoctorMigrateSchemaUndoArgs {
+                run_id: fixture.receipt.run_id.clone(),
+                dry_run: false,
+                json: false,
+            };
+            validate_prepared_undo_receipt(
+                &fixture.receipt,
+                &args,
+                &fixture.migration,
+                &fixture.run_dir,
+                &fixture.receipt.applied_receipt_sha256,
+                &fixture.applied,
+            )
+            .expect("historical receipt validation alone accepts this changed identifier");
+            let error = fixture
+                .verify()
+                .expect_err("resume must preserve newer header state");
+            assert!(
+                error.to_string().contains("application_id changed"),
+                "{error}"
+            );
         }
     }
 

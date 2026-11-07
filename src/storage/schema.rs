@@ -4582,9 +4582,8 @@ pub(crate) fn inspect_current_schema_for_repair(
 /// error propagation. No data-table scan, integrity verdict, or canonical
 /// schema manifest is duplicated here. The returned flag records triggers.
 fn inspect_runtime_schema_metadata(conn: &Connection) -> Result<bool> {
-    let objects = conn.query(
-        "SELECT type, name, tbl_name, sql FROM main.sqlite_schema ORDER BY type, name",
-    )?;
+    let objects =
+        conn.query("SELECT type, name, tbl_name, sql FROM main.sqlite_schema ORDER BY type, name")?;
     conn.query("PRAGMA main.table_list")?;
     let mut names = std::collections::BTreeSet::new();
     let mut has_triggers = false;
@@ -4610,7 +4609,9 @@ fn inspect_runtime_schema_metadata(conn: &Connection) -> Result<bool> {
             .get(3)
             .is_none_or(|sql| !matches!(sql, SqliteValue::Text(_) | SqliteValue::Null))
         {
-            return Err(BeadsError::internal("schema object SQL is neither text nor NULL"));
+            return Err(BeadsError::internal(
+                "schema object SQL is neither text nor NULL",
+            ));
         }
         let escaped = name.replace('\'', "''");
         match kind {
@@ -9919,7 +9920,10 @@ mod tests {
         .unwrap();
         let before = legacy_v15_test_state(&conn);
         let error = inspect_current_schema_for_repair(&conn).unwrap_err();
-        assert!(error.to_string().contains("sync merge is pending"), "{error}");
+        assert!(
+            error.to_string().contains("sync merge is pending"),
+            "{error}"
+        );
         assert_eq!(legacy_v15_test_state(&conn), before);
     }
 

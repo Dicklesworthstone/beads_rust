@@ -268,6 +268,15 @@ hidden row IDs, sequence names/high-water values, and admitted operator schema.
 SQLite's sequence catalog's own row IDs are not application identities.
 Historical v1 profile digests keep their original encoding for receipt
 verification; retained-source comparisons still require exact TEXT bytes.
+Every new migration forecast separately binds SQLite's persistent
+`application_id`, read through the engine so committed WAL metadata is
+included. Source, candidate and installed-state checks preserve it. Old
+receipt serialization remains unchanged; undo and interrupted completion
+compare the live identifier with the verified retained source instead of
+inferring equality from table rows. A prepared undo first reconstructs its
+receipt-bound applied family from live, staging or quarantine components on a
+private copy, so an older prepared intent cannot authorize discarding newer
+application metadata.
 The candidate must preserve that authority, pass fresh-connection integrity
 checks and have the expected target layout. Existing closing actors and
 receipt rows remain exact; a newly added actor is NULL and a new receipt table

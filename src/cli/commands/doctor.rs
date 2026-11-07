@@ -16,8 +16,9 @@ use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassificatio
 use crate::output::{OutputContext, rich_text_panel};
 use crate::storage::SqliteStorage;
 use crate::storage::schema::{
-    CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS, CurrentSchemaRepairInspection,
-    ReviewedRuntimeSchemaUpgrade, inspect_current_schema_for_repair, maintain_current_schema_atomic,
+    CURRENT_SCHEMA_VERSION, CurrentSchemaRepairInspection, REVIEWED_MIGRATION_SOURCE_VERSIONS,
+    ReviewedRuntimeSchemaUpgrade, inspect_current_schema_for_repair,
+    maintain_current_schema_atomic,
 };
 use crate::storage::sqlite::{PendingSyncMergeInspection, database_header_user_version};
 #[cfg(test)]
@@ -791,7 +792,9 @@ fn unsupported_current_layout_in_report(report: &DoctorReport) -> Option<&str> {
             return None;
         }
         let details = check.details.as_ref()?;
-        if details.get("user_version").and_then(serde_json::Value::as_i64)
+        if details
+            .get("user_version")
+            .and_then(serde_json::Value::as_i64)
             != Some(i64::from(CURRENT_SCHEMA_VERSION))
             || details
                 .get("layout_classification")
@@ -804,7 +807,9 @@ fn unsupported_current_layout_in_report(report: &DoctorReport) -> Option<&str> {
             details
                 .get("reason")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("the readable current layout is outside the reviewed maintenance profiles"),
+                .unwrap_or(
+                    "the readable current layout is outside the reviewed maintenance profiles",
+                ),
         )
     })
 }
@@ -827,7 +832,9 @@ fn report_requires_current_schema_maintenance(report: &DoctorReport) -> bool {
         check.name == "schema.runtime"
             && check.status == CheckStatus::Error
             && check.details.as_ref().is_some_and(|details| {
-                details.get("user_version").and_then(serde_json::Value::as_i64)
+                details
+                    .get("user_version")
+                    .and_then(serde_json::Value::as_i64)
                     == Some(i64::from(CURRENT_SCHEMA_VERSION))
                     && details
                         .get("layout_classification")
@@ -4015,9 +4022,9 @@ fn build_issue_write_probe_check(
 fn refuse_known_current_layout_jsonl_rebuild(db_path: &Path) -> Result<()> {
     let reason = match current_schema_layout_before_repair(db_path) {
         Ok(Some(CurrentSchemaRepairInspection::Unsupported { reason })) => Some(reason),
-        Ok(Some(CurrentSchemaRepairInspection::ReviewedUpgrade(_))) => Some(
-            "the source requires the explicit reviewed release-layout upgrade".to_owned(),
-        ),
+        Ok(Some(CurrentSchemaRepairInspection::ReviewedUpgrade(_))) => {
+            Some("the source requires the explicit reviewed release-layout upgrade".to_owned())
+        }
         Ok(Some(CurrentSchemaRepairInspection::MaintenanceRequired)) => Some(
             "the source requires dedicated current-schema index or derived-cache maintenance"
                 .to_owned(),
@@ -5289,7 +5296,10 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
                 checks,
                 "schema.runtime",
                 CheckStatus::Error,
-                Some("Current schema requires reviewed index or derived-cache maintenance".to_owned()),
+                Some(
+                    "Current schema requires reviewed index or derived-cache maintenance"
+                        .to_owned(),
+                ),
                 Some(serde_json::json!({
                     "user_version": version,
                     "runtime_compatible": false,
@@ -15086,13 +15096,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // explicit recovery gates in charge.
     let fixer_filter = FixerFilter::from_args(&args.only, &args.skip);
     let mut current_schema_maintenance_needed = false;
-    if args.repair
-        && !args.robot_triage
-        && !resolve_doctor_no_db(&beads_dir, cli)
-    {
+    if args.repair && !args.robot_triage && !resolve_doctor_no_db(&beads_dir, cli) {
         match current_schema_layout_before_repair(&paths.db_path) {
             Ok(Some(CurrentSchemaRepairInspection::ReviewedUpgrade(upgrade))) => {
-                refuse_doctor_repair_for_runtime_upgrade(&paths.db_path, upgrade, args.dry_run, ctx);
+                refuse_doctor_repair_for_runtime_upgrade(
+                    &paths.db_path,
+                    upgrade,
+                    args.dry_run,
+                    ctx,
+                );
             }
             Ok(Some(CurrentSchemaRepairInspection::Unsupported { reason })) => {
                 refuse_doctor_repair_for_unsupported_current_layout(
@@ -15313,9 +15325,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let authority = repair_write_authority.as_ref().ok_or_else(|| {
             BeadsError::internal("current-schema repair has no database-family write authority")
         })?;
-        let repair_session = session.as_mut().ok_or_else(|| {
-            BeadsError::internal("current-schema repair has no repair session")
-        })?;
+        let repair_session = session
+            .as_mut()
+            .ok_or_else(|| BeadsError::internal("current-schema repair has no repair session"))?;
         if let Err(error) = repair_current_schema_under_write_authority(
             &paths.db_path,
             cli.lock_timeout,
@@ -15354,7 +15366,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let recovery_audit = RecoveryAuditRecord {
             phase: "doctor.current_schema_maintenance".to_owned(),
             action: "doctor.repair_current_schema_maintenance".to_owned(),
-            outcome: if verified { "verified" } else { "verification_failed" }.to_owned(),
+            outcome: if verified {
+                "verified"
+            } else {
+                "verification_failed"
+            }
+            .to_owned(),
             reason: (!verified).then(|| {
                 "Current-schema maintenance passed, but other doctor findings remain".to_owned()
             }),

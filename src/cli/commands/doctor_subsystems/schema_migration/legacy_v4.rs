@@ -314,6 +314,7 @@ mod tests {
             content_hash_refresh_profile: None,
             schema19_runtime_upgrade: None,
             schema19_preservation: None,
+            application_id: None,
             post_migration_maintenance: true,
         };
         let token_before = compute_plan_token("/released-schema4.db", &before, &forecast).unwrap();

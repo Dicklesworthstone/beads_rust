@@ -1,10 +1,11 @@
 //! Release-layout incompatibility must never authorize generic reconstruction.
 
 use super::{
-    TableRows, edit_schema19_fixture, engine_rows, header_user_version, released_schema19_workspace,
-    run_br, schema19_authority_rows, schema19_json, schema19_tracker_files,
-    seed_schema19_database_authority, seed_workflow_schema19_operator_state,
-    workflow_schema19_authority, workflow_schema19_durable_files, workflow_schema19_workspace,
+    TableRows, edit_schema19_fixture, engine_rows, header_user_version,
+    released_schema19_workspace, run_br, schema19_authority_rows, schema19_json,
+    schema19_tracker_files, seed_schema19_database_authority,
+    seed_workflow_schema19_operator_state, workflow_schema19_authority,
+    workflow_schema19_durable_files, workflow_schema19_workspace,
 };
 use crate::common::cli::{BrWorkspace, run_br_with_env};
 use beads_rust::franken_sync::Connection;
@@ -190,13 +191,12 @@ fn generic_repair_refuses_readable_unreviewed_current_layout_before_any_mutation
 
         // Pre-create only the normal authority files. The guard must inspect
         // a private family snapshot before opening or repairing the source.
-        let authority =
-            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
-                &beads,
-                &db,
-                Some(1000),
-            )
-            .unwrap();
+        let authority = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+            &beads,
+            &db,
+            Some(1000),
+        )
+        .unwrap();
         authority.bind_database_inode_for_mutation().unwrap();
         drop(authority);
         let before = schema19_tracker_files(&beads);
@@ -212,11 +212,7 @@ fn generic_repair_refuses_readable_unreviewed_current_layout_before_any_mutation
             );
             // A partial-repair failure after installing a JSONL replacement
             // is still data loss. Check authority before trusting its exit.
-            assert_eq!(
-                workflow_schema19_authority(&db),
-                rows,
-                "{table}: {extra:?}"
-            );
+            assert_eq!(workflow_schema19_authority(&db), rows, "{table}: {extra:?}");
             assert!(
                 schema19_tracker_files(&beads) == before,
                 "{table}: {extra:?} changed tracker files: {} {}",
@@ -230,8 +226,7 @@ fn generic_repair_refuses_readable_unreviewed_current_layout_before_any_mutation
                 refused.stdout,
                 refused.stderr
             );
-            let report: Value =
-                serde_json::from_str(&refused.stdout).expect("whole refusal JSON");
+            let report: Value = serde_json::from_str(&refused.stdout).expect("whole refusal JSON");
             assert_eq!(report["ok"], false);
             assert_eq!(report["code"], "refused_unsafe");
             assert_eq!(report["gate"], GATE);
@@ -243,10 +238,7 @@ fn generic_repair_refuses_readable_unreviewed_current_layout_before_any_mutation
                 report["evidence"]["layout_classification"],
                 "unsupported_current_layout"
             );
-            assert_eq!(
-                report["evidence"]["dry_run"],
-                extra.contains(&"--dry-run")
-            );
+            assert_eq!(report["evidence"]["dry_run"], extra.contains(&"--dry-run"));
             assert_eq!(report["recovery_audit"]["outcome"], "refused");
             assert!(report["recovery_audit"].get("applied_actions").is_none());
             assert!(
@@ -280,13 +272,12 @@ fn generic_repair_restores_current_owned_index_without_jsonl_reconstruction() {
             ),
         )]);
         let catalog = engine_rows(&db, Some(&catalog_columns));
-        let authority =
-            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
-                &beads,
-                &db,
-                Some(1000),
-            )
-            .unwrap();
+        let authority = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+            &beads,
+            &db,
+            Some(1000),
+        )
+        .unwrap();
         authority.bind_database_inode_for_mutation().unwrap();
         drop(authority);
         let before_preview = schema19_tracker_files(&beads);
@@ -416,13 +407,9 @@ fn generic_repair_restores_current_owned_index_without_jsonl_reconstruction() {
             [("BR_DOCTOR_RUNS_DIR", runs.as_os_str())],
             &format!("current_index_repair_{label}_repeat"),
         );
-        assert_eq!(
-            workflow_schema19_durable_files(&workspace),
-            repeated_source
-        );
+        assert_eq!(workflow_schema19_durable_files(&workspace), repeated_source);
         assert_eq!(workflow_schema19_authority(&db), rows);
-        let repeated: Value =
-            serde_json::from_str(&repeated.stdout).expect("whole repeat JSON");
+        let repeated: Value = serde_json::from_str(&repeated.stdout).expect("whole repeat JSON");
         assert_eq!(repeated["repaired"], false);
         assert!(
             repeated["recovery_audit"]["applied_actions"]
@@ -430,6 +417,242 @@ fn generic_repair_restores_current_owned_index_without_jsonl_reconstruction() {
                 .is_none_or(Vec::is_empty)
         );
         assert!(!beads.join(".br_recovery").exists());
+    }
+}
+
+mod application_ids {
+    use super::{
+        Connection, released_schema19_workspace, run_br, schema19_authority_rows, schema19_json,
+        schema19_tracker_files, seed_schema19_database_authority, workflow_schema19_durable_files,
+    };
+    use crate::common::cli::BrWorkspace;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const ORIGINAL_ID: i64 = 123_456_789;
+    const NEWER_ID: i64 = 987_654_321;
+
+    /// Resolve committed page-one changes in WAL without opening the live
+    /// database. Reading its raw main header alone would miss those settings.
+    fn application_id(db: &Path) -> i64 {
+        let private = tempfile::tempdir().unwrap();
+        let copy = private.path().join("settings.db");
+        fs::copy(db, &copy).unwrap();
+        let wal = PathBuf::from(format!("{}-wal", db.display()));
+        if wal.is_file() {
+            fs::copy(wal, private.path().join("settings.db-wal")).unwrap();
+        }
+        let connection = Connection::open(copy.to_string_lossy().into_owned()).unwrap();
+        let value = connection
+            .query_row("PRAGMA application_id")
+            .unwrap()
+            .get(0)
+            .and_then(beads_rust::franken_sync::SqliteValue::as_integer)
+            .unwrap();
+        connection.close().unwrap();
+        value
+    }
+
+    fn set_application_id(workspace: &BrWorkspace, value: i64, leave_in_wal: bool) {
+        let db = workspace.root.join(".beads/beads.db");
+        let mut connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        let main_before = if leave_in_wal {
+            connection.execute("PRAGMA journal_mode=WAL").unwrap();
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            connection.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+            Some(fs::read(&db).unwrap())
+        } else {
+            None
+        };
+        connection
+            .execute(&format!("PRAGMA application_id={value}"))
+            .unwrap();
+        if let Some(main_before) = main_before {
+            connection.close_without_checkpoint_in_place().unwrap();
+            drop(connection);
+            assert_eq!(fs::read(&db).unwrap(), main_before);
+            assert!(
+                fs::metadata(workspace.root.join(".beads/beads.db-wal"))
+                    .unwrap()
+                    .len()
+                    > 32
+            );
+        } else {
+            connection
+                .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            connection.close().unwrap();
+        }
+        assert_eq!(application_id(&db), value);
+    }
+
+    fn source_files(workspace: &BrWorkspace) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = workflow_schema19_durable_files(workspace);
+        let shm = workspace.root.join(".beads/beads.db-shm");
+        if shm.is_file() {
+            files.insert(PathBuf::from("beads.db-shm"), fs::read(shm).unwrap());
+        }
+        files
+    }
+
+    #[test]
+    fn released_schema19_application_id_changes_stale_reviewed_plans() {
+        let workspace = released_schema19_workspace();
+        seed_schema19_database_authority(&workspace);
+        set_application_id(&workspace, ORIGINAL_ID, false);
+        let beads = workspace.root.join(".beads");
+        let db = beads.join("beads.db");
+        let original_rows = schema19_authority_rows(&db, None);
+        let before_plan = schema19_tracker_files(&beads);
+        let original = schema19_json(&run_br(
+            &workspace,
+            ["doctor", "migrate-schema", "plan", "--json"],
+            "application_id_original_plan",
+        ));
+        assert_eq!(original["eligible"], true);
+        assert_eq!(original["forecast"]["application_id"], ORIGINAL_ID);
+        assert_eq!(schema19_tracker_files(&beads), before_plan);
+
+        set_application_id(&workspace, NEWER_ID, false);
+        let changed_files = schema19_tracker_files(&beads);
+        let changed = schema19_json(&run_br(
+            &workspace,
+            ["doctor", "migrate-schema", "plan", "--json"],
+            "application_id_changed_plan",
+        ));
+        assert_eq!(changed["eligible"], true);
+        assert_eq!(changed["forecast"]["application_id"], NEWER_ID);
+        // The persisted logical-v1 witness deliberately keeps its historical
+        // encoding. Metadata needs its own token-bound forecast authority.
+        assert_eq!(changed["logical_witness"], original["logical_witness"]);
+        assert_ne!(changed["plan_token"], original["plan_token"]);
+        assert_eq!(schema19_tracker_files(&beads), changed_files);
+        assert_eq!(schema19_authority_rows(&db, None), original_rows);
+
+        let before_refusal = source_files(&workspace);
+        let stale = run_br(
+            &workspace,
+            [
+                "doctor",
+                "migrate-schema",
+                "apply",
+                "--plan-token",
+                original["plan_token"].as_str().unwrap(),
+                "--json",
+            ],
+            "application_id_stale_apply",
+        );
+        assert!(!stale.status.success(), "{} {}", stale.stdout, stale.stderr);
+        assert_eq!(source_files(&workspace), before_refusal);
+        assert_eq!(application_id(&db), NEWER_ID);
+        assert!(!beads.join(".br_recovery/schema-migrations").exists());
+
+        let applied = schema19_json(&run_br(
+            &workspace,
+            [
+                "doctor",
+                "migrate-schema",
+                "apply",
+                "--plan-token",
+                changed["plan_token"].as_str().unwrap(),
+                "--json",
+            ],
+            "application_id_refreshed_apply",
+        ));
+        assert_eq!(applied["forecast"]["application_id"], NEWER_ID);
+        assert_eq!(application_id(&db), NEWER_ID);
+        assert_eq!(
+            schema19_authority_rows(&db, Some(&original_rows)),
+            original_rows
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[allow(clippy::too_many_lines)]
+    fn released_schema19_undo_preserves_newer_application_id_in_main_or_wal() {
+        for leave_in_wal in [false, true] {
+            let workspace = released_schema19_workspace();
+            seed_schema19_database_authority(&workspace);
+            set_application_id(&workspace, ORIGINAL_ID, false);
+            let beads = workspace.root.join(".beads");
+            let db = beads.join("beads.db");
+            let original_files = source_files(&workspace);
+            let original_rows = schema19_authority_rows(&db, None);
+            let plan = schema19_json(&run_br(
+                &workspace,
+                ["doctor", "migrate-schema", "plan", "--json"],
+                "application_id_undo_setup_plan",
+            ));
+            let applied = schema19_json(&run_br(
+                &workspace,
+                [
+                    "doctor",
+                    "migrate-schema",
+                    "apply",
+                    "--plan-token",
+                    plan["plan_token"].as_str().unwrap(),
+                    "--json",
+                ],
+                "application_id_undo_setup_apply",
+            ));
+            let run_id = applied["run_id"].as_str().unwrap();
+            let run_dir = beads.join(".br_recovery/schema-migrations").join(run_id);
+            let applied_rows = schema19_authority_rows(&db, None);
+            assert_eq!(application_id(&db), ORIGINAL_ID);
+
+            set_application_id(&workspace, NEWER_ID, leave_in_wal);
+            let newer_files = schema19_tracker_files(&beads);
+            assert_eq!(schema19_authority_rows(&db, None), applied_rows);
+            for dry_run in [true, false] {
+                let mut args = vec!["doctor", "migrate-schema", "undo", run_id, "--json"];
+                if dry_run {
+                    args.push("--dry-run");
+                }
+                let refused = run_br(&workspace, args, "application_id_newer_undo_refusal");
+                assert!(
+                    !refused.status.success(),
+                    "wal={leave_in_wal}, dry_run={dry_run}: {} {}",
+                    refused.stdout,
+                    refused.stderr
+                );
+                assert_eq!(schema19_tracker_files(&beads), newer_files);
+                assert_eq!(application_id(&db), NEWER_ID);
+                assert_eq!(schema19_authority_rows(&db, None), applied_rows);
+                assert!(!run_dir.join("undo-prepared.json").exists());
+                assert!(!run_dir.join("undone.json").exists());
+            }
+
+            // Reinstating the applied identifier makes the source eligible
+            // again despite harmless changes to engine header counters.
+            set_application_id(&workspace, ORIGINAL_ID, false);
+            let before_preview = schema19_tracker_files(&beads);
+            schema19_json(&run_br(
+                &workspace,
+                [
+                    "doctor",
+                    "migrate-schema",
+                    "undo",
+                    run_id,
+                    "--dry-run",
+                    "--json",
+                ],
+                "application_id_unchanged_undo_preview",
+            ));
+            assert_eq!(schema19_tracker_files(&beads), before_preview);
+            schema19_json(&run_br(
+                &workspace,
+                ["doctor", "migrate-schema", "undo", run_id, "--json"],
+                "application_id_unchanged_undo",
+            ));
+            assert!(run_dir.join("undone.json").is_file());
+            assert_eq!(application_id(&db), ORIGINAL_ID);
+            assert_eq!(source_files(&workspace), original_files);
+            assert_eq!(schema19_authority_rows(&db, None), original_rows);
+        }
     }
 }
 

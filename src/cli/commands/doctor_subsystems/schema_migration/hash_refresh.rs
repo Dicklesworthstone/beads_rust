@@ -312,6 +312,7 @@ mod tests {
             let plan = lifecycle::build_plan(&migration.db_path).unwrap();
             let mut forecast = plan.forecast.unwrap();
             forecast.content_hash_refresh_profile = None;
+            forecast.application_id = None;
             let plan_token = lifecycle::compute_plan_token(
                 &plan.database_path,
                 &plan.logical_witness,

@@ -2919,6 +2919,14 @@ rewrite or retire those files without changing database semantics. `apply`
 captures and verifies a fresh byte-exact family backup after logical-token
 validation and before migration.
 
+New forecasts also record `application_id`, SQLite's persistent application
+identifier. Changing that header value invalidates the plan even when schema
+and table rows are unchanged. Apply preserves it, and undo refuses a later
+change, including one committed only in WAL. Historical receipts keep their
+original token encoding; their retained source family supplies the identifier
+for recovery verification. Prepared undo resumes reassemble and verify the
+receipt-bound applied family privately before proceeding.
+
 `apply` and non-dry-run `undo` require sole-opener access before observing or
 replacing the live generation. They retain the cooperative opener lease,
 engine namespace locks and native SQLite locks on both the original and
