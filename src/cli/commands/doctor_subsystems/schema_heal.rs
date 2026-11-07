@@ -50,7 +50,9 @@ use crate::error::{BeadsError, Result};
 use crate::franken_sync::Connection;
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
 use crate::model::{Comment, Dependency, Issue, Status};
-use crate::storage::schema::{CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS};
+use crate::storage::schema::{
+    CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedRuntimeSchemaUpgrade,
+};
 use crate::sync::{DatabaseFamilyWriteLock, JsonlSourceSnapshot, PreservedIssue};
 use rebuild_preflight::{audit_local_replay_coverage, audit_unrepresented_state};
 
@@ -231,12 +233,26 @@ pub struct HealOutcome {
     pub action: &'static str,
     /// Where the pre-heal database family was preserved.
     pub backup: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema19_runtime_upgrade: Option<ReviewedRuntimeSchemaUpgrade>,
+    /// Same-version upgrades must describe the layout and downgrade boundary;
+    /// the unchanged integer version alone cannot communicate compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 impl HealOutcome {
     /// One-line human notice for stderr.
     #[must_use]
     pub fn notice(&self) -> String {
+        if self.from_version == self.to_version {
+            return format!(
+                "br: tracker schema {} completed reviewed runtime maintenance — backup at {}. {}",
+                self.from_version,
+                self.backup,
+                self.note.as_deref().unwrap_or_default(),
+            );
+        }
         format!(
             "br: tracker database was on schema {} (this br uses {}); migrated it in place — backup at {}",
             self.from_version, self.to_version, self.backup
@@ -1082,7 +1098,7 @@ pub struct HealContext<'a> {
 
 /// Result of a heal attempt.
 pub enum HealResult {
-    /// The database was not on an older schema.
+    /// No applicable upgrade was found. Explicit heals attest the layout too.
     NotNeeded,
     /// The database is current now.
     Healed(HealOutcome),
@@ -1108,7 +1124,33 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
     let paths = startup.paths.clone();
     ctx.write_authority.verify_database_authority()?;
     let Some(from_version) = stale_schema_version(&paths.db_path)? else {
-        return Ok(HealResult::NotNeeded);
+        if mode == HealMode::Automatic || !paths.db_path.try_exists()? {
+            return Ok(HealResult::NotNeeded);
+        }
+        // Equal user_version values do not prove equal layouts (#596).
+        // Explicit healing uses the very same eligibility checks as plan,
+        // including strict schema admission and integrity diagnostics. Keep
+        // this out of the cheap automatic-startup probe: reads never heal.
+        let plan = super::schema_migration::build_observational_plan(&paths.db_path)?;
+        if !plan.eligible {
+            return Ok(HealResult::NotNeeded);
+        }
+        let migration = super::schema_migration::MigrationContext {
+            beads_dir: ctx.beads_dir.to_path_buf(),
+            db_path: paths.db_path,
+            write_authority: Arc::clone(ctx.write_authority),
+        };
+        let backup = super::schema_migration::plan_and_apply(&migration)?;
+        return Ok(HealResult::Healed(HealOutcome {
+            from_version: plan.from_version,
+            to_version: plan.to_version,
+            action: "migrated",
+            backup: backup.display().to_string(),
+            schema19_runtime_upgrade: plan
+                .forecast
+                .and_then(|forecast| forecast.schema19_runtime_upgrade),
+            note: Some(plan.note),
+        }));
     };
 
     // GH #551: the strict legacy decoder proves JSONL rebuildability, not
@@ -1129,6 +1171,8 @@ pub fn heal_stale_schema(ctx: &HealContext<'_>, mode: HealMode) -> Result<HealRe
                     to_version: current_version(),
                     action: "migrated",
                     backup: backup.display().to_string(),
+                    schema19_runtime_upgrade: None,
+                    note: None,
                 }));
             }
             // GH #585: a migration refusal must remain a refusal during
@@ -1436,7 +1480,40 @@ pub(super) fn execute_heal_preview(
     }
     config::with_database_family_snapshot(&paths.db_path, |snapshot| {
         let Some(from_version) = stale_schema_version(snapshot)? else {
-            return emit_not_needed(args.json);
+            let plan = super::schema_migration::build_plan(snapshot)?;
+            if !plan.eligible {
+                return emit_not_needed(args.json);
+            }
+            let upgrade = plan
+                .forecast
+                .and_then(|forecast| forecast.schema19_runtime_upgrade);
+            let action = if upgrade.is_some() {
+                "reviewed schema-19 runtime layout upgrade with complete database preservation"
+            } else {
+                "reviewed current-schema page-layout maintenance"
+            };
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "dry_run": true,
+                        "heal_needed": true,
+                        "schema_version": plan.from_version,
+                        "from_version": plan.from_version,
+                        "to_version": plan.to_version,
+                        "migration_eligible": true,
+                        "schema19_runtime_upgrade": upgrade,
+                        "automatic_heal_allowed": false,
+                        "automatic_rebuild_allowed": false,
+                        "planned_action": action,
+                        "note": plan.note,
+                    }))?
+                );
+            } else {
+                println!("Heal would perform {action}.");
+                println!("{}", plan.note);
+            }
+            return Ok(());
         };
         let audited = (|| {
             let source = match std::fs::symlink_metadata(&paths.jsonl_path) {
@@ -1487,7 +1564,7 @@ fn emit_not_needed(json: bool) -> Result<()> {
             .map_err(BeadsError::Json)?
         );
     } else {
-        println!("Database is not on an older schema; nothing to heal.");
+        println!("No schema or runtime layout upgrade is needed.");
     }
     Ok(())
 }
@@ -2117,6 +2194,8 @@ mod tests {
             to_version: current_version(),
             action: "migrated",
             backup: "retained-backup".to_owned(),
+            schema19_runtime_upgrade: None,
+            note: None,
         };
         let notice = outcome.notice();
         assert!(notice.contains("migrated it in place"));

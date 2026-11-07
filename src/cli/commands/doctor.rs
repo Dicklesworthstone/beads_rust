@@ -4976,6 +4976,44 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
         );
     }
 
+    // A current user_version is not sufficient: v0.7.6 and newer builds
+    // shipped distinct schema-19 layouts. Use the same strict classifier as
+    // migration planning and explicit healing, on this inspection snapshot.
+    let version = conn
+        .query_row("PRAGMA user_version")?
+        .get(0)
+        .and_then(SqliteValue::as_integer);
+    if version == Some(i64::from(CURRENT_SCHEMA_VERSION)) {
+        match crate::storage::schema::reviewed_runtime_schema_upgrade(conn) {
+            Ok(None) => push_check(checks, "schema.runtime", CheckStatus::Ok, None, None),
+            Ok(Some(upgrade)) => push_check(
+                checks,
+                "schema.runtime",
+                CheckStatus::Error,
+                Some("Schema 19 requires the reviewed v0.7.6 runtime layout upgrade".to_owned()),
+                Some(serde_json::json!({
+                    "user_version": version,
+                    "runtime_compatible": false,
+                    "schema19_runtime_upgrade": upgrade,
+                    "recommended_fix": "br doctor migrate-schema plan --json",
+                    "heal_command": "br doctor migrate-schema heal",
+                    "downgrade": "v0.7.6 cannot read the upgraded close_metadata layout; retain the complete recovery bundle and use guarded undo before further writes",
+                })),
+            ),
+            Err(error) => push_check(
+                checks,
+                "schema.runtime",
+                CheckStatus::Error,
+                Some(error.to_string()),
+                Some(serde_json::json!({
+                    "user_version": version,
+                    "runtime_compatible": false,
+                    "recommended_fix": "br doctor migrate-schema plan --json",
+                })),
+            ),
+        }
+    }
+
     Ok(())
 }
 

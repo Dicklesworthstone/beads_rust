@@ -5460,7 +5460,10 @@ fn validate_sqlite_storage_read_only(
     };
     if !storage.fast_open_runtime_schema_is_compatible() {
         return Err(BeadsError::Config(format!(
-            "{}; the database's runtime schema is incomplete or incompatible",
+            "{}; the database's runtime schema is incomplete or incompatible. Run \
+             `br doctor migrate-schema plan --json` to inspect its actual layout, including \
+             released schema-19 layouts; `br doctor migrate-schema heal` applies supported \
+             lossless upgrades while retaining the original database for guarded undo",
             read_only_storage_refusal_context(db_path),
         )));
     }

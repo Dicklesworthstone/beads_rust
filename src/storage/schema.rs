@@ -243,6 +243,18 @@ pub struct ReviewedSchemaMigrationEffects {
     pub dependency_type_key_added: bool,
 }
 
+/// The only reviewed runtime-layout changes within schema 19.
+///
+/// The v0.7.6 release predates both nullable close attribution and JSONL row
+/// receipts. The explicit migration receipt binds which additions are needed;
+/// existing authoritative values and `user_version` are never rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewedRuntimeSchemaUpgrade {
+    pub jsonl_row_receipts_created: bool,
+    pub closed_by_column_added: bool,
+}
+
 /// The complete SQL schema for the beads database.
 /// Schema matches classic bd (Go) for interoperability.
 pub const SCHEMA_SQL: &str = r"
@@ -4120,8 +4132,92 @@ fn apply_jsonl_row_receipts_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
+    // A pending merge binds the original schema catalog. Its recovery path
+    // must continue to read the exact released layout until that merge ends.
+    runtime_schema_compatible_with_release_additions(
+        conn,
+        has_pending_sync_merge_metadata(conn).unwrap_or(false),
+    )
+}
+
+/// Inspect the complete current-version runtime contract without changing it.
+/// Only the two reviewed additive differences from v0.7.6 are eligible.
+pub(crate) fn reviewed_runtime_schema_upgrade(
+    conn: &Connection,
+) -> Result<Option<ReviewedRuntimeSchemaUpgrade>> {
+    let version = connection_user_version(conn)?;
+    if version != current_schema_version_u32()? {
+        return Err(BeadsError::Config(format!(
+            "schema-19 runtime upgrade requires schema {CURRENT_SCHEMA_VERSION}; observed {version}"
+        )));
+    }
+    if runtime_schema_compatible_with_release_additions(conn, false) {
+        return Ok(None);
+    }
+    // Even malformed pending receipts freeze the catalog. They cannot be
+    // bypassed by classifying the missing additions as ordinary maintenance.
+    refuse_schema_repair_during_pending_merge(conn)?;
+    if !runtime_schema_compatible_with_release_additions(conn, true)
+        || (!jsonl_row_receipts_schema_canonical(conn)
+            && !runtime_schema_name_absent(conn, "jsonl_row_receipts"))
+    {
+        return Err(BeadsError::Config(
+            "database declares schema 19 but its runtime layout is neither current nor the \
+             reviewed v0.7.6 layout; only an absent jsonl_row_receipts table and a nullable \
+             close_metadata.closed_by addition are supported. Preserve the original database; \
+             an unknown layout cannot be safely rebuilt from JSONL"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(ReviewedRuntimeSchemaUpgrade {
+        jsonl_row_receipts_created: !jsonl_row_receipts_schema_canonical(conn),
+        closed_by_column_added: !column_exists(conn, "close_metadata", "closed_by"),
+    }))
+}
+
+/// Apply exactly the inspected schema-19 additions in the caller's transaction.
+/// The caller owns the write authority and commits or rolls back the candidate.
+pub(crate) fn apply_reviewed_runtime_schema_upgrade_in_transaction(
+    conn: &Connection,
+    expected: ReviewedRuntimeSchemaUpgrade,
+) -> Result<()> {
+    if reviewed_runtime_schema_upgrade(conn)? != Some(expected) {
+        return Err(BeadsError::Config(
+            "schema-19 runtime upgrade refused: the runtime layout changed after inspection"
+                .to_owned(),
+        ));
+    }
+    if expected.jsonl_row_receipts_created {
+        conn.execute(JSONL_ROW_RECEIPTS_SCHEMA_SQL)?;
+    }
+    if expected.closed_by_column_added {
+        // NULL means attribution was not recorded. Never infer audit actors
+        // from an issue's current assignee, owner, or other mutable state.
+        conn.execute("ALTER TABLE close_metadata ADD COLUMN closed_by TEXT")?;
+    }
+    if !runtime_schema_compatible_with_release_additions(conn, false) {
+        return Err(BeadsError::Config(
+            "schema-19 runtime upgrade post-check failed: the candidate layout is not canonical"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn runtime_schema_name_absent(conn: &Connection, name: &str) -> bool {
+    conn.query_with_params(
+        "SELECT 1 FROM main.sqlite_schema WHERE name = ? COLLATE NOCASE LIMIT 1",
+        &[SqliteValue::from(name)],
+    )
+    .is_ok_and(|rows| rows.is_empty())
+}
+
+#[allow(clippy::too_many_lines)]
+fn runtime_schema_compatible_with_release_additions(
+    conn: &Connection,
+    allow_release_additions: bool,
+) -> bool {
     let version_ok = current_schema_version_declared(conn);
     let triggers_ok = runtime_has_no_persistent_triggers(conn);
     let issues_ok = core_runtime_table_canonical(
@@ -4215,8 +4311,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         false,
     );
     let jsonl_row_receipts_ok = jsonl_row_receipts_schema_canonical(conn)
-        || (!table_exists(conn, "jsonl_row_receipts")
-            && has_pending_sync_merge_metadata(conn).unwrap_or(false));
+        || (allow_release_additions && !table_exists(conn, "jsonl_row_receipts"));
     let blocked_cache_ok = core_runtime_table_canonical(
         conn,
         "blocked_issues_cache",
@@ -4242,7 +4337,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         "close_metadata",
         CLOSE_METADATA_COLUMNS,
         CLOSE_METADATA_INDEXES,
-    ) || (has_pending_sync_merge_metadata(conn).unwrap_or(false)
+    ) || (allow_release_additions
         && auxiliary_runtime_table_canonical(
             conn,
             "close_metadata",
@@ -8816,6 +8911,175 @@ mod tests {
             metadata_latest.get(0).and_then(SqliteValue::as_text),
             Some("new")
         );
+    }
+
+    fn runtime_upgrade_fixture(
+        receipts_present: bool,
+        attribution_present: bool,
+    ) -> (tempfile::TempDir, Connection) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let conn =
+            Connection::open(temp.path().join("beads.db").to_string_lossy().into_owned()).unwrap();
+        let schema = if attribution_present {
+            SCHEMA_SQL.to_owned()
+        } else {
+            SCHEMA_SQL.replace("        closed_by TEXT,\n", "")
+        };
+        execute_batch(&conn, &schema).unwrap();
+        if receipts_present {
+            conn.execute(JSONL_ROW_RECEIPTS_SCHEMA_SQL).unwrap();
+        }
+        conn.execute("PRAGMA user_version = 19").unwrap();
+        (temp, conn)
+    }
+
+    #[test]
+    fn reviewed_schema19_runtime_upgrade_is_observational_and_additive() {
+        for (receipts_present, attribution_present) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (_temp, conn) = runtime_upgrade_fixture(receipts_present, attribution_present);
+            conn.execute("INSERT INTO issues (id, title) VALUES ('br-old', 'Release issue')")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO close_metadata (rowid, issue_id, bypass_reason) \
+                 VALUES (47, 'br-old', X'00ff')",
+            )
+            .unwrap();
+            if attribution_present {
+                conn.execute("UPDATE close_metadata SET closed_by = 'recorded-actor'")
+                    .unwrap();
+            }
+            if receipts_present {
+                conn.execute(
+                    "INSERT INTO jsonl_row_receipts (issue_id, row_hash) VALUES ('br-old', 'opaque-receipt')",
+                )
+                .unwrap();
+            }
+            let schema_before = format!("{:?}", conn.query("SELECT * FROM sqlite_schema").unwrap());
+            let rows_before = format!(
+                "{:?}",
+                conn.query("SELECT rowid, issue_id, bypass_reason FROM close_metadata")
+                    .unwrap()
+            );
+            let inspected = reviewed_runtime_schema_upgrade(&conn).unwrap();
+            assert_eq!(
+                format!("{:?}", conn.query("SELECT * FROM sqlite_schema").unwrap()),
+                schema_before,
+                "inspection must not alter the catalog"
+            );
+            if receipts_present && attribution_present {
+                assert!(inspected.is_none());
+                continue;
+            }
+            let expected = ReviewedRuntimeSchemaUpgrade {
+                jsonl_row_receipts_created: !receipts_present,
+                closed_by_column_added: !attribution_present,
+            };
+            assert_eq!(inspected, Some(expected));
+            assert!(!runtime_schema_compatible(&conn));
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, expected).unwrap();
+            conn.execute("COMMIT").unwrap();
+            assert_eq!(connection_user_version(&conn).unwrap(), 19);
+            assert!(runtime_schema_compatible(&conn));
+            assert!(reviewed_runtime_schema_upgrade(&conn).unwrap().is_none());
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    conn.query("SELECT rowid, issue_id, bypass_reason FROM close_metadata")
+                        .unwrap()
+                ),
+                rows_before,
+                "existing audit values and rowids must remain exact"
+            );
+            let attribution = conn
+                .query_row("SELECT closed_by FROM close_metadata")
+                .unwrap();
+            if attribution_present {
+                assert_eq!(
+                    attribution.get(0).and_then(SqliteValue::as_text),
+                    Some("recorded-actor")
+                );
+            } else {
+                assert!(matches!(attribution.get(0), Some(SqliteValue::Null)));
+            }
+            let receipts = conn
+                .query("SELECT row_hash FROM jsonl_row_receipts")
+                .unwrap();
+            if receipts_present {
+                assert_eq!(
+                    receipts[0].get(0).and_then(SqliteValue::as_text),
+                    Some("opaque-receipt")
+                );
+            } else {
+                assert!(
+                    receipts.is_empty(),
+                    "migration must not invent export receipts"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reviewed_schema19_runtime_upgrade_refuses_unreviewed_layouts_without_writes() {
+        for drift in [
+            "DROP TABLE gate_results",
+            "ALTER TABLE close_metadata ADD COLUMN unexpected TEXT",
+            "CREATE VIEW jsonl_row_receipts AS SELECT id AS issue_id, title AS row_hash FROM issues",
+            "CREATE TABLE JSONL_ROW_RECEIPTS (issue_id TEXT, row_hash TEXT)",
+            "CREATE UNIQUE INDEX operator_close_policy ON close_metadata(bypass_reason)",
+            "PRAGMA user_version = 18",
+            "PRAGMA user_version = 20",
+        ] {
+            let (_temp, conn) = runtime_upgrade_fixture(false, false);
+            conn.execute(drift).unwrap();
+            let schema_before = format!("{:?}", conn.query("SELECT * FROM sqlite_schema").unwrap());
+            assert!(
+                reviewed_runtime_schema_upgrade(&conn).is_err(),
+                "admitted {drift}"
+            );
+            assert!(
+                apply_reviewed_runtime_schema_upgrade_in_transaction(
+                    &conn,
+                    ReviewedRuntimeSchemaUpgrade {
+                        jsonl_row_receipts_created: true,
+                        closed_by_column_added: true,
+                    },
+                )
+                .is_err(),
+                "applied {drift}"
+            );
+            assert_eq!(
+                format!("{:?}", conn.query("SELECT * FROM sqlite_schema").unwrap()),
+                schema_before
+            );
+        }
+    }
+
+    #[test]
+    fn reviewed_schema19_runtime_upgrade_refuses_pending_merges_and_stale_forecasts() {
+        let (_temp, conn) = runtime_upgrade_fixture(false, false);
+        let expected = reviewed_runtime_schema_upgrade(&conn).unwrap().unwrap();
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES (?, '')",
+            &[SqliteValue::from(crate::sync::METADATA_SYNC_MERGE_PENDING)],
+        )
+        .unwrap();
+        assert!(
+            runtime_schema_compatible(&conn),
+            "merge recovery can read its original layout"
+        );
+        let error = reviewed_runtime_schema_upgrade(&conn).unwrap_err();
+        assert!(error.to_string().contains("resume `br sync --merge`"));
+        assert!(apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, expected).is_err());
+        assert!(!table_exists(&conn, "jsonl_row_receipts"));
+        assert!(!column_exists(&conn, "close_metadata", "closed_by"));
+
+        let (_temp, conn) = runtime_upgrade_fixture(false, false);
+        conn.execute(JSONL_ROW_RECEIPTS_SCHEMA_SQL).unwrap();
+        assert!(apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, expected).is_err());
+        assert!(!column_exists(&conn, "close_metadata", "closed_by"));
     }
 
     #[test]

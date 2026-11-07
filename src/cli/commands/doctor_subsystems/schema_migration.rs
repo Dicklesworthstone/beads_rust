@@ -41,11 +41,12 @@ use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::schema::{
     CURRENT_SCHEMA_VERSION, REVIEWED_LEGACY_V15_RETIRED_INDEXES,
-    REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedSchemaMigrationEffects,
-    apply_reviewed_legacy_v15_core_conversion_in_transaction,
+    REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedRuntimeSchemaUpgrade,
+    ReviewedSchemaMigrationEffects, apply_reviewed_legacy_v15_core_conversion_in_transaction,
+    apply_reviewed_runtime_schema_upgrade_in_transaction,
     attest_reviewed_migration_source_core_tables, is_reviewed_dependency_retired_index,
-    is_reviewed_migration_managed_index, run_reviewed_schema_migration_steps_in_transaction,
-    runtime_schema_compatible,
+    is_reviewed_migration_managed_index, reviewed_runtime_schema_upgrade,
+    run_reviewed_schema_migration_steps_in_transaction, runtime_schema_compatible,
 };
 use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
 
@@ -142,7 +143,7 @@ struct LegacyV15Projection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct MigrationForecast {
+pub(super) struct MigrationForecast {
     from_version: u32,
     to_version: u32,
     content_hash_rows_rebuilt: usize,
@@ -157,23 +158,28 @@ struct MigrationForecast {
     legacy_v4_conversion: Option<LegacyV4Projection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_hash_refresh_profile: Option<String>,
+    /// The released and current layouts both declare schema 19. Bind the
+    /// precise additive transition instead of treating equal versions as a
+    /// maintenance-only operation or accepting arbitrary runtime repairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) schema19_runtime_upgrade: Option<ReviewedRuntimeSchemaUpgrade>,
     #[serde(default, skip_serializing_if = "is_false")]
     post_migration_maintenance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MigrationPlanReceipt {
+pub(super) struct MigrationPlanReceipt {
     schema_version: String,
-    eligible: bool,
+    pub(super) eligible: bool,
     database_path: String,
-    from_version: u32,
-    to_version: u32,
+    pub(super) from_version: u32,
+    pub(super) to_version: u32,
     raw_witness: RawFamilyWitness,
     logical_witness: LogicalDatabaseWitness,
-    forecast: Option<MigrationForecast>,
+    pub(super) forecast: Option<MigrationForecast>,
     plan_token: Option<String>,
     apply_command: Option<String>,
-    note: String,
+    pub(super) note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -256,6 +262,8 @@ struct ReviewedSchemaMigrationEffectsReceipt {
     dependency_type_key_added: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     legacy_v15_tables_converted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema19_runtime_upgrade: Option<ReviewedRuntimeSchemaUpgrade>,
     #[serde(default, skip_serializing_if = "is_false")]
     post_migration_maintenance_completed: bool,
 }
@@ -270,6 +278,7 @@ impl From<ReviewedSchemaMigrationEffects> for ReviewedSchemaMigrationEffectsRece
             prerequisites_column_added: value.prerequisites_column_added,
             dependency_type_key_added: value.dependency_type_key_added,
             legacy_v15_tables_converted: false,
+            schema19_runtime_upgrade: None,
             post_migration_maintenance_completed: false,
         }
     }
@@ -411,7 +420,7 @@ fn with_migration_read_snapshot<T>(
     })
 }
 
-fn build_observational_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
+pub(super) fn build_observational_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     with_migration_read_snapshot(db_path, |snapshot, raw| {
         let mut plan = build_plan(snapshot)?;
         plan.database_path = db_path.display().to_string();
@@ -2803,7 +2812,7 @@ fn recover_engine_admission_with_complete_backup(
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
+pub(super) fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     refuse_non_regular_component(db_path)?;
     let logical_witness = logical_witness(db_path)?;
     let raw_witness = raw_family_witness(db_path)?;
@@ -2813,14 +2822,13 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     let integrity_clean = integrity_check_is_clean(&logical_witness.integrity_check);
 
     if from == target {
-        if !current_runtime_shape_is_canonical(db_path)? {
-            return Err(BeadsError::internal(
-                "database declares the current schema version but its runtime shape is not \
-                 canonical; refusing to issue a migration no-op receipt",
-            ));
-        }
-        if !integrity_clean {
-            if !integrity_check_is_repairable(&logical_witness.integrity_check) {
+        let conn = open_read_only(db_path)?;
+        let upgrade = reviewed_runtime_schema_upgrade(&conn);
+        close_connection(conn)?;
+        let schema19_runtime_upgrade = upgrade?;
+        if schema19_runtime_upgrade.is_some() || !integrity_clean {
+            if !integrity_clean && !integrity_check_is_repairable(&logical_witness.integrity_check)
+            {
                 return Err(BeadsError::internal(format!(
                     "database declares the current schema version but its integrity diagnostics \
                      are not eligible for reviewed page-layout maintenance: {:?}",
@@ -2837,6 +2845,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 legacy_v15_conversion: None,
                 legacy_v4_conversion: None,
                 content_hash_refresh_profile: None,
+                schema19_runtime_upgrade,
                 post_migration_maintenance: true,
             };
             let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -2853,10 +2862,21 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                     "br doctor migrate-schema apply --plan-token {plan_token}"
                 )),
                 plan_token: Some(plan_token),
-                note: "the current schema has a repairable page-layout diagnostic; apply will \
-                       preserve a complete recovery bundle, checkpoint, rebuild indexes, rewrite \
-                       the database pages, and require a clean fresh-connection integrity check"
-                    .to_string(),
+                note: if schema19_runtime_upgrade.is_some() {
+                    "the schema-19 layout requires the reviewed v0.7.6 runtime upgrade. Apply \
+                     adds only the forecast receipt table and nullable close attribution column, \
+                     preserves every existing database record and operator schema, and retains \
+                     the complete original SQLite family for guarded undo. user_version stays \
+                     19; v0.7.6 cannot read the upgraded close_metadata layout. Replacing only \
+                     the executable is not a safe downgrade: use this br's receipt-bound undo \
+                     before further writes or restore the complete pre-upgrade database family"
+                        .to_string()
+                } else {
+                    "the current schema has a repairable page-layout diagnostic; apply will \
+                     preserve a complete recovery bundle, checkpoint, rebuild indexes, rewrite \
+                     the database pages, and require a clean fresh-connection integrity check"
+                        .to_string()
+                },
             });
         }
         return Ok(MigrationPlanReceipt {
@@ -2923,6 +2943,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
         legacy_v15_conversion,
         legacy_v4_conversion,
         content_hash_refresh_profile,
+        schema19_runtime_upgrade: None,
         post_migration_maintenance: true,
     };
     let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
@@ -2990,6 +3011,7 @@ fn emit_plan(plan: &MigrationPlanReceipt, json: bool) -> Result<()> {
             "Apply: {}",
             plan.apply_command.as_deref().unwrap_or_default()
         );
+        println!("{}", plan.note);
     } else {
         println!("{}", plan.note);
     }
@@ -3147,6 +3169,7 @@ fn apply_with_plan_token(
         || effects.prerequisites_column_added != forecast.prerequisites_column_added
         || effects.dependency_type_key_added != forecast.dependency_type_key_added
         || effects.legacy_v15_tables_converted != forecast.legacy_v15_conversion.is_some()
+        || effects.schema19_runtime_upgrade != forecast.schema19_runtime_upgrade
         || !maintenance_matches_forecast
     {
         attestation_errors.push(format!(
@@ -3346,6 +3369,7 @@ fn validate_commit_ready_marker(
         || marker.effects.dependency_type_key_added != marker.forecast.dependency_type_key_added
         || marker.effects.legacy_v15_tables_converted
             != marker.forecast.legacy_v15_conversion.is_some()
+        || marker.effects.schema19_runtime_upgrade != marker.forecast.schema19_runtime_upgrade
         || maintenance_completion_disagrees_with_forecast
         || marker.logical_after.user_version != marker.forecast.to_version
         || !integrity_check_is_clean(&marker.logical_after.integrity_check)
@@ -3908,7 +3932,7 @@ fn run_post_migration_maintenance(
     require_absent_family(&candidate_path)?;
     vacuum_candidate_from_private_source(db_path, &candidate_path, run_dir, raw_before)?;
 
-    let effects = if from == to {
+    let effects = if from == to && forecast.schema19_runtime_upgrade.is_none() {
         ReviewedSchemaMigrationEffectsReceipt {
             from_version: from,
             to_version: to,
@@ -3917,6 +3941,7 @@ fn run_post_migration_maintenance(
             prerequisites_column_added: false,
             dependency_type_key_added: false,
             legacy_v15_tables_converted: false,
+            schema19_runtime_upgrade: None,
             post_migration_maintenance_completed: false,
         }
     } else {
@@ -3925,10 +3950,25 @@ fn run_post_migration_maintenance(
         conn.execute("PRAGMA foreign_keys = ON")?;
         conn.execute("BEGIN IMMEDIATE")?;
         let result = (|| {
+            if let Some(upgrade) = forecast.schema19_runtime_upgrade {
+                apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, upgrade)?;
+                return Ok(ReviewedSchemaMigrationEffectsReceipt {
+                    from_version: from,
+                    to_version: to,
+                    content_hash_rows_rebuilt: 0,
+                    gate_result_history_created: false,
+                    prerequisites_column_added: false,
+                    dependency_type_key_added: false,
+                    legacy_v15_tables_converted: false,
+                    schema19_runtime_upgrade: Some(upgrade),
+                    post_migration_maintenance_completed: false,
+                });
+            }
             if forecast.legacy_v15_conversion.is_some() {
                 apply_reviewed_legacy_v15_core_conversion_in_transaction(&conn)?;
             }
             run_reviewed_schema_migration_steps_in_transaction(&conn, from, to, marked_at)
+                .map(ReviewedSchemaMigrationEffectsReceipt::from)
         })();
         let result = match result {
             Ok(effects) => match conn.execute("COMMIT") {
@@ -3944,7 +3984,7 @@ fn run_post_migration_maintenance(
             }
         };
         close_connection(conn)?;
-        let mut effects = ReviewedSchemaMigrationEffectsReceipt::from(result?);
+        let mut effects = result?;
         effects.legacy_v15_tables_converted = forecast.legacy_v15_conversion.is_some();
         effects
     };
@@ -4017,7 +4057,9 @@ fn run_post_migration_maintenance(
     verify_reviewed_profile(&candidate_path, forecast, false)?;
     let candidate_logical = logical_witness(&candidate_path)?;
     verify_reviewed_state_preservation(&candidate_path, source_preservation.as_ref(), true)?;
-    let candidate_matches_reviewed_operation = if from == to {
+    let candidate_matches_reviewed_operation = if from == to
+        && forecast.schema19_runtime_upgrade.is_none()
+    {
         logical_witnesses_match_except_integrity(&source_logical, &candidate_logical)
     } else {
         candidate_logical.user_version == to && current_runtime_shape_is_canonical(&candidate_path)?
@@ -6028,6 +6070,9 @@ fn verify_retained_migration_preservation_at(
     forecast: &MigrationForecast,
     scratch_parent: Option<&Path>,
 ) -> Result<()> {
+    if forecast.schema19_runtime_upgrade.is_some() {
+        verify_reviewed_profile(db_path, forecast, false)?;
+    }
     if forecast.from_version == 4
         || forecast.legacy_v15_conversion.is_some()
         || forecast.legacy_v4_conversion.is_some()
@@ -6046,6 +6091,9 @@ fn verify_retained_migration_preservation_at(
     copy_family_to_backup(&retained_source, private.path(), raw_before)?;
     verify_backup_family(&retained_source, private.path(), raw_before)?;
     let private_source = backup_component_path(private.path(), db_path, "")?;
+    if forecast.schema19_runtime_upgrade.is_some() {
+        verify_reviewed_profile(&private_source, forecast, true)?;
+    }
     let expected = capture_reviewed_state_preservation(&private_source, forecast)?;
     let verified = verify_reviewed_state_preservation(db_path, expected.as_ref(), true);
     verify_backup_family(db_path, &before_dir, raw_before)?;
@@ -6351,6 +6399,50 @@ fn verify_reviewed_profile(
     forecast: &MigrationForecast,
     project_source: bool,
 ) -> Result<()> {
+    if let Some(upgrade) = forecast.schema19_runtime_upgrade {
+        if forecast.from_version != 19
+            || forecast.to_version != 19
+            || forecast.legacy_v4_conversion.is_some()
+            || forecast.legacy_v15_conversion.is_some()
+            || forecast.content_hash_refresh_profile.is_some()
+            || forecast.content_hash_rows_rebuilt != 0
+            || forecast.gate_result_history_created
+            || forecast.prerequisites_column_added
+            || forecast.dependency_type_key_added
+            || !forecast.post_migration_maintenance
+            || !(upgrade.jsonl_row_receipts_created || upgrade.closed_by_column_added)
+        {
+            return Err(BeadsError::Config(
+                "schema-19 runtime upgrade requires its exclusive reviewed additive profile"
+                    .to_owned(),
+            ));
+        }
+        with_preservation_snapshot(db_path, |conn| {
+            if project_source {
+                if reviewed_runtime_schema_upgrade(conn)? != Some(upgrade) {
+                    return Err(BeadsError::Config(
+                        "schema-19 source layout differs from the reviewed upgrade forecast"
+                            .to_owned(),
+                    ));
+                }
+            } else if !runtime_schema_compatible(conn)
+                || (upgrade.jsonl_row_receipts_created
+                    && query_count(conn, "SELECT COUNT(*) FROM jsonl_row_receipts")? != 0)
+                || (upgrade.closed_by_column_added
+                    && query_count(
+                        conn,
+                        "SELECT COUNT(*) FROM close_metadata WHERE closed_by IS NOT NULL",
+                    )? != 0)
+            {
+                return Err(BeadsError::Config(
+                    "schema-19 candidate does not match the reviewed additive layout; new \
+                     receipts must be empty and historical close actors must remain unknown"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        })?;
+    }
     if (forecast.from_version == 4) != forecast.legacy_v4_conversion.is_some()
         || (forecast.legacy_v4_conversion.is_some() && forecast.legacy_v15_conversion.is_some())
     {
@@ -9097,6 +9189,7 @@ mod tests {
             legacy_v15_conversion: None,
             legacy_v4_conversion: None,
             content_hash_refresh_profile: None,
+            schema19_runtime_upgrade: None,
             post_migration_maintenance: true,
         };
         let first = compute_plan_token("db", &logical, &forecast).unwrap();
@@ -9456,6 +9549,7 @@ mod tests {
             legacy_v15_conversion: None,
             legacy_v4_conversion: None,
             content_hash_refresh_profile: None,
+            schema19_runtime_upgrade: None,
             post_migration_maintenance: false,
         };
         (temp, db_path, forecast)
@@ -10615,7 +10709,7 @@ mod tests {
         for (statements, expected_error) in [
             (
                 vec!["PRAGMA user_version = 19"],
-                "runtime shape is not canonical",
+                "runtime layout is neither current nor the reviewed v0.7.6 layout",
             ),
             (
                 vec!["ALTER TABLE issues ADD COLUMN prerequisites TEXT NOT NULL DEFAULT ''"],
@@ -10626,7 +10720,7 @@ mod tests {
                     "ALTER TABLE issues ADD COLUMN prerequisites TEXT DEFAULT ''",
                     "PRAGMA user_version = 19",
                 ],
-                "runtime shape is not canonical",
+                "runtime layout is neither current nor the reviewed v0.7.6 layout",
             ),
         ] {
             let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
@@ -11604,6 +11698,7 @@ mod tests {
                 prerequisites_column_added: forecast.prerequisites_column_added,
                 dependency_type_key_added: forecast.dependency_type_key_added,
                 legacy_v15_tables_converted: forecast.legacy_v15_conversion.is_some(),
+                schema19_runtime_upgrade: forecast.schema19_runtime_upgrade,
                 post_migration_maintenance_completed: true,
             },
         )
