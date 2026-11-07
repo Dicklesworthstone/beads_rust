@@ -457,10 +457,16 @@ mod tests {
                 beads_dir,
                 db_path,
             };
-            let (applied, _) =
-                lifecycle::resume_commit_ready_migration(&legacy.prepared.plan_token, &migration)
-                    .unwrap()
-                    .expect("an already-installed historical generation remains recoverable");
+            let (applied, _) = {
+                let mut exclusion = lifecycle::exclude_migration_openers(&migration).unwrap();
+                lifecycle::resume_commit_ready_migration(
+                    &legacy.prepared.plan_token,
+                    &migration,
+                    &mut exclusion,
+                )
+                .unwrap()
+                .expect("an already-installed historical generation remains recoverable")
+            };
             assert!(applied.attested);
             assert!(applied.forecast.content_hash_refresh_profile.is_none());
             lifecycle::execute_undo(

@@ -2896,6 +2896,18 @@ rewrite or retire those files without changing database semantics. `apply`
 captures and verifies a fresh byte-exact family backup after logical-token
 validation and before migration.
 
+`apply` and non-dry-run `undo` require sole-opener access before observing or
+replacing the live generation. They retain the cooperative opener lease,
+engine namespace locks and native SQLite locks on both the original and
+replacement main files through installation, rollback and durable receipt
+publication. An open native SQLite transaction therefore refuses the operation
+with `SYNC_CONFLICT`; close other `br` and SQLite connections, then retry. If
+that transaction commits newer work, generate a fresh plan; undo refuses to
+discard it. Hard-linked main files are refused because replacing one pathname
+cannot upgrade every alias safely. Inspection uses verified private copies
+while replacement locks are held. `plan` and dry-run `undo` remain observational
+and do not acquire these replacement locks.
+
 On Linux and macOS, `apply` and non-dry-run `undo` first test the filesystem's
 exchange-rename behavior using temporary locked files beside the database.
 Some shared mounts report a successful exchange while replacing one file

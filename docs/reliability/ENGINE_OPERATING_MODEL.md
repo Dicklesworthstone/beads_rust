@@ -256,6 +256,17 @@ is empty. History, configuration, workflow records and relations stay in active
 storage; JSONL remains unchanged.
 
 The recovery protocol retains the exact DB, WAL, SHM and rollback journal.
+Mutating apply and undo retain cooperative sole-opener access, exclusive
+namespace admission and SQLite-compatible native locks through replacement and
+receipt durability. Native exclusion covers both original and candidate main
+inodes, including exchange and rollback; an active external SQLite transaction
+refuses before a migration or undo intent is created. This prevents a peer
+from acknowledging a commit into the displaced generation. Locked live
+generations are inspected only through verified private family copies; copied
+namespace evidence is validated with the engine's parser, leaving the live
+ledger intact. Existing recovery receipts remain the only durable transition
+protocol. Read-only planning and undo previews do not acquire replacement
+exclusion.
 Interrupted completion and undo recheck the source proof on private copies of
 the retained family. Historical installed receipts retain their original
 semantics; fresh layout-upgrade plans bind the stronger proof and replace old

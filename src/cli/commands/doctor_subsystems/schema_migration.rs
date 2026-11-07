@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use crate::franken_sync::Connection;
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
+use crate::franken_sync::wal_index::DatabaseReplacementExclusion;
 use chrono::Utc;
 use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
@@ -420,6 +421,44 @@ fn resolve_context(cli: &config::CliOverrides) -> Result<MigrationContext> {
     })
 }
 
+fn migration_file_identity(path: &Path) -> Result<fsqlite_vfs::FileIdentity> {
+    let metadata = secure_file_metadata(path)?
+        .ok_or_else(|| BeadsError::internal("schema-migration database disappeared"))?;
+    let retained = File::open(path)?;
+    if !same_file_identity(&metadata, &retained.metadata()?) {
+        return Err(BeadsError::SyncConflict {
+            message: "Schema-migration database changed before exclusion could bind its identity"
+                .to_owned(),
+        });
+    }
+    fsqlite_vfs::FileIdentity::from_file(&retained)?
+        .ok_or_else(|| BeadsError::internal("schema-migration database identity is unavailable"))
+}
+
+fn exclude_migration_openers(migration: &MigrationContext) -> Result<DatabaseReplacementExclusion> {
+    migration.write_authority.verify_database_authority()?;
+    let exclusion = DatabaseReplacementExclusion::acquire(
+        &migration.db_path,
+        migration_file_identity(&migration.db_path)?,
+    )?;
+    migration.write_authority.verify_database_authority()?;
+    Ok(exclusion)
+}
+
+fn retain_migration_candidate(
+    exclusion: &mut DatabaseReplacementExclusion,
+    candidate: &Path,
+) -> Result<()> {
+    exclusion.retain_candidate(candidate, migration_file_identity(candidate)?)
+}
+
+fn verify_excluded_migration_path(
+    exclusion: &DatabaseReplacementExclusion,
+    path: &Path,
+) -> Result<()> {
+    exclusion.verify_path(path, migration_file_identity(path)?)
+}
+
 fn execute_plan(args: &DoctorMigrateSchemaPlanArgs, db_path: &Path) -> Result<()> {
     let plan = build_observational_plan(db_path)?;
     emit_plan(&plan, args.json)?;
@@ -436,13 +475,21 @@ fn with_migration_read_snapshot<T>(
 ) -> Result<T> {
     refuse_non_regular_component(db_path)?;
     let raw = raw_family_witness(db_path)?;
-    config::with_database_family_snapshot(db_path, |snapshot| {
-        let directory = snapshot
-            .parent()
-            .ok_or_else(|| BeadsError::internal("migration snapshot has no parent"))?;
-        verify_backup_family(db_path, directory, &raw)?;
-        read(snapshot, &raw)
-    })
+    let directory = tempfile::Builder::new()
+        .prefix("schema-migration-read-")
+        .tempdir()?;
+    let database_name = db_path
+        .file_name()
+        .ok_or_else(|| BeadsError::internal("migration snapshot has no database filename"))?;
+    let snapshot = directory.path().join(database_name);
+    crate::storage::sqlite::copy_database_family_read_snapshot(db_path, &snapshot)?;
+    verify_backup_family(&snapshot, directory.path(), &raw)?;
+    // The source namespace stays excluded during apply/undo. Validate and
+    // rebind only its copied ledger, so private engine reads neither conflict
+    // with our native locks nor hide unfinished namespace transitions.
+    #[cfg(any(unix, windows))]
+    crate::storage::sqlite::admit_private_database_namespace(&directory, database_name)?;
+    read(&snapshot, &raw)
 }
 
 pub(super) fn build_observational_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
@@ -3100,7 +3147,7 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
 /// already audited the upgrade; the plan is still recomputed and token-bound
 /// exactly as an operator-driven `plan` + `apply` pair would be.
 pub(super) fn plan_and_apply(migration: &MigrationContext) -> Result<PathBuf> {
-    let plan = build_plan(&migration.db_path)?;
+    let plan = build_observational_plan(&migration.db_path)?;
     let token = plan.plan_token.ok_or_else(|| {
         BeadsError::internal(format!(
             "schema migration is not eligible for this database: {}",
@@ -3120,14 +3167,19 @@ fn apply_with_plan_token(
             "schema migration apply requires a non-empty --plan-token",
         ));
     }
+    // The br writer byte does not conflict with SQLite's native locks. Keep
+    // sole-opener, engine-namespace and native exclusion from the first source
+    // observation through installation/rollback and applied receipt durability.
+    // Every live database inspection below runs against a verified private copy.
+    let mut exclusion = exclude_migration_openers(migration)?;
     // Resume can also install a retained candidate. Check the actual database
     // filesystem before either a fresh migration or a recovery path can write.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     verify_migration_exchange_support(&migration.db_path, exchange_database_paths)?;
-    if let Some(resumed) = resume_commit_ready_migration(plan_token, migration)? {
+    if let Some(resumed) = resume_commit_ready_migration(plan_token, migration, &mut exclusion)? {
         return Ok(resumed);
     }
-    let plan = build_plan(&migration.db_path)?;
+    let plan = build_observational_plan(&migration.db_path)?;
     let Some(recomputed_token) = plan.plan_token.as_deref() else {
         return Err(BeadsError::internal(
             "schema migration apply refused because no migration is currently eligible",
@@ -3177,6 +3229,7 @@ fn apply_with_plan_token(
         &plan.raw_witness,
         &migration.write_authority,
         &mut failed_stage,
+        &mut exclusion,
     );
     let authority_result = migration.write_authority.verify_database_authority();
     let authority_verified_after = authority_result.is_ok();
@@ -3212,7 +3265,12 @@ fn apply_with_plan_token(
                 logical_before: plan.logical_witness,
                 raw_observed_after_failure: raw_family_witness(&migration.db_path).ok(),
                 logical_observed_after_failure: authority_verified_after
-                    .then(|| logical_witness(&migration.db_path).ok())
+                    .then(|| {
+                        with_migration_read_snapshot(&migration.db_path, |snapshot, _| {
+                            logical_witness(snapshot)
+                        })
+                        .ok()
+                    })
                     .flatten(),
             };
             write_json_new(&run_dir.join("failed.json"), &failed)?;
@@ -3249,15 +3307,21 @@ fn apply_with_plan_token(
         ));
     }
 
-    let logical_after = match logical_witness(&migration.db_path) {
-        Ok(witness) => Some(witness),
-        Err(error) => {
-            attestation_errors.push(format!(
-                "could not capture the committed logical witness: {error}"
-            ));
-            None
-        }
-    };
+    let (logical_after, canonical_after) =
+        match with_migration_read_snapshot(&migration.db_path, |snapshot, _| {
+            Ok((
+                logical_witness(snapshot)?,
+                current_runtime_shape_is_canonical(snapshot)?,
+            ))
+        }) {
+            Ok((witness, canonical)) => (Some(witness), Some(canonical)),
+            Err(error) => {
+                attestation_errors.push(format!(
+                    "could not capture the committed logical and runtime witnesses: {error}"
+                ));
+                (None, None)
+            }
+        };
     let raw_after = match raw_family_witness(&migration.db_path) {
         Ok(witness) => Some(witness),
         Err(error) => {
@@ -3276,18 +3340,10 @@ fn apply_with_plan_token(
             forecast.to_version
         ));
     }
-    match current_runtime_shape_is_canonical(&migration.db_path) {
-        Ok(true) => {}
-        Ok(false) => {
-            attestation_errors.push(
-                "committed database does not have the canonical current runtime shape".to_string(),
-            );
-        }
-        Err(error) => {
-            attestation_errors.push(format!(
-                "could not attest the committed canonical runtime shape: {error}"
-            ));
-        }
+    if canonical_after == Some(false) {
+        attestation_errors.push(
+            "committed database does not have the canonical current runtime shape".to_string(),
+        );
     }
     let attested = attestation_errors.is_empty();
     let applied = AppliedMigrationReceipt {
@@ -3309,6 +3365,7 @@ fn apply_with_plan_token(
     };
     let commit_ready: CommitReadyMigrationReceipt = read_json(&run_dir.join("commit-ready.json"))?;
     validate_applied_against_commit_ready(&applied, &commit_ready, &run_dir)?;
+    verify_excluded_migration_path(&exclusion, &migration.db_path)?;
     write_json_new(&run_dir.join("applied.json"), &applied)?;
     sync_directory(&run_dir)?;
 
@@ -3458,6 +3515,7 @@ fn validate_commit_ready_marker(
 fn resume_commit_ready_migration(
     plan_token: &str,
     migration: &MigrationContext,
+    exclusion: &mut DatabaseReplacementExclusion,
 ) -> Result<Option<(AppliedMigrationReceipt, PathBuf)>> {
     let root = migration_runs_root(&migration.beads_dir);
     let entries = match fs::read_dir(&root) {
@@ -3507,16 +3565,19 @@ fn resume_commit_ready_migration(
         // run no longer speaks for it — fall through to a fresh apply.
         let applied: AppliedMigrationReceipt = read_json(&applied_path)?;
         validate_applied_against_commit_ready(&applied, &marker, &run_dir)?;
-        let logical_live = logical_witness(&migration.db_path).ok();
-        let projection_unchanged = verify_retained_migration_preservation(
-            &migration.db_path,
-            &run_dir,
-            &applied.raw_before,
-            &applied.forecast,
-        )
-        .is_ok();
-        // Capture the fallback raw witness after the SQLite probe so a
-        // legitimate shared-memory sidecar rewrite cannot stale it immediately.
+        let (logical_live, projection_unchanged) =
+            with_migration_read_snapshot(&migration.db_path, |snapshot, _| {
+                Ok((
+                    logical_witness(snapshot).ok(),
+                    verify_retained_migration_preservation(
+                        snapshot,
+                        &run_dir,
+                        &applied.raw_before,
+                        &applied.forecast,
+                    )
+                    .is_ok(),
+                ))
+            })?;
         let raw_live = raw_family_witness(&migration.db_path)?;
         if require_unchanged_applied_state(
             &applied,
@@ -3537,6 +3598,7 @@ fn resume_commit_ready_migration(
     }
 
     migration.write_authority.verify_database_authority()?;
+    verify_excluded_migration_path(exclusion, &migration.db_path)?;
     let raw_live_before_logical_probe = raw_family_witness(&migration.db_path)?;
     let original_main = component_for_suffix(&marker.raw_before, "")?;
     let live_main = component_for_suffix(&raw_live_before_logical_probe, "")?;
@@ -3551,7 +3613,9 @@ fn resume_commit_ready_migration(
             &marker.raw_before,
             &migration.write_authority,
         )?;
-        let logical_live = logical_witness(&migration.db_path)?;
+        let logical_live = with_migration_read_snapshot(&migration.db_path, |snapshot, _| {
+            logical_witness(snapshot)
+        })?;
         migration.write_authority.verify_database_authority()?;
         let raw_live_after_probe = raw_family_witness(&migration.db_path)?;
         if logical_live != marker.logical_before
@@ -3591,27 +3655,30 @@ fn resume_commit_ready_migration(
         }
         return Ok(None);
     }
-    let logical_live = logical_witness(&migration.db_path)?;
-    if logical_live != marker.logical_after {
-        return Err(BeadsError::internal(format!(
-            "commit-ready schema migration {} cannot be resumed because the live database is \
-             an unrecognized generation; retained all recovery artifacts at {}",
-            marker.run_id,
-            run_dir.display()
-        )));
-    }
-    verify_retained_migration_preservation(
-        &migration.db_path,
-        &run_dir,
-        &marker.raw_before,
-        &marker.forecast,
-    )?;
-    if !current_runtime_shape_is_canonical(&migration.db_path)? {
-        return Err(BeadsError::internal(format!(
-            "commit-ready schema migration {} matches logically but not the canonical runtime shape",
-            marker.run_id
-        )));
-    }
+    let logical_live = with_migration_read_snapshot(&migration.db_path, |snapshot, _| {
+        let logical_live = logical_witness(snapshot)?;
+        if logical_live != marker.logical_after {
+            return Err(BeadsError::internal(format!(
+                "commit-ready schema migration {} cannot be resumed because the live database is \
+                 an unrecognized generation; retained all recovery artifacts at {}",
+                marker.run_id,
+                run_dir.display()
+            )));
+        }
+        verify_retained_migration_preservation(
+            snapshot,
+            &run_dir,
+            &marker.raw_before,
+            &marker.forecast,
+        )?;
+        if !current_runtime_shape_is_canonical(snapshot)? {
+            return Err(BeadsError::internal(format!(
+                "commit-ready schema migration {} matches logically but not the canonical runtime shape",
+                marker.run_id
+            )));
+        }
+        Ok(logical_live)
+    })?;
     let raw_live = raw_family_witness(&migration.db_path)?;
     let retained_original_guard = certify_resumed_installed_generation(
         &migration.db_path,
@@ -3619,6 +3686,7 @@ fn resume_commit_ready_migration(
         &run_dir,
         &marker,
         &migration.write_authority,
+        exclusion,
     )?;
     migration.write_authority.finalize_database_replacement()?;
     let applied = AppliedMigrationReceipt {
@@ -3639,6 +3707,7 @@ fn resume_commit_ready_migration(
         undo_command: format!("br doctor migrate-schema undo {}", marker.run_id),
     };
     validate_applied_against_commit_ready(&applied, &marker, &run_dir)?;
+    verify_excluded_migration_path(exclusion, &migration.db_path)?;
     write_json_new(&applied_path, &applied)?;
     sync_directory(&run_dir)?;
     drop(retained_original_guard);
@@ -3651,6 +3720,7 @@ fn certify_resumed_installed_generation(
     run_dir: &Path,
     marker: &CommitReadyMigrationReceipt,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
+    exclusion: &mut DatabaseReplacementExclusion,
 ) -> Result<File> {
     verify_backup_family(db_path, before_dir, &marker.raw_before)?;
     write_authority.verify_database_authority()?;
@@ -3675,8 +3745,10 @@ fn certify_resumed_installed_generation(
         )));
     }
     let guard = if displaced_exists {
+        retain_migration_candidate(exclusion, &displaced_main)?;
         write_authority.lock_database_replacement_candidate(&displaced_main)?
     } else if candidate_exists {
+        retain_migration_candidate(exclusion, &candidate_path)?;
         let guard = write_authority.lock_database_replacement_candidate(&candidate_path)?;
         write_authority.verify_locked_database_replacement_candidate(&candidate_path, &guard)?;
         rename_path_no_replace(&candidate_path, &displaced_main)?;
@@ -3689,7 +3761,8 @@ fn certify_resumed_installed_generation(
         )));
     };
     write_authority.verify_locked_database_replacement_candidate(&displaced_main, &guard)?;
-    let retained_logical = logical_witness(&displaced_main)?;
+    let retained_logical =
+        with_migration_read_snapshot(&displaced_main, |snapshot, _| logical_witness(snapshot))?;
     if retained_logical != marker.logical_before {
         return Err(BeadsError::internal(format!(
             "resumed schema migration {} retained an unrecognized displaced generation at {}",
@@ -3858,6 +3931,7 @@ fn validate_applied_against_commit_ready(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_reviewed_migration(
     db_path: &Path,
     forecast: &MigrationForecast,
@@ -3866,6 +3940,7 @@ fn apply_reviewed_migration(
     raw_before: &RawFamilyWitness,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
     failed_stage: &mut Option<String>,
+    exclusion: &mut DatabaseReplacementExclusion,
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
     run_post_migration_maintenance(
         db_path,
@@ -3875,6 +3950,7 @@ fn apply_reviewed_migration(
         raw_before,
         write_authority,
         failed_stage,
+        exclusion,
     )
 }
 
@@ -3981,7 +4057,7 @@ fn vacuum_candidate_from_private_source(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn run_post_migration_maintenance(
     db_path: &Path,
     forecast: &MigrationForecast,
@@ -3990,6 +4066,7 @@ fn run_post_migration_maintenance(
     raw_before: &RawFamilyWitness,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
     failed_stage: &mut Option<String>,
+    exclusion: &mut DatabaseReplacementExclusion,
 ) -> Result<ReviewedSchemaMigrationEffectsReceipt> {
     // An old receipt may recognize an already-installed generation for undo,
     // but cannot authorize another candidate using destructive v13 semantics.
@@ -3998,10 +4075,22 @@ fn run_post_migration_maintenance(
     let to = forecast.to_version;
     mark_stage(failed_stage, "source-witness");
     write_authority.verify_database_authority()?;
-    verify_reviewed_profile(db_path, forecast, true)?;
-    let source_logical = logical_witness(db_path)?;
-    let source_preservation = capture_reviewed_state_preservation(db_path, forecast)?;
-    let source_permissions_witness = raw_family_witness(db_path)?;
+    verify_excluded_migration_path(exclusion, db_path)?;
+    let (source_logical, source_preservation, source_permissions_witness) =
+        with_migration_read_snapshot(db_path, |snapshot, raw| {
+            verify_reviewed_profile(snapshot, forecast, true)?;
+            Ok((
+                logical_witness(snapshot)?,
+                capture_reviewed_state_preservation(snapshot, forecast)?,
+                raw.clone(),
+            ))
+        })?;
+    if source_permissions_witness != *raw_before {
+        return Err(BeadsError::SyncConflict {
+            message: "Schema-migration source differs from the verified recovery family before candidate construction"
+                .to_owned(),
+        });
+    }
     let source_unix_mode = component_for_suffix(&source_permissions_witness, "")?.unix_mode;
     // Build and migrate a replacement database without mutating the live
     // family.  The live main file and sidecars remain the rollback authority
@@ -4158,18 +4247,25 @@ fn run_post_migration_maintenance(
         )));
     }
 
-    let source_logical_after = logical_witness(db_path)?;
-    verify_reviewed_profile(db_path, forecast, true)?;
-    verify_reviewed_state_preservation(db_path, source_preservation.as_ref(), false)?;
-    if source_logical_after != source_logical {
+    verify_excluded_migration_path(exclusion, db_path)?;
+    let source_raw = raw_family_witness(db_path)?;
+    if source_raw != source_permissions_witness {
         return Err(BeadsError::internal(format!(
             "live database changed while the copy-on-write migration candidate was prepared; \
              refusing installation and retaining the candidate at {}",
             candidate_path.display()
         )));
     }
-    let source_raw = raw_family_witness(db_path)?;
     let candidate_raw = raw_family_witness(&candidate_path)?;
+    // Protect the replacement inode before its first exposure at the live
+    // name. Retain both generations through post-install checks and rollback.
+    retain_migration_candidate(exclusion, &candidate_path)?;
+    if raw_family_witness(&candidate_path)? != candidate_raw {
+        return Err(BeadsError::SyncConflict {
+            message: "Schema-migration candidate changed before replacement exclusion was acquired"
+                .to_owned(),
+        });
+    }
     mark_stage(failed_stage, "candidate-sidecar-retention");
     let candidate_sidecars_dir = run_dir.join("maintenance-candidate-sidecars");
     move_present_sidecars_new(
@@ -4238,10 +4334,13 @@ fn run_post_migration_maintenance(
     }
     mark_stage(failed_stage, "post-install-verification");
     let post_install_result = (|| {
+        verify_excluded_migration_path(exclusion, db_path)?;
         verify_backup_family(db_path, &displaced_dir, &source_raw)?;
-        let installed_logical = logical_witness(db_path)?;
-        verify_reviewed_profile(db_path, forecast, false)?;
-        verify_reviewed_state_preservation(db_path, source_preservation.as_ref(), true)?;
+        let installed_logical = with_migration_read_snapshot(db_path, |snapshot, _| {
+            verify_reviewed_profile(snapshot, forecast, false)?;
+            verify_reviewed_state_preservation(snapshot, source_preservation.as_ref(), true)?;
+            logical_witness(snapshot)
+        })?;
         if installed_logical != candidate_logical {
             return Err(BeadsError::internal(format!(
                 "installed compacted database did not match its attested candidate \
@@ -5188,6 +5287,7 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
         validate_completed_undo_receipt(&receipt, args, migration)?;
         return emit_undo(&receipt, args.json);
     }
+    let mut exclusion = exclude_migration_openers(migration)?;
     let applied_path = run_dir.join("applied.json");
     let applied_receipt_sha256 = file_sha256(&applied_path)?;
     let applied: AppliedMigrationReceipt = read_json(&applied_path)?;
@@ -5212,17 +5312,21 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
         )?;
         receipt
     } else {
-        let logical_live = logical_witness(&migration.db_path).ok();
-        let projection_unchanged = verify_retained_migration_preservation(
-            &migration.db_path,
-            &run_dir,
-            &applied.raw_before,
-            &applied.forecast,
-        )
-        .is_ok();
-        // The receipt later governs exact quarantine moves. Capture it after
-        // the SQLite probe, which may legitimately rewrite the volatile -shm
-        // sidecar even though the logical database is unchanged.
+        let (logical_live, projection_unchanged) =
+            with_migration_read_snapshot(&migration.db_path, |snapshot, _| {
+                Ok((
+                    logical_witness(snapshot).ok(),
+                    verify_retained_migration_preservation(
+                        snapshot,
+                        &run_dir,
+                        &applied.raw_before,
+                        &applied.forecast,
+                    )
+                    .is_ok(),
+                ))
+            })?;
+        // The receipt governs exact quarantine moves. Engine probes use a
+        // private copy, leaving the excluded live SHM/WAL generation untouched.
         let raw_live = raw_family_witness(&migration.db_path)?;
         require_unchanged_applied_state(
             &applied,
@@ -5281,6 +5385,7 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
         &receipt.raw_live_before_undo,
         &applied.raw_before,
         &migration.write_authority,
+        &mut exclusion,
     )?;
     quarantine_live_family_resuming(
         &migration.db_path,
@@ -5290,8 +5395,7 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
     )?;
     restore_backup_family_resuming(&migration.db_path, &before_dir, &applied.raw_before)?;
 
-    // Prove the byte-for-byte restore before opening SQLite: a read-only open
-    // may legitimately create or rewrite the volatile shared-memory sidecar.
+    // Prove the byte-for-byte restore before inspecting a private engine copy.
     let raw_restored_exact = raw_family_witness(&migration.db_path)?;
     if raw_restored_exact != applied.raw_before {
         return Err(BeadsError::internal(format!(
@@ -5301,10 +5405,10 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
             quarantine_dir.display()
         )));
     }
-    let logical_restored = logical_witness(&migration.db_path)?;
+    let logical_restored =
+        with_migration_read_snapshot(&migration.db_path, |snapshot, _| logical_witness(snapshot))?;
     let raw_restored_after_probe = raw_family_witness(&migration.db_path)?;
-    if logical_restored != applied.logical_before
-        || !stable_raw_eq(&raw_restored_after_probe, &raw_restored_exact)
+    if logical_restored != applied.logical_before || raw_restored_after_probe != raw_restored_exact
     {
         return Err(BeadsError::internal(format!(
             "schema migration undo for run {} did not reproduce the verified pre-state; \
@@ -5324,6 +5428,7 @@ fn execute_undo(args: &DoctorMigrateSchemaUndoArgs, migration: &MigrationContext
     sync_directory(&restored_candidate_dir)?;
     sync_directory(&run_dir)?;
     migration.write_authority.verify_database_authority()?;
+    verify_excluded_migration_path(&exclusion, &migration.db_path)?;
     migration.write_authority.finalize_database_replacement()?;
     drop(quarantined_main_guard);
     write_json_new(&run_dir.join("undone.json"), &receipt)?;
@@ -5357,7 +5462,9 @@ fn install_undo_restored_main_resuming(
     applied: &RawFamilyWitness,
     restored: &RawFamilyWitness,
     write_authority: &Arc<DatabaseFamilyWriteLock>,
+    exclusion: &mut DatabaseReplacementExclusion,
 ) -> Result<Option<File>> {
+    verify_excluded_migration_path(exclusion, db_path)?;
     let applied_main = component_for_suffix(applied, "")?;
     let restored_main = component_for_suffix(restored, "")?;
     if !applied_main.present || !restored_main.present {
@@ -5385,6 +5492,7 @@ fn install_undo_restored_main_resuming(
     let live_matches_restored = component_bytes_match(db_path, &live_metadata, restored_main)?;
 
     if let Some(quarantined_metadata) = secure_file_metadata(&quarantined_main)? {
+        retain_migration_candidate(exclusion, &quarantined_main)?;
         verify_component_bytes(&quarantined_main, &quarantined_metadata, applied_main)?;
         if !live_matches_restored {
             return Err(BeadsError::internal(
@@ -5401,6 +5509,7 @@ fn install_undo_restored_main_resuming(
         if component_bytes_match(restored_candidate, &candidate_metadata, applied_main)?
             && live_matches_restored
         {
+            retain_migration_candidate(exclusion, restored_candidate)?;
             let guard = write_authority.lock_database_replacement_candidate(restored_candidate)?;
             write_authority
                 .verify_locked_database_replacement_candidate(restored_candidate, &guard)?;
@@ -5439,6 +5548,10 @@ fn install_undo_restored_main_resuming(
         ));
     }
     write_authority.verify_database_authority()?;
+    retain_migration_candidate(exclusion, restored_candidate)?;
+    let candidate_metadata = secure_file_metadata(restored_candidate)?
+        .ok_or_else(|| BeadsError::internal("schema-migration undo candidate disappeared"))?;
+    verify_component_bytes(restored_candidate, &candidate_metadata, restored_main)?;
     let replacement_lock =
         write_authority.lock_database_replacement_candidate(restored_candidate)?;
     write_authority
@@ -5494,6 +5607,7 @@ fn install_undo_restored_main_resuming(
     _applied: &RawFamilyWitness,
     _restored: &RawFamilyWitness,
     _write_authority: &Arc<DatabaseFamilyWriteLock>,
+    _exclusion: &mut DatabaseReplacementExclusion,
 ) -> Result<Option<File>> {
     require_atomic_undo_exchange()?;
     unreachable!("unsupported schema-migration undo exchange returned success")
@@ -5614,9 +5728,9 @@ fn validate_completed_undo_receipt(
         &migration.beads_dir,
         &migration.db_path,
     )?;
-    let logical = logical_witness(&migration.db_path)?;
-    let raw = raw_family_witness(&migration.db_path)?;
-    validate_completed_undo_live_state(receipt, &logical, &raw)
+    with_migration_read_snapshot(&migration.db_path, |snapshot, raw| {
+        validate_completed_undo_live_state(receipt, &logical_witness(snapshot)?, raw)
+    })
 }
 
 fn validate_completed_undo_receipt_structure(
@@ -12145,9 +12259,12 @@ mod tests {
             beads_dir,
             db_path,
         };
-        let (applied, resumed_before_dir) = resume_commit_ready_migration(&plan_token, &migration)
-            .expect("resume commit-ready migration")
-            .expect("committed generation must materialize applied receipt");
+        let (applied, resumed_before_dir) = {
+            let mut exclusion = exclude_migration_openers(&migration).unwrap();
+            resume_commit_ready_migration(&plan_token, &migration, &mut exclusion)
+                .expect("resume commit-ready migration")
+                .expect("committed generation must materialize applied receipt")
+        };
         assert_eq!(resumed_before_dir, before_dir);
         assert!(applied.attested);
         assert!(run_dir.join("applied.json").is_file());
@@ -12216,8 +12333,11 @@ mod tests {
         )
         .expect("persist pre-install commit-ready marker");
 
-        let resumed = resume_commit_ready_migration(&plan_token, &migration)
-            .expect("classify interrupted pre-install intent");
+        let resumed = {
+            let mut exclusion = exclude_migration_openers(&migration).unwrap();
+            resume_commit_ready_migration(&plan_token, &migration, &mut exclusion)
+                .expect("classify interrupted pre-install intent")
+        };
         assert!(
             resumed.is_none(),
             "an unchanged original generation must be retried, never called applied"
@@ -12588,6 +12708,7 @@ mod tests {
             let before_refusal = raw_family_witness(&migration.db_path).unwrap();
             let staged = candidate_dir.join("beads.db");
 
+            let mut exclusion = exclude_migration_openers(&migration).unwrap();
             let error = install_undo_restored_main_resuming(
                 &migration.db_path,
                 &before_dir,
@@ -12596,6 +12717,7 @@ mod tests {
                 &applied,
                 &original,
                 &migration.write_authority,
+                &mut exclusion,
             )
             .expect_err("every unreviewed sidecar must refuse before changing the main");
             assert!(error.to_string().contains(suffix), "{suffix}: {error}");
@@ -12940,6 +13062,7 @@ mod tests {
         fs::write(run_dir.join("commit-ready.json"), b"{}").expect("occupy marker path");
 
         let mut failed_stage = None;
+        let mut exclusion = exclude_migration_openers(&migration).unwrap();
         run_post_migration_maintenance(
             &migration.db_path,
             &forecast,
@@ -12948,6 +13071,7 @@ mod tests {
             &prepared.raw_before,
             &migration.write_authority,
             &mut failed_stage,
+            &mut exclusion,
         )
         .expect_err("an occupied commit-ready marker path must fail the pipeline");
         assert_eq!(

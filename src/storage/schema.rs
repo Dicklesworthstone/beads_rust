@@ -1312,12 +1312,17 @@ fn refuse_external_references_to_tables(
     operation: &str,
     replaced_tables: &[&str],
 ) -> Result<()> {
-    for table in conn.query("SELECT name FROM main.sqlite_schema WHERE type = 'table' ORDER BY name")? {
+    for table in
+        conn.query("SELECT name FROM main.sqlite_schema WHERE type = 'table' ORDER BY name")?
+    {
         let name = table
             .get(0)
             .and_then(SqliteValue::as_text)
             .ok_or_else(|| BeadsError::internal("schema table name is not text"))?;
-        if replaced_tables.iter().any(|table| name.eq_ignore_ascii_case(table)) {
+        if replaced_tables
+            .iter()
+            .any(|table| name.eq_ignore_ascii_case(table))
+        {
             continue;
         }
         let escaped = name.replace('\'', "''");
@@ -1326,7 +1331,10 @@ fn refuse_external_references_to_tables(
                 .get(2)
                 .and_then(SqliteValue::as_text)
                 .ok_or_else(|| BeadsError::internal("foreign-key parent table name is not text"))?;
-            if replaced_tables.iter().any(|table| parent.eq_ignore_ascii_case(table)) {
+            if replaced_tables
+                .iter()
+                .any(|table| parent.eq_ignore_ascii_case(table))
+            {
                 return Err(BeadsError::Config(format!(
                     "{operation} refused: table {name} has a foreign key referencing {parent}; \
                      replacing that parent could change authoritative records outside the \
@@ -3088,7 +3096,11 @@ fn attest_current_schema_maintenance(conn: &Connection, operation: &str) -> Resu
     }
 
     for (table, columns, indexes) in [
-        ("close_metadata", CLOSE_METADATA_COLUMNS, CLOSE_METADATA_INDEXES),
+        (
+            "close_metadata",
+            CLOSE_METADATA_COLUMNS,
+            CLOSE_METADATA_INDEXES,
+        ),
         ("gate_results", GATE_RESULTS_COLUMNS, GATE_RESULTS_INDEXES),
         (
             "capacity_exemptions",
@@ -9287,14 +9299,16 @@ mod tests {
         );
     }
 
-    fn current_schema_table_records(
-        conn: &Connection,
-    ) -> Vec<(String, Vec<Vec<SqliteValue>>)> {
+    fn current_schema_table_records(conn: &Connection) -> Vec<(String, Vec<Vec<SqliteValue>>)> {
         conn.query("SELECT name FROM main.sqlite_schema WHERE type = 'table' ORDER BY name")
             .unwrap()
             .iter()
             .map(|row| {
-                let name = row.get(0).and_then(SqliteValue::as_text).unwrap().to_owned();
+                let name = row
+                    .get(0)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap()
+                    .to_owned();
                 let records = conn
                     .query(&format!(
                         "SELECT rowid, * FROM main.{} ORDER BY rowid",
@@ -9362,23 +9376,40 @@ mod tests {
             );
             let operator_index = format!(
                 "{:?}",
-                conn.query("SELECT * FROM main.sqlite_schema WHERE name = 'idx_dependencies_issue_id'")
-                    .unwrap()
+                conn.query(
+                    "SELECT * FROM main.sqlite_schema WHERE name = 'idx_dependencies_issue_id'"
+                )
+                .unwrap()
             );
             assert!(!runtime_schema_compatible(&conn));
 
             let (result, statements) =
                 crate::franken_sync::statement_log::capture(|| repair(&conn));
             result.unwrap();
-            let begin = statements.iter().position(|sql| sql == "BEGIN IMMEDIATE").unwrap();
+            let begin = statements
+                .iter()
+                .position(|sql| sql == "BEGIN IMMEDIATE")
+                .unwrap();
             let commit = statements.iter().position(|sql| sql == "COMMIT").unwrap();
             for (index, sql) in statements.iter().enumerate() {
                 if sql.contains("CREATE INDEX") || sql.contains("CREATE TABLE") {
-                    assert!(begin < index && index < commit, "DDL outside transaction: {sql}");
+                    assert!(
+                        begin < index && index < commit,
+                        "DDL outside transaction: {sql}"
+                    );
                 }
-                assert!(!sql.contains("issues_rebuild_tmp"), "legacy projection: {sql}");
-                assert!(!sql.starts_with("DROP TABLE"), "index repair dropped a table: {sql}");
-                assert!(!sql.starts_with("UPDATE "), "index repair changed rows: {sql}");
+                assert!(
+                    !sql.contains("issues_rebuild_tmp"),
+                    "legacy projection: {sql}"
+                );
+                assert!(
+                    !sql.starts_with("DROP TABLE"),
+                    "index repair dropped a table: {sql}"
+                );
+                assert!(
+                    !sql.starts_with("UPDATE "),
+                    "index repair changed rows: {sql}"
+                );
             }
             assert!(!conn.as_async().in_transaction());
 
@@ -9397,16 +9428,16 @@ mod tests {
             assert_eq!(
                 format!(
                     "{:?}",
-                    conn.query("SELECT * FROM main.sqlite_schema WHERE name = 'idx_dependencies_issue_id'")
-                        .unwrap()
+                    conn.query(
+                        "SELECT * FROM main.sqlite_schema WHERE name = 'idx_dependencies_issue_id'"
+                    )
+                    .unwrap()
                 ),
                 operator_index,
                 "current maintenance must not retire an operator's legacy-named index"
             );
-            for (table, expected) in [
-                ("config", "latest config"),
-                ("metadata", "latest metadata"),
-            ] {
+            for (table, expected) in [("config", "latest config"), ("metadata", "latest metadata")]
+            {
                 let latest = conn
                     .query_row(&format!(
                         "SELECT value FROM {table} WHERE key = 'duplicate' ORDER BY rowid DESC LIMIT 1"
@@ -9464,8 +9495,8 @@ mod tests {
                 assert!(error.to_string().contains("schema"), "{drift}: {error}");
                 assert_eq!(legacy_v15_test_state(&conn), before, "{drift}");
             }
-            let error = crate::storage::SqliteStorage::open(&temp.path().join("beads.db"))
-                .unwrap_err();
+            let error =
+                crate::storage::SqliteStorage::open(&temp.path().join("beads.db")).unwrap_err();
             assert!(error.to_string().contains("schema"), "{drift}: {error}");
             assert_eq!(legacy_v15_test_state(&conn), before, "{drift}");
         }
@@ -9971,7 +10002,9 @@ mod tests {
         let error = apply_schema(&conn)
             .expect_err("a current version stamp cannot authorize a workflow layout change");
         assert!(
-            error.to_string().contains("workflow table capacity_occupancy"),
+            error
+                .to_string()
+                .contains("workflow table capacity_occupancy"),
             "{error}"
         );
         assert_eq!(legacy_v15_test_state(&conn), before);
@@ -10035,7 +10068,9 @@ mod tests {
         let error = apply_schema(&conn)
             .expect_err("repair must not invent a historical occupancy timestamp");
         assert!(
-            error.to_string().contains("workflow table capacity_occupancy"),
+            error
+                .to_string()
+                .contains("workflow table capacity_occupancy"),
             "unexpected repair error: {error}"
         );
         assert!(

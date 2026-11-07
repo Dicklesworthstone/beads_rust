@@ -77,7 +77,8 @@ pub const DATABASE_INODE_LOCK_OFFSET: i64 = i64::MAX - 1;
 // Keep the platform-specific implementation of the recovery guard in this
 // sanctioned syscall module. Unlike the write-authority byte above, this
 // guard MUST conflict with SQLite's pending/reserved/shared byte ranges:
-// replacing -shm while even an idle SQLite reader retains a mapping is unsafe.
+// replacing a main file or -shm while another connection retains the original
+// generation is unsafe.
 impl crate::franken_sync::wal_index::RecoveryLock {
     #[cfg(any(
         target_os = "linux",
@@ -112,16 +113,26 @@ impl crate::franken_sync::wal_index::RecoveryLock {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn acquire(file: File) -> Result<Self, TryLockError> {
+        // Unlike the distant br authority byte, this range must conflict
+        // with native SQLite readers and writers. Replacement admission
+        // refuses payload extending into it before taking this mandatory lock.
+        try_lock_windows_range(&file, 0x4000_0000, 512)?;
+        Ok(Self { file })
+    }
+
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
         target_os = "macos",
-        target_os = "ios"
+        target_os = "ios",
+        windows
     )))]
     pub(crate) fn acquire(_file: File) -> Result<Self, TryLockError> {
         // Never substitute flock: it does not exclude SQLite's POSIX locks
         // on Linux. Other platforms need a qualified byte-range guard and
-        // durable quarantine primitive before enabling this repair.
+        // durable replacement primitives before enabling these operations.
         Err(TryLockError::Error(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "WAL-index quarantine is not supported on this platform",
@@ -239,13 +250,21 @@ pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
 /// Windows implementation: one-byte `LockFileEx` at
 /// [`DATABASE_INODE_LOCK_OFFSET`].
 #[cfg(windows)]
+pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
+    #[allow(clippy::cast_sign_loss)]
+    let offset = DATABASE_INODE_LOCK_OFFSET as u64;
+    try_lock_windows_range(file, offset, 1)
+}
+
+/// Non-blocking Windows lock shared by br authority and native SQLite exclusion.
+#[cfg(windows)]
 #[allow(
     unsafe_code,
     non_snake_case,
     clippy::items_after_statements,
     clippy::incompatible_msrv
 )]
-pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
+fn try_lock_windows_range(file: &File, offset: u64, length: u32) -> Result<(), TryLockError> {
     use std::os::windows::io::AsRawHandle;
 
     // Minimal local declarations mirroring `windows-sys`; kept private so the
@@ -275,8 +294,6 @@ pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
         ) -> i32;
     }
 
-    #[allow(clippy::cast_sign_loss)]
-    let offset = DATABASE_INODE_LOCK_OFFSET as u64;
     let mut overlapped = Overlapped {
         internal: 0,
         internal_high: 0,
@@ -293,7 +310,7 @@ pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
             file.as_raw_handle() as isize,
             LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
             0,
-            1,
+            length,
             0,
             &raw mut overlapped,
         )

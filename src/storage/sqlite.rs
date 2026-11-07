@@ -19257,11 +19257,26 @@ pub(crate) fn copy_database_family_read_snapshot(path: &Path, destination: &Path
 }
 
 /// Validate namespace transition evidence only in an owned, verified copy.
-/// Both callers copy to this fixed filename inside their private directory;
+/// Snapshot readers use this fixed filename inside their private directory;
 /// accepting the directory keeps this operation separate from live admission.
 #[cfg(any(unix, windows))]
-fn admit_private_snapshot_namespace(directory: &tempfile::TempDir) -> Result<()> {
-    let path = directory.path().join("snapshot.db");
+pub(crate) fn admit_private_snapshot_namespace(directory: &tempfile::TempDir) -> Result<()> {
+    admit_private_database_namespace(directory, std::ffi::OsStr::new("snapshot.db"))
+}
+
+/// Validate a copied namespace while retaining the original database basename
+/// for recovery-bundle lookups. The directory must be a private temporary copy.
+#[cfg(any(unix, windows))]
+pub(crate) fn admit_private_database_namespace(
+    directory: &tempfile::TempDir,
+    database_name: &std::ffi::OsStr,
+) -> Result<()> {
+    if Path::new(database_name).file_name() != Some(database_name) {
+        return Err(BeadsError::internal(
+            "private database namespace requires a single database filename",
+        ));
+    }
+    let path = directory.path().join(database_name);
     let use_path = database_sidecar_path(&path, "-fsqlite-ns-use");
     match std::fs::symlink_metadata(&use_path) {
         Ok(_) => {}
@@ -36206,7 +36221,10 @@ required_fields:
             let db_path = temp.path().join("beads.db");
             let mut storage = SqliteStorage::open(&db_path).unwrap();
             let now = Utc::now();
-            for (id, title) in [("bd-cache-parent", "Blocker"), ("bd-cache-child", "Blocked")] {
+            for (id, title) in [
+                ("bd-cache-parent", "Blocker"),
+                ("bd-cache-child", "Blocked"),
+            ] {
                 storage
                     .create_issue(
                         &make_issue(id, title, Status::Open, 2, None, now, None),
@@ -36279,8 +36297,7 @@ required_fields:
                     .unwrap()
                     .iter()
                     .all(|row| {
-                        row.get(0).and_then(SqliteValue::as_text)
-                            == Some(BLOCKED_CACHE_STATE_STALE)
+                        row.get(0).and_then(SqliteValue::as_text) == Some(BLOCKED_CACHE_STATE_STALE)
                     }),
                 "every duplicate marker must become stale"
             );
@@ -39319,7 +39336,9 @@ required_fields:
                 .unwrap();
             storage
                 .conn
-                .execute("INSERT INTO config (rowid, key, value) VALUES (17, 'issue_prefix', 'legacy')")
+                .execute(
+                    "INSERT INTO config (rowid, key, value) VALUES (17, 'issue_prefix', 'legacy')",
+                )
                 .unwrap();
 
             storage
@@ -39333,7 +39352,9 @@ required_fields:
                 .unwrap();
             storage
                 .conn
-                .execute("INSERT INTO metadata (rowid, key, value) VALUES (91, 'project', X'00ff80')")
+                .execute(
+                    "INSERT INTO metadata (rowid, key, value) VALUES (91, 'project', X'00ff80')",
+                )
                 .unwrap();
         }
 

@@ -11,6 +11,10 @@
 //! differing salts, and a missing/short index are NOT quarantine authority.
 //! Neither is stock SQLite's checksummed empty index beside a header-only WAL:
 //! the pinned engine admits it and binds its first write normally (GH #555).
+//!
+//! Database replacement also uses the same native exclusion primitive. Its
+//! guard retains every main inode involved in an exchange and keeps namespace
+//! admission closed without introducing a second durable recovery protocol.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, Write};
@@ -24,9 +28,215 @@ use super::FrankenError;
 
 /// Owns a SQLite-compatible exclusive main-file range lock. Its platform
 /// constructor lives in sync::db_inode_lock, the existing syscall boundary.
-/// Closing this owned descriptor releases its OFD lock; unrelated closes do not.
+/// Closing this owned descriptor or handle releases its lock; unrelated closes
+/// do not. Unix uses an OFD lock and Windows uses a mandatory byte-range lock.
+#[derive(Debug)]
 pub struct RecoveryLock {
     pub(crate) file: File,
+}
+
+/// Exclude engine and stock SQLite openers throughout a database replacement.
+///
+/// A br writer lock intentionally avoids SQLite's native byte range. It cannot
+/// authorize replacing a main file that an external writer still owns. This
+/// guard holds the cooperative opener lease, both namespace locks, and native
+/// exclusion for every retained inode until the caller has published its
+/// receipts or completed rollback. Engine inspection must use private copies.
+///
+/// Namespace admissions remain unbound: no live ledger is rewritten, and a
+/// crash introduces no new durable intent beyond the caller's existing
+/// recovery receipts. The engine's private-copy validator accepts completed
+/// copied ledgers and torn bootstrap headers, while refusing unfinished or
+/// unrecognized transition evidence. The live ledger stays unchanged.
+#[derive(Debug)]
+pub(crate) struct DatabaseReplacementExclusion {
+    // Field order keeps native exclusion until every namespace and cooperative
+    // opener hold has been released. No mutation happens during teardown.
+    namespaces: Vec<(PathBuf, PendingNamespaceOpen)>,
+    _exclusive_opener: crate::sync::DatabaseOpenerExclusiveHold,
+    _opener_lease: crate::sync::DatabaseOpenerLease,
+    inodes: Vec<(FileIdentity, RecoveryLock)>,
+}
+
+impl DatabaseReplacementExclusion {
+    /// Acquire exclusion for the exact current main, without opening an engine.
+    pub(crate) fn acquire(
+        requested: &Path,
+        expected_identity: FileIdentity,
+    ) -> crate::Result<Self> {
+        let path = replacement_path(requested)?;
+        let mut lease = crate::sync::DatabaseOpenerLease::register(&path)?;
+        let exclusive = lease
+            .try_exclusive()
+            .ok_or_else(replacement_opener_conflict)?;
+        let mut guard = Self {
+            namespaces: Vec::new(),
+            _exclusive_opener: exclusive,
+            _opener_lease: lease,
+            inodes: Vec::new(),
+        };
+        guard.retain_candidate(&path, expected_identity)?;
+        Ok(guard)
+    }
+
+    /// Retain a replacement or displaced inode before it can become live.
+    ///
+    /// Re-entering with a previously retained inode is harmless, including
+    /// after an exchange moved it to a different name. Existing guards remain
+    /// held if admission of an additional candidate fails.
+    pub(crate) fn retain_candidate(
+        &mut self,
+        requested: &Path,
+        expected_identity: FileIdentity,
+    ) -> crate::Result<()> {
+        let path = replacement_path(requested)?;
+        let file = open_regular(&path, true)?;
+        if identity(&file)? != expected_identity {
+            return Err(crate::BeadsError::SyncConflict {
+                message: "Database replacement candidate no longer matches its retained identity"
+                    .to_string(),
+            });
+        }
+        require_replacement_payload_below_mandatory_lock(file.metadata()?.len())?;
+        let native = if self.inodes.iter().any(|(id, _)| *id == expected_identity) {
+            None
+        } else {
+            // Take the native lock before creating namespace sidecars. An
+            // active stock SQLite connection must refuse before admission can
+            // make this database look like a quiescent engine generation.
+            Some(RecoveryLock::acquire(file).map_err(|error| match error {
+                TryLockError::WouldBlock => replacement_opener_conflict(),
+                TryLockError::Error(error) => crate::BeadsError::Io(error),
+            })?)
+        };
+        let namespace = if self.namespaces.iter().any(|(name, _)| name == &path) {
+            None
+        } else {
+            let pending = PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::Shared).map_err(
+                |error| match error {
+                    FrankenError::Busy
+                    | FrankenError::BusyRecovery
+                    | FrankenError::IncompatiblePeerEngine { .. }
+                    | FrankenError::DatabaseLocked { .. } => replacement_opener_conflict(),
+                    other => crate::BeadsError::Database(other),
+                },
+            )?;
+            if pending.expected_identity().is_some() {
+                return Err(replacement_opener_conflict());
+            }
+            validate_replacement_namespace(&path, &pending)?;
+            Some(pending)
+        };
+        // Identity is checked again after both admissions; neither a path race
+        // nor a successful lock on a different inode authorizes a replacement.
+        let named = open_regular(&path, false)?;
+        if identity(&named)? != expected_identity {
+            return Err(crate::BeadsError::SyncConflict {
+                message: "Database replacement path changed while acquiring exclusion".to_string(),
+            });
+        }
+        if let Some(native) = native {
+            self.inodes.push((expected_identity, native));
+        }
+        if let Some(namespace) = namespace {
+            self.namespaces.push((path, namespace));
+        }
+        Ok(())
+    }
+
+    /// Prove that a name still refers to one of this guard's locked inodes.
+    pub(crate) fn verify_path(
+        &self,
+        requested: &Path,
+        expected_identity: FileIdentity,
+    ) -> crate::Result<()> {
+        let retained = self
+            .inodes
+            .iter()
+            .find(|(id, _)| *id == expected_identity)
+            .ok_or_else(|| crate::BeadsError::SyncConflict {
+                message: "Database replacement inode has no retained native exclusion".to_string(),
+            })?;
+        if identity(&retained.1.file)? != expected_identity
+            || identity(&open_regular(&replacement_path(requested)?, false)?)? != expected_identity
+        {
+            return Err(crate::BeadsError::SyncConflict {
+                message: "Database replacement name no longer identifies its locked generation"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn replacement_opener_conflict() -> crate::BeadsError {
+    crate::BeadsError::SyncConflict {
+        message: "Database replacement requires exclusive access; close other br and SQLite \
+                  connections, preserve the database family, and retry"
+            .to_string(),
+    }
+}
+
+fn replacement_path(requested: &Path) -> io::Result<PathBuf> {
+    let parent = requested
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(fs::canonicalize(parent)?.join(
+        requested
+            .file_name()
+            .ok_or_else(|| invalid("missing database replacement filename"))?,
+    ))
+}
+
+fn require_replacement_payload_below_mandatory_lock(length: u64) -> crate::Result<()> {
+    // Windows range locks also deny reads through other descriptors. The raw
+    // copy/hash protocol uses separate descriptors, so refuse before mutation
+    // if payload overlaps SQLite's lock byte. Unix locks are advisory and do
+    // not restrict large-database copying.
+    if cfg!(windows) && length > 0x4000_0000 {
+        return Err(crate::BeadsError::Config(
+            "Database replacement on Windows requires the main file to be at most 1 GiB so \
+             native SQLite exclusion cannot overlap the bytes being copied and verified; \
+             preserve this larger database and migrate it on a supported Unix host"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn validate_replacement_namespace(
+    path: &Path,
+    pending: &PendingNamespaceOpen,
+) -> crate::Result<()> {
+    if !pending.has_quiescent_record_bytes()? {
+        return Ok(());
+    }
+    // Pending Shared owns the source gate/use locks exclusively, but does not
+    // parse a quiescent ledger until bind. Validate a tiny owned copy using the
+    // engine's parser; binding the live record would modify recovery evidence.
+    let private = tempfile::Builder::new()
+        .prefix("br-replacement-namespace-")
+        .tempdir()?;
+    let snapshot = private.path().join("snapshot.db");
+    File::create_new(&snapshot)?;
+    for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        let mut source = open_regular(&sidecar(path, suffix), false)?;
+        let mut destination = File::create_new(sidecar(&snapshot, suffix))?;
+        io::copy(&mut source, &mut destination)?;
+    }
+    crate::storage::sqlite::admit_private_snapshot_namespace(&private)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_replacement_namespace(
+    _path: &Path,
+    _pending: &PendingNamespaceOpen,
+) -> crate::Result<()> {
+    Err(crate::BeadsError::Config(
+        "Database replacement requires native namespace exclusion on this platform".to_string(),
+    ))
 }
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -230,9 +440,10 @@ fn poisoned_headers(wal: &[u8; 32], shm: &[u8; 96]) -> bool {
 pub const ENGINE_READS_ON_DISK_WAL_INDEX: bool = cfg!(unix);
 
 /// Whether this target can perform the identity-bound WAL-index quarantine:
-/// the POSIX open-file-description byte-range guard in
-/// `RecoveryLock::acquire` exists only on these targets (keep the two cfg
-/// lists identical). Elsewhere acquisition always fails as unsupported.
+/// these targets provide both the native byte-range guard and durable
+/// quarantine primitive. Windows also provides native replacement exclusion,
+/// but its engine does not read the on-disk WAL index, so quarantine remains
+/// unsupported there.
 pub const WAL_INDEX_QUARANTINE_SUPPORTED: bool = cfg!(any(
     target_os = "linux",
     target_os = "android",
@@ -1261,6 +1472,279 @@ pub mod tests {
 
     fn payload(db: &Path) -> [Vec<u8>; 3] {
         ["", "-wal", "-shm"].map(|suffix| fs::read(sidecar(db, suffix)).unwrap())
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        windows
+    ))]
+    #[test]
+    fn replacement_exclusion_refuses_native_and_cooperative_peers() {
+        #[cfg(unix)]
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::replacement_exclusion_refuses_native_and_cooperative_peers",
+        ) {
+            return;
+        }
+        for native_peer in [false, true] {
+            let (_temp, db, id) = fixture();
+            let before = payload(&db);
+            let native = native_peer
+                .then(|| RecoveryLock::acquire(open_regular(&db, true).unwrap()).unwrap());
+            let cooperative =
+                (!native_peer).then(|| crate::sync::DatabaseOpenerLease::register(&db).unwrap());
+            let error = DatabaseReplacementExclusion::acquire(&db, id).unwrap_err();
+            assert!(matches!(error, crate::BeadsError::SyncConflict { .. }));
+            assert_eq!(payload(&db), before);
+            assert!(!sidecar(&db, "-fsqlite-ns-use").exists());
+            drop(native);
+            drop(cooperative);
+
+            let guard = DatabaseReplacementExclusion::acquire(&db, id).unwrap();
+            guard.verify_path(&db, id).unwrap();
+            assert!(matches!(
+                RecoveryLock::acquire(open_regular(&db, true).unwrap()),
+                Err(TryLockError::WouldBlock)
+            ));
+            assert!(
+                PendingNamespaceOpen::begin(&db, NamespaceOpenIntent::ReservedExclusive).is_err()
+            );
+            assert_eq!(payload(&db), before);
+            drop(guard);
+            let retry = DatabaseReplacementExclusion::acquire(&db, id).unwrap();
+            retry.verify_path(&db, id).unwrap();
+            drop(retry);
+            assert!(RecoveryLock::acquire(open_regular(&db, true).unwrap()).is_ok());
+        }
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn replacement_exclusion_retains_both_inodes_through_exchange_and_rollback() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::replacement_exclusion_retains_both_inodes_through_exchange_and_rollback",
+        ) {
+            return;
+        }
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+        let (_temp, db, original_id) = fixture();
+        let original = fs::read(&db).unwrap();
+        let candidate = db.with_file_name("candidate.db");
+        fs::write(&candidate, b"distinct candidate generation").unwrap();
+        let candidate_id = identity(&File::open(&candidate).unwrap()).unwrap();
+        let mut guard = DatabaseReplacementExclusion::acquire(&db, original_id).unwrap();
+        guard.retain_candidate(&candidate, candidate_id).unwrap();
+        let ledger = fs::read(sidecar(&db, "-fsqlite-ns-use")).unwrap();
+
+        renameat_with(CWD, &db, CWD, &candidate, RenameFlags::EXCHANGE).unwrap();
+        guard.verify_path(&db, candidate_id).unwrap();
+        guard.verify_path(&candidate, original_id).unwrap();
+        assert!(guard.verify_path(&db, original_id).is_err());
+        // Re-entry must keep the already-held inode instead of trying a second
+        // native lock on it through its new name and conflicting with itself.
+        guard.retain_candidate(&db, candidate_id).unwrap();
+        guard.retain_candidate(&candidate, original_id).unwrap();
+        for path in [&db, &candidate] {
+            assert!(matches!(
+                RecoveryLock::acquire(open_regular(path, true).unwrap()),
+                Err(TryLockError::WouldBlock)
+            ));
+            assert!(
+                PendingNamespaceOpen::begin(path, NamespaceOpenIntent::ReservedExclusive).is_err()
+            );
+        }
+
+        renameat_with(CWD, &db, CWD, &candidate, RenameFlags::EXCHANGE).unwrap();
+        guard.verify_path(&db, original_id).unwrap();
+        guard.verify_path(&candidate, candidate_id).unwrap();
+        assert_eq!(fs::read(&db).unwrap(), original);
+        assert_eq!(fs::read(sidecar(&db, "-fsqlite-ns-use")).unwrap(), ledger);
+        drop(guard);
+        let mut resumed = DatabaseReplacementExclusion::acquire(&db, original_id).unwrap();
+        resumed.retain_candidate(&candidate, candidate_id).unwrap();
+        resumed.verify_path(&db, original_id).unwrap();
+        resumed.verify_path(&candidate, candidate_id).unwrap();
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        windows
+    ))]
+    #[test]
+    fn replacement_candidate_refusal_keeps_live_exclusion() {
+        #[cfg(unix)]
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::replacement_candidate_refusal_keeps_live_exclusion",
+        ) {
+            return;
+        }
+        let (_temp, db, id) = fixture();
+        let before = payload(&db);
+        let candidate = db.with_file_name("invalid-candidate.db");
+        fs::write(&candidate, b"candidate whose ledger cannot be admitted").unwrap();
+        let candidate_id = identity(&File::open(&candidate).unwrap()).unwrap();
+        let namespace = PendingNamespaceOpen::begin(&candidate, NamespaceOpenIntent::Shared)
+            .unwrap()
+            .bind(candidate_id)
+            .unwrap();
+        namespace.finish_bootstrap().unwrap();
+        drop(namespace);
+        let use_path = sidecar(&candidate, "-fsqlite-ns-use");
+        let invalid = b"invalid candidate namespace transition evidence must remain unchanged";
+        fs::write(&use_path, invalid).unwrap();
+        let mut guard = DatabaseReplacementExclusion::acquire(&db, id).unwrap();
+        let error = guard
+            .retain_candidate(&candidate, candidate_id)
+            .unwrap_err();
+        assert!(error.to_string().contains("copied fsqlite namespace"));
+        guard.verify_path(&db, id).unwrap();
+        assert!(matches!(
+            RecoveryLock::acquire(open_regular(&db, true).unwrap()),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert!(PendingNamespaceOpen::begin(&db, NamespaceOpenIntent::ReservedExclusive).is_err());
+        assert_eq!(payload(&db), before);
+        assert_eq!(fs::read(&use_path).unwrap(), invalid);
+        assert!(guard.verify_path(&candidate, candidate_id).is_err());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        windows
+    ))]
+    #[test]
+    fn replacement_exclusion_refuses_live_and_unfinished_namespaces() {
+        #[cfg(unix)]
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::replacement_exclusion_refuses_live_and_unfinished_namespaces",
+        ) {
+            return;
+        }
+        for state in ["live", "malformed", "prepared"] {
+            let (_temp, db, id) = fixture();
+            let binding = PendingNamespaceOpen::begin(&db, NamespaceOpenIntent::Shared)
+                .unwrap()
+                .bind(id)
+                .unwrap();
+            binding.finish_bootstrap().unwrap();
+            let binding = (state == "live").then_some(binding);
+            let use_path = sidecar(&db, "-fsqlite-ns-use");
+            if state == "malformed" {
+                fs::write(
+                    &use_path,
+                    b"unrecognized namespace transition evidence must remain unchanged",
+                )
+                .unwrap();
+            } else if state == "prepared" {
+                let transition =
+                    fsqlite_vfs::namespace::begin_database_namespace_generation_transition(&db, id)
+                        .unwrap();
+                drop(transition);
+            }
+            let before = payload(&db);
+            let ledger = fs::read(&use_path).unwrap();
+            let error = DatabaseReplacementExclusion::acquire(&db, id).unwrap_err();
+            if state == "live" {
+                assert!(matches!(error, crate::BeadsError::SyncConflict { .. }));
+            } else {
+                assert!(
+                    error.to_string().contains("copied fsqlite namespace"),
+                    "{state}: {error}"
+                );
+            }
+            assert_eq!(payload(&db), before, "{state}");
+            assert_eq!(fs::read(&use_path).unwrap(), ledger, "{state}");
+            drop(binding);
+        }
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        windows
+    ))]
+    #[test]
+    fn replacement_exclusion_accepts_completed_copied_ledgers_without_rewriting_them() {
+        #[cfg(unix)]
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::replacement_exclusion_accepts_completed_copied_ledgers_without_rewriting_them",
+        ) {
+            return;
+        }
+        for ledger_state in ["base", "completed", "short_bootstrap"] {
+            let (_temp, db, old_id) = fixture();
+            let binding = PendingNamespaceOpen::begin(&db, NamespaceOpenIntent::Shared)
+                .unwrap()
+                .bind(old_id)
+                .unwrap();
+            binding.finish_bootstrap().unwrap();
+            drop(binding);
+            if ledger_state == "completed" {
+                let mut transition =
+                    fsqlite_vfs::namespace::begin_database_namespace_generation_transition(
+                        &db, old_id,
+                    )
+                    .unwrap();
+                transition.finish().unwrap();
+            } else if ledger_state == "short_bootstrap" {
+                // The engine deliberately admits torn bootstrap headers of
+                // at most 40 bytes. Preserve that contract while retaining
+                // every original byte; transition tails are tested above.
+                fs::write(sidecar(&db, "-fsqlite-ns-use"), b"torn bootstrap").unwrap();
+            }
+            let before = payload(&db);
+            let retained = db.with_file_name("retained-original.db");
+            fs::rename(&db, &retained).unwrap();
+            fs::copy(&retained, &db).unwrap();
+            let current_id = identity(&File::open(&db).unwrap()).unwrap();
+            assert_ne!(current_id, old_id);
+            let ledger = fs::read(sidecar(&db, "-fsqlite-ns-use")).unwrap();
+
+            let guard = DatabaseReplacementExclusion::acquire(&db, current_id).unwrap();
+            guard.verify_path(&db, current_id).unwrap();
+            assert_eq!(payload(&db), before);
+            assert_eq!(fs::read(sidecar(&db, "-fsqlite-ns-use")).unwrap(), ledger);
+            drop(guard);
+            // Ordinary writable admission can bind the installed generation
+            // after the guard drops; no new durable transition must be healed.
+            let reopened = PendingNamespaceOpen::begin(&db, NamespaceOpenIntent::Shared)
+                .unwrap()
+                .bind_replacing_quiescent_record(current_id)
+                .unwrap();
+            reopened.finish_bootstrap().unwrap();
+            assert_eq!(reopened.identity(), current_id);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_windows_size_boundary_never_overlaps_native_lock_bytes() {
+        // Inspect lengths without allocating a multi-gigabyte fixture. Exactly
+        // 1 GiB ends before SQLite's first mandatory lock byte.
+        for length in [0, 4096, 0x3fff_ffff, 0x4000_0000] {
+            require_replacement_payload_below_mandatory_lock(length).unwrap();
+        }
+        for length in [0x4000_0001, u64::MAX] {
+            let error = require_replacement_payload_below_mandatory_lock(length).unwrap_err();
+            assert!(error.to_string().contains("at most 1 GiB"));
+        }
     }
 
     #[test]
