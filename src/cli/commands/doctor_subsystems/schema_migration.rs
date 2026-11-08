@@ -63,6 +63,7 @@ const PREPARED_SCHEMA: &str = "br.doctor.schema_migration.prepared.v1";
 const COMMIT_READY_SCHEMA: &str = "br.doctor.schema_migration.commit_ready.v1";
 const APPLIED_SCHEMA: &str = "br.doctor.schema_migration.applied.v1";
 const FAILED_SCHEMA: &str = "br.doctor.schema_migration.failed.v1";
+const PREINSTALL_RESTORED_SCHEMA: &str = "br.doctor.schema_migration.preinstall_restored.v1";
 const UNDO_SCHEMA: &str = "br.doctor.schema_migration.undo.v1";
 const FAMILY_SUFFIXES: &[&str] = &["", "-wal", "-shm", "-journal"];
 const MIGRATION_RECEIPT_NAMES: &[&str] = &[
@@ -70,6 +71,7 @@ const MIGRATION_RECEIPT_NAMES: &[&str] = &[
     "commit-ready.json",
     "applied.json",
     "failed.json",
+    "preinstall-restored.json",
     "undo-prepared.json",
     "undone.json",
 ];
@@ -295,6 +297,22 @@ struct FailedMigrationReceipt {
     logical_before: LogicalDatabaseWitness,
     raw_observed_after_failure: Option<RawFamilyWitness>,
     logical_observed_after_failure: Option<LogicalDatabaseWitness>,
+}
+
+/// Terminal proof that a failed pre-install intent has restored its original
+/// family. Keep the failure receipt immutable: its observed state can describe
+/// a partial family and must not be rewritten to stand for later recovery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PreinstallRestoredMigrationReceipt {
+    schema_version: String,
+    run_id: String,
+    database_path: String,
+    plan_token: String,
+    commit_ready_receipt_sha256: String,
+    failed_receipt_sha256: String,
+    raw_restored: RawFamilyWitness,
+    logical_restored: LogicalDatabaseWitness,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -627,6 +645,7 @@ fn require_completed_migration_run(
         "undo-prepared.json",
         "undone.json",
         "failed.json",
+        "preinstall-restored.json",
     ] {
         let path = run_dir.join(name);
         if secure_file_metadata(&path)?.is_some() {
@@ -653,6 +672,11 @@ fn require_completed_migration_run(
         return Err(BeadsError::internal(
             "schema-migration receipts name different database routes",
         ));
+    }
+    if has("preinstall-restored.json") {
+        let restored = read_json(&run_dir.join("preinstall-restored.json"))?;
+        validate_preinstall_restored_marker(&restored, &marker, run_dir)?;
+        return Ok(());
     }
     let stored_path = Path::new(&marker.database_path);
     let args = DoctorMigrateSchemaUndoArgs {
@@ -3906,6 +3930,77 @@ fn validate_commit_ready_marker(
     Ok(())
 }
 
+fn persist_preinstall_restored_marker(
+    run_dir: &Path,
+    marker: &CommitReadyMigrationReceipt,
+    raw_restored: RawFamilyWitness,
+    logical_restored: LogicalDatabaseWitness,
+) -> Result<()> {
+    let receipt = PreinstallRestoredMigrationReceipt {
+        schema_version: PREINSTALL_RESTORED_SCHEMA.to_owned(),
+        run_id: marker.run_id.clone(),
+        database_path: marker.database_path.clone(),
+        plan_token: marker.plan_token.clone(),
+        commit_ready_receipt_sha256: file_sha256(&run_dir.join("commit-ready.json"))?,
+        failed_receipt_sha256: file_sha256(&run_dir.join("failed.json"))?,
+        raw_restored,
+        logical_restored,
+    };
+    validate_preinstall_restored_marker(&receipt, marker, run_dir)?;
+    let path = run_dir.join("preinstall-restored.json");
+    write_json_new(&path, &receipt)?;
+    let persisted = read_json(&path)?;
+    validate_preinstall_restored_marker(&persisted, marker, run_dir)?;
+    if persisted != receipt {
+        return Err(BeadsError::internal(
+            "persisted pre-install restoration receipt changed during read-back",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate historical completion without requiring today's live tracker to
+/// remain the restored generation. A later reviewed apply or ordinary write
+/// must not be fenced by an earlier failure that has already been recovered.
+fn validate_preinstall_restored_marker(
+    receipt: &PreinstallRestoredMigrationReceipt,
+    marker: &CommitReadyMigrationReceipt,
+    run_dir: &Path,
+) -> Result<()> {
+    validate_commit_ready_marker(marker, run_dir)?;
+    validate_raw_family_witness(&receipt.raw_restored)?;
+    for conflicting in ["applied.json", "undo-prepared.json", "undone.json"] {
+        if secure_file_metadata(&run_dir.join(conflicting))?.is_some() {
+            return Err(BeadsError::internal(format!(
+                "pre-install restoration receipt in {} conflicts with {conflicting}",
+                run_dir.display()
+            )));
+        }
+    }
+    if receipt.schema_version != PREINSTALL_RESTORED_SCHEMA
+        || receipt.run_id != marker.run_id
+        || receipt.database_path != marker.database_path
+        || !constant_time_text_eq(&receipt.plan_token, &marker.plan_token)
+        || !constant_time_text_eq(
+            &receipt.commit_ready_receipt_sha256,
+            &file_sha256(&run_dir.join("commit-ready.json"))?,
+        )
+        || !constant_time_text_eq(
+            &receipt.failed_receipt_sha256,
+            &file_sha256(&run_dir.join("failed.json"))?,
+        )
+        || receipt.raw_restored != marker.raw_before
+        || receipt.logical_restored != marker.logical_before
+    {
+        return Err(BeadsError::internal(format!(
+            "pre-install restoration receipt in {} is not bound to its retained receipts and exact original generation",
+            run_dir.display()
+        )));
+    }
+    let failed = read_json(&run_dir.join("failed.json"))?;
+    validate_failed_against_commit_ready(&failed, marker, run_dir)
+}
+
 #[allow(clippy::too_many_lines)]
 fn resume_commit_ready_migration(
     plan_token: &str,
@@ -3947,6 +4042,12 @@ fn resume_commit_ready_migration(
     let before_dir = run_dir.join("before");
     verify_backup_family(&migration.db_path, &before_dir, &marker.raw_before)?;
 
+    let restored_path = run_dir.join("preinstall-restored.json");
+    if secure_file_metadata(&restored_path)?.is_some() {
+        let restored = read_json(&restored_path)?;
+        validate_preinstall_restored_marker(&restored, &marker, &run_dir)?;
+        return Ok(None);
+    }
     let applied_path = run_dir.join("applied.json");
     if secure_file_metadata(&applied_path)?.is_some() {
         // A completed run has consumed its plan token: the token binds a plan
@@ -4038,8 +4139,8 @@ fn resume_commit_ready_migration(
             failed_stage: None,
             raw_before: marker.raw_before.clone(),
             logical_before: marker.logical_before.clone(),
-            raw_observed_after_failure: Some(raw_live_after_probe),
-            logical_observed_after_failure: Some(logical_live),
+            raw_observed_after_failure: Some(raw_live_after_probe.clone()),
+            logical_observed_after_failure: Some(logical_live.clone()),
         };
         let failed_path = run_dir.join("failed.json");
         if secure_file_metadata(&failed_path)?.is_some() {
@@ -4048,6 +4149,12 @@ fn resume_commit_ready_migration(
         } else {
             write_json_new(&failed_path, &failed)?;
         }
+        // A pre-existing failure may have recorded a partial family. Preserve
+        // those original bytes and separately terminate this recovered intent
+        // before a new run can replace the now-verified original generation.
+        migration.write_authority.verify_database_authority()?;
+        verify_excluded_migration_path(exclusion, &migration.db_path)?;
+        persist_preinstall_restored_marker(&run_dir, &marker, raw_live_after_probe, logical_live)?;
         return Ok(None);
     }
     let logical_live = with_migration_read_snapshot(&migration.db_path, |snapshot, _| {
@@ -4295,6 +4402,12 @@ fn validate_applied_against_commit_ready(
     marker: &CommitReadyMigrationReceipt,
     run_dir: &Path,
 ) -> Result<()> {
+    if secure_file_metadata(&run_dir.join("preinstall-restored.json"))?.is_some() {
+        return Err(BeadsError::internal(format!(
+            "applied schema-migration receipt in {} conflicts with a pre-install restoration receipt",
+            run_dir.display()
+        )));
+    }
     validate_commit_ready_marker(marker, run_dir)?;
     let raw_after = applied.raw_after.as_ref().ok_or_else(|| {
         BeadsError::internal(format!(
@@ -8760,6 +8873,17 @@ mod tests {
                 write_json_new(&self.run_dir.join("failed.json"), &failed).unwrap();
             }
 
+            fn preinstall_restored(&self) {
+                let marker = read_json(&self.run_dir.join("commit-ready.json")).unwrap();
+                persist_preinstall_restored_marker(
+                    &self.run_dir,
+                    &marker,
+                    self.prepared.raw_before.clone(),
+                    self.prepared.logical_before.clone(),
+                )
+                .unwrap();
+            }
+
             fn undo_prepared(&self, applied: &AppliedMigrationReceipt) -> UndoReceipt {
                 let receipt = UndoReceipt {
                     schema_version: UNDO_SCHEMA.to_owned(),
@@ -8994,6 +9118,164 @@ mod tests {
                 run.refused_without_changes()
                     .contains("migrate-schema apply")
             );
+        }
+
+        #[test]
+        fn preinstall_restoration_preserves_failure_history_and_allows_later_generations() {
+            let (_temp, first) = fixture();
+            first.commit_ready();
+            first.failed(false);
+            first.refused_without_changes();
+            let failed_path = first.run_dir.join("failed.json");
+            let failure_history = fs::read(&failed_path).unwrap();
+            first.preinstall_restored();
+            first.admit().unwrap();
+            assert_eq!(fs::read(&failed_path).unwrap(), failure_history);
+
+            let retry = ReceiptRun::new(&first.beads_dir, &first.db_path, "restored-retry-run");
+            retry.commit_ready();
+            retry.applied();
+            retry.admit().unwrap();
+            fs::write(&retry.db_path, b"later authoritative tracker work").unwrap();
+            fs::write(
+                family_component_path(&retry.db_path, "-wal"),
+                b"later WAL work",
+            )
+            .unwrap();
+            retry.admit().unwrap();
+            assert_eq!(fs::read(&failed_path).unwrap(), failure_history);
+            assert!(!first.run_dir.join("before").exists());
+        }
+
+        #[test]
+        fn private_observation_binds_preinstall_restoration_completion() {
+            let (_temp, run) = fixture();
+            run.commit_ready();
+            // The legacy exact-restoration failure is already safe. Adding
+            // its explicit terminal receipt during capture still changes the
+            // observed generation and must prevent publication of that view.
+            run.failed(true);
+            let failure_history = fs::read(run.run_dir.join("failed.json")).unwrap();
+            let error = with_database_transition_observation(&run.beads_dir, &run.db_path, || {
+                run.preinstall_restored();
+                run.admit().unwrap();
+                Ok("view captured across restoration completion")
+            })
+            .expect_err("the new terminal receipt participates in observation fencing");
+            assert!(
+                error
+                    .to_string()
+                    .contains("receipts changed during private observation"),
+                "{error}"
+            );
+            assert_eq!(
+                fs::read(run.run_dir.join("failed.json")).unwrap(),
+                failure_history
+            );
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn preinstall_restoration_refuses_unbound_or_conflicting_completion() {
+            for damage in [
+                "truncated",
+                "unknown-field",
+                "schema",
+                "route",
+                "token",
+                "raw",
+                "logical",
+                "prepared-hash",
+                "commit-ready-hash",
+                "failed-hash",
+                "missing-failure",
+                "applied.json",
+                "undo-prepared.json",
+                "undone.json",
+            ] {
+                let (temp, run) = fixture();
+                run.commit_ready();
+                run.failed(false);
+                run.preinstall_restored();
+                run.admit().unwrap();
+                let path = run.run_dir.join("preinstall-restored.json");
+                match damage {
+                    "truncated" => fs::write(&path, b"{").unwrap(),
+                    "unknown-field" => {
+                        let mut receipt: serde_json::Value = read_json(&path).unwrap();
+                        receipt["unreviewed_completion"] = true.into();
+                        fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+                    }
+                    "prepared-hash" | "commit-ready-hash" | "failed-hash" => {
+                        let name = match damage {
+                            "prepared-hash" => "prepared.json",
+                            "commit-ready-hash" => "commit-ready.json",
+                            _ => "failed.json",
+                        };
+                        // Keep the dependency semantically valid: its exact
+                        // retained bytes, not only identity fields, are bound.
+                        OpenOptions::new()
+                            .append(true)
+                            .open(run.run_dir.join(name))
+                            .unwrap()
+                            .write_all(b"\n")
+                            .unwrap();
+                    }
+                    "missing-failure" => {
+                        fs::rename(
+                            run.run_dir.join("failed.json"),
+                            run.run_dir.join("retained-failure-evidence.json"),
+                        )
+                        .unwrap();
+                    }
+                    "applied.json" => {
+                        let applied = run.applied();
+                        let args = DoctorMigrateSchemaUndoArgs {
+                            run_id: applied.run_id.clone(),
+                            dry_run: false,
+                            json: false,
+                        };
+                        let error = validate_applied_receipt_for_path(
+                            &applied,
+                            &args,
+                            &run.db_path,
+                            &run.run_dir,
+                        )
+                        .expect_err("explicit undo must refuse conflicting terminal receipts too");
+                        assert!(error.to_string().contains("conflicts"), "{error}");
+                    }
+                    "undo-prepared.json" | "undone.json" => {
+                        write_json_new(
+                            &run.run_dir.join(damage),
+                            &serde_json::json!({ "database_path": &run.prepared.database_path }),
+                        )
+                        .unwrap();
+                    }
+                    _ => {
+                        let mut receipt: PreinstallRestoredMigrationReceipt =
+                            read_json(&path).unwrap();
+                        match damage {
+                            "schema" => receipt.schema_version = "unreviewed-contract".to_owned(),
+                            "route" => {
+                                receipt.database_path =
+                                    temp.path().join("other.db").display().to_string();
+                            }
+                            "token" => receipt.plan_token = "unreviewed-token".to_owned(),
+                            "raw" => {
+                                receipt.raw_restored.components[0].sha256 = Some("3".repeat(64))
+                            }
+                            "logical" => receipt.logical_restored.contents_sha256 = "4".repeat(64),
+                            _ => unreachable!(),
+                        }
+                        fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+                    }
+                }
+                let error = run.refused_without_changes();
+                assert!(
+                    error.contains("incomplete or unverifiable"),
+                    "{damage}: {error}"
+                );
+            }
         }
 
         #[test]

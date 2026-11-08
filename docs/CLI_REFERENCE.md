@@ -2853,6 +2853,15 @@ asks for a new plan. If installation was interrupted, applying the same token
 uses the existing recovery protocol to identify the live generation, retain
 the original family and complete or refuse the run safely.
 
+When recovery restores the exact original family before retrying installation,
+it retains any earlier `failed.json` unchanged and records
+`preinstall-restored.json`. That terminal receipt binds the commit-ready and
+failure receipts to the verified original raw and logical state. It ends the
+old installation intent, so its earlier partial-family failure observation
+cannot block reads after a successful retry. Missing, inconsistent, or
+conflicting completion evidence still refuses; ordinary reads never create
+this receipt or finish a recovery.
+
 `heal` attempts the same reviewed migration and refuses if that migration is
 unavailable or fails. Its dry run uses the same private database snapshot,
 eligibility checks and plan token as `plan`, including actual runtime shape

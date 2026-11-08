@@ -104,6 +104,11 @@ database is still live. They assert that ordinary reads do not finish either
 operation, that explicit apply resumes or retries, and that the original
 backup stays intact. These are deterministic state-recovery tests, not
 abrupt process termination, power-loss, or filesystem fault-injection tests.
+The preinstall case also retains a failure receipt describing the incomplete
+family while configuration remains only in the displaced original WAL. An
+explicit retry must preserve that receipt, attest the completed original
+restoration separately, permit unchanged default reads after the new apply,
+and retain exact guarded undo of the original records and durable files.
 
 Separate restore-copy regressions inject an I/O error after 64 bytes and a
 short copy that incorrectly reports success. Neither may publish the final

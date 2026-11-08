@@ -907,6 +907,12 @@ incomplete, so a missing WAL cannot silently replace database configuration
 with defaults. These checks preserve the live family and retained recovery
 files.
 
+If a preinstall failure already recorded a partial family, explicit retry
+preserves that failure report and records a separate, verified restoration
+receipt before starting another installation. The historical failure then no
+longer blocks ordinary reads after the retry succeeds. Keep both receipts and
+the original backup; deleting failure evidence is not a recovery step.
+
 Restoration copies each receipt-bound component into a unique sibling staging
 file, verifies its length and digest, restores its recorded permissions, and
 syncs it before publishing the final name without replacement. An interrupted

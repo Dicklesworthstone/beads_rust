@@ -2263,13 +2263,39 @@ fn schema19_raw_text_changes_stale_plans_and_refuse_undo_without_losing_bytes() 
 /// Reconstruct the pre-install boundary from genuine migration receipts and
 /// retained original files. This does not simulate a process or power failure.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn schema19_workflows_preinstall_recovery_requires_explicit_retry() {
+    for recorded_failure in [false, true] {
+        schema19_preinstall_retry_case(recorded_failure);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn schema19_preinstall_retry_case(recorded_failure: bool) {
     let workspace = workflow_schema19_workspace();
     seed_workflow_schema19_operator_state(&workspace);
     let db = workspace.root.join(".beads/beads.db");
+    let mut connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+    connection.execute("PRAGMA journal_mode=WAL").unwrap();
+    connection.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+    connection
+        .execute("INSERT INTO config (key, value) VALUES ('preinstall_retry_sentinel', 'configuration retained only in the original WAL')")
+        .unwrap();
+    connection.close_without_checkpoint_in_place().unwrap();
+    drop(connection);
     let before = workflow_schema19_authority(&db);
     let source = fs::read(&db).unwrap();
+    let source_family = workflow_schema19_durable_files(&workspace);
+    let sentinel = b"configuration retained only in the original WAL";
+    assert!(
+        !source
+            .windows(sentinel.len())
+            .any(|bytes| bytes == sentinel)
+    );
+    assert!(
+        source_family[Path::new("beads.db-wal")]
+            .windows(sentinel.len())
+            .any(|bytes| bytes == sentinel)
+    );
     let plan = workflow_schema19_plan(&workspace);
     let token = plan["plan_token"].as_str().unwrap();
     let applied = workflow_schema19_apply(&workspace, token);
@@ -2297,11 +2323,60 @@ fn schema19_workflows_preinstall_recovery_requires_explicit_retry() {
     }
     fs::rename(run_dir.join("maintenance-displaced/beads.db"), &db).unwrap();
     assert_eq!(fs::read(&db).unwrap(), source);
+    let marker: Value = serde_json::from_slice(&intent).unwrap();
+    let mut partial = marker["raw_before"].clone();
+    for component in partial["components"].as_array_mut().unwrap() {
+        if component["suffix"] != "" {
+            let suffix = component["suffix"].as_str().unwrap();
+            assert!(!PathBuf::from(format!("{}{suffix}", db.display())).exists());
+            component["present"] = Value::Bool(false);
+            component["length"] = Value::Null;
+            component["sha256"] = Value::Null;
+            component["unix_mode"] = Value::Null;
+        }
+    }
+    assert_ne!(partial, marker["raw_before"]);
+    let failed_before = recorded_failure.then(|| {
+        let receipt = serde_json::json!({
+            "schema_version": "br.doctor.schema_migration.failed.v1",
+            "run_id": marker["run_id"],
+            "database_path": marker["database_path"],
+            "plan_token": marker["plan_token"],
+            "marked_at": marker["marked_at"],
+            "error": "injected preinstall failure after retaining original sidecars",
+            "failed_stage": "install-candidate",
+            "raw_before": marker["raw_before"],
+            "logical_before": marker["logical_before"],
+            "raw_observed_after_failure": partial,
+            "logical_observed_after_failure": null,
+        });
+        let bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        fs::write(run_dir.join("failed.json"), &bytes).unwrap();
+        bytes
+    });
     let interrupted = schema19_tracker_files(&workspace.root.join(".beads"));
     for command in ["stats", "info", "list"] {
         let label = format!("workflow19_preinstall_{command}");
         if command == "info" {
-            assert_workflow_schema19_read(&workspace, command, &label);
+            let info = schema19_json(&run_br(
+                &workspace,
+                [
+                    "info",
+                    "--json",
+                    "--schema",
+                    "--projections",
+                    "--no-auto-import",
+                    "--no-auto-flush",
+                ],
+                &label,
+            ));
+            let diagnostic = info["database_inspection_error"].as_str().unwrap();
+            assert!(diagnostic.contains(run_id), "{diagnostic}");
+            assert!(diagnostic.contains("migrate-schema apply"), "{diagnostic}");
+            for field in ["issue_count", "config", "schema", "projections"] {
+                assert!(info.get(field).is_none(), "{field}: {info}");
+            }
+            assert_eq!(info["database_path"], db.display().to_string());
         } else {
             let refused = run_br(
                 &workspace,
@@ -2322,24 +2397,65 @@ fn schema19_workflows_preinstall_recovery_requires_explicit_retry() {
             schema19_tracker_files(&workspace.root.join(".beads")),
             interrupted
         );
-        assert!(!run_dir.join("failed.json").exists());
+        assert_eq!(run_dir.join("failed.json").exists(), recorded_failure);
+        assert!(!run_dir.join("preinstall-restored.json").exists());
         assert!(!run_dir.join("applied.json").exists());
     }
     let retried = workflow_schema19_apply(&workspace, token);
     assert_ne!(retried["run_id"], run_id);
-    let classified: Value =
-        serde_json::from_slice(&fs::read(run_dir.join("failed.json")).unwrap()).unwrap();
-    assert!(
-        classified["error"]
-            .as_str()
-            .unwrap()
-            .contains("before the replacement became live")
+    let failed_after = fs::read(run_dir.join("failed.json")).unwrap();
+    if let Some(original_failure) = failed_before {
+        assert_eq!(failed_after, original_failure);
+    } else {
+        let classified: Value = serde_json::from_slice(&failed_after).unwrap();
+        assert!(
+            classified["error"]
+                .as_str()
+                .unwrap()
+                .contains("before the replacement became live")
+        );
+    }
+    let restored: Value =
+        serde_json::from_slice(&fs::read(run_dir.join("preinstall-restored.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        restored["schema_version"],
+        "br.doctor.schema_migration.preinstall_restored.v1"
     );
+    assert_eq!(restored["raw_restored"], marker["raw_before"]);
+    assert_eq!(restored["logical_restored"], marker["logical_before"]);
     assert!(!run_dir.join("applied.json").exists());
     assert_eq!(header_user_version(&db), 19);
     assert_eq!(engine_rows(&db, Some(&before)), before);
     assert_eq!(fs::read(run_dir.join("commit-ready.json")).unwrap(), intent);
     assert_eq!(fs::read(before_dir.join("beads.db")).unwrap(), original);
+    let installed = schema19_tracker_files(&workspace.root.join(".beads"));
+    for command in ["stats", "list", "info"] {
+        schema19_json(&run_br(
+            &workspace,
+            [command, "--json"],
+            &format!("workflow19_after_preinstall_retry_{command}"),
+        ));
+        assert_eq!(
+            schema19_tracker_files(&workspace.root.join(".beads")),
+            installed
+        );
+    }
+    assert_eq!(workflow_schema19_plan(&workspace)["eligible"], false);
+    schema19_json(&run_br(
+        &workspace,
+        [
+            "doctor",
+            "migrate-schema",
+            "undo",
+            retried["run_id"].as_str().unwrap(),
+            "--json",
+        ],
+        "workflow19_undo_after_preinstall_retry",
+    ));
+    assert_eq!(workflow_schema19_durable_files(&workspace), source_family);
+    assert_eq!(workflow_schema19_authority(&db), before);
+    assert_eq!(fs::read(run_dir.join("failed.json")).unwrap(), failed_after);
 }
 
 #[test]
