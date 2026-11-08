@@ -660,9 +660,18 @@ Ordinary commands retain their existing stdout and JSON result shapes.
 Refused automatic recovery uses the existing structured error envelope in JSON mode;
 the diagnostic is visible without enabling warning-level logging. The same
 preservation gate applies to post-open anomaly recovery, failed startup
-probes, and recovery after a command encounters database damage. An explicit
-import retains its requested JSONL-authoritative semantics when it opens
-through the deferred-import path. If an already-open `--rebuild` command
+probes, and recovery after a command encounters database damage. Deferring
+initial import does not authorize replacing an existing database:
+`--skip-invalid-records` and `--rename-prefix` refuse with `SYNC_CONFLICT`
+before replacement if that database cannot be read. They preserve its bytes
+and the JSONL source, because valid source rows cannot prove that database-only
+issues, event history, configuration, or operator records are expendable.
+These import modes can initialize a genuinely missing database only when no
+nonempty or unreadable orphaned WAL or rollback journal needs preservation.
+
+Only `sync --import-only --rebuild` selects the separate, explicit
+JSONL-authoritative startup replacement path. It is not a lossless schema
+upgrade. If an already-open `--rebuild` command
 delegates later corruption recovery to this shared recovery path, the same
 preservation refusal applies; doctor remains the explicit best-effort repair
 path. Reconstructing a genuinely missing database from JSONL remains

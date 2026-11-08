@@ -1963,6 +1963,7 @@ br sync [OPTIONS]
 - If open-time recovery rebuilt the database before a semantic import flag such as `--rename-prefix` could apply, br prints a rerun command that includes the needed flags.
 
 **Prefix rename semantics (`--rename-prefix`):**
+- Without `--rebuild`, prefix renaming never authorizes replacement of an existing unreadable database. Startup refuses with `SYNC_CONFLICT` (exit 6) and preserves the database and JSONL source. A genuinely missing database can be initialized only when no data-bearing or unreadable orphaned WAL or rollback journal needs preservation.
 - Only the prefix segment is replaced; the id remainder (descriptive slug and hash) is preserved: `oldp-cargo-license-spdx-ay8` becomes `newp-cargo-license-spdx-ay8`.
 - A doubled prefix collapses exactly once, never recursively: `oldp-oldp-central-build-inputs-3un` becomes `newp-central-build-inputs-3un`.
 - If the preserved id would collide with an existing id (or the old id has no separable prefix), that issue falls back to a freshly generated id and the receipt marks it with `fallback` (`regenerated-on-collision` or `regenerated-unparseable-id`).
@@ -1973,6 +1974,7 @@ br sync [OPTIONS]
 **Malformed-record salvage (`--skip-invalid-records`):**
 - This is an explicit recovery operation and is valid only with `--import-only`; normal import remains fail-closed on every invalid record.
 - Salvage is additive. It rejects `--force`, `--rebuild`, and `--rename-prefix` so a malformed source row cannot authorize deletion or ID rewriting.
+- An existing unreadable database causes `SYNC_CONFLICT` (exit 6) before source cleanup or database replacement. Salvage may initialize a genuinely missing database only after the same orphaned WAL/journal preservation check; accepting valid JSONL survivors does not prove preservation of existing database-only records.
 - Merge-conflict markers are never skipped. Resolve `<<<<<<<` / `=======` / `>>>>>>>` regions before salvage.
 - br validates each nonblank line as a complete issue record, rejects invalid or duplicate records, and refuses to publish an empty survivor set.
 - Before replacing the tracked JSONL, br stores the exact original bytes in a protected `.beads/.br_history/*pre-salvage*.jsonl` backup with target metadata. Automatic age/count rotation excludes protected backups; an explicit history-prune command can still remove them.

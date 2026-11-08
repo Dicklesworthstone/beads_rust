@@ -1,5 +1,6 @@
 mod common;
 
+use beads_rust::franken_sync::{Connection, SqliteValue};
 use beads_rust::storage::SqliteStorage;
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
@@ -1540,9 +1541,9 @@ fn e2e_sync_rename_prefix_clears_duplicate_external_ref_after_missing_db_recover
 }
 
 #[test]
-fn e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family() {
+fn e2e_sync_explicit_rename_rebuild_failed_import_restores_original_corrupt_db_family() {
     let _log = common::test_log(
-        "e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family",
+        "e2e_sync_explicit_rename_rebuild_failed_import_restores_original_corrupt_db_family",
     );
     let workspace = BrWorkspace::new();
 
@@ -1578,6 +1579,7 @@ fn e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family() {
             "sync",
             "--import-only",
             "--rename-prefix",
+            "--rebuild",
             "--json",
             "--no-auto-import",
             "--no-auto-flush",
@@ -1599,6 +1601,168 @@ fn e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family() {
         restored_bytes, original_bytes,
         "failed deferred import should restore the original corrupt db bytes"
     );
+}
+
+/// Salvage and prefix interpretation are not permission to replace database
+/// authority. A bad header makes the normal engine open fail while leaving
+/// the original table pages, including facts absent from JSONL, recoverable.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_sync_salvage_and_rename_preserve_unreadable_database_authority() {
+    for mode in ["--skip-invalid-records", "--rename-prefix"] {
+        let workspace = BrWorkspace::new();
+        let init = run_br(&workspace, ["init", "--prefix", "target"], "init");
+        assert!(init.status.success(), "{init:?}");
+        let created = run_br(
+            &workspace,
+            [
+                "create",
+                "Authoritative database-only issue",
+                "--json",
+                "--no-auto-import",
+                "--no-auto-flush",
+            ],
+            "create_local_authority",
+        );
+        assert!(created.status.success(), "{created:?}");
+        let issue: Value = serde_json::from_str(&extract_json_payload(&created.stdout)).unwrap();
+        let id = issue["id"].as_str().unwrap();
+        let comment = run_br(
+            &workspace,
+            [
+                "comments",
+                "add",
+                id,
+                "Database-only history must survive import refusal",
+                "--no-auto-import",
+                "--no-auto-flush",
+            ],
+            "seed_local_history",
+        );
+        assert!(comment.status.success(), "{comment:?}");
+        let beads = workspace.root.join(".beads");
+        let seed_db = beads.join("beads.db");
+        let db = beads.join("unreadable-existing.db");
+        let connection = Connection::open(seed_db.to_string_lossy().into_owned()).unwrap();
+        for sql in [
+            "INSERT INTO config (key, value) VALUES ('compact_model', 'database-only-model')",
+            "CREATE TABLE operator_evidence (id INTEGER PRIMARY KEY, payload BLOB)",
+            "INSERT INTO operator_evidence VALUES (37, X'00FF1020')",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ] {
+            connection.execute(sql).unwrap();
+        }
+        let event_count = connection.query("SELECT COUNT(*) FROM events").unwrap()[0]
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap();
+        assert!(event_count >= 2, "the fixture must have history to lose");
+        connection.close().unwrap();
+        if let Ok(wal) = fs::read(beads.join("beads.db-wal")) {
+            assert!(
+                wal.len() <= 32,
+                "fixture main must contain all committed pages"
+            );
+        }
+        let original = fs::read(&seed_db).unwrap();
+        assert!(original.starts_with(b"SQLite format 3\0"));
+        let mut damaged = original.clone();
+        damaged[0] = b'!';
+        // An alternate family has no derived sidecars from the seed. The
+        // failed opener is specifically the damaged signature, independent
+        // of WAL-index or namespace admission behavior.
+        fs::write(&db, &damaged).unwrap();
+
+        let mut incoming = common::fixtures::issue("Incoming source-only issue");
+        incoming.id = if mode == "--rename-prefix" {
+            "legacy-incoming".to_string()
+        } else {
+            "target-incoming".to_string()
+        };
+        let mut source = format!("{}\n", serde_json::to_string(&incoming).unwrap());
+        if mode == "--skip-invalid-records" {
+            source.push_str("{ malformed source row\n");
+        }
+        fs::write(beads.join("issues.jsonl"), &source).unwrap();
+        let protected = || {
+            [
+                "beads.db",
+                "beads.db-wal",
+                "beads.db-journal",
+                "unreadable-existing.db",
+                "unreadable-existing.db-wal",
+                "unreadable-existing.db-journal",
+                "issues.jsonl",
+                "issues.history.jsonl",
+                "config.yaml",
+                "metadata.json",
+            ]
+            .map(|name| {
+                let bytes = match fs::read(beads.join(name)) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("cannot inspect {name}: {error}"),
+                };
+                (name, bytes)
+            })
+        };
+        let before = protected();
+        assert!(!beads.join(".br_recovery").exists());
+        let db_argument = db.to_str().unwrap();
+        let refused = run_br(
+            &workspace,
+            ["--db", db_argument, "sync", "--import-only", mode, "--json"],
+            "refuse_unproven_existing_database_replacement",
+        );
+        assert_eq!(refused.status.code(), Some(6), "{mode}: {refused:?}");
+        let error: Value = serde_json::from_str(&extract_json_payload(&refused.stdout)).unwrap();
+        assert_eq!(error["error"]["code"], "SYNC_CONFLICT");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("preservation"), "{message}");
+        assert!(message.contains("database was not replaced"), "{message}");
+        assert_eq!(protected(), before, "{mode} changed authoritative payloads");
+        assert!(!beads.join(".br_recovery").exists());
+
+        // Repair only a disposable inspection copy's known signature. Exact
+        // source-byte equality above proves all original columns and rowids
+        // survived; this query also demonstrates retained issue/history/config
+        // authority that the proposed JSONL replacement could not represent.
+        let inspection = tempfile::tempdir().unwrap();
+        let inspected_db = inspection.path().join("retained.db");
+        let mut retained = fs::read(&db).unwrap();
+        retained[..16].copy_from_slice(&original[..16]);
+        assert_eq!(retained, original);
+        fs::write(&inspected_db, retained).unwrap();
+        let connection = Connection::open(inspected_db.to_string_lossy().into_owned()).unwrap();
+        let issues = connection
+            .query("SELECT id FROM issues ORDER BY id")
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].get(0).and_then(SqliteValue::as_text), Some(id));
+        assert_eq!(
+            connection.query("SELECT COUNT(*) FROM events").unwrap()[0]
+                .get(0)
+                .and_then(SqliteValue::as_integer),
+            Some(event_count)
+        );
+        assert_eq!(
+            connection
+                .query("SELECT value FROM config WHERE key = 'compact_model'")
+                .unwrap()[0]
+                .get(0)
+                .and_then(SqliteValue::as_text),
+            Some("database-only-model")
+        );
+        assert_eq!(
+            connection
+                .query("SELECT hex(payload) FROM operator_evidence WHERE id = 37")
+                .unwrap()[0]
+                .get(0)
+                .and_then(SqliteValue::as_text),
+            Some("00FF1020")
+        );
+        connection.close().unwrap();
+    }
 }
 
 #[test]

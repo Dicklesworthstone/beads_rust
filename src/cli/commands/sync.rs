@@ -759,7 +759,7 @@ fn prepare_sync_startup(
     let open_result = config::open_storage_with_startup_config_and_jsonl_policy(
         startup,
         &open_overrides,
-        should_defer_jsonl_recovery(args),
+        sync_startup_recovery_strategy(args),
         allow_external_jsonl,
     )?;
 
@@ -817,12 +817,20 @@ fn resolve_sync_startup_paths(
 
 /// Explicit rebuilds may prepare a fresh database when the original cannot
 /// open; the command retains its original backup until import succeeds.
-/// Rename and salvage imports also defer recovery so their requested import
-/// semantics are applied by the command instead of an implicit startup import.
-fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
-    args.reconcile_additive
+/// Rename, salvage, and reviewed reconciliation only defer initial loading of
+/// a genuinely missing database. Their import semantics do not authorize
+/// replacing an existing database or abandoning unreadable orphaned state.
+fn sync_startup_recovery_strategy(args: &SyncArgs) -> config::JsonlRecoveryStrategy {
+    if args.import_only && args.rebuild {
+        config::JsonlRecoveryStrategy::ExplicitRebuild
+    } else if args.reconcile_additive
         || args.migrate_source_repo_path
-        || (args.import_only && (args.rebuild || args.rename_prefix || args.skip_invalid_records))
+        || (args.import_only && (args.rename_prefix || args.skip_invalid_records))
+    {
+        config::JsonlRecoveryStrategy::DeferMissingDatabase
+    } else {
+        config::JsonlRecoveryStrategy::Automatic
+    }
 }
 
 /// Reject argument combinations that must fail BEFORE opening storage or
@@ -6027,12 +6035,12 @@ mod tests {
         freelist_warrants_compaction, import_args_for_prepared_storage,
         jsonl_contains_duplicate_external_refs, jsonl_contains_prefix_mismatch,
         maybe_delegate_rebuild, merge_conflict_resolution, post_import_compaction_reason,
-        prepare_sync_startup, should_defer_jsonl_recovery, should_render_human_sync_output,
-        sync_operation, validate_operator_requested_sync_path, validate_sync_mode_args,
-        validate_sync_paths, write_manifest_atomically,
+        prepare_sync_startup, should_render_human_sync_output, sync_operation,
+        sync_startup_recovery_strategy, validate_operator_requested_sync_path,
+        validate_sync_mode_args, validate_sync_paths, write_manifest_atomically,
     };
     use crate::cli::SyncArgs;
-    use crate::config::{self, CliOverrides};
+    use crate::config::{self, CliOverrides, JsonlRecoveryStrategy};
     use crate::error::BeadsError;
     use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::output::OutputContext;
@@ -6344,7 +6352,10 @@ mod tests {
         };
 
         assert_eq!(sync_operation(&args), SyncOperation::Witness);
-        assert!(!should_defer_jsonl_recovery(&args));
+        assert_eq!(
+            sync_startup_recovery_strategy(&args),
+            JsonlRecoveryStrategy::Automatic
+        );
     }
 
     #[cfg(unix)]
@@ -6594,7 +6605,10 @@ mod tests {
             sync_operation(&dry_run),
             SyncOperation::MigrateSourceRepoPath
         );
-        assert!(should_defer_jsonl_recovery(&dry_run));
+        assert_eq!(
+            sync_startup_recovery_strategy(&dry_run),
+            JsonlRecoveryStrategy::DeferMissingDatabase
+        );
 
         let apply = SyncArgs {
             apply: true,
@@ -6731,13 +6745,16 @@ mod tests {
     }
 
     #[test]
-    fn test_should_defer_jsonl_recovery_for_operator_controlled_import_modes() {
+    fn additive_import_modes_only_defer_missing_database_initialization() {
         let rename_import = SyncArgs {
             import_only: true,
             rename_prefix: true,
             ..SyncArgs::default()
         };
-        assert!(should_defer_jsonl_recovery(&rename_import));
+        assert_eq!(
+            sync_startup_recovery_strategy(&rename_import),
+            JsonlRecoveryStrategy::DeferMissingDatabase
+        );
 
         let salvage_import = SyncArgs {
             import_only: true,
@@ -6745,7 +6762,10 @@ mod tests {
             ..SyncArgs::default()
         };
         validate_sync_mode_args(&salvage_import).unwrap();
-        assert!(should_defer_jsonl_recovery(&salvage_import));
+        assert_eq!(
+            sync_startup_recovery_strategy(&salvage_import),
+            JsonlRecoveryStrategy::DeferMissingDatabase
+        );
 
         let bare_salvage = SyncArgs {
             skip_invalid_records: true,
@@ -6756,7 +6776,10 @@ mod tests {
         assert!(
             matches!(&error, BeadsError::Validation { field, .. } if field == "skip_invalid_records")
         );
-        assert!(!should_defer_jsonl_recovery(&bare_salvage));
+        assert_eq!(
+            sync_startup_recovery_strategy(&bare_salvage),
+            JsonlRecoveryStrategy::Automatic
+        );
 
         for destructive in [
             SyncArgs {
@@ -6789,41 +6812,45 @@ mod tests {
             rename_prefix: true,
             ..SyncArgs::default()
         };
-        assert!(!should_defer_jsonl_recovery(&bare_rename));
-
-        let status = SyncArgs {
-            status: true,
-            rename_prefix: true,
-            ..SyncArgs::default()
-        };
-        assert!(!should_defer_jsonl_recovery(&status));
-
-        let flush = SyncArgs {
-            flush_only: true,
-            rename_prefix: true,
-            ..SyncArgs::default()
-        };
-        assert!(!should_defer_jsonl_recovery(&flush));
-
-        let merge = SyncArgs {
-            merge: true,
-            rename_prefix: true,
-            ..SyncArgs::default()
-        };
-        assert!(!should_defer_jsonl_recovery(&merge));
+        for args in [
+            bare_rename.clone(),
+            SyncArgs {
+                status: true,
+                ..bare_rename.clone()
+            },
+            SyncArgs {
+                flush_only: true,
+                ..bare_rename.clone()
+            },
+            SyncArgs {
+                merge: true,
+                ..bare_rename
+            },
+        ] {
+            assert_eq!(
+                sync_startup_recovery_strategy(&args),
+                JsonlRecoveryStrategy::Automatic
+            );
+        }
 
         let reconcile_plan = SyncArgs {
             reconcile_additive: true,
             ..SyncArgs::default()
         };
-        assert!(should_defer_jsonl_recovery(&reconcile_plan));
+        assert_eq!(
+            sync_startup_recovery_strategy(&reconcile_plan),
+            JsonlRecoveryStrategy::DeferMissingDatabase
+        );
 
         let reconcile_apply = SyncArgs {
             reconcile_additive: true,
             apply: true,
             ..SyncArgs::default()
         };
-        assert!(should_defer_jsonl_recovery(&reconcile_apply));
+        assert_eq!(
+            sync_startup_recovery_strategy(&reconcile_apply),
+            JsonlRecoveryStrategy::DeferMissingDatabase
+        );
     }
 
     #[test]
@@ -6834,18 +6861,27 @@ mod tests {
             ..SyncArgs::default()
         };
         validate_sync_mode_args(&rebuild).unwrap();
-        assert!(should_defer_jsonl_recovery(&rebuild));
+        assert_eq!(
+            sync_startup_recovery_strategy(&rebuild),
+            JsonlRecoveryStrategy::ExplicitRebuild
+        );
         let plain_import = SyncArgs {
             rebuild: false,
             ..rebuild.clone()
         };
-        assert!(!should_defer_jsonl_recovery(&plain_import));
+        assert_eq!(
+            sync_startup_recovery_strategy(&plain_import),
+            JsonlRecoveryStrategy::Automatic
+        );
         let bare_rebuild = SyncArgs {
             import_only: false,
             ..rebuild
         };
         assert!(validate_sync_mode_args(&bare_rebuild).is_err());
-        assert!(!should_defer_jsonl_recovery(&bare_rebuild));
+        assert_eq!(
+            sync_startup_recovery_strategy(&bare_rebuild),
+            JsonlRecoveryStrategy::Automatic
+        );
     }
 
     fn damaged_database_for_explicit_rebuild() -> (TempDir, CliOverrides, Vec<u8>) {
@@ -6868,6 +6904,82 @@ mod tests {
             ..CliOverrides::default()
         };
         (temp, cli, original)
+    }
+
+    #[test]
+    fn additive_sync_startup_refuses_existing_unreadable_database() {
+        for args in [
+            SyncArgs {
+                import_only: true,
+                skip_invalid_records: true,
+                ..SyncArgs::default()
+            },
+            SyncArgs {
+                import_only: true,
+                rename_prefix: true,
+                ..SyncArgs::default()
+            },
+            SyncArgs {
+                migrate_source_repo_path: true,
+                apply: true,
+                expect_plan_sha256: Some("a".repeat(64)),
+                ..SyncArgs::default()
+            },
+        ] {
+            let (_temp, cli, original) = damaged_database_for_explicit_rebuild();
+            validate_sync_mode_args(&args).unwrap();
+            let db_path = cli.db.as_ref().unwrap();
+            let beads_dir = db_path.parent().unwrap();
+            let source_before = fs::read(beads_dir.join("issues.jsonl")).unwrap();
+            let error = prepare_sync_startup(&args, &cli, false)
+                .err()
+                .expect("additive sync cannot reconstruct an unreadable existing database");
+            assert!(matches!(error, BeadsError::SyncConflict { .. }));
+            assert!(error.to_string().contains("preservation"), "{error}");
+            assert_eq!(fs::read(db_path).unwrap(), original);
+            assert_eq!(
+                fs::read(beads_dir.join("issues.jsonl")).unwrap(),
+                source_before
+            );
+            assert!(!beads_dir.join(".br_recovery").exists());
+        }
+    }
+
+    #[test]
+    fn salvage_import_initializes_missing_database_after_validating_survivors() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let source_path = beads_dir.join("issues.jsonl");
+        let issue = make_test_issue("bd-survivor", "Valid salvage survivor");
+        let valid_source = format!("{}\n", serde_json::to_string(&issue).unwrap());
+        let damaged_source = format!("{valid_source}not a valid issue record\n");
+        fs::write(&source_path, &damaged_source).unwrap();
+        fs::write(beads_dir.join("config.yaml"), "issue_prefix: bd\n").unwrap();
+        let cli = CliOverrides {
+            db: Some(db_path.clone()),
+            lock_timeout: Some(1_000),
+            ..CliOverrides::default()
+        };
+        let args = SyncArgs {
+            import_only: true,
+            skip_invalid_records: true,
+            ..SyncArgs::default()
+        };
+        validate_sync_mode_args(&args).unwrap();
+        let ctx = OutputContext::from_flags(true, false, true);
+        execute(&args, true, &cli, &ctx, false)
+            .expect("missing-database startup must leave source parsing to the salvage command");
+        assert_eq!(fs::read_to_string(&source_path).unwrap(), valid_source);
+        let storage = SqliteStorage::open_current_read_only(&db_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage.get_issue(&issue.id).unwrap().unwrap().title,
+            issue.title
+        );
+        assert_eq!(storage.count_issues().unwrap(), 1);
     }
 
     #[test]

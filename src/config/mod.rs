@@ -791,10 +791,24 @@ struct RecoveryLivePathWitness {
     fingerprint: Option<RecoveryArtifactFingerprint>,
 }
 
+/// Startup import timing is separate from permission to replace an existing
+/// database. Additive imports may defer a genuinely missing database's initial
+/// load, but unreadable existing records still require an explicit rebuild.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JsonlRecoveryStrategy {
-    RebuildFromJsonl,
-    DeferToExplicitImport,
+pub(crate) enum JsonlRecoveryStrategy {
+    Automatic,
+    DeferMissingDatabase,
+    ExplicitRebuild,
+}
+
+impl JsonlRecoveryStrategy {
+    const fn from_deferred_import(defer: bool) -> Self {
+        if defer {
+            Self::DeferMissingDatabase
+        } else {
+            Self::Automatic
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -819,7 +833,7 @@ struct SqliteRecoveryOpenResult {
 
 #[derive(Debug, Clone, Copy)]
 struct SqliteStartupOpenOptions<'a> {
-    defer_jsonl_recovery: bool,
+    recovery_strategy: JsonlRecoveryStrategy,
     read_only_fast_open: bool,
     read_only_storage: bool,
     write_authority: Option<&'a Arc<crate::sync::DatabaseFamilyWriteLock>>,
@@ -840,7 +854,7 @@ fn open_sqlite_storage_with_recovery(
         lock_timeout,
         bootstrap_layer,
         allow_external_jsonl,
-        JsonlRecoveryStrategy::RebuildFromJsonl,
+        JsonlRecoveryStrategy::Automatic,
         write_authority,
     )
 }
@@ -908,7 +922,7 @@ fn open_sqlite_storage_with_recovery_after_fast_open_miss(
             lock_timeout,
             bootstrap_layer,
             allow_external_jsonl,
-            JsonlRecoveryStrategy::RebuildFromJsonl,
+            JsonlRecoveryStrategy::Automatic,
             Some(effective_authority),
         )?
     } else {
@@ -922,25 +936,6 @@ fn open_sqlite_storage_with_recovery_after_fast_open_miss(
         )?
     };
     Ok((open_result, owned_write_authority))
-}
-
-fn open_sqlite_storage_with_deferred_jsonl_recovery(
-    beads_dir: &Path,
-    paths: &ConfigPaths,
-    lock_timeout: Option<u64>,
-    bootstrap_layer: &ConfigLayer,
-    allow_external_jsonl: bool,
-    write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
-) -> Result<SqliteRecoveryOpenResult> {
-    open_sqlite_storage_with_recovery_strategy(
-        beads_dir,
-        paths,
-        lock_timeout,
-        bootstrap_layer,
-        allow_external_jsonl,
-        JsonlRecoveryStrategy::DeferToExplicitImport,
-        write_authority,
-    )
 }
 
 fn open_sqlite_storage_with_recovery_strategy(
@@ -957,7 +952,7 @@ fn open_sqlite_storage_with_recovery_strategy(
     // permission to quarantine sidecars or reconstruct it from JSONL.
     refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
     if !paths.db_path.is_file() {
-        if recovery_strategy == JsonlRecoveryStrategy::RebuildFromJsonl {
+        if recovery_strategy != JsonlRecoveryStrategy::ExplicitRebuild {
             require_no_unreadable_orphan_state(beads_dir, &paths.db_path)?;
         }
         // Whether the fresh database comes from the JSONL rebuild below or
@@ -1065,7 +1060,7 @@ fn open_when_db_file_is_missing(
 ) -> Result<SqliteRecoveryOpenResult> {
     refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
     match recovery_strategy {
-        JsonlRecoveryStrategy::RebuildFromJsonl => {
+        JsonlRecoveryStrategy::Automatic => {
             require_no_unreadable_orphan_state(beads_dir, &paths.db_path)?;
             let (storage, recovered_jsonl) = rebuild_database_from_jsonl(
                 beads_dir,
@@ -1082,7 +1077,10 @@ fn open_when_db_file_is_missing(
                 recovered_jsonl: Some(recovered_jsonl),
             })
         }
-        JsonlRecoveryStrategy::DeferToExplicitImport => {
+        JsonlRecoveryStrategy::DeferMissingDatabase | JsonlRecoveryStrategy::ExplicitRebuild => {
+            if recovery_strategy == JsonlRecoveryStrategy::DeferMissingDatabase {
+                require_no_unreadable_orphan_state(beads_dir, &paths.db_path)?;
+            }
             warn!(
                 db_path = %paths.db_path.display(),
                 jsonl_path = %paths.jsonl_path.display(),
@@ -1336,8 +1334,9 @@ fn prepare_fresh_storage_for_deferred_import(
 }
 
 /// An unopened database cannot establish which unflushed changes need to
-/// survive a rebuild. Refuse automatic replacement; only an explicit import
-/// may move the broken family aside without a preservation snapshot.
+/// survive a rebuild. Deferring an additive import does not authorize replacing
+/// it; only the separately requested explicit rebuild may retain and replace
+/// the broken family.
 fn rebuild_or_defer_after_open_error(
     open_err: &BeadsError,
     beads_dir: &Path,
@@ -1346,14 +1345,16 @@ fn rebuild_or_defer_after_open_error(
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<SqliteRecoveryOpenResult> {
     match recovery_strategy {
-        JsonlRecoveryStrategy::RebuildFromJsonl => Err(automatic_recovery_preservation_refusal(
-            beads_dir,
-            &paths.db_path,
-            &[format!(
-                "the original database could not be opened ({open_err}); unflushed tombstones, dirty issues, and their relationships could not be read"
-            )],
-        )),
-        JsonlRecoveryStrategy::DeferToExplicitImport => {
+        JsonlRecoveryStrategy::Automatic | JsonlRecoveryStrategy::DeferMissingDatabase => {
+            Err(automatic_recovery_preservation_refusal(
+                beads_dir,
+                &paths.db_path,
+                &[format!(
+                    "the original database could not be opened ({open_err}); unflushed tombstones, dirty issues, and their relationships could not be read"
+                )],
+            ))
+        }
+        JsonlRecoveryStrategy::ExplicitRebuild => {
             warn!(
                 db_path = %paths.db_path.display(),
                 jsonl_path = %paths.jsonl_path.display(),
@@ -1506,8 +1507,8 @@ fn is_recoverable_database_internal_error(detail: &str) -> bool {
 }
 
 /// An open connection does not prove that JSONL represents every durable
-/// record. Automatic recovery refuses before replacing this database; an
-/// explicitly requested import retains its deliberate reconstruction path.
+/// record. Automatic recovery and additive imports refuse before replacing this
+/// database; an explicitly requested rebuild retains its reconstruction path.
 fn rebuild_or_defer_after_recoverable_anomaly(
     storage: SqliteStorage,
     anomaly: &str,
@@ -1517,12 +1518,10 @@ fn rebuild_or_defer_after_recoverable_anomaly(
     prepare_fresh_storage: &dyn Fn() -> Result<(SqliteStorage, RecoveryBackupSet)>,
 ) -> Result<SqliteRecoveryOpenResult> {
     match recovery_strategy {
-        JsonlRecoveryStrategy::RebuildFromJsonl => Err(automatic_database_replacement_refusal(
-            beads_dir,
-            &paths.db_path,
-            anomaly,
-        )),
-        JsonlRecoveryStrategy::DeferToExplicitImport => {
+        JsonlRecoveryStrategy::Automatic | JsonlRecoveryStrategy::DeferMissingDatabase => Err(
+            automatic_database_replacement_refusal(beads_dir, &paths.db_path, anomaly),
+        ),
+        JsonlRecoveryStrategy::ExplicitRebuild => {
             warn!(
                 db_path = %paths.db_path.display(),
                 jsonl_path = %paths.jsonl_path.display(),
@@ -5285,6 +5284,8 @@ pub fn resolved_history_config_from_layer(
 }
 
 /// Open storage with a preloaded startup snapshot and support for `--no-db` mode.
+/// Deferral only postpones import into a missing database; it never authorizes
+/// replacement of an existing database whose records cannot be preserved.
 ///
 /// # Errors
 ///
@@ -5294,7 +5295,12 @@ pub fn open_storage_with_startup_config(
     cli: &CliOverrides,
     defer_jsonl_recovery: bool,
 ) -> Result<OpenStorageResult> {
-    open_storage_with_owned_write_authority(startup, cli, defer_jsonl_recovery, false)
+    open_storage_with_owned_write_authority(
+        startup,
+        cli,
+        JsonlRecoveryStrategy::from_deferred_import(defer_jsonl_recovery),
+        false,
+    )
 }
 
 /// Open storage with an explicit JSONL path policy supplied by a command that
@@ -5306,21 +5312,16 @@ pub fn open_storage_with_startup_config(
 pub(crate) fn open_storage_with_startup_config_and_jsonl_policy(
     startup: StartupConfig,
     cli: &CliOverrides,
-    defer_jsonl_recovery: bool,
+    recovery_strategy: JsonlRecoveryStrategy,
     allow_external_jsonl: bool,
 ) -> Result<OpenStorageResult> {
-    open_storage_with_owned_write_authority(
-        startup,
-        cli,
-        defer_jsonl_recovery,
-        allow_external_jsonl,
-    )
+    open_storage_with_owned_write_authority(startup, cli, recovery_strategy, allow_external_jsonl)
 }
 
 fn open_storage_with_owned_write_authority(
     startup: StartupConfig,
     cli: &CliOverrides,
-    defer_jsonl_recovery: bool,
+    recovery_strategy: JsonlRecoveryStrategy,
     allow_external_jsonl: bool,
 ) -> Result<OpenStorageResult> {
     let mut layers = startup.layers.clone();
@@ -5336,7 +5337,7 @@ fn open_storage_with_owned_write_authority(
         return open_storage_with_startup_config_impl(
             startup,
             cli,
-            defer_jsonl_recovery,
+            recovery_strategy,
             None,
             allow_external_jsonl,
         );
@@ -5349,7 +5350,7 @@ fn open_storage_with_owned_write_authority(
         let mut result = open_storage_with_startup_config_impl(
             startup,
             cli,
-            defer_jsonl_recovery,
+            recovery_strategy,
             Some(authority),
             allow_external_jsonl,
         )?;
@@ -5369,7 +5370,7 @@ fn open_storage_with_owned_write_authority(
         return open_storage_with_startup_config_impl(
             startup,
             cli,
-            defer_jsonl_recovery,
+            recovery_strategy,
             None,
             allow_external_jsonl,
         );
@@ -5386,7 +5387,7 @@ fn open_storage_with_owned_write_authority(
     let mut result = open_storage_with_startup_config_impl(
         startup,
         cli,
-        defer_jsonl_recovery,
+        recovery_strategy,
         Some(&authority),
         allow_external_jsonl,
     )?;
@@ -5416,7 +5417,7 @@ pub fn open_storage_with_startup_config_under_write_lock(
     let mut result = open_storage_with_startup_config_impl(
         startup,
         cli,
-        defer_jsonl_recovery,
+        JsonlRecoveryStrategy::from_deferred_import(defer_jsonl_recovery),
         Some(authority),
         false,
     )?;
@@ -5575,7 +5576,7 @@ fn open_sqlite_storage_for_startup(
     if options.read_only_storage {
         return open_strict_sqlite_storage_for_startup(beads_dir, &paths.db_path);
     }
-    if options.defer_jsonl_recovery {
+    if options.recovery_strategy != JsonlRecoveryStrategy::Automatic {
         refuse_incomplete_database_transition(beads_dir, &paths.db_path)?;
         let database_was_missing = options
             .write_authority
@@ -5589,16 +5590,17 @@ fn open_sqlite_storage_for_startup(
                 lock_timeout,
                 bootstrap_layer,
                 options.allow_external_jsonl,
-                JsonlRecoveryStrategy::DeferToExplicitImport,
+                options.recovery_strategy,
                 options.write_authority,
             )?
         } else {
-            open_sqlite_storage_with_deferred_jsonl_recovery(
+            open_sqlite_storage_with_recovery_strategy(
                 beads_dir,
                 paths,
                 lock_timeout,
                 bootstrap_layer,
                 options.allow_external_jsonl,
+                options.recovery_strategy,
                 options.write_authority,
             )?
         };
@@ -5625,7 +5627,7 @@ fn open_sqlite_storage_for_startup(
                 lock_timeout,
                 bootstrap_layer,
                 options.allow_external_jsonl,
-                JsonlRecoveryStrategy::RebuildFromJsonl,
+                JsonlRecoveryStrategy::Automatic,
                 options.write_authority,
             )?
         } else {
@@ -5646,7 +5648,7 @@ fn open_sqlite_storage_for_startup(
 fn open_storage_with_startup_config_impl(
     startup: StartupConfig,
     cli: &CliOverrides,
-    defer_jsonl_recovery: bool,
+    recovery_strategy: JsonlRecoveryStrategy,
     write_authority: Option<&Arc<crate::sync::DatabaseFamilyWriteLock>>,
     explicit_allow_external_jsonl: bool,
 ) -> Result<OpenStorageResult> {
@@ -5776,7 +5778,7 @@ fn open_storage_with_startup_config_impl(
             resolved_lock_timeout,
             &merged_layer,
             SqliteStartupOpenOptions {
-                defer_jsonl_recovery,
+                recovery_strategy,
                 read_only_fast_open: cli.read_only_fast_open,
                 read_only_storage: cli.read_only_storage,
                 write_authority,
@@ -10109,9 +10111,13 @@ routing:
         write_single_issue_jsonl(&jsonl_path, "bd-recover1", "Recovered from JSONL");
 
         let jsonl_before = fs::read(&jsonl_path).expect("read JSONL");
-        for _ in 0..2 {
-            let error = open_storage_with_cli(&beads_dir, &CliOverrides::default())
-                .expect_err("unreadable database must require explicit repair");
+        for defer_initial_import in [false, true] {
+            let error = open_storage_with_cli_impl(
+                &beads_dir,
+                &CliOverrides::default(),
+                defer_initial_import,
+            )
+            .expect_err("unreadable database must require explicit repair");
             assert!(matches!(error, BeadsError::SyncConflict { .. }));
             let message = error.to_string();
             assert!(
@@ -10500,34 +10506,39 @@ routing:
     }
 
     #[test]
-    fn automatic_probe_error_recovery_refuses_incomplete_preservation() {
-        let context = retained_unreadable_dirty_context();
-        let db_path = context.paths.db_path.clone();
-        let beads_dir = context.paths.beads_dir.clone();
-        let before = fs::read(&db_path).unwrap();
-        let probe_error = BeadsError::Database(FrankenError::DatabaseCorrupt {
-            detail: "damaged startup probe page".to_string(),
-        });
-        let error = rebuild_or_defer_after_probe_error(
-            context.storage,
-            &probe_error,
-            &beads_dir,
-            &context.paths,
-            JsonlRecoveryStrategy::RebuildFromJsonl,
-            &|| panic!("automatic refusal must not prepare fresh storage"),
-        )
-        .expect_err("failed probe must not bypass preservation");
-        assert!(matches!(error, BeadsError::SyncConflict { .. }));
-        assert!(
-            error.to_string().contains("damaged startup probe page"),
-            "{error}"
-        );
-        assert!(
-            error.to_string().contains("complete database preservation"),
-            "{error}"
-        );
-        assert_eq!(fs::read(&db_path).unwrap(), before);
-        assert!(!recovery_dir_for_db_path(&db_path, &beads_dir).exists());
+    fn non_rebuild_probe_error_recovery_refuses_incomplete_preservation() {
+        for strategy in [
+            JsonlRecoveryStrategy::Automatic,
+            JsonlRecoveryStrategy::DeferMissingDatabase,
+        ] {
+            let context = retained_unreadable_dirty_context();
+            let db_path = context.paths.db_path.clone();
+            let beads_dir = context.paths.beads_dir.clone();
+            let before = fs::read(&db_path).unwrap();
+            let probe_error = BeadsError::Database(FrankenError::DatabaseCorrupt {
+                detail: "damaged startup probe page".to_string(),
+            });
+            let error = rebuild_or_defer_after_probe_error(
+                context.storage,
+                &probe_error,
+                &beads_dir,
+                &context.paths,
+                strategy,
+                &|| panic!("non-rebuild refusal must not prepare fresh storage"),
+            )
+            .expect_err("failed probe must not bypass preservation");
+            assert!(matches!(error, BeadsError::SyncConflict { .. }));
+            assert!(
+                error.to_string().contains("damaged startup probe page"),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains("complete database preservation"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&db_path).unwrap(), before);
+            assert!(!recovery_dir_for_db_path(&db_path, &beads_dir).exists());
+        }
     }
 
     #[test]
@@ -11209,6 +11220,25 @@ routing:
         );
     }
 
+    /// Exercise the real replacement/rollback boundary with an explicitly
+    /// prepared backup. Duplicate configuration is valid authoritative state
+    /// and must no longer be used to trigger implicit replacement at startup.
+    fn explicit_recovery_rollback_fixture(beads_dir: &Path) -> OpenStorageResult {
+        let mut context = open_storage_with_cli(beads_dir, &CliOverrides::default()).unwrap();
+        let authority = Arc::clone(context.write_authority.as_ref().unwrap());
+        context.storage = SqliteStorage::open_memory().unwrap();
+        let (replacement, backup) = prepare_fresh_storage_for_deferred_import(
+            &context.paths.db_path,
+            beads_dir,
+            context.resolved_lock_timeout,
+            &authority,
+        )
+        .unwrap();
+        context.storage = replacement;
+        context.pending_recovery_backup = Some(backup);
+        context
+    }
+
     #[test]
     fn deferred_recovery_restore_reopens_original_database_family() {
         let mut temp = TempDir::new().expect("tempdir");
@@ -11234,14 +11264,16 @@ routing:
         storage
             .create_issue(&original_issue, "tester")
             .expect("seed original issue");
+        storage
+            .set_config("operator-setting", "database-only value")
+            .unwrap();
+        let events_before = storage.get_events(&original_issue.id, 100).unwrap();
+        assert!(!events_before.is_empty());
         drop(storage);
 
-        insert_duplicate_issue_prefix_config_row(&db_path, "bd");
         write_single_issue_jsonl(&jsonl_path, "bd-import", "Deferred import payload");
 
-        let mut storage_ctx =
-            open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, &CliOverrides::default())
-                .expect("storage");
+        let mut storage_ctx = explicit_recovery_rollback_fixture(&beads_dir);
 
         assert!(
             storage_ctx.pending_recovery_dir().is_some(),
@@ -11272,6 +11304,21 @@ routing:
             .expect("query restored issue")
             .expect("original issue should be readable after restore");
         assert_eq!(restored_issue.title, "Original on-disk issue");
+        assert_eq!(
+            storage_ctx
+                .storage
+                .get_events(&original_issue.id, 100)
+                .unwrap(),
+            events_before
+        );
+        assert_eq!(
+            storage_ctx
+                .storage
+                .get_config("operator-setting")
+                .unwrap()
+                .as_deref(),
+            Some("database-only value")
+        );
     }
 
     #[test]
@@ -11298,12 +11345,9 @@ routing:
             .create_issue(&original_issue, "tester")
             .expect("seed original issue");
         drop(storage);
-        insert_duplicate_issue_prefix_config_row(&db_path, "bd");
         write_single_issue_jsonl(&jsonl_path, "bd-import", "Deferred import payload");
 
-        let mut storage_ctx =
-            open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, &CliOverrides::default())
-                .expect("prepare deferred recovery");
+        let mut storage_ctx = explicit_recovery_rollback_fixture(&beads_dir);
         let backup_path = storage_ctx
             .pending_recovery_backup
             .as_ref()
@@ -11771,8 +11815,8 @@ routing:
     }
 
     #[test]
-    fn automatic_missing_db_recovery_refuses_orphaned_data_on_both_open_lanes() {
-        for fast_open in [false, true] {
+    fn missing_db_initialization_refuses_orphaned_data_on_all_open_lanes() {
+        for (fast_open, defer_initial_import) in [(false, false), (true, false), (false, true)] {
             for suffix in ["-wal", "-journal"] {
                 let retained = TempDir::new().expect("tempdir").keep();
                 let beads_dir = retained.join(".beads");
@@ -11788,7 +11832,7 @@ routing:
                     ..CliOverrides::default()
                 };
 
-                let error = open_storage_with_cli(&beads_dir, &cli)
+                let error = open_storage_with_cli_impl(&beads_dir, &cli, defer_initial_import)
                     .expect_err("unreadable orphaned state must require explicit repair");
 
                 assert!(matches!(error, BeadsError::SyncConflict { .. }));
