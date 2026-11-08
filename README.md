@@ -418,7 +418,12 @@ RUST_LOG=error br serve --actor codex
 The server uses MCP over stdio. It is launched by an MCP client, does not listen
 on a network port, and uses the same SQLite database, JSONL export path, write
 locks, audit events, and sync safety model as the normal CLI. It does not run
-git. Use shell/JSON
+git. Server startup and read requests observe the existing database without
+initializing it or changing schema and migration metadata. In a fresh clone,
+run `br sync --import-only` explicitly before starting the server. MCP requires
+SQLite storage and rejects `--no-db` and equivalent configuration; ordinary
+`br --no-db <command>` invocations remain available for JSONL-only work.
+Use shell/JSON
 commands for simple scripts; use MCP when an agent benefits from discoverable
 tools, resources, prompts, and structured recovery hints. MCP clients can read
 `beads://coordination/status` for the same `br.coordination.v1` stale-claim

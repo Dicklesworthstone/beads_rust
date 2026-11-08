@@ -101,6 +101,13 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         }
     };
 
+    // MCP request handlers use persistent SQLite storage. Reject a resolved
+    // JSONL-only mode before even the pending-merge startup gate opens it.
+    #[cfg(feature = "mcp")]
+    if matches!(cli.command, Commands::Serve(_)) {
+        beads_rust::mcp::validate_serve_storage_mode(ctx.no_db())?;
+    }
+
     // The last-touched file records who touched the issue so an id-less
     // mutation never silently acts on another actor's work (GitHub #518).
     if let Some(layer) = ctx.config.as_ref() {
@@ -1604,6 +1611,8 @@ const fn requires_read_only_storage(cmd: &Commands) -> bool {
         Commands::Sync(args) => commands::sync::requires_read_only_storage(args),
         Commands::Doctor(args) => doctor_requires_read_only_storage(args),
         Commands::Info(_) | Commands::Where => true,
+        #[cfg(feature = "mcp")]
+        Commands::Serve(_) => true,
         Commands::Config { command } => matches!(
             command,
             beads_rust::cli::ConfigCommands::List { .. }
@@ -3257,6 +3266,19 @@ mod tests {
                 "{args:?} has explicit mutation intent"
             );
         }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn serve_startup_is_observational_without_relaxing_pending_merge_admission() {
+        let cli = Cli::parse_from(["br", "serve"]);
+        assert!(build_cli_overrides(&cli).read_only_storage);
+        assert!(!should_auto_import(&cli.command));
+        assert!(!is_mutating_command(&cli.command));
+        assert_eq!(
+            pending_merge_startup_disposition(&cli.command),
+            PendingMergeStartupDisposition::Refuse,
+        );
     }
 
     #[test]

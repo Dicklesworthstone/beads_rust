@@ -927,6 +927,90 @@ mod tests {
     }
 
     #[test]
+    fn serve_bootstrap_reads_configuration_without_rewriting_metadata_or_taking_writer_lock() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp, temp.path().join(".beads/issues.jsonl"));
+        let mut storage = SqliteStorage::open(&state.db_path).unwrap();
+        storage.set_config("issue_prefix", "observed").unwrap();
+        storage
+            .set_metadata(
+                "runtime_schema_witness_v1",
+                "retained older contract witness",
+            )
+            .unwrap();
+        drop(storage);
+        fs::write(
+            state.beads_dir.join("config.yaml"),
+            "sync.history_enabled: false\n",
+        )
+        .unwrap();
+        let before = database_family_snapshot(&state.db_path).unwrap();
+        let _writer = crate::sync::blocking_write_lock(&state.beads_dir).unwrap();
+        let startup = config::load_startup_config_with_paths(&state.beads_dir, None).unwrap();
+        let overrides = config::CliOverrides {
+            lock_timeout: Some(1),
+            ..config::CliOverrides::default()
+        };
+
+        let (prefix, db, jsonl, history) = bootstrap_serve_paths(startup, &overrides)
+            .expect("server configuration observation must not acquire writer authority");
+
+        assert_eq!(prefix.as_deref(), Some("observed"));
+        assert_eq!(db, state.db_path);
+        assert_eq!(jsonl, state.jsonl_path);
+        assert!(!history.enabled);
+        assert_eq!(database_family_snapshot(&state.db_path).unwrap(), before);
+        let storage = state.open_read_storage().unwrap();
+        assert_eq!(
+            storage
+                .get_metadata("runtime_schema_witness_v1")
+                .unwrap()
+                .as_deref(),
+            Some("retained older contract witness"),
+        );
+    }
+
+    #[test]
+    fn serve_bootstrap_refuses_missing_or_unreadable_database_without_importing_jsonl() {
+        for unreadable in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            fs::create_dir(&beads_dir).unwrap();
+            let db_path = beads_dir.join("beads.db");
+            let jsonl_path = beads_dir.join("issues.jsonl");
+            let source =
+                serde_json::to_vec(&test_issue("br-source", "Existing interchange source"))
+                    .unwrap();
+            fs::write(&jsonl_path, &source).unwrap();
+            if unreadable {
+                fs::write(&db_path, b"unreadable database evidence").unwrap();
+            }
+            let before = database_family_snapshot(&db_path).unwrap();
+            let startup = config::load_startup_config_with_paths(&beads_dir, None).unwrap();
+
+            let error = bootstrap_serve_paths(startup, &config::CliOverrides::default())
+                .expect_err(
+                    "starting a read-capable server cannot initialize or reconstruct the database",
+                );
+
+            assert!(
+                error.to_string().contains("Read-only storage open refused"),
+                "{error}"
+            );
+            if !unreadable {
+                assert!(
+                    error.to_string().contains("br sync --import-only"),
+                    "{error}"
+                );
+            }
+            assert_eq!(database_family_snapshot(&db_path).unwrap(), before);
+            assert_eq!(fs::read(&jsonl_path).unwrap(), source);
+            assert!(!beads_dir.join(".br_recovery").exists());
+            assert!(!beads_dir.join(".write.lock").exists());
+        }
+    }
+
+    #[test]
     fn open_read_storage_uses_read_only_fast_path_without_write_lock() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -1723,39 +1807,45 @@ fn build_serve_cx() -> crate::Result<(asupersync::runtime::Runtime, fastmcp_rust
     Ok((runtime, cx))
 }
 
-/// Open the workspace once under the write lock to read the configured
-/// prefix, resolve the paths and the history config every auto-flush must
-/// use, then release everything before the server starts.
+/// Reject JSONL-only mode before any MCP startup storage access. Request
+/// handlers retain a persistent database path and cannot honor `--no-db`.
 ///
-/// Everything the bootstrap open owns — the connection *and* the
-/// database-family write authority the open result keeps a clone of — must
-/// drop here. Keeping the result alive held `.beads/.write.lock` for the
-/// whole serve session: every mutating tool then timed out waiting for a
-/// lock it could never get, and CLI writes in other processes hung.
+/// # Errors
+/// Returns an actionable configuration error when JSONL-only mode is enabled.
+pub fn validate_serve_storage_mode(no_db: bool) -> crate::Result<()> {
+    if no_db {
+        return Err(BeadsError::Config(
+            "br serve requires SQLite storage and does not support --no-db or no-db configuration. \
+             Disable JSONL-only mode for MCP; ordinary `br --no-db <command>` invocations can \
+             work directly with JSONL"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the configured prefix, paths, and auto-flush history policy through
+/// an observational snapshot. Starting a server grants no authority to repair
+/// or initialize a tracker, or to rewrite preserved migration metadata.
+/// The snapshot is dropped before serving; mutations acquire their own fresh
+/// authority and writable storage only when a client requests them.
 fn bootstrap_serve_paths(
-    beads_dir: &Path,
     startup: config::StartupConfig,
     overrides: &config::CliOverrides,
-    lock_timeout: Option<u64>,
 ) -> crate::Result<(
     Option<String>,
     PathBuf,
     PathBuf,
     crate::sync::history::HistoryConfig,
 )> {
-    let write_lock = Arc::new(
-        crate::sync::blocking_database_family_write_lock_with_timeout(
-            beads_dir,
-            &startup.paths.db_path,
-            lock_timeout,
-        )?,
-    );
-    let res = config::open_storage_with_startup_config_under_write_lock(
-        startup,
-        overrides,
-        false,
-        &write_lock,
-    )?;
+    let mut layers = startup.layers.clone();
+    layers.push(overrides.as_layer());
+    let merged = config::ConfigLayer::merge_layers(&layers);
+    validate_serve_storage_mode(config::no_db_from_layer(&merged).unwrap_or(false))?;
+
+    let mut observational = overrides.clone();
+    observational.read_only_storage = true;
+    let res = config::open_storage_with_startup_config(startup, &observational, false)?;
     let prefix = res
         .storage
         .get_config("issue_prefix")?
@@ -1781,8 +1871,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .or_else(|| config::lock_timeout_from_layer(&merged_layer))
         .or(Some(crate::sync::default_write_lock_timeout_ms()));
     let retention_days = startup.paths.metadata.deletions_retention_days;
-    let (prefix, db_path, jsonl_path, history) =
-        bootstrap_serve_paths(&beads_dir, startup, overrides, lock_timeout)?;
+    let (prefix, db_path, jsonl_path, history) = bootstrap_serve_paths(startup, overrides)?;
     let allow_external_jsonl =
         config::implicit_external_jsonl_allowed(&beads_dir, &db_path, &jsonl_path);
     let state = std::sync::Arc::new(BeadsState {

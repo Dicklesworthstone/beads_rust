@@ -13,7 +13,7 @@
 #![cfg(all(unix, feature = "mcp"))]
 
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -546,6 +546,212 @@ fn assert_mutations_reached_workspace(root: &Path, new_id: &str) {
         jsonl.contains(new_id),
         "issues.jsonl should carry the MCP-created issue after auto-flush"
     );
+}
+
+fn migration_durable_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for name in [
+        "beads.db",
+        "beads.db-wal",
+        "beads.db-journal",
+        "issues.jsonl",
+        "issues.history.jsonl",
+        "metadata.json",
+        "config.yaml",
+        "policy.yaml",
+    ] {
+        match std::fs::read(root.join(".beads").join(name)) {
+            Ok(bytes) => {
+                files.insert(name.to_string(), bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot observe durable {name}: {error}"),
+        }
+    }
+    files
+}
+
+fn migration_database_rows(root: &Path) -> BTreeMap<String, String> {
+    // The test never opens its authoritative database, even for the oracle.
+    let scratch = TempDir::new().unwrap();
+    let snapshot = scratch.path().join("copy.db");
+    std::fs::copy(root.join(".beads/beads.db"), &snapshot).unwrap();
+    for suffix in ["-wal", "-journal"] {
+        let source = root.join(".beads").join(format!("beads.db{suffix}"));
+        if source.is_file() {
+            std::fs::copy(source, scratch.path().join(format!("copy.db{suffix}"))).unwrap();
+        }
+    }
+    let connection =
+        beads_rust::franken_sync::Connection::open(snapshot.to_string_lossy().into_owned())
+            .unwrap();
+    let mut tables = BTreeMap::new();
+    for row in connection
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+    {
+        let name = row
+            .get(0)
+            .and_then(beads_rust::franken_sync::SqliteValue::as_text)
+            .expect("table name");
+        let sql = format!(
+            "SELECT rowid, * FROM \"{}\" ORDER BY rowid",
+            name.replace('"', "\"\"")
+        );
+        tables.insert(
+            name.to_owned(),
+            format!("{:?}", connection.query(&sql).unwrap()),
+        );
+    }
+    connection.close().unwrap();
+    tables
+}
+
+#[test]
+fn serve_release_upgrade_reads_preserve_database_authority_and_guarded_undo() {
+    let workspace = ProtocolWorkspace::new().expect("workspace");
+    let root = workspace.path();
+    let beads_dir = root.join(".beads");
+    std::fs::create_dir(&beads_dir).unwrap();
+    let fixture = include_bytes!("fixtures/schema_migration/schema19_v076_workflows.db.gz");
+    let mut original_database = Vec::new();
+    flate2::read::GzDecoder::new(&fixture[..])
+        .read_to_end(&mut original_database)
+        .unwrap();
+    std::fs::write(beads_dir.join("beads.db"), &original_database).unwrap();
+    std::fs::write(
+        beads_dir.join("issues.jsonl"),
+        include_bytes!("fixtures/schema_migration/schema19_v076_workflows_issues.jsonl"),
+    )
+    .unwrap();
+    std::fs::write(
+        beads_dir.join("config.yaml"),
+        include_bytes!("fixtures/schema_migration/schema19_v076_workflows_config.yaml"),
+    )
+    .unwrap();
+    std::fs::write(
+        beads_dir.join("policy.yaml"),
+        include_bytes!("fixtures/schema_migration/schema19_v076_workflows_policy.yaml"),
+    )
+    .unwrap();
+    let original_files = migration_durable_files(root);
+    let original_rows = migration_database_rows(root);
+    assert!(original_rows["metadata"].contains("contract-v19-typed-dependencies"));
+    assert!(
+        !std::fs::read_to_string(beads_dir.join("issues.jsonl"))
+            .unwrap()
+            .contains("release-9sp")
+    );
+
+    let plan = cli_json(root, &["doctor", "migrate-schema", "plan"]);
+    assert_eq!(plan["from_version"], 19);
+    assert_eq!(plan["to_version"], 19);
+    assert_eq!(plan["eligible"], true);
+    let applied = cli_json(
+        root,
+        &[
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            plan["plan_token"].as_str().unwrap(),
+        ],
+    );
+    let installed_files = migration_durable_files(root);
+    let installed_rows = migration_database_rows(root);
+    assert_eq!(installed_rows["metadata"], original_rows["metadata"]);
+
+    let mut client = McpClient::spawn(root);
+    assert_discovery_surface(&mut client);
+    assert_eq!(
+        migration_durable_files(root),
+        installed_files,
+        "bootstrap changed durable files"
+    );
+    assert_eq!(
+        migration_database_rows(root),
+        installed_rows,
+        "bootstrap rewrote preserved metadata"
+    );
+    let shown = client.call_tool("show_issue", json!({"id": "release-9sp"}));
+    assert_eq!(shown["title"], "Database-only ephemeral issue");
+    let closed = client.call_tool("show_issue", json!({"id": "release-0ta.1"}));
+    assert_eq!(closed["status"], "closed");
+    let events = client.read_resource("beads://events/recent");
+    assert_eq!(events["count"], 23);
+    client.call_tool("project_overview", json!({}));
+    assert_eq!(
+        migration_durable_files(root),
+        installed_files,
+        "MCP reads changed durable files"
+    );
+    assert_eq!(
+        migration_database_rows(root),
+        installed_rows,
+        "MCP reads changed authoritative rows"
+    );
+    let (status, stderr) = client.finish();
+    assert!(
+        status.success() || status.code() == Some(130),
+        "{status}: {stderr}"
+    );
+    assert_eq!(
+        migration_durable_files(root),
+        installed_files,
+        "server shutdown changed durable files"
+    );
+
+    cli_json(
+        root,
+        &[
+            "doctor",
+            "migrate-schema",
+            "undo",
+            applied["run_id"].as_str().unwrap(),
+        ],
+    );
+    assert_eq!(migration_durable_files(root), original_files);
+    assert_eq!(migration_database_rows(root), original_rows);
+}
+
+#[test]
+fn serve_rejects_jsonl_only_mode_before_opening_the_database() {
+    for configured in [false, true] {
+        let workspace = ProtocolWorkspace::new().expect("workspace");
+        let root = workspace.path();
+        cli_json(root, &["init", "--prefix", "mcp"]);
+        cli_json(root, &["create", "Database must remain untouched"]);
+        if configured {
+            std::fs::write(root.join(".beads/config.yaml"), "no-db: true\n").unwrap();
+        }
+        let before = migration_durable_files(root);
+        let _writer = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+        let mut command = br_command(root);
+        command.args(["--lock-timeout", "1"]);
+        if !configured {
+            command.arg("--no-db");
+        }
+        let output = command
+            .arg("serve")
+            .stdin(Stdio::null())
+            .output()
+            .expect("refused serve startup");
+        let message = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success(),
+            "JSONL-only MCP startup must refuse"
+        );
+        assert!(
+            message.contains("br serve requires SQLite storage"),
+            "{message}"
+        );
+        assert!(message.contains("--no-db"), "{message}");
+        assert_eq!(migration_durable_files(root), before);
+    }
 }
 
 #[test]
