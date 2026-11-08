@@ -7,6 +7,7 @@
 //! - External DB reference safety and path normalization
 //! - Clear errors for missing/invalid routes
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::process::Command;
@@ -80,6 +81,25 @@ fn write_single_issue_jsonl(workspace: &BrWorkspace, issue: &Value) {
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
     let serialized = serde_json::to_string(issue).expect("serialize issue jsonl");
     fs::write(&jsonl_path, format!("{serialized}\n")).expect("write issues.jsonl");
+}
+
+fn tracker_artifacts(workspace: &BrWorkspace) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let root = workspace.root.join(".beads");
+    let mut directories = vec![root.clone()];
+    let mut files = BTreeMap::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(&root).unwrap().to_path_buf();
+            if path.is_dir() {
+                files.insert(relative, None);
+                directories.push(path);
+            } else {
+                files.insert(relative, Some(fs::read(path).unwrap()));
+            }
+        }
+    }
+    files
 }
 
 #[cfg(target_os = "linux")]
@@ -1831,8 +1851,8 @@ fn e2e_routing_comments_add_and_list_external_issue_via_main_workspace() {
 }
 
 #[test]
-fn e2e_routing_comments_list_imports_stale_external_jsonl() {
-    let _log = common::test_log("e2e_routing_comments_list_imports_stale_external_jsonl");
+fn e2e_routing_comments_list_requires_explicit_external_import() {
+    let _log = common::test_log("e2e_routing_comments_list_requires_explicit_external_import");
 
     let main_workspace = BrWorkspace::new();
     let external_workspace = BrWorkspace::new();
@@ -1861,10 +1881,50 @@ fn e2e_routing_comments_list_imports_stale_external_jsonl() {
     jsonl_issue["updated_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
     write_single_issue_jsonl(&external_workspace, &jsonl_issue);
 
+    let main_files = tracker_artifacts(&main_workspace);
+    let external_files = tracker_artifacts(&external_workspace);
+    let refused = run_br(
+        &main_workspace,
+        ["comments", "list", &routed_input, "--json"],
+        "comments_list_refuses_external_import",
+    );
+    assert_eq!(refused.status.code(), Some(6), "{refused:?}");
+    let refusal: Value = serde_json::from_str(&refused.stdout).expect("refusal JSON");
+    assert_eq!(refusal["error"]["code"], "SYNC_CONFLICT");
+    let message = refusal["error"]["message"].as_str().unwrap();
+    assert!(message.contains("br sync --import-only"), "{message}");
+    assert!(
+        message.contains(&external_workspace.root.display().to_string()),
+        "refusal must identify the external workspace: {message}"
+    );
+    assert_eq!(tracker_artifacts(&main_workspace), main_files);
+    assert_eq!(tracker_artifacts(&external_workspace), external_files);
+
+    for opt_out in ["--allow-stale", "--no-auto-import"] {
+        let original = run_br(
+            &main_workspace,
+            ["comments", "list", &routed_input, "--json", opt_out],
+            "comments_list_observes_original_external_database",
+        );
+        assert!(original.status.success(), "{original:?}");
+        let comments: Vec<Value> =
+            serde_json::from_str(&extract_json_payload(&original.stdout)).expect("comments JSON");
+        assert!(comments.is_empty());
+        assert_eq!(tracker_artifacts(&main_workspace), main_files);
+        assert_eq!(tracker_artifacts(&external_workspace), external_files);
+    }
+
+    let imported = run_br(
+        &external_workspace,
+        ["sync", "--import-only", "--json"],
+        "explicit_import_external_comment",
+    );
+    assert!(imported.status.success(), "{imported:?}");
+    let imported_files = tracker_artifacts(&external_workspace);
     let comment_list = run_br(
         &main_workspace,
         ["comments", "list", &routed_input, "--json"],
-        "comments_list_external_stale_jsonl_via_route",
+        "comments_list_after_explicit_external_import",
     );
     assert!(
         comment_list.status.success(),
@@ -1889,6 +1949,8 @@ fn e2e_routing_comments_list_imports_stale_external_jsonl() {
         shown[0]["comments"][0]["text"].as_str(),
         Some("External comment from stale JSONL")
     );
+    assert_eq!(tracker_artifacts(&main_workspace), main_files);
+    assert_eq!(tracker_artifacts(&external_workspace), imported_files);
 }
 
 #[test]

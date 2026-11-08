@@ -123,26 +123,11 @@ fn execute_inner(
     beads_dir: &Path,
     preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<()> {
-    // beads_rust-750p: ordinary orphans scans must auto-import a newer JSONL
-    // before scanning issue state, so JSONL-only closures (e.g. from `git
-    // pull`) are reflected in the orphan list. An explicit read-only fast
-    // open (`--no-auto-import --no-auto-flush`) instead preserves that
-    // contract here: open the current database read-only and do not join the
-    // workspace writer queue. The preloaded path was already handled by
-    // main.rs under the same policy.
-    //
-    // CONCURRENCY NOTE: We do NOT acquire the project's `.write.lock`
-    // explicitly here. This deviates from the audit/close/etc. flows in
-    // sibling commands which acquire the lock before opening writable.
-    // Rationale: orphans is on the read-only-fast-open list; main.rs's
-    // startup path (which DOES acquire the lock) is the canonical
-    // serialization point. The non-preloaded path is exercised in narrow
-    // cases (e.g. dispatch fallback, certain test harnesses) where the
-    // race is bounded by SQLite's per-connection locking. If two orphans
-    // invocations race the auto-import here, SQLite's WAL serializes the
-    // import write; the worst observable outcome is one waiting briefly
-    // for the other's transaction. This is acceptable for a read command
-    // and is documented at SYNC_SAFETY_INVARIANTS.md.
+    // An ordinary scan inspects a private read snapshot and requires explicit
+    // synchronization when JSONL changed. --allow-stale / --no-auto-import
+    // instead permits scanning the existing database. Only --fix has mutation
+    // intent and may use automatic import under its retained write authority.
+    // A preloaded context has already passed the same startup policy in main.
     let owned_storage_ctx = if preloaded_storage_ctx.is_some() {
         None
     } else {

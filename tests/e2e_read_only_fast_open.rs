@@ -1,8 +1,8 @@
 //! E2E coverage for CLI read-only fast-open behavior.
 //!
-//! These tests compare the optimized current-schema read-only path against the
-//! conservative locked path, then prove representative read commands still run
-//! while another process holds `.beads/.write.lock`.
+//! These tests compare reads with the fast-open optimization enabled and
+//! disabled, then prove both retain their observational intent while another
+//! process holds `.beads/.write.lock`.
 
 mod common;
 
@@ -237,10 +237,7 @@ fn status_and_report_commands() -> Vec<MatrixCommand> {
             "graph_all_compact",
             strings(["graph", "--all", "--compact"]),
         ),
-        exact_command(
-            "orphans_robot_explicit_stale_opt_out",
-            strings(["--no-auto-import", "--no-auto-flush", "orphans", "--robot"]),
-        ),
+        exact_command("orphans_robot", strings(["orphans", "--robot"])),
     ]
 }
 
@@ -388,9 +385,8 @@ fn run_command(workspace: &BrWorkspace, command: &MatrixCommand, disable_fast_op
         );
     }
 
-    // Exercise the default synchronized-probe path. Individual matrix entries
-    // carry explicit opt-outs only when that command intentionally owns a
-    // separate auto-import contract (currently bare `orphans`).
+    // Default reads may check JSONL freshness, but neither optimization mode
+    // may import or refresh the persistent database while executing a read.
     run_br(
         workspace,
         command.args.iter().map(String::as_str),
@@ -402,7 +398,7 @@ fn assert_outputs_match(command: &MatrixCommand, fast: &BrRun, conservative: &Br
     match command.compare_mode {
         CompareMode::Exact => assert_eq!(
             fast.stdout, conservative.stdout,
-            "{} stdout changed between read-only fast-open and conservative locked path",
+            "{} stdout changed when read-only fast-open was disabled",
             command.label
         ),
         CompareMode::JsonWithoutKeys(keys) => {
@@ -419,7 +415,7 @@ fn assert_outputs_match(command: &MatrixCommand, fast: &BrRun, conservative: &Br
 
             assert_eq!(
                 fast_json, conservative_json,
-                "{} normalized JSON changed between read-only fast-open and conservative locked path",
+                "{} normalized JSON changed when read-only fast-open was disabled",
                 command.label
             );
         }
@@ -480,35 +476,29 @@ fn cli_read_only_fast_open_matrix_bypasses_held_write_lock() {
     for command in matrix_commands(&seed) {
         let fast = run_command(&seed.workspace, &command, false);
         assert_success(&fast, command.label);
+        let conservative = run_command(&seed.workspace, &command, true);
+        assert_success(&conservative, command.label);
+        assert_outputs_match(&command, &fast, &conservative);
     }
 
     assert_eq!(
         regular_file_evidence(&beads_dir),
         before,
-        "read-only fast-open matrix changed file bytes or modes under .beads"
+        "read-only matrix changed file bytes or modes under .beads"
     );
 
-    let blocked_conservative = run_command(
+    // Disabling an optimization must not revoke the command's read intent.
+    // An explicit short timeout cannot make it queue behind this writer.
+    let conservative = run_command(
         &seed.workspace,
         &exact_command(
-            "list_json_locked_conservative",
+            "list_json_conservative_short_timeout",
             strings(["--lock-timeout", "50", "list", "--json", "--limit", "1"]),
         ),
         true,
     );
-    assert!(
-        !blocked_conservative.status.success(),
-        "disabled fast-open should wait for the held write lock and time out"
-    );
-    let combined = format!(
-        "{} {}",
-        blocked_conservative.stdout, blocked_conservative.stderr
-    )
-    .to_ascii_lowercase();
-    assert!(
-        combined.contains("lock") || combined.contains("timed out"),
-        "conservative failure should mention lock contention, got: {combined}"
-    );
+    assert_success(&conservative, "read intent with fast-open disabled");
+    assert_eq!(regular_file_evidence(&beads_dir), before);
 }
 
 #[test]
@@ -620,7 +610,7 @@ fn query_private_copy(db: &Path, sql: &str) -> Vec<Vec<SqliteValue>> {
 }
 
 #[test]
-fn gh585_current_schema_auto_import_cannot_enter_generic_anomaly_recovery() {
+fn gh585_current_schema_read_cannot_import_or_enter_generic_anomaly_recovery() {
     let workspace = BrWorkspace::new();
     run_success(
         &workspace,
@@ -636,8 +626,8 @@ fn gh585_current_schema_auto_import_cannot_enter_generic_anomaly_recovery() {
     let connection = Connection::open(db.to_string_lossy().into_owned()).unwrap();
     for sql in [
         // Duplicate keys trigger the generic writable-open anomaly recovery.
-        // Auto-import from a read must use a current-schema-only reopen that
-        // cannot rebuild the database and discard any of these records.
+        // A read must never attempt that writable open, even when JSONL
+        // changed. These authoritative records stay in the original tracker.
         "INSERT INTO config (key, value) VALUES ('issue_prefix', 'guard')",
         "INSERT INTO config (key, value) VALUES ('compact_model', 'operator-model')",
         "INSERT INTO metadata (key, value) VALUES ('operator_checkpoint', 'first authority')",
@@ -650,6 +640,7 @@ fn gh585_current_schema_auto_import_cannot_enter_generic_anomaly_recovery() {
     connection.close().unwrap();
     let events = query_private_copy(&db, "SELECT * FROM events ORDER BY id");
     assert!(!events.is_empty(), "the test must have history to lose");
+    let issues = query_private_copy(&db, "SELECT * FROM issues ORDER BY id");
     let config = query_private_copy(&db, "SELECT key, value FROM config ORDER BY rowid");
     assert_eq!(
         config
@@ -680,32 +671,49 @@ fn gh585_current_schema_auto_import_cannot_enter_generic_anomaly_recovery() {
         .collect();
     fs::write(&jsonl, format!("{}\n", rewritten.join("\n"))).unwrap();
     let export_before = fs::read(&jsonl).unwrap();
-    let result = run_br(
-        &workspace,
-        ["list", "--json", "--lock-timeout", "1000"],
-        "guard_auto_import",
-    );
-    if result.status.success() {
-        assert!(
-            result
-                .stdout
-                .contains("Incoming JSONL revision without database history"),
-            "{}",
-            result.stdout
+    let before = regular_file_evidence(&workspace.root.join(".beads"));
+    for disable_fast_open in [false, true] {
+        let result = run_command(
+            &workspace,
+            &exact_command(
+                "guard_read_import_refusal",
+                strings(["list", "--json", "--lock-timeout", "1000"]),
+            ),
+            disable_fast_open,
         );
-    } else {
+        assert_eq!(result.status.code(), Some(6), "{result:?}");
         let error: Value =
             serde_json::from_str(&result.stdout).expect("actionable structured refusal");
+        assert_eq!(error["error"]["code"], "SYNC_CONFLICT");
         assert!(
             error["error"]["message"]
                 .as_str()
-                .is_some_and(|message| !message.is_empty())
+                .is_some_and(|message| message.contains("br sync --import-only"))
+        );
+        assert_eq!(
+            regular_file_evidence(&workspace.root.join(".beads")),
+            before
+        );
+    }
+    for opt_out in ["--allow-stale", "--no-auto-import"] {
+        let original = run_br(
+            &workspace,
+            ["show", &issue_id, "--json", opt_out],
+            "guard_explicit_original_read",
+        );
+        assert_success(&original, "explicit read of original database");
+        let shown: Value = serde_json::from_str(&original.stdout).unwrap();
+        assert_eq!(shown[0]["title"], "Original local history");
+        assert_eq!(
+            regular_file_evidence(&workspace.root.join(".beads")),
+            before
         );
     }
     let after_events = query_private_copy(&db, "SELECT * FROM events ORDER BY id");
-    assert!(
-        events.iter().all(|row| after_events.contains(row)),
-        "auto-import dropped original audit history"
+    assert_eq!(after_events, events, "read changed original audit history");
+    assert_eq!(
+        query_private_copy(&db, "SELECT * FROM issues ORDER BY id"),
+        issues
     );
     assert_eq!(
         query_private_copy(&db, "SELECT key, value FROM config ORDER BY rowid"),

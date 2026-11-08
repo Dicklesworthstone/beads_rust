@@ -626,14 +626,18 @@ the original database and are not represented by that view. Diagnostic commands
 such as `info`, `where`, and configuration reads inspect the original database
 through observational paths. Statistics do not persist cache updates on a read.
 
-Current-schema auto-import remains available when enabled and a nonmutating
-freshness probe establishes that it is needed. Startup then acquires write
-authority, reprobes the same database, and opens only the compatible current
-schema for import. That reopen cannot repair or reconstruct the database.
-`--no-auto-import` suppresses this transition; combined with `--no-auto-flush`,
-it keeps explicitly observational commands free of sync writes. Routed read
-helpers that need an import refuse with `br sync --import-only` guidance instead
-of promoting a read-only handle to writable recovery.
+Ordinary reads never promote their private snapshot to a writable import.
+If the configured freshness check finds changed JSONL content, startup refuses
+with `SYNC_CONFLICT` and `br sync --import-only` guidance. `--allow-stale` or
+`--no-auto-import` deliberately reads the existing database instead. Receipt
+version changes alone are maintenance work and do not make a read stale; this
+preserves the exact installed state and guarded undo after a release-layout
+upgrade. Probe errors propagate without a writable retry. Main startup and
+command-local or routed readers enforce the same boundary.
+
+Mutating commands retain automatic import when enabled, under database-family
+write authority. Explicit synchronization also remains available. Neither
+path may use a refused schema upgrade as permission to rebuild from JSONL.
 
 The dispatcher routes errors through `handle_error(err, json_mode, color_mode)`.
 Successful mutations with auto-flush enabled then publish pending JSONL through

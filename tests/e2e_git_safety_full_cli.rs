@@ -1077,7 +1077,7 @@ fn regression_auto_flush_does_not_touch_git() {
     eprintln!("[PASS] Auto-flush does not touch .git");
 }
 
-/// Test that auto-import doesn't touch .git
+/// Read refusal and a mutating command's automatic import must not touch .git.
 #[test]
 fn regression_auto_import_does_not_touch_git() {
     let workspace = BrWorkspace::new();
@@ -1087,31 +1087,86 @@ fn regression_auto_import_does_not_touch_git() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success());
 
-    let _ = run_br(
+    let created = run_br(
         &workspace,
-        ["create", "Issue 1", "--no-auto-flush"],
+        ["create", "Issue 1", "--no-auto-flush", "--json"],
         "create1",
     );
+    assert!(created.status.success(), "{created:?}");
+    let issue: serde_json::Value = serde_json::from_str(&created.stdout).unwrap();
+    let issue_id = issue["id"].as_str().expect("created issue ID");
 
     // Manually flush
-    let _ = run_br(&workspace, ["sync", "--flush-only"], "flush");
+    let flushed = run_br(&workspace, ["sync", "--flush-only"], "flush");
+    assert!(flushed.status.success(), "{flushed:?}");
 
-    // Touch the JSONL to make it newer
+    // Change actual source content. A mere mtime touch never proves that an
+    // import took place, because matching content hashes suppress it.
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
-    if jsonl_path.exists() {
-        let content = fs::read_to_string(&jsonl_path).expect("read");
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        fs::write(&jsonl_path, content).expect("write");
-    }
+    let mut row: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&jsonl_path).expect("read JSONL")).unwrap();
+    row["title"] = serde_json::Value::from("Title imported automatically by a mutation");
+    row["updated_at"] = serde_json::Value::from("2099-01-01T00:00:00Z");
+    row.as_object_mut().unwrap().remove("content_hash");
+    let source = format!("{}\n", serde_json::to_string(&row).unwrap());
+    fs::write(&jsonl_path, &source).expect("write changed JSONL");
 
     // Take baseline
     let baseline_git = snapshot_git_dir(&workspace.root);
     let baseline_head = get_head_commit(&workspace.root);
     let baseline_count = get_commit_count(&workspace.root);
+    let beads_dir = workspace.root.join(".beads");
+    let mut baseline_tracker = BTreeMap::new();
+    collect_dir_hashes(&beads_dir, &beads_dir, &mut baseline_tracker);
 
-    // Run list (should trigger auto-import)
-    let list = run_br(&workspace, ["list"], "list_auto_import");
-    assert!(list.status.success());
+    // A default read refuses implicit import and changes neither tracker nor
+    // Git state. The explicit stale read still exposes the original DB row.
+    let list = run_br(&workspace, ["list", "--json"], "list_refuses_import");
+    assert_eq!(list.status.code(), Some(6), "{list:?}");
+    let refusal: serde_json::Value = serde_json::from_str(&list.stdout).unwrap();
+    assert_eq!(refusal["error"]["code"], "SYNC_CONFLICT");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("br sync --import-only"))
+    );
+    let original = run_br(
+        &workspace,
+        ["show", issue_id, "--json", "--allow-stale"],
+        "show_before_automatic_import",
+    );
+    assert!(original.status.success(), "{original:?}");
+    let original: serde_json::Value = serde_json::from_str(&original.stdout).unwrap();
+    assert_eq!(original[0]["title"], "Issue 1");
+    let mut after_reads = BTreeMap::new();
+    collect_dir_hashes(&beads_dir, &beads_dir, &mut after_reads);
+    assert_eq!(after_reads, baseline_tracker);
+    assert_eq!(snapshot_git_dir(&workspace.root), baseline_git);
+
+    // Preserve coverage of Automatic import policy with real mutating intent.
+    // Removing an absent label does not edit or dirty the issue itself.
+    let imported = run_br(
+        &workspace,
+        [
+            "label",
+            "remove",
+            issue_id,
+            "absent-import-probe-label",
+            "--no-auto-flush",
+            "--json",
+        ],
+        "mutation_automatic_import",
+    );
+    assert!(imported.status.success(), "{imported:?}");
+    let shown = run_br(
+        &workspace,
+        ["show", issue_id, "--json", "--no-auto-import"],
+        "show_after_automatic_import",
+    );
+    assert!(shown.status.success(), "{shown:?}");
+    let shown: serde_json::Value = serde_json::from_str(&shown.stdout).unwrap();
+    assert_eq!(shown[0]["title"], row["title"]);
+    assert_eq!(fs::read_to_string(&jsonl_path).unwrap(), source);
 
     // Verify .git unchanged
     let after_git = snapshot_git_dir(&workspace.root);

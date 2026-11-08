@@ -2,7 +2,9 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_issues_array, extract_json_payload, run_br};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::PathBuf;
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -34,6 +36,25 @@ fn write_single_issue_jsonl(workspace: &BrWorkspace, issue: &Value) {
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
     let serialized = serde_json::to_string(issue).expect("serialize issue jsonl");
     fs::write(&jsonl_path, format!("{serialized}\n")).expect("write issues.jsonl");
+}
+
+fn tracker_artifacts(workspace: &BrWorkspace) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let root = workspace.root.join(".beads");
+    let mut directories = vec![root.clone()];
+    let mut files = BTreeMap::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(&root).unwrap().to_path_buf();
+            if path.is_dir() {
+                files.insert(relative, None);
+                directories.push(path);
+            } else {
+                files.insert(relative, Some(fs::read(path).unwrap()));
+            }
+        }
+    }
+    files
 }
 
 fn issue_list_contains_id(issues: &[Value], issue_id: &str) -> bool {
@@ -543,8 +564,8 @@ fn ready_respects_external_dependencies() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn ready_imports_stale_external_jsonl_before_status_probe() {
-    let _log = common::test_log("ready_imports_stale_external_jsonl_before_status_probe");
+fn ready_observes_external_database_until_explicit_peer_import() {
+    let _log = common::test_log("ready_observes_external_database_until_explicit_peer_import");
     let workspace = BrWorkspace::new();
     let external = BrWorkspace::new();
 
@@ -621,10 +642,45 @@ fn ready_imports_stale_external_jsonl_before_status_probe() {
     set_issue_jsonl_string(&mut provider_jsonl, "close_reason", "stale JSONL closure");
     write_single_issue_jsonl(&external, &provider_jsonl);
 
+    let main_files = tracker_artifacts(&workspace);
+    let external_files = tracker_artifacts(&external);
+    let pending = run_br(
+        &workspace,
+        ["ready", "--json"],
+        "ready_with_pending_external_jsonl",
+    );
+    assert!(pending.status.success(), "{pending:?}");
+    let ready_json: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&pending.stdout)).expect("ready json");
+    assert!(
+        !issue_list_contains_id(&ready_json, &issue_id),
+        "external status probes must observe the still-open database provider"
+    );
+    assert_eq!(tracker_artifacts(&workspace), main_files);
+    assert_eq!(tracker_artifacts(&external), external_files);
+
+    let original = run_br(
+        &external,
+        ["show", &provider_id, "--json", "--no-auto-import"],
+        "show_external_before_explicit_import",
+    );
+    assert!(original.status.success(), "{original:?}");
+    let shown: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&original.stdout)).expect("show json");
+    assert_eq!(shown[0]["status"].as_str(), Some("open"));
+    assert_eq!(tracker_artifacts(&external), external_files);
+
+    let imported = run_br(
+        &external,
+        ["sync", "--import-only", "--json"],
+        "explicit_external_provider_import",
+    );
+    assert!(imported.status.success(), "{imported:?}");
+    let imported_files = tracker_artifacts(&external);
     let ready_after = run_br(
         &workspace,
         ["ready", "--json"],
-        "ready_after_stale_external_jsonl",
+        "ready_after_explicit_external_import",
     );
     assert!(
         ready_after.status.success(),
@@ -635,13 +691,13 @@ fn ready_imports_stale_external_jsonl_before_status_probe() {
     let ready_json: Vec<Value> = serde_json::from_str(&ready_payload).expect("ready json");
     assert!(
         issue_list_contains_id(&ready_json, &issue_id),
-        "ready should import the external JSONL closure before probing dependency status"
+        "ready should observe the closure explicitly imported in the external workspace"
     );
 
     let show_external = run_br(
         &external,
         ["show", &provider_id, "--json"],
-        "show_external_after_ready_import",
+        "show_external_after_explicit_import",
     );
     assert!(
         show_external.status.success(),
@@ -651,6 +707,8 @@ fn ready_imports_stale_external_jsonl_before_status_probe() {
     let shown: Vec<Value> =
         serde_json::from_str(&extract_json_payload(&show_external.stdout)).expect("show json");
     assert_eq!(shown[0]["status"].as_str(), Some("closed"));
+    assert_eq!(tracker_artifacts(&workspace), main_files);
+    assert_eq!(tracker_artifacts(&external), imported_files);
 }
 
 #[test]

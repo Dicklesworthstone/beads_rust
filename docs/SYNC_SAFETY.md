@@ -242,9 +242,24 @@ Incremental automatic export checks complete row receipts before replacing or
 removing a source row. These receipts include comments, relations, timestamps,
 and other fields excluded by the issue content hash. It can publish unrelated
 local changes while preserving unread peer rows byte-for-byte. Those peer rows
-remain pending for the next auto-import, even after the exporter records the
+remain pending for explicit import or a mutating command's next auto-import,
+even after the exporter records the
 new file's hash. A later edit to the same issue still requires reconciliation;
 an unrelated publication cannot certify the peer's unread version.
+
+Ordinary CLI reads only inspect freshness. Changed JSONL content produces
+`SYNC_CONFLICT` with explicit synchronization guidance; `--allow-stale` or
+`--no-auto-import` selects the existing database view. A read never backfills
+receipt tables, refreshes stored file witnesses, or promotes itself to writer
+authority. An older receipt version with unchanged JSONL is still readable.
+
+During an authorized automatic import, a legacy row may omit attribution that
+the database already records for the same closure. Missing attribution can be
+retained only when issue identity, creation time, and the nonempty closure time
+agree, supplied attribution does not conflict, and every other synced field and
+relationship matches. The original source remains uncertified and `needs_flush`
+stays set until a later publication includes the retained evidence. This does
+not authorize overwriting known attribution or accepting a different closure.
 
 Row receipt version 2 also protects upgrades from older binaries that could
 acknowledge a conflicting source without resolving it. Legacy receipts do not

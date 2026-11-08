@@ -317,9 +317,9 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     // Issue #243 established the cross-process authority boundary: serialize
     // all mutating operations through a blocking flock on
     // `.beads/.write.lock`. Strict observational opens never enter writable
-    // recovery. A read that needs an automatic import acquires authority
-    // below and repeats its advisory probes under that authority. After
-    // startup, it must hand off to a verified read snapshot before dispatch.
+    // recovery or automatic import. A read that finds changed JSONL requires
+    // explicit synchronization; its freshness probe never grants write
+    // authority. Mutation startup retains the existing automatic-import lane.
     let ordinary_database_authority_required = should_acquire_startup_write_lock(
         command_needs_write_lock,
         should_preopen_storage,
@@ -567,10 +567,10 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         None
     };
 
-    // Phase 3: Auto-Import. Normal staleness probes can opportunistically
-    // refresh JSONL witness metadata. Read-only startup probes skip that
-    // refresh and reopen writable storage only when an import is actually
-    // needed.
+    // Phase 3: Freshness and Auto-Import. Mutating startup can refresh witnesses
+    // and import. Read-only startup checks content freshness without changing
+    // metadata, including legacy receipts retained by a lossless migration.
+    // A changed source or a failed probe cannot promote a read to a writer.
     if let Some(paths) = ctx.paths.as_ref()
         && should_auto_import_now
         && storage_result.is_some()
@@ -618,14 +618,11 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
             ),
             None => Ok(false),
         };
-        let mut should_attempt_auto_import = import_probe.unwrap_or_else(|error| {
-            tracing::debug!(
-                target: "br::startup",
-                error = %error,
-                "Automatic-import probe failed; retrying under database-family authority"
-            );
-            true
-        });
+        let mut should_attempt_auto_import = resolve_auto_import_probe(
+            import_probe,
+            ctx.overrides.read_only_storage,
+            &paths.beads_dir,
+        )?;
 
         if should_attempt_auto_import {
             if (ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage)
@@ -1467,6 +1464,37 @@ fn resolve_auto_import_expected_prefix(
 ) -> Result<String> {
     let layer = storage_result.load_config(cli)?;
     Ok(config::id_config_from_layer(&layer).prefix)
+}
+
+/// A freshness finding does not grant write intent. Refuse a read before it can
+/// acquire import authority, reopen writable storage, or refresh witnesses.
+fn resolve_auto_import_probe(
+    probe: Result<bool>,
+    read_only_storage: bool,
+    beads_dir: &Path,
+) -> Result<bool> {
+    if read_only_storage {
+        if probe? {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Read-only command found JSONL changes requiring import in {}. \
+                     Run `br sync --import-only` in that workspace, or pass \
+                     `--allow-stale` or `--no-auto-import` to inspect the existing database \
+                     without changing it",
+                    beads_dir.display(),
+                ),
+            });
+        }
+        return Ok(false);
+    }
+    Ok(probe.unwrap_or_else(|error| {
+        tracing::debug!(
+            target: "br::startup",
+            error = %error,
+            "Automatic-import probe failed; retrying under database-family authority"
+        );
+        true
+    }))
 }
 
 fn execute_create_command(
@@ -2705,8 +2733,8 @@ fn lock_mode_octal(_lock_path: &Path) -> Option<String> {
 fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
     // `--lock-timeout` deliberately does NOT disable the fast path. The
     // timeout governs how long to wait *when a lock is required*, and a
-    // strict read-only open acquires none. An automatic import still takes
-    // the write lock and honors the timeout. Gating on it meant
+    // strict read-only open acquires none. Mutating startup's automatic import
+    // still takes the write lock and honors the timeout. Gating on it meant
     // any scripted caller that passed `--lock-timeout` silently lost lock-free
     // reads and serialized every read command behind an exclusive flock,
     // which shows up as spurious lock-timeout failures under parallel reads.
@@ -3229,6 +3257,80 @@ mod tests {
                 "{args:?} has explicit mutation intent"
             );
         }
+    }
+
+    #[test]
+    fn read_startup_freshness_never_grants_import_authority() {
+        let beads_dir = Path::new("tracker/.beads");
+        for argv in [
+            vec!["br", "list"],
+            vec!["br", "stats"],
+            vec!["br", "status"],
+            vec!["br", "show", "bd-1"],
+            vec!["br", "lint", "bd-1"],
+        ] {
+            let cli = Cli::parse_from(argv);
+            let overrides = build_cli_overrides(&cli);
+            assert!(should_auto_import(&cli.command));
+            assert!(!should_acquire_startup_write_lock(
+                needs_write_lock(&cli.command),
+                true,
+                overrides.read_only_fast_open || overrides.read_only_storage,
+            ));
+            assert!(
+                !resolve_auto_import_probe(Ok(false), overrides.read_only_storage, beads_dir)
+                    .unwrap()
+            );
+
+            let changed =
+                resolve_auto_import_probe(Ok(true), overrides.read_only_storage, beads_dir)
+                    .expect_err("content changes require explicit synchronization");
+            assert!(matches!(&changed, BeadsError::SyncConflict { .. }));
+            let message = changed.to_string();
+            for instruction in ["br sync --import-only", "--allow-stale", "--no-auto-import"] {
+                assert!(message.contains(instruction), "{message}");
+            }
+
+            let error = resolve_auto_import_probe(
+                Err(BeadsError::Config("JSONL source is unreadable".to_string())),
+                overrides.read_only_storage,
+                beads_dir,
+            )
+            .expect_err("probe failure cannot authorize a writable retry");
+            assert!(matches!(
+                error,
+                BeadsError::Config(message) if message == "JSONL source is unreadable"
+            ));
+        }
+    }
+
+    #[test]
+    fn mutation_startup_retains_automatic_import_and_protected_retry() {
+        let cli = Cli::parse_from(["br", "create", "New work"]);
+        let overrides = build_cli_overrides(&cli);
+        let beads_dir = Path::new("tracker/.beads");
+        assert!(should_auto_import(&cli.command));
+        assert!(!overrides.read_only_storage);
+        assert!(should_acquire_startup_write_lock(
+            needs_write_lock(&cli.command),
+            true,
+            overrides.read_only_fast_open || overrides.read_only_storage,
+        ));
+        for pending in [false, true] {
+            assert_eq!(
+                resolve_auto_import_probe(Ok(pending), overrides.read_only_storage, beads_dir)
+                    .unwrap(),
+                pending
+            );
+        }
+        assert!(
+            resolve_auto_import_probe(
+                Err(BeadsError::Config("probe must be repeated".to_string())),
+                overrides.read_only_storage,
+                beads_dir,
+            )
+            .unwrap()
+        );
     }
 
     #[test]

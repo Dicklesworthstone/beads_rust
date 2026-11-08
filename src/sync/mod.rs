@@ -12730,13 +12730,14 @@ pub fn auto_import_probe_refreshing_witnesses(
                 != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)))
 }
 
-/// Check whether auto-import needs to inspect JSONL contents without mutating metadata.
+/// Check whether JSONL contains unobserved content without mutating metadata.
 ///
-/// This variant is intended for read-only startup probes. It deliberately skips
-/// the opportunistic JSONL witness refresh that
-/// [`auto_import_probe_refreshing_witnesses`] performs, so callers can use a
-/// read-only SQLite handle and reopen writable storage only if import work is
-/// actually needed.
+/// Read-only startup must distinguish content freshness from receipt-format
+/// maintenance. A release database can retain its matching JSONL hash and
+/// legacy receipts after a lossless schema upgrade; those receipts alone do
+/// not make its issue data stale. This probe never refreshes witnesses or asks
+/// a reader to upgrade receipts. Mutating callers use
+/// [`auto_import_probe_refreshing_witnesses`] to retain that maintenance.
 ///
 /// # Errors
 ///
@@ -12752,12 +12753,7 @@ pub fn auto_import_probe(
         validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
     }
     let probe = compute_jsonl_newer_impl(storage, jsonl_path)?;
-    Ok(probe.jsonl_newer
-        || (probe.jsonl_exists
-            && storage
-                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)?
-                .as_deref()
-                != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)))
+    Ok(probe.jsonl_newer)
 }
 
 fn compute_staleness_impl(
@@ -16008,6 +16004,52 @@ fn skipped_import_matches_stored_issue(
     stored.sync_equals(&expected)
 }
 
+/// A skipped automatic import may retain additional local facts without
+/// discarding anything supplied by the source. Comments have already been
+/// unioned by the importer. Legacy releases also omitted closure attribution
+/// from JSONL despite retaining it in the database (GitHub #596).
+///
+/// Fill only absent attribution in a comparison copy, and only for the exact
+/// same issue and closure. Conflicting supplied attribution, another closure,
+/// and every other scalar or relationship difference remain subject to the
+/// complete sync comparison. This does not certify the original source as an
+/// export of the database: the caller must retain the uncertified-local-win
+/// path so the original audit remains intact and later publication is needed.
+fn skipped_automatic_import_preserves_source(
+    stored: &Issue,
+    target_id: &str,
+    incoming: &Issue,
+) -> bool {
+    let mut retained = stored.clone();
+    let mut expected = incoming.clone();
+    if stored.id == target_id
+        && incoming.id == target_id
+        && stored.status == crate::model::Status::Closed
+        && incoming.status == crate::model::Status::Closed
+        && stored.created_at == incoming.created_at
+        && stored.closed_at.is_some()
+        && stored.closed_at == incoming.closed_at
+    {
+        canonicalize_closure_attribution(&mut expected);
+        for (known, supplied) in [
+            (&stored.closed_by, &mut expected.closed_by),
+            (
+                &stored.closed_by_agent_name,
+                &mut expected.closed_by_agent_name,
+            ),
+            (&stored.closed_by_harness, &mut expected.closed_by_harness),
+            (&stored.closed_by_model, &mut expected.closed_by_model),
+        ] {
+            if supplied.is_none() {
+                supplied.clone_from(known);
+            }
+        }
+    }
+    retained.comments.clear();
+    expected.comments.clear();
+    skipped_import_matches_stored_issue(Some(&retained), target_id, &expected)
+}
+
 /// Accept new evidence for the same closure without replacing any known
 /// attribution. Legacy JSONL and databases may predate the exported fields;
 /// neither the import actor nor a different closure can supply this evidence.
@@ -16170,13 +16212,7 @@ fn certify_skipped_imports(
         if !skipped_import_matches_stored_issue(stored.get(&id), &id, &incoming) {
             if mode == ImportMode::Automatic {
                 let preserves_source = stored.get(&id).is_some_and(|stored| {
-                    let mut stored = stored.clone();
-                    let mut incoming = incoming.clone();
-                    // Comments are append-only facts. Their union preserves
-                    // both sources even when the issue clock did not advance.
-                    stored.comments.clear();
-                    incoming.comments.clear();
-                    skipped_import_matches_stored_issue(Some(&stored), &id, &incoming)
+                    skipped_automatic_import_preserves_source(stored, &id, &incoming)
                 });
                 if !preserves_source {
                     // This error rolls back the entire import transaction,
@@ -25870,6 +25906,62 @@ mod tests {
     }
 
     #[test]
+    fn test_read_freshness_probe_does_not_upgrade_legacy_receipts() {
+        for version in [None, Some("1"), Some("2"), Some("3")] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+            fs::write(&jsonl_path, "{\"id\":\"bd-observed\"}\n").unwrap();
+            let source = fs::read(&jsonl_path).unwrap();
+            storage
+                .set_metadata(
+                    METADATA_JSONL_CONTENT_HASH,
+                    &compute_jsonl_hash(&jsonl_path).unwrap(),
+                )
+                .unwrap();
+            if let Some(version) = version {
+                storage
+                    .set_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION, version)
+                    .unwrap();
+            }
+            let metadata = storage
+                .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                .unwrap();
+            assert!(storage.get_jsonl_row_receipts().unwrap().is_empty());
+            assert!(!auto_import_probe(&storage, &beads_dir, &jsonl_path, false).unwrap());
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                    .unwrap(),
+                metadata,
+                "read probe changed metadata for receipt version {version:?}"
+            );
+            assert!(storage.get_jsonl_row_receipts().unwrap().is_empty());
+            assert_eq!(fs::read(&jsonl_path).unwrap(), source);
+
+            // A real writer still performs guarded legacy receipt backfill.
+            assert_eq!(
+                auto_import_probe_refreshing_witnesses(
+                    &mut storage,
+                    &beads_dir,
+                    &jsonl_path,
+                    false,
+                )
+                .unwrap(),
+                version != Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
+            );
+            storage
+                .set_metadata(METADATA_JSONL_UNIMPORTED_SOURCE, "true")
+                .unwrap();
+            assert!(auto_import_probe(&storage, &beads_dir, &jsonl_path, false).unwrap());
+            storage
+                .set_metadata(METADATA_JSONL_UNIMPORTED_SOURCE, "false")
+                .unwrap();
+            fs::write(&jsonl_path, "{\"id\":\"bd-unobserved\"}\n").unwrap();
+            assert!(auto_import_probe(&storage, &beads_dir, &jsonl_path, false).unwrap());
+        }
+    }
+
+    #[test]
     fn test_auto_import_if_stale_validates_external_path_before_hashing() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -28216,6 +28308,283 @@ mod tests {
             storage.get_metadata("needs_flush").unwrap().as_deref(),
             Some("true")
         );
+    }
+
+    #[test]
+    fn test_automatic_skip_retains_only_omitted_same_closure_attribution() {
+        let mut local = make_issue_at("bd-legacy-close", "Known closure", fixed_time(100));
+        local.status = Status::Closed;
+        local.closed_at = Some(fixed_time(100));
+        local.closed_by = Some("retained-operator".to_string());
+        local.closed_by_agent_name = Some("retained-agent".to_string());
+        local.closed_by_harness = Some("retained-harness".to_string());
+        local.closed_by_model = Some("retained-model".to_string());
+        local.labels = vec!["retained-label".to_string()];
+
+        for omitted in ["actor", "agent", "harness", "model", "all"] {
+            let mut incoming = local.clone();
+            match omitted {
+                "actor" => incoming.closed_by = None,
+                "agent" => incoming.closed_by_agent_name = None,
+                "harness" => incoming.closed_by_harness = None,
+                "model" => incoming.closed_by_model = None,
+                _ => {
+                    incoming.closed_by = None;
+                    incoming.closed_by_agent_name = None;
+                    incoming.closed_by_harness = None;
+                    incoming.closed_by_model = None;
+                }
+            }
+            assert!(!skipped_import_matches_stored_issue(
+                Some(&local),
+                &local.id,
+                &incoming
+            ));
+            assert!(
+                skipped_automatic_import_preserves_source(&local, &local.id, &incoming),
+                "omitted {omitted} must not erase retained evidence"
+            );
+        }
+
+        for conflict in [
+            "actor",
+            "agent",
+            "harness",
+            "model",
+            "created_at",
+            "closed_at",
+            "missing_close",
+            "identity",
+            "title",
+            "labels",
+        ] {
+            let mut incoming = local.clone();
+            incoming.closed_by = None;
+            incoming.closed_by_agent_name = None;
+            incoming.closed_by_harness = None;
+            incoming.closed_by_model = None;
+            match conflict {
+                "actor" => incoming.closed_by = Some("different-operator".to_string()),
+                "agent" => incoming.closed_by_agent_name = Some("different-agent".to_string()),
+                "harness" => incoming.closed_by_harness = Some("different-harness".to_string()),
+                "model" => incoming.closed_by_model = Some("different-model".to_string()),
+                "created_at" => incoming.created_at = fixed_time(10),
+                "closed_at" => incoming.closed_at = Some(fixed_time(90)),
+                "missing_close" => incoming.closed_at = None,
+                "identity" => incoming.id = "bd-other-identity".to_string(),
+                "title" => incoming.title = "Different payload".to_string(),
+                _ => incoming.labels.clear(),
+            }
+            assert!(
+                !skipped_automatic_import_preserves_source(&local, &local.id, &incoming),
+                "{conflict} must still require explicit reconciliation"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_auto_import_backfills_legacy_receipts_without_erasing_close_attribution() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        let mut local = make_issue_at("bd-legacy-close", "Released closure", fixed_time(100));
+        local.status = Status::Closed;
+        local.closed_at = Some(fixed_time(100));
+        local.closed_by_agent_name = Some("release-agent".to_string());
+        local.closed_by_harness = Some("release-harness".to_string());
+        local.closed_by_model = Some("release-model".to_string());
+        storage.upsert_issue_for_import(&local).unwrap();
+        storage
+            .execute_raw_with_params(
+                "INSERT INTO events (issue_id, event_type, actor, comment) \
+                 VALUES (?, 'closed', 'release-operator', 'Database-only closure history')",
+                &[SqliteValue::from(local.id.as_str())],
+            )
+            .unwrap();
+        storage
+            .set_export_hash(&local.id, &local.compute_content_hash())
+            .unwrap();
+
+        // v0.7.6 stored these attribution fields locally but omitted them
+        // from JSONL. Shape migration adds the receipt table and preserves
+        // the version-1 metadata, including the matching source hash.
+        let mut legacy = local.clone();
+        legacy.closed_by_agent_name = None;
+        legacy.closed_by_harness = None;
+        legacy.closed_by_model = None;
+        write_jsonl_issues(&jsonl_path, &[&legacy]);
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+        let legacy_hashes = jsonl_row_hashes(&source).unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, source.content_sha256())
+            .unwrap();
+        storage
+            .set_metadata(
+                METADATA_JSONL_ROW_HASHES,
+                &serde_json::to_string(&legacy_hashes).unwrap(),
+            )
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION, "1")
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_UNIMPORTED_SOURCE, "false")
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+        assert!(storage.get_jsonl_row_receipts().unwrap().is_empty());
+        let original_issue = issue_with_exported_close_audit(&storage, &local.id);
+        let original_audit = storage
+            .execute_raw_query("SELECT rowid, * FROM close_metadata ORDER BY rowid")
+            .unwrap();
+        let original_events = storage
+            .execute_raw_query("SELECT rowid, * FROM events ORDER BY rowid")
+            .unwrap();
+        let original_source = fs::read(&jsonl_path).unwrap();
+        assert!(!auto_import_probe(&storage, &beads_dir, &jsonl_path, false).unwrap());
+        assert!(
+            auto_import_probe_refreshing_witnesses(&mut storage, &beads_dir, &jsonl_path, false,)
+                .unwrap()
+        );
+
+        let imported = auto_import_if_stale(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            Some("bd"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect("a guarded writer can retain the same closure's omitted release evidence");
+        assert!(imported.attempted);
+        assert_eq!(imported.imported_count, 0);
+        assert_eq!(
+            issue_with_exported_close_audit(&storage, &local.id),
+            original_issue
+        );
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, * FROM close_metadata ORDER BY rowid")
+                .unwrap(),
+            original_audit
+        );
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, * FROM events ORDER BY rowid")
+                .unwrap(),
+            original_events
+        );
+        assert_eq!(fs::read(&jsonl_path).unwrap(), original_source);
+        assert_eq!(storage.get_jsonl_row_receipts().unwrap(), legacy_hashes);
+        assert_eq!(
+            storage
+                .get_metadata(METADATA_JSONL_ROW_RECEIPT_VERSION)
+                .unwrap()
+                .as_deref(),
+            Some(CURRENT_JSONL_ROW_RECEIPT_VERSION)
+        );
+        assert!(
+            storage
+                .get_metadata(METADATA_JSONL_ROW_HASHES)
+                .unwrap()
+                .is_none()
+        );
+        assert!(storage.get_export_hash(&local.id).unwrap().is_none());
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+
+        let published = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            None,
+            HistoryConfig::default(),
+        )
+        .unwrap();
+        assert!(published.flushed);
+        let exported = read_issues_from_jsonl(&jsonl_path).unwrap().remove(0);
+        assert_eq!(exported.closed_by_agent_name, local.closed_by_agent_name);
+        assert_eq!(exported.closed_by_harness, local.closed_by_harness);
+        assert_eq!(exported.closed_by_model, local.closed_by_model);
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, * FROM close_metadata ORDER BY rowid")
+                .unwrap(),
+            original_audit
+        );
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, * FROM events ORDER BY rowid")
+                .unwrap(),
+            original_events
+        );
+    }
+
+    #[test]
+    fn test_auto_import_conflicting_close_attribution_rolls_back_prior_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+        let mut local = make_issue_at("bd-retained-close", "Retained closure", fixed_time(100));
+        local.status = Status::Closed;
+        local.closed_at = Some(fixed_time(100));
+        local.closed_by_agent_name = Some("retained-agent".to_string());
+        local.closed_by_harness = Some("retained-harness".to_string());
+        storage.upsert_issue_for_import(&local).unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        let original_issues = storage
+            .execute_raw_query("SELECT rowid, * FROM issues ORDER BY rowid")
+            .unwrap();
+        let original_audit = storage
+            .execute_raw_query("SELECT rowid, * FROM close_metadata ORDER BY rowid")
+            .unwrap();
+        let original_metadata = storage
+            .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+            .unwrap();
+
+        let earlier_insert = make_issue_at("bd-before-conflict", "Must roll back", fixed_time(200));
+        let mut incoming = local.clone();
+        incoming.closed_by_agent_name = Some("conflicting-agent".to_string());
+        incoming.closed_by_harness = None;
+        write_jsonl_issues(&jsonl_path, &[&earlier_insert, &incoming]);
+        let source = fs::read(&jsonl_path).unwrap();
+        let error = auto_import_if_stale(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            Some("bd"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect_err("omitted evidence must not hide a conflicting supplied value");
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert!(storage.get_issue(&earlier_insert.id).unwrap().is_none());
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, * FROM issues ORDER BY rowid")
+                .unwrap(),
+            original_issues
+        );
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, * FROM close_metadata ORDER BY rowid")
+                .unwrap(),
+            original_audit
+        );
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                .unwrap(),
+            original_metadata
+        );
+        assert!(storage.get_jsonl_row_receipts().unwrap().is_empty());
+        assert_eq!(fs::read(&jsonl_path).unwrap(), source);
     }
 
     #[test]

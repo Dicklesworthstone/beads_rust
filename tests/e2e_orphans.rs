@@ -8,7 +8,9 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env, run_br_with_stdin};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use tracing::info;
 
@@ -98,6 +100,25 @@ fn rewrite_jsonl_issue_as_closed(workspace: &BrWorkspace, issue_id: &str) {
         .join("\n");
 
     fs::write(&jsonl_path, format!("{rewritten}\n")).expect("write issues.jsonl");
+}
+
+fn tracker_artifacts(workspace: &BrWorkspace) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let root = workspace.root.join(".beads");
+    let mut directories = vec![root.clone()];
+    let mut files = BTreeMap::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(&root).unwrap().to_path_buf();
+            if path.is_dir() {
+                files.insert(relative, None);
+                directories.push(path);
+            } else {
+                files.insert(relative, Some(fs::read(path).unwrap()));
+            }
+        }
+    }
+    files
 }
 
 fn imported_issue_from_seed(seed_issue: &Value, id: &str, title: &str, description: &str) -> Value {
@@ -231,9 +252,9 @@ fn e2e_orphans_detects_open_issue_in_commit() {
 }
 
 #[test]
-fn e2e_orphans_auto_imports_newer_jsonl_before_scanning_issue_state() {
+fn e2e_orphans_requires_explicit_import_of_changed_jsonl() {
     common::init_test_logging();
-    info!("e2e_orphans_auto_imports_newer_jsonl_before_scanning_issue_state: starting");
+    info!("e2e_orphans_requires_explicit_import_of_changed_jsonl: starting");
     let workspace = BrWorkspace::new();
 
     init_git(&workspace, "git_init");
@@ -256,7 +277,32 @@ fn e2e_orphans_auto_imports_newer_jsonl_before_scanning_issue_state() {
 
     rewrite_jsonl_issue_as_closed(&workspace, &issue_id);
 
-    let orphans = run_br(&workspace, ["orphans"], "orphans_auto_import");
+    let before = tracker_artifacts(&workspace);
+    let refused = run_br(&workspace, ["orphans"], "orphans_refuses_implicit_import");
+    assert_eq!(refused.status.code(), Some(6), "{refused:?}");
+    let message = format!("{}{}", refused.stdout, refused.stderr);
+    assert!(message.contains("br sync --import-only"), "{message}");
+    assert_eq!(tracker_artifacts(&workspace), before);
+
+    for opt_out in ["--allow-stale", "--no-auto-import"] {
+        let original = run_br(
+            &workspace,
+            ["orphans", opt_out],
+            "orphans_original_database",
+        );
+        assert!(original.status.success(), "{original:?}");
+        assert!(original.stdout.contains(&issue_id), "{}", original.stdout);
+        assert_eq!(tracker_artifacts(&workspace), before);
+    }
+
+    let imported = run_br(
+        &workspace,
+        ["sync", "--import-only", "--json"],
+        "orphans_explicit_import",
+    );
+    assert!(imported.status.success(), "{imported:?}");
+    let imported_files = tracker_artifacts(&workspace);
+    let orphans = run_br(&workspace, ["orphans"], "orphans_after_explicit_import");
     assert!(
         orphans.status.success(),
         "orphans failed: {}",
@@ -264,10 +310,19 @@ fn e2e_orphans_auto_imports_newer_jsonl_before_scanning_issue_state() {
     );
     assert!(
         orphans.stdout.contains("No orphan"),
-        "expected auto-imported closed issue to disappear from orphan list, got: {}",
+        "expected explicitly imported closed issue to disappear from orphan list, got: {}",
         orphans.stdout
     );
-    info!("e2e_orphans_auto_imports_newer_jsonl_before_scanning_issue_state: assertions passed");
+    let shown = run_br(
+        &workspace,
+        ["show", &issue_id, "--json"],
+        "orphans_imported_closed_issue",
+    );
+    assert!(shown.status.success(), "{shown:?}");
+    let issues: Value = serde_json::from_str(&shown.stdout).unwrap();
+    assert_eq!(issues[0]["status"], "closed");
+    assert_eq!(tracker_artifacts(&workspace), imported_files);
+    info!("e2e_orphans_requires_explicit_import_of_changed_jsonl: assertions passed");
 }
 
 #[test]

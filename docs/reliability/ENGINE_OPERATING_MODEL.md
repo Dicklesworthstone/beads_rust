@@ -95,35 +95,32 @@ checkpoints are skipped while peers are present; `br doctor` reports `wal_size`
 and the sole-opener state (`beads_rust-dk45.5` adds an `engine` block with the
 lease holder).
 
-### Read startup authority handoff (#586)
+### Observational read startup (#585, #586, #596)
 
-Read intent and writer authority have separate lifetimes. Ordinary reads never
-request schema migration or recovery of the original family (#585), but a
-freshness probe may require an automatic import. That escalation must retain
-the same workspace, canonical-path and database-inode authority through the
-protected freshness/pending-merge reprobe, the import, and writable teardown.
+Ordinary reads never request schema migration, recovery, automatic import, or
+receipt maintenance on the original family. Their freshness probe compares
+source content without refreshing stored witnesses. Changed JSONL produces
+`SYNC_CONFLICT` with explicit `br sync --import-only` guidance; `--allow-stale`
+or `--no-auto-import` selects the existing database view. A probe failure also
+returns without a writable retry. Receipt-format differences alone do not
+make otherwise unchanged content stale. This preserves the installed state
+and guarded undo after a lossless release-layout upgrade.
 
-Before an automatic import begins, read-startup admission cooperatively honors
-shutdown requests at each authority component, including fair-queue registration.
-Cancellation releases partial acquisitions and the caller's own waiter entry;
-it does not wait for the lock holder to finish or start the pending import.
-The CLI preserves the signal's exit status without rendering query output.
-Mutating commands, recovery and cleanup retain their existing acquisition
-semantics, and an already-started import retains protected completion and close.
-These checkpoints do not impose a hard wall-clock bound on filesystem calls.
+Reads do not join the writer queue to satisfy freshness. Mutating commands
+retain automatic import under the same workspace, canonical-path and
+database-inode authority through the protected freshness/pending-merge
+reprobe, import and writable teardown. An already-started write retains
+protected completion and close; read intent never releases authority in the
+middle of a write to satisfy a timeout.
 
-Before command dispatch, `OpenStorageResult::finish_read_only_startup` verifies
-the routing and authority, captures and verifies a private database family,
-and closes the writable connection while its authority is still live. The
-existing sole-opener checkpoint gate remains in force during that close. The
-CLI override markers and top-level guard release their tokens before this
-consuming handoff; the context and storage retain authority through capture
-and teardown, then release it before the private copy is opened. Private WAL
-recovery, integrity checks, and runtime schema attestation must finish before
-query execution, but no longer retain authority over the original family.
-An existing protected read snapshot can be reused without another capture.
+Before dispatch, `OpenStorageResult::finish_read_only_startup` normally reuses
+the existing verified private snapshot. Its defensive handoff still handles
+a context retaining writer authority: verify routing, capture and verify the
+family, close writable storage under the sole-opener checkpoint gate, then
+release all authority before opening the copy. Private WAL recovery, integrity
+checks, and runtime schema attestation must finish before query execution.
 A shared lock on `.write.lock` would still exclude writers and is not an
-appropriate downgrade.
+appropriate read policy.
 
 Private snapshot admission must also validate surviving namespace transition
 evidence. A missing `-fsqlite-ns-gate` must not make the engine ignore an
@@ -144,16 +141,15 @@ observational plan; real routed deletions retain authority through planning,
 application, and writable teardown.
 
 Pending-merge verdicts disable automatic synchronization before any subsequent
-storage action, but their user-facing warnings are deferred until this handoff
-has completed. Backpressure on stderr must not retain authority for a warning
-after the no-import decision is final. Likewise, the automatic-import path
-must acquire its nonblocking sync lock before reopening writable storage. A
-busy sync lock leaves the protected private snapshot intact and avoids an
-unnecessary live open, teardown, and second capture.
+storage action, but their user-facing warnings are deferred until read startup
+has completed. Backpressure on stderr must not retain writer authority for a
+warning. Command-local and routed reads enforce the same content-only freshness
+boundary; external dependency status probes inspect existing peer databases
+without synchronizing them.
 
 The CLI's tracing stderr writer also defers diagnostics for the entire read
-startup scope. This covers nested import and engine traces, partial lock
-acquisition, and destructor diagnostics, not just the final handoff event.
+startup scope. This covers engine traces and destructor diagnostics, not just
+the final handoff event.
 The scope starts before storage or authority owners exist and ends after the
 handoff; on early return its destructor runs after those owners have unwound.
 All logging threads share the deferral state, and no stderr write or flush
@@ -165,24 +161,22 @@ before dispatching its query.
 The CLI configures only this stderr sink; the library's optional JSON log file
 writer has its own immediate-output behavior.
 
-The non-repairing reopen for automatic import also refuses a torn WAL or a WAL
+The non-repairing reopen for mutating startup's automatic import refuses a torn WAL or a WAL
 index that requires recovery before entering the writable engine open. A private
 read snapshot's successful recovery does not authorize repair of the live family.
 This keeps the sole-opener, preserved-evidence and reviewed-recovery requirements
 in force; a healthy WAL remains eligible for an ordinary import.
 The refusal classifies recovery needs using the engine's on-disk index behavior,
 independently of platform quarantine support. An unsupported quarantine operation
-cannot authorize implicit live index repair during a read's automatic import.
+cannot authorize implicit live index repair during automatic import.
 
 The snapshot retains the committed startup state independently of later writes
 or database-family replacement. An unfinished recovery or an unverifiable
 snapshot refuses the command; it never falls back to a long read under exclusive
-authority. The acquisition deadline is unchanged and is not a wall-clock bound
-on required imports, checkpoints, or filesystem calls. No authority is released
-in the middle of a write or recovery operation to satisfy a timeout. The
-earlier protected freshness/pending-merge reprobe also retains authority
-because its verdict authorizes the subsequent import; the post-startup
-handoff does not change that decision protocol.
+authority. Acquisition deadlines are not wall-clock bounds on required imports,
+checkpoints, or filesystem calls. A mutating startup's protected
+freshness/pending-merge reprobe retains authority because its verdict authorizes
+the subsequent import.
 
 ### Runtime layout identity and explicit upgrades (#596)
 

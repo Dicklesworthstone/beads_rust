@@ -419,9 +419,10 @@ pub(super) fn auto_import_storage_ctx_if_stale(
     let expected_prefix = crate::config::id_config_from_layer(&config_layer).prefix;
 
     if cli.read_only_storage {
-        // A command-local or routed read does not own main's checked
-        // reopen protocol. It may inspect freshness, but must never convert
-        // its observation handle into a writable import or witness refresh.
+        // Command-local, routed, and main startup reads share the same
+        // observational intent. Only changed source content requires sync;
+        // legacy receipt bookkeeping alone must neither block a compatible
+        // database read nor authorize an import or witness refresh.
         if !cli.allow_stale.unwrap_or(false)
             && !no_auto_import
             && auto_import_probe(
@@ -435,7 +436,8 @@ pub(super) fn auto_import_storage_ctx_if_stale(
                 message: format!(
                     "Read-only command found JSONL changes requiring import in {}. \
                      Run `br sync --import-only` in that workspace, or pass \
-                     `--no-auto-import` to inspect the existing database",
+                     `--allow-stale` or `--no-auto-import` to inspect the existing database \
+                     without changing it",
                     storage_ctx.paths.beads_dir.display(),
                 ),
             });
@@ -1047,6 +1049,43 @@ mod tests {
         );
         assert_eq!(fs::read(&paths.jsonl_path).unwrap(), jsonl_before);
         assert!(!paths.beads_dir.join(".br_recovery").exists());
+    }
+
+    #[test]
+    fn strict_read_only_local_freshness_preserves_legacy_receipts() {
+        let (_temp, mut original) = storage_ctx_with_exported_issue();
+        let paths = original.paths.clone();
+        let hash = crate::sync::compute_jsonl_hash(&paths.jsonl_path).unwrap();
+        original
+            .storage
+            .set_metadata("jsonl_content_hash", &hash)
+            .unwrap();
+        original
+            .storage
+            .set_metadata("jsonl_unimported_source", "false")
+            .unwrap();
+        original
+            .storage
+            .set_metadata("jsonl_row_receipt_version", "1")
+            .unwrap();
+        original
+            .storage
+            .set_metadata("jsonl_row_hashes", &format!("{{\"bd-1\":\"{hash}\"}}"))
+            .unwrap();
+        let records = raw_storage_record_state(&original.storage);
+        drop(original);
+        let before = tracker_artifact_snapshot(&paths.beads_dir);
+        let cli = CliOverrides {
+            read_only_storage: true,
+            ..CliOverrides::default()
+        };
+        let mut storage_ctx = open_storage_with_cli(&paths.beads_dir, &cli).unwrap();
+
+        auto_import_storage_ctx_if_stale(&mut storage_ctx, &cli)
+            .expect("unchanged JSONL does not require receipt backfill for a read");
+        assert_eq!(raw_storage_record_state(&storage_ctx.storage), records);
+        drop(storage_ctx);
+        assert_eq!(tracker_artifact_snapshot(&paths.beads_dir), before);
     }
 
     #[test]

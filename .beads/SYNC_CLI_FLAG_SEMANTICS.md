@@ -86,6 +86,20 @@ br sync --reconcile-additive --resolve-source-id bd-x
 
 ---
 
+### 2.3 Ordinary Reads and Startup Synchronization
+
+An ordinary read never performs import, witness refresh, or receipt backfill.
+With freshness checks enabled, changed JSONL returns `SYNC_CONFLICT` and directs
+the operator to `br sync --import-only`. `--allow-stale`, `--no-auto-import`, or
+configured `no-auto-import` deliberately selects the existing database view.
+These flags do not authorize schema repair or bypass snapshot validation.
+Unchanged content with legacy receipt metadata remains readable without writes,
+including immediately after a reviewed release-layout upgrade.
+
+Mutating commands retain automatic import when enabled. Their import conflict,
+orphan-preservation, workflow and publication guards still apply before command
+dispatch. Explicit sync retains its own mode-specific validation and authority.
+
 ## 3. Safety Guards and Their Bypass Flags
 
 ### 3.1 Export Safety Guards

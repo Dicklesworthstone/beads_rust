@@ -44,6 +44,25 @@ fn checked_br(workspace: &BrWorkspace, args: &[&str], label: &str) -> common::cl
     result
 }
 
+/// Exercise Automatic import under genuine mutation intent without adding
+/// issues or dirtying existing rows. This absent-label removal is a no-op;
+/// disabling its flush retains the import's pending-publication evidence.
+fn import_before_noop_mutation(workspace: &BrWorkspace, id: &str, label: &str) {
+    checked_br(
+        workspace,
+        &[
+            "label",
+            "remove",
+            id,
+            "--label",
+            "absent-import-probe",
+            "--no-auto-flush",
+            "--json",
+        ],
+        label,
+    );
+}
+
 fn git(workspace: &BrWorkspace, args: &[&str]) {
     let result = std::process::Command::new("git")
         .current_dir(&workspace.root)
@@ -685,7 +704,7 @@ fn implicit_import_combines_comments_with_non_advancing_issue_timestamps() {
         }
         write_jsonl_records(&path, &incoming);
         let source_before = fs::read(&path).expect("incoming comment bytes");
-        checked_br(&workspace, &["list", "--json"], "import_comment_union");
+        import_before_noop_mutation(&workspace, "bd-shared", "import_comment_union");
         assert_eq!(fs::read(&path).unwrap(), source_before);
         let stored: Issue = serde_json::from_value(show_without_sync(
             &workspace,
@@ -864,11 +883,7 @@ fn legacy_clean_receipts_publish_disjoint_work_before_guarded_import() {
             );
         } else {
             let source_before = fs::read(&path).expect("upgraded source");
-            checked_br(
-                &workspace,
-                &["list", "--json"],
-                "certify_unchanged_legacy_rows",
-            );
+            import_before_noop_mutation(&workspace, "bd-shared", "certify_unchanged_legacy_rows");
             assert_eq!(fs::read(&path).unwrap(), source_before);
             let metadata = sync_metadata(&workspace);
             assert_eq!(metadata["jsonl_unimported_source"], "false");
@@ -951,7 +966,7 @@ fn legacy_empty_source_records_omissions_before_later_full_flush() {
         "true",
         "a partial v2 receipt must not clear pending omissions without importing"
     );
-    checked_br(&workspace, &["list", "--json"], "record_legacy_omissions");
+    import_before_noop_mutation(&workspace, &keeper_id, "record_legacy_omissions");
     let metadata = sync_metadata(&workspace);
     assert_eq!(metadata["jsonl_unimported_source"], "false");
     let recorded: BTreeSet<String> = serde_json::from_str(&metadata["import_omitted_ids"])
@@ -966,7 +981,7 @@ fn legacy_empty_source_records_omissions_before_later_full_flush() {
         "keeper_local_comment",
     );
     add_peer_comment(&path, &keeper_id);
-    checked_br(&workspace, &["list", "--json"], "keeper_comment_union");
+    import_before_noop_mutation(&workspace, &keeper_id, "keeper_comment_union");
     let witness = sync_witness(&workspace);
     assert_eq!(witness.metadata["needs_flush"], "true");
     let mutation = checked_br(
@@ -1251,7 +1266,7 @@ fn incremental_export_preserves_unread_peer_comments_until_import() {
 }
 
 #[test]
-fn incremental_export_keeps_unrelated_peer_changes_pending_for_auto_import() {
+fn incremental_export_keeps_unrelated_peer_changes_pending_for_explicit_import() {
     let workspace = BrWorkspace::new();
     checked_br(&workspace, &["init", "--prefix", "bd"], "init");
     let peer = parse_created_id(&checked_br(&workspace, &["create", "Peer"], "peer").stdout);
@@ -1265,7 +1280,19 @@ fn incremental_export_keeps_unrelated_peer_changes_pending_for_auto_import() {
         &["create", "Safe append", "--no-auto-import", "--allow-stale"],
         "append",
     );
-    let shown = checked_br(&workspace, &["show", &peer, "--json"], "auto_import");
+    let before = import_database_state(&workspace);
+    let source = fs::read(&path).unwrap();
+    let refused = run_br(
+        &workspace,
+        ["show", &peer, "--json"],
+        "read_requires_import",
+    );
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(refused.stdout.contains("sync --import-only"), "{refused:?}");
+    assert_eq!(import_database_state(&workspace), before);
+    assert_eq!(fs::read(&path).unwrap(), source);
+    checked_br(&workspace, &["sync", "--import-only"], "explicit_import");
+    let shown = checked_br(&workspace, &["show", &peer, "--json"], "after_import");
     assert!(shown.stdout.contains("Pulled peer title"));
 }
 
@@ -1283,7 +1310,7 @@ fn branch_switch_imports_peer_edits_and_comments_before_mutation() {
     let local_id = parse_created_id(&local.stdout);
     commit_jsonl(&workspace, "feature issue");
     git(&workspace, &["checkout", "main"]);
-    checked_br(&workspace, &["list", "--json"], "after_checkout");
+    import_before_noop_mutation(&workspace, &shared_id, "after_checkout");
     assert!(dirty_ids(&workspace).is_empty());
     assert_eq!(sync_metadata(&workspace)["needs_flush"], "false");
 
@@ -1346,7 +1373,8 @@ fn peer_purge_is_not_undone_by_subsequent_mutation() {
     for tombstone in [false, true] {
         let workspace = BrWorkspace::new();
         checked_br(&workspace, &["init", "--prefix", "bd"], "init");
-        checked_br(&workspace, &["create", "Keeper"], "keeper");
+        let keeper_id =
+            parse_created_id(&checked_br(&workspace, &["create", "Keeper"], "keeper").stdout);
         let victim = checked_br(&workspace, &["create", "Peer purge victim"], "victim");
         let victim_id = parse_created_id(&victim.stdout);
         if tombstone {
@@ -1363,7 +1391,7 @@ fn peer_purge_is_not_undone_by_subsequent_mutation() {
             "peer_purge",
         );
         fs::copy(peer.root.join(".beads/issues.jsonl"), &path).expect("pull purge");
-        checked_br(&workspace, &["list", "--json"], "import_purge");
+        import_before_noop_mutation(&workspace, &keeper_id, "import_purge");
         checked_br(&workspace, &["create", "After peer purge"], "mutate");
         assert!(
             !jsonl_records(&path)
@@ -2299,8 +2327,21 @@ fn import_keeps_a_close_that_the_workflow_policy_cannot_undo() {
         } = issue_540_workspace();
         let peer_bytes = fs::read(&path).expect("peer generation");
 
-        // An ordinary command refuses before it runs and changes nothing.
-        let refused = run_br(&workspace, ["list", "--json"], "implicit_import");
+        // Mutation startup still exercises the workflow guard; a read now
+        // refuses changed JSONL before running the importer at all.
+        let refused = run_br(
+            &workspace,
+            [
+                "label",
+                "remove",
+                &id,
+                "--label",
+                "absent-import-probe",
+                "--no-auto-flush",
+                "--json",
+            ],
+            "implicit_import",
+        );
         assert_sync_conflict(&refused);
         assert!(
             refused.stdout.contains("workflow.transitions") && refused.stdout.contains(&id),
@@ -2731,7 +2772,7 @@ const BYPASS_DEAD_END_POLICY: &str = "workflow:\n  strict: true\n  statuses: [op
 /// GitHub #540: `br close --bypass-policy` out of a dead end that
 /// `workflow.transitions` does not let `closed` follow, with no close policy
 /// or gate configured, records the bypass on the exported row, so a peer's
-/// ordinary command applies the close instead of refusing it as a status the
+/// mutating command applies the close instead of refusing it as a status the
 /// policy cannot reach.
 #[test]
 fn transition_only_bypass_close_reaches_a_peer() {
@@ -2787,9 +2828,15 @@ fn transition_only_bypass_close_reaches_a_peer() {
     );
     commit_publication(&local, "bypassed close", false);
 
-    // The peer's next ordinary command imports the close and its audit.
+    // Mutation startup imports the close and its audit. A query must leave
+    // both sources unchanged until that synchronization is authorized.
     pull_peer(&peer, &local);
-    checked_br(&peer, &["list", "--json"], "peer_auto_import");
+    let before = import_database_state(&peer);
+    let refused = run_br(&peer, ["list", "--json"], "peer_read_requires_import");
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(refused.stdout.contains("sync --import-only"), "{refused:?}");
+    assert_eq!(import_database_state(&peer), before);
+    import_before_noop_mutation(&peer, &id, "peer_auto_import");
     let shown = show_without_sync(&peer, &id, "peer_closed");
     assert_eq!(shown["status"], "closed", "{shown}");
     assert_eq!(

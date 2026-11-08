@@ -128,7 +128,7 @@ are visible in that command. The original database has not been upgraded.
 | Failure class | Symptom signature | Likely root cause | Observability surface | Data-loss risk | Desired system response |
 |---------------|-------------------|-------------------|-----------------------|----------------|-------------------------|
 | Database locked / concurrent writer | Mutating command fails or waits on lock acquisition | Multiple agents or shells writing the same workspace simultaneously | Lock timeout errors, verbose logs, active process list | Low to medium | Fail or retry cleanly; never reinterpret a lock as corruption, and keep the operator-visible error distinct from recovery flows |
-| Interleaved read/write staleness | One actor reads stale DB state while another updated JSONL or performed import/export | Missing import before read, overlapping sessions, long-lived processes | `br sync --status`, auto-import warnings, surprising ready/list results | Medium | Current-schema auto-import requires a positive freshness probe and write authority. Use `br sync --import-only` when a routed read refuses stale data, or `--no-auto-import` to inspect the existing database; keep stale-export guards enabled |
+| Interleaved read/write staleness | A read reports JSONL changes awaiting import, or an explicitly stale view omits peer changes | Missing import before read, overlapping sessions, long-lived processes | `br sync --status`, `SYNC_CONFLICT`, explicit stale-view flags | Medium | Reads remain non-mutating. Use `br sync --import-only` to import, or `--allow-stale` / `--no-auto-import` to inspect the existing database; keep stale-export guards enabled |
 | Existing-workspace assumptions hidden by hermetic tests | Commands work in fresh tempdirs but fail in long-lived or ambient-env workspaces | Test harness isolates env too aggressively, latent dependency on preexisting files/config | Non-hermetic smoke runs, field repros, ambient-env regressions | Medium | Keep a lightweight smoke profile against existing workspaces and preserve selected ambient env variables in regression coverage |
 | Multiple agents sharing one workspace with different local state | Different shells see different config/env resolution and reach different conclusions about safety | Divergent `HOME`, config files, env overrides, manually edited `.beads/` artifacts | `br config list -v`, shell env, agent repro transcripts | Medium | Make path/config provenance explicit in diagnostics so multi-actor sessions converge on the same effective workspace before mutating it |
 
@@ -677,19 +677,19 @@ before a read command starts its query or renders output. A slow search or a
 blocked stdout pipe must not extend that critical section.
 
 Ordinary reads open a coherent private snapshot of the current database. If an
-automatic-import probe finds work, the command can still join the writer queue.
-It then reopens the canonical database and checks freshness and pending-merge
-state again under the same database-family authority. When startup finishes,
-the command copies the database family and rechecks the original identities,
-metadata, and contents, then closes the writable connection while authority is
-still held. It releases every retained authority token before hashing the
-private copy against the captured source digests. That check rejects changed
-or unexpectedly appeared private components before namespace changes or engine
-access. Opening the private copy, recovering its WAL index if necessary, and
-checking its integrity and runtime schema also happen after authority ends.
-Those final private checks must succeed before query execution. The result
-describes the captured snapshot; a later writer's changes appear in a later
-command.
+enabled freshness probe finds changed JSONL, the command returns `SYNC_CONFLICT`
+with `br sync --import-only` guidance. It does not join the writer queue or
+promote the read into an import. `--allow-stale` or `--no-auto-import` selects
+the existing database view. Receipt-format maintenance alone does not require
+synchronization for a read, including after a release-layout upgrade.
+
+The command captures the database family and rechecks original identities,
+metadata and contents. It verifies the private copy against captured digests
+before namespace admission or engine access. Private WAL recovery, integrity
+checks and runtime-schema checks must succeed before query execution. The
+result describes that captured snapshot; a later writer's changes appear in a
+later command. A failed freshness or snapshot probe never authorizes a writable
+retry against the original family.
 
 The same read intent applies to `br delete --dry-run`, including IDs routed to
 another workspace. A preview does not acquire the destination's write lock or
@@ -702,18 +702,14 @@ untouched. They do not flush dirty database records, create a missing JSONL
 snapshot, publish history, or update the last-touched ID. The pending changes
 remain available for a later real mutation or explicit synchronization.
 
-If the protected recheck discovers a pending merge, automatic synchronization
-is disabled immediately. Its warning is emitted after the read handoff has
-released authority, so a full stderr pipe cannot make that warning hold up
-other writers. If `.sync.lock` is already held, startup skips automatic import
-without opening the original database writable; it keeps the verified private
-snapshot already obtained by the recheck.
+If startup discovers a pending merge, automatic synchronization is disabled
+immediately. Its warning is emitted after read startup, so a full stderr pipe
+cannot make that warning hold up other writers.
 
 Tracing and warnings about unknown policy keys to stderr are buffered during
-read startup until its authority is released, including diagnostics from an
-import or connection teardown. Policy warnings remain visible even with logging
-disabled; a new unknown key discovered after queuing cannot make warning
-delivery retain writer authority. An error or interruption releases the retained
+read startup, including diagnostics from connection teardown. Policy warnings
+remain visible even with logging disabled; warning delivery cannot grant writer
+authority. An error or interruption releases the retained
 storage and lock owners before the buffer is drained. A full stderr pipe can
 therefore leave the read waiting to deliver diagnostics after startup, while
 another writer proceeds. The buffer retains
@@ -722,16 +718,9 @@ reports omitted middle bytes while preserving the startup and completion details
 Timestamps refer to when events occurred, so the delayed output can be used to
 reconstruct startup without treating delivery time as lock-hold time.
 An interruption received while those diagnostics drain is checked before query
-dispatch; an import that already committed remains committed.
+dispatch. A cancelled read does not start import or produce query output.
 
-A shutdown signal received while a read is waiting to start automatic import
-cancels that admission and releases any authority it has already acquired. The
-command exits with the signal's status without starting the import or producing
-query output, even if another process still holds the contested lock. Once an
-import has started, its safe completion and writable teardown remain protected;
-cancellation does not roll back an already committed import.
-
-Automatic import refuses a torn WAL or a WAL index that needs live recovery.
+Mutating startup's automatic import refuses a torn WAL or a WAL index that needs live recovery.
 A readable private snapshot is not permission to repair the original family.
 Inspect the reported condition with `br doctor --json` and use the applicable
 reviewed recovery procedure. Healthy WAL-backed databases remain eligible for
@@ -740,13 +729,13 @@ This refusal also applies on native Unix platforms where Beads cannot perform
 its verified quarantine procedure; unavailable recovery is not evidence that
 the live index is safe for a writable open.
 
-This handoff keeps normal writers serialized, preserves sole-opener checkpoint
-admission, and does not let database replacement change an in-flight query.
+These boundaries keep normal writers serialized, preserve sole-opener checkpoint
+admission, and do not let database replacement change an in-flight query.
 Incomplete recovery, changed database routing or identity, and an unavailable
 safe read snapshot cause an error before query execution. There is no fallback
-that executes the read while retaining writer authority. An import already
-committed before a later snapshot failure remains committed; that failure is
-not an import rollback.
+that executes the read while retaining writer authority. Explicit sync and
+automatic import during a mutation retain authority through their writes and
+writable teardown.
 
 An unfinished namespace transition also remains a refusal if its companion
 gate file is missing. A read validates surviving transition evidence inside its
@@ -756,18 +745,18 @@ it with `br doctor` before retrying. Healthy partial namespace layouts remain
 readable; missing one sidecar alone is not diagnosed as unfinished recovery.
 
 `--lock-timeout` bounds acquisition waits, not the duration of an import,
-checkpoint, filesystem I/O, query, or output operation. A required startup
-write can still occupy the lock while it completes safely. Increasing the
+checkpoint, filesystem I/O, query, or output operation. A mutating command's
+startup write can still occupy the lock while it completes safely. Increasing the
 timeout does not fix an excessively long holder. The protected import recheck
 also remains under authority because its decision permits a subsequent write;
 the final snapshot's private hashing, recovery, and validation do not. To read the
-current database without automatic synchronization, use:
+current database even when JSONL has changes awaiting import, use:
 
 ```bash
-br --no-auto-import --no-auto-flush search QUERY --all --json
+br --allow-stale search QUERY --all --json
 ```
 
-These flags do not make JSONL equivalent to the current database. `--no-db`
+Stale-view flags do not make JSONL equivalent to the current database. `--no-db`
 reads JSONL, which may omit database-only records. Older-schema issue queries
 can use that view only with the existing explicit warning; diagnostic commands
 inspect the original through their legacy-schema readers. Read commands never
@@ -785,10 +774,9 @@ At that revision, plausible routes into writable startup included the debugging
 override, an older or incomplete runtime schema, a read-only engine-open miss
 (including namespace permission repair), startup recovery, and a positive or
 failed automatic-import probe. These are source-derived candidates, not a
-diagnosis of the production incident. Current read-intent protection from #585
-refuses the repair/migration fallback; #586's handoff also ends authority after
-an automatic-import escalation, including when the protected reprobe finds
-that another writer already completed the import or a sync merge is pending.
+diagnosis of the production incident. Current read-intent protection refuses
+repair, migration and automatic-import escalation. The defensive handoff from
+#586 also ends any retained authority before opening the private query copy.
 
 When investigating a new incident, capture the binary revision, flags and
 fast-open override, verbose startup logs, the holder's PID and lock descriptors,

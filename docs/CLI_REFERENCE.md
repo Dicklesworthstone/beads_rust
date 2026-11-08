@@ -75,8 +75,8 @@ These options apply to all commands:
 | `--json` | Output as JSON (machine-readable) |
 | `--no-daemon` | Force direct mode (no daemon) |
 | `--no-auto-flush` | Skip automatic JSONL export after mutations |
-| `--no-auto-import` | Skip automatic import check |
-| `--allow-stale` | Allow stale DB (bypass freshness check warning) |
+| `--no-auto-import` | Skip startup import and read freshness checks; read the existing database |
+| `--allow-stale` | Allow the existing database view when JSONL has changes awaiting import |
 | `--lock-timeout <LOCK_TIMEOUT>` | SQLite busy/write-lock timeout in milliseconds |
 | `--no-db` | Run issue operations from JSONL using a private in-memory database rebuilt on each invocation. Startup may still inspect a present database for pending-merge safety; doctor checks namespace evidence before that inspection and reports which consistency/recovery checks it skips. Loading cost grows with the whole JSONL; progress appears on an interactive stderr. For large workspaces prefer the default database-backed mode, which imports once and answers from SQLite |
 | `-v, --verbose` | Increase logging verbosity (-v, -vv) |
@@ -2662,9 +2662,14 @@ through their legacy-schema diagnostic readers. Supported issue queries can
 read `issues.jsonl` in a private in-memory database instead, with a warning
 that database-only records are retained in SQLite and may be absent from that
 view. Commands without a safe reader refuse with migration guidance.
-`--no-auto-import --no-auto-flush` also prevents automatic synchronization;
-disabling the fast-open optimization does not disable read-only protection.
-Explicitly read-only paths inspect coherent private copies of the database
+Ordinary reads also never import or update sync bookkeeping. When JSONL has
+changed, an issue query returns `SYNC_CONFLICT` with explicit
+`br sync --import-only` guidance. Use `--allow-stale` or `--no-auto-import` to
+inspect the existing database without importing. An old receipt format alone
+does not require synchronization for a read, so inspecting an upgraded release
+database preserves its guarded undo. Mutating commands retain automatic import
+when enabled. Disabling fast-open does not disable read-only protection.
+Read-only paths inspect coherent private copies of the database
 family, so even opener registration and shared-memory reader marks cannot
 change the tracker. This includes `info --json`, routed issue reads, and
 discovery from nested directories. Sync status and reconciliation or

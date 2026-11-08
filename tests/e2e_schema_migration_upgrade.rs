@@ -39,7 +39,7 @@ mod common;
 mod runtime_safety;
 
 use beads_rust::franken_sync::{Connection, SqliteValue};
-use common::cli::{BrRun, BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrRun, BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::fs;
@@ -1488,6 +1488,227 @@ fn workflow_schema19_apply(workspace: &BrWorkspace, token: &str) -> Value {
         ],
         "workflow19_apply",
     ))
+}
+
+#[test]
+fn schema19_release_default_reads_preserve_upgrade_and_guarded_undo() {
+    for (workspace, issue_count) in [
+        (released_schema19_workspace(), 3),
+        (workflow_schema19_workspace(), 4),
+    ] {
+        let beads = workspace.root.join(".beads");
+        let db = beads.join("beads.db");
+        let original = workflow_schema19_durable_files(&workspace);
+        let rows = schema19_authority_rows(&db, None);
+        let (columns, metadata) = &rows["metadata"];
+        let key = columns.iter().position(|name| name == "key").unwrap();
+        let value = columns.iter().position(|name| name == "value").unwrap();
+        assert!(metadata.iter().any(|row| {
+            row[key] == format!("text {:?}", Some("jsonl_row_receipt_version"))
+                && row[value] == format!("text {:?}", Some("1"))
+        }));
+        let plan = workflow_schema19_plan(&workspace);
+        let applied = workflow_schema19_apply(&workspace, plan["plan_token"].as_str().unwrap());
+        let installed = schema19_tracker_files(&beads);
+
+        // No sync opt-outs: even an unchanged v1 receipt used to promote a
+        // normal read into a metadata-writing import and invalidate undo.
+        // The storage intent must hold with the fast-open optimization off.
+        for disable_fast_open in ["0", "1"] {
+            for (index, args) in [
+                vec!["stats", "--json"],
+                vec!["list", "--all", "--json"],
+                vec!["ready", "--json"],
+                vec!["info", "--schema", "--projections", "--json"],
+                vec!["config", "list", "--json"],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let report = schema19_json(&run_br_with_env(
+                    &workspace,
+                    args,
+                    [("BR_DISABLE_READ_ONLY_FAST_OPEN", disable_fast_open)],
+                    &format!("release_default_read_{disable_fast_open}_{index}"),
+                ));
+                if index == 3 {
+                    assert_eq!(report["issue_count"], issue_count);
+                }
+                assert_eq!(schema19_tracker_files(&beads), installed);
+                assert_eq!(schema19_authority_rows(&db, Some(&rows)), rows);
+            }
+        }
+        schema19_json(&run_br(
+            &workspace,
+            [
+                "doctor",
+                "migrate-schema",
+                "undo",
+                applied["run_id"].as_str().unwrap(),
+                "--json",
+            ],
+            "release_undo_after_default_reads",
+        ));
+        assert_eq!(workflow_schema19_durable_files(&workspace), original);
+        assert_eq!(schema19_authority_rows(&db, None), rows);
+    }
+}
+
+#[test]
+fn schema19_default_read_requires_explicit_import_of_changed_jsonl() {
+    let workspace = workflow_schema19_workspace();
+    let beads = workspace.root.join(".beads");
+    let db = beads.join("beads.db");
+    let plan = workflow_schema19_plan(&workspace);
+    workflow_schema19_apply(&workspace, plan["plan_token"].as_str().unwrap());
+    let original_rows = workflow_schema19_authority(&db);
+    let jsonl = beads.join("issues.jsonl");
+    let changed = fs::read_to_string(&jsonl)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut issue: Value = serde_json::from_str(line).unwrap();
+            if issue["id"] == "release-66o" {
+                issue["title"] = Value::from("Peer change awaiting explicit import");
+                issue["updated_at"] = Value::from("2099-01-01T00:00:00Z");
+            }
+            serde_json::to_string(&issue).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(changed.contains("Peer change awaiting explicit import"));
+    fs::write(&jsonl, format!("{changed}\n")).unwrap();
+    let before = schema19_tracker_files(&beads);
+    for args in [
+        vec!["list", "--all", "--json"],
+        vec!["stats", "--json"],
+        vec!["show", "release-66o", "--json"],
+    ] {
+        let refused = run_br(&workspace, args, "release_changed_jsonl_read");
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(
+            format!("{}{}", refused.stdout, refused.stderr).contains("sync --import-only"),
+            "{refused:?}"
+        );
+        assert_eq!(schema19_tracker_files(&beads), before);
+    }
+    for flag in ["--allow-stale", "--no-auto-import"] {
+        let inspected = schema19_json(&run_br(
+            &workspace,
+            ["list", "--all", "--json", flag],
+            "release_explicit_database_view",
+        ));
+        assert!(
+            !inspected
+                .to_string()
+                .contains("Peer change awaiting explicit import")
+        );
+        assert_eq!(schema19_tracker_files(&beads), before);
+    }
+    assert_eq!(workflow_schema19_authority(&db), original_rows);
+}
+
+#[test]
+fn schema19_default_mutation_preserves_release_closure_history_and_configuration() {
+    let workspace = workflow_schema19_workspace();
+    edit_schema19_fixture(
+        &workspace,
+        &[
+            "INSERT INTO config (key, value) VALUES ('compact_model', 'database-only-model')",
+            "INSERT INTO metadata (key, value) VALUES ('operator_checkpoint', 'retain this checkpoint')",
+        ],
+    );
+    let beads = workspace.root.join(".beads");
+    let db = beads.join("beads.db");
+    let before = workflow_schema19_authority(&db);
+    let config = fs::read(beads.join("config.yaml")).unwrap();
+    let policy = fs::read(beads.join("policy.yaml")).unwrap();
+    let source: Vec<Value> = fs::read_to_string(beads.join("issues.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let old_close = source
+        .iter()
+        .find(|issue| issue["id"] == "release-0ta.1")
+        .unwrap();
+    for field in [
+        "closed_by_agent_name",
+        "closed_by_harness",
+        "closed_by_model",
+    ] {
+        assert!(old_close[field].is_null(), "release JSONL omitted {field}");
+    }
+    let plan = workflow_schema19_plan(&workspace);
+    workflow_schema19_apply(&workspace, plan["plan_token"].as_str().unwrap());
+
+    // This uses normal import and flush settings. Receipt conversion must
+    // retain the release database's same-closure attribution when its older
+    // JSONL omitted those fields, then publish that evidence with the new work.
+    let created = run_br(
+        &workspace,
+        ["create", "Work after a reviewed release upgrade", "--json"],
+        "release_default_mutation",
+    );
+    schema19_json(&created);
+    assert!(!created.stderr.contains("AUTO_FLUSH_FAILED"), "{created:?}");
+    let after = engine_rows(&db, Some(&before));
+    for table in [
+        "dependencies",
+        "comments",
+        "labels",
+        "close_metadata",
+        "gate_results",
+        "gate_result_history",
+        "capacity_exemptions",
+        "capacity_exemption_history",
+        "child_counters",
+        "config",
+    ] {
+        assert_eq!(after[table], before[table], "retained {table}");
+    }
+    for table in ["issues", "events", "capacity_occupancy"] {
+        for row in &before[table].1 {
+            assert!(
+                after[table].1.contains(row),
+                "default mutation lost original {table} row {row:?}"
+            );
+        }
+    }
+    assert_eq!(after["issues"].1.len(), before["issues"].1.len() + 1);
+    assert!(after["events"].1.len() > before["events"].1.len());
+    let metadata_key = before["metadata"]
+        .0
+        .iter()
+        .position(|column| column == "key")
+        .unwrap();
+    let checkpoint = before["metadata"]
+        .1
+        .iter()
+        .find(|row| row[metadata_key] == format!("text {:?}", Some("operator_checkpoint")))
+        .unwrap();
+    assert!(after["metadata"].1.contains(checkpoint));
+    assert_eq!(fs::read(beads.join("config.yaml")).unwrap(), config);
+    assert_eq!(fs::read(beads.join("policy.yaml")).unwrap(), policy);
+    let published: Vec<Value> = fs::read_to_string(beads.join("issues.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let close = published
+        .iter()
+        .find(|issue| issue["id"] == "release-0ta.1")
+        .unwrap();
+    assert_eq!(close["closed_by_agent_name"], "release-agent");
+    assert_eq!(close["closed_by_harness"], "release-harness");
+    assert_eq!(close["closed_by_model"], "release-model");
+    let installed = schema19_tracker_files(&beads);
+    schema19_json(&run_br(
+        &workspace,
+        ["stats", "--json"],
+        "release_read_after_normal_mutation",
+    ));
+    assert_eq!(schema19_tracker_files(&beads), installed);
 }
 
 fn assert_workflow_schema19_read(workspace: &BrWorkspace, command: &str, label: &str) {

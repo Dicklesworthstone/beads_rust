@@ -85,6 +85,18 @@ Duplicate effective sequence names refuse before planning or installation:
 their row order can affect future ID allocation despite identical multisets
 of sequence names and reservations.
 
+The default-command regressions also retain the release's receipt version 1
+and matching JSONL hash. Ordinary list, ready, stats, info and configuration
+reads must leave every tracker file unchanged with fast-open both enabled and
+disabled, so guarded undo still restores the exact release family. A changed
+JSONL source must instead produce explicit synchronization guidance without
+altering any file. The first default mutation exercises guarded receipt
+backfill and publication: this release stored closure agent/harness/model in
+SQLite while omitting them from JSONL. That evidence must survive, together
+with all preexisting issues, events, configuration, relations and workflow
+records, and appear in the newly published source. Receipt conversion does not
+authorize replacing those facts from an incomplete export.
+
 The interruption cases reconstruct two persisted boundaries from a genuine
 completed migration and retain all displaced test artifacts: installation
 before `applied.json` publication, and a commit-ready intent whose original

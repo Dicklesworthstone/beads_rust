@@ -807,7 +807,31 @@ fn assert_automatic_import_keeps_orphans(workspace: &mut BrWorkspace, db: &Path,
     assert!(read.status.success(), "{} {}", read.stdout, read.stderr);
     assert_tracker_unchanged(&beads_dir, &files);
 
-    let automatic = run_br(workspace, ["list", "--json"], "orphan_automatic_import");
+    let refused_read = run_br(workspace, ["list", "--json"], "orphan_read_requires_sync");
+    assert_eq!(refused_read.status.code(), Some(6), "{refused_read:?}");
+    let refusal = json_stdout(&refused_read.stdout);
+    assert_eq!(refusal["error"]["code"], "SYNC_CONFLICT");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("br sync --import-only"))
+    );
+    assert_tracker_unchanged(&beads_dir, &files);
+
+    // A mutating command still uses Automatic import policy, whose distinct
+    // orphan-preservation guard must run before its no-op label operation.
+    let automatic = run_br(
+        workspace,
+        [
+            "label",
+            "remove",
+            live_id,
+            "absent-import-probe-label",
+            "--no-auto-flush",
+            "--json",
+        ],
+        "orphan_automatic_import",
+    );
     assert!(
         !automatic.status.success(),
         "automatic import must refuse before cleanup: {} {}",

@@ -213,8 +213,8 @@ fn render_lint_output(summary: LintSummary, ctx: &OutputContext) {
         }
     }
 
-    // Lint can follow an auto-import owned by main. Let that storage checkpoint
-    // before applying the warning status, just like other diagnostic commands.
+    // Return the warning status through normal command teardown so every
+    // storage handle is released before process exit.
     if summary.warnings != 0 {
         crate::output::record_pending_exit_code(summary.exit_code(false));
     }

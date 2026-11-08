@@ -18,8 +18,8 @@
 //! A second test checks that every `br ...` example in the README command
 //! tables, and every flag in its Global Flags table, names a subcommand and
 //! flags the built binary's `--help` actually lists.
-//! Behavioral checks separately exercise automatic local JSONL import and its
-//! opt-outs; matching example syntax alone does not verify prose semantics.
+//! Behavioral checks separately exercise explicit local JSONL import and
+//! observational read opt-outs; syntax alone does not verify prose semantics.
 #![allow(clippy::pedantic, clippy::nursery)]
 
 mod common;
@@ -27,8 +27,9 @@ mod common;
 use assert_cmd::Command;
 use common::cli::{BrWorkspace, run_br};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::PathBuf;
 
 const DOCS: &[&str] = &["docs/ARCHITECTURE.md"];
 
@@ -172,8 +173,27 @@ fn documented_json_examples_match_live_key_structure() {
     );
 }
 
+fn tracker_artifacts(workspace: &BrWorkspace) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let root = workspace.root.join(".beads");
+    let mut directories = vec![root.clone()];
+    let mut files = BTreeMap::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(&root).unwrap().to_path_buf();
+            if path.is_dir() {
+                files.insert(relative, None);
+                directories.push(path);
+            } else {
+                files.insert(relative, Some(fs::read(path).unwrap()));
+            }
+        }
+    }
+    files
+}
+
 #[test]
-fn documented_auto_import_reads_local_edits_and_honors_opt_outs() {
+fn documented_reads_require_explicit_import_and_honor_opt_outs() {
     for disable_with_config in [false, true] {
         let workspace = BrWorkspace::new();
         let init = run_br(&workspace, ["init", "--prefix", "doc"], "init");
@@ -206,11 +226,16 @@ fn documented_auto_import_reads_local_edits_and_honors_opt_outs() {
         } else {
             "br list --no-auto-import --json"
         };
+        let before_files = tracker_artifacts(&workspace);
         let before = run_documented_command(&workspace, list_command);
         assert_eq!(before["total"], 1);
         assert_eq!(before["issues"][0]["id"], id);
         assert_eq!(before["issues"][0]["title"], "Original local title");
         assert_eq!(fs::read_to_string(&jsonl_path).unwrap(), edited);
+        assert_eq!(tracker_artifacts(&workspace), before_files);
+        let stale = run_documented_command(&workspace, "br list --allow-stale --json");
+        assert_eq!(stale["issues"][0]["title"], "Original local title");
+        assert_eq!(tracker_artifacts(&workspace), before_files);
 
         if disable_with_config {
             let config = run_br(
@@ -220,18 +245,32 @@ fn documented_auto_import_reads_local_edits_and_honors_opt_outs() {
             );
             assert!(config.status.success(), "config failed: {}", config.stderr);
         }
+        let before_import = tracker_artifacts(&workspace);
+        let refused = run_documented_command(&workspace, "br list --json");
+        assert_eq!(refused["error"]["code"], "SYNC_CONFLICT");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("br sync --import-only"))
+        );
+        assert_eq!(tracker_artifacts(&workspace), before_import);
+
+        let imported = run_documented_command(&workspace, "br sync --import-only --json");
+        assert!(imported.get("error").is_none(), "{imported}");
+        let after_import = tracker_artifacts(&workspace);
         let after = run_documented_command(&workspace, "br list --json");
         assert_eq!(after["total"], 1);
         assert_eq!(after["issues"][0]["id"], id);
         assert_eq!(after["issues"][0]["title"], row["title"]);
 
-        // A second command with import disabled proves the first imported the
-        // value durably, rather than rendering directly from the JSONL file.
+        // The explicit import must persist the value. Neither query may
+        // change database records, receipt metadata, or workspace artifacts.
         let persisted = run_documented_command(&workspace, "br list --no-auto-import --json");
         assert_eq!(persisted["issues"][0]["title"], row["title"]);
         assert_eq!(fs::read_to_string(&jsonl_path).unwrap(), edited);
+        assert_eq!(tracker_artifacts(&workspace), after_import);
         eprintln!(
-            "[docs_auto_import] config_opt_out={disable_with_config} id={id}: skipped edit, imported edit, persisted DB value, JSONL bytes preserved"
+            "[docs_explicit_import] config_opt_out={disable_with_config} id={id}: observational opt-outs and refusal, explicit import, persisted DB value, JSONL bytes preserved"
         );
     }
 }

@@ -13,6 +13,8 @@ The e2e sync test suite verifies several critical safety properties:
 5. **No Partial Writes** - Failed operations leave state unchanged
 6. **Lossless Additive Recovery** - Dry-run is read-only; token-bound apply preserves DB-only rows, audit/close/gate evidence, JSONL bytes, and relation identity
 7. **Fail-Closed Review** - Mismatched/stale plan tokens, unreviewed scalar drift, lossy JSON, and relation drift roll back without partial state
+8. **Observational Reads** - Default reads preserve tracker bytes and never import or upgrade receipt bookkeeping; changed JSONL requires explicit sync or an existing-database opt-out
+9. **Release Closure Preservation** - Receipt backfill retains attribution omitted by legacy JSONL only for the same closure with otherwise matching synced state; conflicting evidence rolls back the entire import
 
 ## Test Files
 
@@ -27,6 +29,9 @@ The e2e sync test suite verifies several critical safety properties:
 | `tests/e2e_sync_reconcile.rs` | Additive `--reconcile`: false-equal repair, event preservation, dry-run zero-mutation, witness rollback |
 | `tests/e2e_basic_lifecycle.rs` | Additive dry-run/apply/idempotency receipt, event preservation, and unchanged-source coverage |
 | `tests/repro_3way_merge_bug.rs` | Local-export anchor regressions: branch close/reopen/create, missing rows and retention, stale/equal/clock-skewed updates, explicit winners, and tombstones |
+| `tests/e2e_schema_migration_upgrade.rs` | Authentic v0.7.6 layouts: additive upgrade, default reads with retained guarded undo, and the first default mutation preserving database-only issues, audit/configuration and related rows |
+| `tests/e2e_sync_needs_flush_guard.rs` | Automatic import through real mutating intent, complete source receipts, retained closure/workflow evidence, unread peer rows and explicit synchronization after read refusal |
+| `tests/e2e_read_only_fast_open.rs`, `tests/e2e_concurrency.rs` | Read freshness refusal and snapshot preservation under writer contention and output backpressure, with fast-open enabled and disabled |
 
 ## Running the Tests
 
@@ -68,6 +73,10 @@ cargo test --test e2e_sync_preflight_integration --release
 cargo test --test e2e_sync_reconcile --release
 # Export-anchor and deterministic merge regressions
 cargo test --test repro_3way_merge_bug --test repro_mergereport_determinism --release
+# Authentic release upgrade, observational reads and guarded undo
+cargo test --test e2e_schema_migration_upgrade schema19
+# Startup synchronization and publication safety
+cargo test --test e2e_sync_needs_flush_guard --test e2e_read_only_fast_open
 # Additive recovery with command-level logs retained by BrWorkspace
 RUST_LOG=beads_rust=debug cargo test --test e2e_basic_lifecycle \
   e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent \

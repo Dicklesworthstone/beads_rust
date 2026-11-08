@@ -17,7 +17,9 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 // =============================================================================
@@ -128,7 +130,26 @@ fn e2e_lint_issue_with_all_required_sections_passes() {
 // Missing Sections Tests by Issue Type
 // =============================================================================
 
-fn assert_lint_warning_exit_checkpoints_auto_import(quiet: bool) {
+fn tracker_artifacts(workspace: &BrWorkspace) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let root = workspace.root.join(".beads");
+    let mut directories = vec![root.clone()];
+    let mut files = BTreeMap::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(&root).unwrap().to_path_buf();
+            if path.is_dir() {
+                files.insert(relative, None);
+                directories.push(path);
+            } else {
+                files.insert(relative, Some(fs::read(path).unwrap()));
+            }
+        }
+    }
+    files
+}
+
+fn assert_lint_warning_exit_requires_explicit_import(quiet: bool) {
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
     let id = create_issue_with_description(&workspace, "Original bug", "bug", None);
@@ -151,10 +172,51 @@ fn assert_lint_warning_exit_checkpoints_auto_import(quiet: bool) {
         .set_times(fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(60)))
         .unwrap();
 
+    let before = tracker_artifacts(&workspace);
+    let refused = run_br(
+        &workspace,
+        ["lint", if quiet { "--quiet" } else { "--no-color" }],
+        "lint_refuses_implicit_import",
+    );
+    assert_eq!(refused.status.code(), Some(6), "{refused:?}");
+    let message = format!("{}{}", refused.stdout, refused.stderr);
+    assert!(message.contains("br sync --import-only"), "{message}");
+    assert_eq!(tracker_artifacts(&workspace), before);
+
+    let original = run_br(
+        &workspace,
+        ["show", &id, "--json", "--allow-stale"],
+        "show_original_before_explicit_import",
+    );
+    assert!(original.status.success(), "{original:?}");
+    let issues: Value = serde_json::from_str(&original.stdout).unwrap();
+    assert_eq!(issues[0]["title"], "Original bug");
+    assert_eq!(tracker_artifacts(&workspace), before);
+
+    let imported = run_br(
+        &workspace,
+        ["sync", "--import-only", "--json"],
+        "explicit_import_before_lint",
+    );
+    assert!(imported.status.success(), "{imported:?}");
+
+    // Inspect before any engine or CLI reopen can hide missed teardown.
+    let wal = workspace.root.join(".beads/beads.db-wal");
+    let wal_size = match fs::metadata(&wal) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("read WAL metadata: {error}"),
+    };
+    assert!(
+        wal_size <= 32,
+        "explicit import exit must checkpoint its writes; WAL has {wal_size} bytes"
+    );
+
+    let imported_files = tracker_artifacts(&workspace);
     let lint = run_br(
         &workspace,
         ["lint", if quiet { "--quiet" } else { "--no-color" }],
-        "lint_after_auto_import",
+        "lint_after_explicit_import",
     );
     assert_eq!(lint.status.code(), Some(1), "{lint:?}");
     assert!(lint.stderr.is_empty(), "{}", lint.stderr);
@@ -168,35 +230,25 @@ fn assert_lint_warning_exit_checkpoints_auto_import(quiet: bool) {
             lint.stdout
         );
     }
-
-    // Inspect before any engine or CLI reopen can hide missed teardown.
-    let wal = workspace.root.join(".beads/beads.db-wal");
-    let wal_size = match fs::metadata(&wal) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => panic!("read WAL metadata: {error}"),
-    };
-    assert!(
-        wal_size <= 32,
-        "lint warning exit must checkpoint its auto-import; WAL has {wal_size} bytes"
-    );
+    assert_eq!(tracker_artifacts(&workspace), imported_files);
 
     let shown = run_br(&workspace, ["show", &id, "--json"], "show_imported_issue");
     assert!(shown.status.success(), "{shown:?}");
     let issues: Value = serde_json::from_str(&shown.stdout).unwrap();
     assert_eq!(issues[0]["title"], "Imported warning");
+    assert_eq!(tracker_artifacts(&workspace), imported_files);
 }
 
 #[test]
-fn e2e_lint_text_warning_exit_checkpoints_auto_import() {
-    let _log = common::test_log("e2e_lint_text_warning_exit_checkpoints_auto_import");
-    assert_lint_warning_exit_checkpoints_auto_import(false);
+fn e2e_lint_text_warning_exit_requires_explicit_import() {
+    let _log = common::test_log("e2e_lint_text_warning_exit_requires_explicit_import");
+    assert_lint_warning_exit_requires_explicit_import(false);
 }
 
 #[test]
-fn e2e_lint_quiet_warning_exit_checkpoints_auto_import() {
-    let _log = common::test_log("e2e_lint_quiet_warning_exit_checkpoints_auto_import");
-    assert_lint_warning_exit_checkpoints_auto_import(true);
+fn e2e_lint_quiet_warning_exit_requires_explicit_import() {
+    let _log = common::test_log("e2e_lint_quiet_warning_exit_requires_explicit_import");
+    assert_lint_warning_exit_requires_explicit_import(true);
 }
 
 #[test]
