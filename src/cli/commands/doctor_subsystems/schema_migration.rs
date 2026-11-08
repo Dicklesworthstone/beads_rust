@@ -4241,7 +4241,7 @@ fn restore_interrupted_preinstall_family(
         // captured. Preserve that displaced evidence and restore the exact
         // receipt-bound bytes from the immutable recovery bundle.
         let backup = backup_component_path(before_dir, db_path, &component.suffix)?;
-        copy_regular_file_new(&backup, &live, component.unix_mode)?;
+        copy_verified_restore_component_new(&backup, &live, component)?;
     }
     if let Some(parent) = db_path.parent() {
         sync_directory(parent)?;
@@ -5937,7 +5937,7 @@ fn install_undo_restored_main_resuming(
             ));
         }
         let backup_main = backup_component_path(before_dir, db_path, "")?;
-        copy_regular_file_new(&backup_main, restored_candidate, restored_main.unix_mode)?;
+        copy_verified_restore_component_new(&backup_main, restored_candidate, restored_main)?;
         if let Some(parent) = restored_candidate.parent() {
             sync_directory(parent)?;
         }
@@ -8171,6 +8171,54 @@ fn copy_regular_file_new(
     Ok(())
 }
 
+/// Publish only a complete, receipt-verified restore component. A failed or
+/// interrupted copy must not leave a partial main/WAL at its final name: the
+/// undo and pre-install recovery protocols correctly refuse unknown live
+/// bytes, so such a file would prevent their next invocation from resuming.
+/// Staging evidence remains at a unique private name on failure, and an
+/// existing destination is never replaced.
+fn copy_verified_restore_component_new(
+    source: &Path,
+    destination: &Path,
+    expected: &RawComponentWitness,
+) -> Result<()> {
+    copy_verified_restore_component_with_copy(source, destination, expected, std::io::copy)
+}
+
+fn copy_verified_restore_component_with_copy(
+    source: &Path,
+    destination: &Path,
+    expected: &RawComponentWitness,
+    copy: impl FnOnce(&mut File, &mut File) -> std::io::Result<u64>,
+) -> Result<()> {
+    let source_metadata = secure_file_metadata(source)?.ok_or_else(|| {
+        BeadsError::internal(format!(
+            "schema migration restore source disappeared before copy: {}",
+            source.display()
+        ))
+    })?;
+    let mut source_file = File::open(source).map_err(BeadsError::Io)?;
+    if !same_file_identity(&source_metadata, &source_file.metadata()?) {
+        return Err(BeadsError::internal(format!(
+            "schema migration restore source changed identity before copy: {}",
+            source.display()
+        )));
+    }
+    let (staged_path, mut staged_file) = allocate_staged_migration_file(destination, "restore")?;
+    copy(&mut source_file, &mut staged_file).map_err(BeadsError::Io)?;
+    verify_component_bytes(&staged_path, &staged_file.metadata()?, expected)?;
+    set_file_permissions(&staged_path, expected.unix_mode)?;
+    // Keep the writable handle through chmod and fsync, including when the
+    // recorded mode is read-only. Publication cannot expose incomplete bytes
+    // or a mode change that has not passed its durability barrier.
+    staged_file.sync_all().map_err(BeadsError::Io)?;
+    drop(staged_file);
+    rename_path_no_replace(&staged_path, destination)?;
+    sync_directory(destination.parent().ok_or_else(|| {
+        BeadsError::internal("schema migration restore destination has no parent")
+    })?)
+}
+
 fn verify_backup_family(
     db_path: &Path,
     before_dir: &Path,
@@ -8213,9 +8261,26 @@ fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
             path.display()
         ))
     })?;
+    let (staged_path, mut file) = allocate_staged_migration_file(path, "write")?;
+    file.write_all(&encoded).map_err(BeadsError::Io)?;
+    file.write_all(b"\n").map_err(BeadsError::Io)?;
+    file.sync_all().map_err(BeadsError::Io)?;
+    drop(file);
+    rename_path_no_replace(&staged_path, path)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn allocate_staged_migration_file(path: &Path, operation: &str) -> Result<(PathBuf, File)> {
+    let parent = path.parent().ok_or_else(|| {
+        BeadsError::internal(format!(
+            "schema migration artifact path has no parent: {}",
+            path.display()
+        ))
+    })?;
     let file_name = path.file_name().ok_or_else(|| {
         BeadsError::internal(format!(
-            "schema migration receipt path has no file name: {}",
+            "schema migration artifact path has no file name: {}",
             path.display()
         ))
     })?;
@@ -8230,7 +8295,7 @@ fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         let mut staged_name = OsString::from(".");
         staged_name.push(file_name);
         staged_name.push(format!(
-            ".write-{}-{nonce}-{attempt}.tmp",
+            ".{operation}-{}-{nonce}-{attempt}.tmp",
             std::process::id()
         ));
         let staged_path = parent.join(staged_name);
@@ -8243,19 +8308,12 @@ fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
             Err(error) => return Err(error),
         }
     }
-    let (staged_path, mut file) = staged.ok_or_else(|| {
+    staged.ok_or_else(|| {
         BeadsError::internal(format!(
-            "could not allocate a unique staged receipt beside {}",
+            "could not allocate a unique staged migration artifact beside {}",
             path.display()
         ))
-    })?;
-    file.write_all(&encoded).map_err(BeadsError::Io)?;
-    file.write_all(b"\n").map_err(BeadsError::Io)?;
-    file.sync_all().map_err(BeadsError::Io)?;
-    drop(file);
-    rename_path_no_replace(&staged_path, path)?;
-    sync_directory(parent)?;
-    Ok(())
+    })
 }
 
 fn file_sha256(path: &Path) -> Result<String> {
@@ -8430,7 +8488,7 @@ fn restore_backup_family_resuming(
             verify_component_bytes(&destination, &metadata, component)?;
             set_file_permissions(&destination, component.unix_mode)?;
         } else {
-            copy_regular_file_new(&source, &destination, component.unix_mode)?;
+            copy_verified_restore_component_new(&source, &destination, component)?;
         }
     }
     if let Some(parent) = db_path.parent() {
@@ -14723,6 +14781,377 @@ mod tests {
                 error.to_string().contains("application_id changed"),
                 "{error}"
             );
+        }
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
+    mod atomic_restore_copy {
+        use super::*;
+
+        fn copy_prefix_then_fail(source: &mut File, target: &mut File) -> std::io::Result<u64> {
+            std::io::copy(&mut source.take(64), target)?;
+            Err(std::io::Error::other("injected interrupted restore copy"))
+        }
+
+        fn staging_files(destination: &Path) -> Vec<PathBuf> {
+            let prefix = format!(
+                ".{}.restore-",
+                destination.file_name().unwrap().to_string_lossy()
+            );
+            let mut files: Vec<_> = fs::read_dir(destination.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(&prefix)
+                })
+                .collect();
+            files.sort();
+            files
+        }
+
+        #[test]
+        fn failed_or_short_restore_copy_never_publishes_a_partial_component() {
+            let temp = TempDir::new().unwrap();
+            let source = temp.path().join("before.db");
+            let original = b"receipt-bound original bytes".repeat(16);
+            fs::write(&source, &original).unwrap();
+            set_file_permissions(&source, Some(0o440)).unwrap();
+            let expected = raw_family_witness(&source).unwrap();
+            let component = component_for_suffix(&expected, "").unwrap();
+
+            for io_failure in [true, false] {
+                let destination = temp.path().join(format!("restored-{io_failure}.db"));
+                let error = copy_verified_restore_component_with_copy(
+                    &source,
+                    &destination,
+                    component,
+                    |source, target| {
+                        if io_failure {
+                            copy_prefix_then_fail(source, target)
+                        } else {
+                            std::io::copy(&mut source.take(64), target)
+                        }
+                    },
+                )
+                .expect_err("an I/O error or short successful copy cannot publish a restore");
+                assert!(
+                    error.to_string().contains(if io_failure {
+                        "injected interrupted restore copy"
+                    } else {
+                        "does not match its receipt"
+                    }),
+                    "{error}"
+                );
+                assert!(!destination.exists());
+                assert_eq!(raw_family_witness(&source).unwrap(), expected);
+                let evidence = staging_files(&destination);
+                assert_eq!(evidence.len(), 1);
+                assert_eq!(fs::read(&evidence[0]).unwrap(), original[..64]);
+
+                copy_verified_restore_component_new(&source, &destination, component)
+                    .expect("retry must ignore retained incomplete staging evidence");
+                assert_eq!(fs::read(&destination).unwrap(), original);
+                assert_eq!(
+                    unix_file_mode(&fs::metadata(&destination).unwrap()),
+                    component.unix_mode,
+                    "the recorded read-only mode must be durable before publication"
+                );
+                assert_eq!(staging_files(&destination), evidence);
+                assert_eq!(fs::read(&evidence[0]).unwrap(), original[..64]);
+                assert_eq!(raw_family_witness(&source).unwrap(), expected);
+            }
+        }
+
+        #[test]
+        fn verified_restore_copy_never_overwrites_a_competing_destination() {
+            let temp = TempDir::new().unwrap();
+            let source = temp.path().join("before.db");
+            let destination = temp.path().join("restored.db-wal");
+            let original = b"complete receipt-bound original component";
+            let competing = b"unrecognized work appearing during restoration";
+            fs::write(&source, original).unwrap();
+            let expected = raw_family_witness(&source).unwrap();
+            let component = component_for_suffix(&expected, "").unwrap();
+            let error = copy_verified_restore_component_with_copy(
+                &source,
+                &destination,
+                component,
+                |source, target| {
+                    let copied = std::io::copy(source, target)?;
+                    fs::write(&destination, competing)?;
+                    Ok(copied)
+                },
+            )
+            .expect_err("a complete staged restore cannot overwrite a foreign final name");
+            assert!(matches!(error, BeadsError::SyncConflict { .. }));
+            assert_eq!(fs::read(&destination).unwrap(), competing);
+            assert_eq!(raw_family_witness(&source).unwrap(), expected);
+            let evidence = staging_files(&destination);
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(fs::read(&evidence[0]).unwrap(), original);
+        }
+
+        #[test]
+        fn preinstall_backup_copy_retries_after_interrupted_staging() {
+            let (_temp, migration) = reviewed_v14_migration_context();
+            let journal = family_component_path(&migration.db_path, "-journal");
+            let original = b"receipt-bound original journal bytes".repeat(8);
+            fs::write(&journal, &original).unwrap();
+            let expected = raw_family_witness(&migration.db_path).unwrap();
+            let run_dir = migration.beads_dir.join("interrupted-preinstall-copy");
+            let before_dir = run_dir.join("before");
+            let displaced_dir = run_dir.join("maintenance-displaced");
+            ensure_new_directory(&before_dir).unwrap();
+            ensure_new_directory(&displaced_dir).unwrap();
+            copy_family_to_backup(&migration.db_path, &before_dir, &expected).unwrap();
+            let before_main = backup_component_path(&before_dir, &migration.db_path, "").unwrap();
+            let backup_before = raw_family_witness(&before_main).unwrap();
+            let backup_journal =
+                backup_component_path(&before_dir, &migration.db_path, "-journal").unwrap();
+            let displaced_journal =
+                backup_component_path(&displaced_dir, &migration.db_path, "-journal").unwrap();
+            rename_path_no_replace(&journal, &displaced_journal).unwrap();
+            let rewritten = b"retained engine-rewritten sidecar evidence";
+            fs::write(&displaced_journal, rewritten).unwrap();
+
+            copy_verified_restore_component_with_copy(
+                &backup_journal,
+                &journal,
+                component_for_suffix(&expected, "-journal").unwrap(),
+                copy_prefix_then_fail,
+            )
+            .expect_err("interrupt the fallback copy before publication");
+            assert!(!journal.exists());
+            let evidence = staging_files(&journal);
+            assert_eq!(evidence.len(), 1);
+
+            let restored = restore_interrupted_preinstall_family(
+                &migration.db_path,
+                &before_dir,
+                &displaced_dir,
+                &expected,
+                &migration.write_authority,
+            )
+            .expect("preinstall retry must recover from the immutable backup");
+            assert_eq!(restored, expected);
+            assert_eq!(raw_family_witness(&before_main).unwrap(), backup_before);
+            assert_eq!(fs::read(&displaced_journal).unwrap(), rewritten);
+            assert_eq!(staging_files(&journal), evidence);
+            assert_eq!(fs::read(&evidence[0]).unwrap(), original[..64]);
+            migration
+                .write_authority
+                .verify_database_authority()
+                .unwrap();
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        fn history_and_config(db: &Path) -> (LegacyTableProjection, LegacyTableProjection) {
+            with_migration_read_snapshot(db, |snapshot, _| {
+                with_preservation_snapshot(snapshot, |connection| {
+                    Ok((
+                        legacy_table_projection(connection, "events", false, false)?,
+                        legacy_table_projection(connection, "config", false, false)?,
+                    ))
+                })
+            })
+            .unwrap()
+        }
+
+        #[test]
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[allow(
+            clippy::too_many_lines,
+            reason = "one authentic release upgrade proves both torn-copy undo boundaries and their shared restart"
+        )]
+        fn schema19_undo_resumes_after_interrupted_main_and_wal_copy() {
+            const CONFIG_VALUE: &str = "WAL-only config preserved across interrupted undo";
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            fs::create_dir(&beads_dir).unwrap();
+            let db_path = beads_dir.join("beads.db");
+            let fixture = include_bytes!(
+                "../../../../tests/fixtures/schema_migration/schema19_v076_workflows.db.gz"
+            );
+            let mut released = Vec::new();
+            flate2::read::GzDecoder::new(&fixture[..])
+                .read_to_end(&mut released)
+                .unwrap();
+            fs::write(&db_path, released).unwrap();
+            let mut connection = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            connection.execute("PRAGMA journal_mode=WAL").unwrap();
+            connection.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+            connection
+                .execute(&format!(
+                    "INSERT INTO config (key, value) VALUES ('undo_copy_sentinel', '{CONFIG_VALUE}')"
+                ))
+                .unwrap();
+            connection.close_without_checkpoint_in_place().unwrap();
+            drop(connection);
+            let migration = MigrationContext {
+                write_authority: Arc::new(
+                    crate::sync::blocking_database_family_write_lock_with_timeout(
+                        &beads_dir,
+                        &db_path,
+                        Some(1000),
+                    )
+                    .unwrap(),
+                ),
+                beads_dir,
+                db_path,
+            };
+            let plan = build_observational_plan(&migration.db_path).unwrap();
+            assert_eq!((plan.from_version, plan.to_version), (19, 19));
+            let original = plan.raw_witness.clone();
+            let original_wal = component_for_suffix(&original, "-wal").unwrap();
+            assert!(original_wal.length.unwrap() > 64);
+            let wal = family_component_path(&migration.db_path, "-wal");
+            assert!(
+                fs::read(&wal)
+                    .unwrap()
+                    .windows(CONFIG_VALUE.len())
+                    .any(|bytes| bytes == CONFIG_VALUE.as_bytes())
+            );
+            assert!(
+                !fs::read(&migration.db_path)
+                    .unwrap()
+                    .windows(CONFIG_VALUE.len())
+                    .any(|bytes| bytes == CONFIG_VALUE.as_bytes()),
+                "the configuration record must require restoration of the original WAL"
+            );
+            let authoritative = history_and_config(&migration.db_path);
+            assert_eq!(authoritative.0.table.row_count, 23);
+            assert_eq!(authoritative.1.table.row_count, 2);
+            assert!(!migration.beads_dir.join("issues.jsonl").exists());
+            let (applied, before_dir) =
+                apply_with_plan_token(plan.plan_token.as_deref().unwrap(), &migration).unwrap();
+            let run_dir = migration_runs_root(&migration.beads_dir).join(&applied.run_id);
+            let before_main = backup_component_path(&before_dir, &migration.db_path, "").unwrap();
+            let backup_before = raw_family_witness(&before_main).unwrap();
+            let args = DoctorMigrateSchemaUndoArgs {
+                run_id: applied.run_id.clone(),
+                dry_run: false,
+                json: false,
+            };
+            let mut receipt =
+                build_undo_preview(&args, &migration.beads_dir, &migration.db_path).unwrap();
+            receipt.dry_run = false;
+            let quarantine = validate_quarantine_path(&receipt, &run_dir).unwrap();
+            ensure_directory(quarantine.parent().unwrap()).unwrap();
+            write_json_new(&run_dir.join("undo-prepared.json"), &receipt).unwrap();
+            ensure_new_directory(&quarantine).unwrap();
+            let candidate_dir = run_dir.join("undo-restored-candidate");
+            ensure_new_directory(&candidate_dir).unwrap();
+            let candidate = backup_component_path(&candidate_dir, &migration.db_path, "").unwrap();
+
+            copy_verified_restore_component_with_copy(
+                &before_main,
+                &candidate,
+                component_for_suffix(&original, "").unwrap(),
+                copy_prefix_then_fail,
+            )
+            .expect_err("interrupt original main staging before exchange");
+            assert!(!candidate.exists());
+            let main_evidence = staging_files(&candidate);
+            assert_eq!(main_evidence.len(), 1);
+            let main_prefix = fs::read(&main_evidence[0]).unwrap();
+            assert_eq!(main_prefix.len(), 64);
+            assert_eq!(raw_family_witness(&before_main).unwrap(), backup_before);
+
+            let mut exclusion = exclude_migration_openers(&migration).unwrap();
+            let quarantined_guard = install_undo_restored_main_resuming(
+                &migration.db_path,
+                &before_dir,
+                &candidate,
+                &quarantine,
+                &receipt.raw_live_before_undo,
+                &original,
+                &migration.write_authority,
+                &mut exclusion,
+            )
+            .expect("retry stages and exchanges the complete original main");
+            quarantine_live_family_resuming(
+                &migration.db_path,
+                &quarantine,
+                &receipt.raw_live_before_undo,
+                &original,
+            )
+            .unwrap();
+            assert!(!wal.exists());
+            let backup_wal =
+                backup_component_path(&before_dir, &migration.db_path, "-wal").unwrap();
+            copy_verified_restore_component_with_copy(
+                &backup_wal,
+                &wal,
+                original_wal,
+                copy_prefix_then_fail,
+            )
+            .expect_err("interrupt original WAL restoration after the main exchange");
+            assert!(
+                !wal.exists(),
+                "a partial WAL must never occupy the live name"
+            );
+            let wal_evidence = staging_files(&wal);
+            assert_eq!(wal_evidence.len(), 1);
+            let wal_prefix = fs::read(&wal_evidence[0]).unwrap();
+            assert_eq!(wal_prefix.len(), 64);
+            assert_eq!(raw_family_witness(&before_main).unwrap(), backup_before);
+            assert!(
+                refuse_incomplete_database_transition(&migration.beads_dir, &migration.db_path)
+                    .is_err()
+            );
+
+            // Drop every in-process authority to reproduce a restart with the
+            // original main live, the applied family quarantined, and only
+            // retained staging prefixes from the two interrupted copies.
+            drop(quarantined_guard);
+            drop(exclusion);
+            let beads_dir = migration.beads_dir.clone();
+            let db_path = migration.db_path.clone();
+            drop(migration);
+            let migration = MigrationContext {
+                write_authority: Arc::new(
+                    crate::sync::blocking_database_family_write_lock_with_timeout(
+                        &beads_dir,
+                        &db_path,
+                        Some(1000),
+                    )
+                    .unwrap(),
+                ),
+                beads_dir,
+                db_path,
+            };
+            execute_undo(&args, &migration)
+                .expect("normal undo must finish after both torn copies");
+            assert_eq!(raw_family_witness(&migration.db_path).unwrap(), original);
+            assert_eq!(raw_family_witness(&before_main).unwrap(), backup_before);
+            assert_eq!(history_and_config(&migration.db_path), authoritative);
+            assert_eq!(
+                with_migration_read_snapshot(&migration.db_path, |snapshot, _| logical_witness(
+                    snapshot
+                ))
+                .unwrap(),
+                plan.logical_witness,
+                "all original issue, history, configuration, and related-table state must return"
+            );
+            assert_eq!(fs::read(&main_evidence[0]).unwrap(), main_prefix);
+            assert_eq!(fs::read(&wal_evidence[0]).unwrap(), wal_prefix);
+            verify_backup_family(
+                &migration.db_path,
+                &quarantine,
+                &receipt.raw_live_before_undo,
+            )
+            .unwrap();
+            assert!(run_dir.join("undone.json").is_file());
+            refuse_incomplete_database_transition(&migration.beads_dir, &migration.db_path)
+                .unwrap();
         }
     }
 

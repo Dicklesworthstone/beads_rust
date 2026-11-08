@@ -105,6 +105,18 @@ operation, that explicit apply resumes or retries, and that the original
 backup stays intact. These are deterministic state-recovery tests, not
 abrupt process termination, power-loss, or filesystem fault-injection tests.
 
+Separate restore-copy regressions inject an I/O error after 64 bytes and a
+short copy that incorrectly reports success. Neither may publish the final
+component name; retry must retain the failed staging evidence and preserve the
+original backup. The authentic release workflow case adds a configuration
+record only in the original WAL, interrupts both restored-main staging and WAL
+restoration, releases every in-process authority, and resumes through normal
+undo. It requires the exact original family bytes and modes, all 23 release
+events, the WAL-only configuration, and the complete original logical state.
+Competing destination files are also retained without replacement. These
+injected-copy and reconstructed-restart cases do not claim process-kill or
+power-loss coverage.
+
 ## Generation recipe
 
 Every command below used the checksum-verified release executable and global

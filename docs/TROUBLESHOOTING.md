@@ -907,6 +907,15 @@ incomplete, so a missing WAL cannot silently replace database configuration
 with defaults. These checks preserve the live family and retained recovery
 files.
 
+Restoration copies each receipt-bound component into a unique sibling staging
+file, verifies its length and digest, restores its recorded permissions, and
+syncs it before publishing the final name without replacement. An interrupted
+copy therefore leaves the final name absent, so the next explicit recovery
+invocation can retry from the retained backup. Incomplete staging files remain
+available as evidence. A file already occupying the final name must still match
+the receipt; recovery never overwrites unknown bytes, including a partial file
+left by an older implementation.
+
 **Replacing only the executable is not a safe downgrade.** The upgraded
 layout is incompatible with v0.7.6 despite the unchanged version. Preview and
 run the receipt's guarded undo before subsequent changes:
