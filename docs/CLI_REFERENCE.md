@@ -2959,7 +2959,18 @@ resume. `plan` and `heal --dry-run` use the same check; they cannot declare an
 intermediate family healthy. Plain `doctor` reports
 `db.schema_migration_pending` and skips database engine probes. Explicit
 apply/undo recovery remains available, as do `info` and explicit JSONL-only
-reads for diagnosis.
+reads for diagnosis. During an unfinished transition, `info` reports paths and
+engine details but omits database-derived issue counts, configuration, schema,
+and projections. Its optional `database_inspection_error` explains the refusal.
+`config list` and `config get` refuse to present merged configuration until the
+transition finishes, including when invoked with `--no-db`, because these
+commands normally include the database configuration layer. `config path` and
+`config schema` remain available.
+
+Once an undo has begun, `apply` refuses to start another migration until that
+run's explicit `undo` completes. Restoring the original main file alone does
+not finish undo: its retained sidecars and completion receipt must agree too.
+After verified completion, a fresh upgrade is allowed as usual.
 
 Completed runs and failures that attest exact restoration of the original
 family permit subsequent ordinary work. Startup checks receipts without

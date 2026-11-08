@@ -9,6 +9,7 @@
 
 #![allow(clippy::default_trait_access)]
 
+use crate::cli::commands::doctor_subsystems::schema_migration::with_database_transition_observation;
 use crate::cli::{ConfigCommands, OutputFormatBasic};
 use crate::config::{
     self, CliOverrides, ConfigLayer, ConfigPaths, canonical_config_key, default_config_layer,
@@ -259,7 +260,7 @@ fn build_layers(
         let paths = config::resolve_paths(dir, db_overrides.db.as_ref())?;
         (
             load_jsonl_inferred_layer(&paths)?,
-            load_db_layer_without_recovery(&paths),
+            load_db_layer_without_recovery(&paths)?,
         )
     } else {
         (ConfigLayer::default(), ConfigLayer::default())
@@ -319,42 +320,49 @@ fn load_jsonl_inferred_layer(paths: &ConfigPaths) -> Result<ConfigLayer> {
     Ok(layer)
 }
 
-fn load_db_layer_without_recovery(paths: &ConfigPaths) -> ConfigLayer {
-    if !paths.db_path.is_file() {
-        return ConfigLayer::default();
-    }
+fn load_db_layer_without_recovery(paths: &ConfigPaths) -> Result<ConfigLayer> {
+    // A partial database replacement is not an absent configuration layer.
+    // Preserve path/file-only diagnostics, but refuse merged configuration
+    // rather than present defaults or a main file missing its retained WAL.
+    // The outer fence also rejects a transition completed during the copy.
+    with_database_transition_observation(&paths.beads_dir, &paths.db_path, || {
+        if !paths.db_path.is_file() {
+            return Ok(ConfigLayer::default());
+        }
 
-    match config::with_database_family_snapshot(&paths.db_path, |snapshot_db_path| {
-        let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
-        let rows = conn.query("SELECT key, value FROM config")?;
-        let mut layer = ConfigLayer::default();
+        let loaded = config::with_database_family_snapshot(&paths.db_path, |snapshot_db_path| {
+            let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+            let rows = conn.query("SELECT key, value FROM config")?;
+            let mut layer = ConfigLayer::default();
 
-        for row in rows {
-            let Some(key) = row.get(0).and_then(SqliteValue::as_text) else {
-                continue;
-            };
-            let Some(value) = row.get(1).and_then(SqliteValue::as_text) else {
-                continue;
-            };
-            if config::is_startup_key(key) {
-                continue;
+            for row in rows {
+                let Some(key) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(value) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                if config::is_startup_key(key) {
+                    continue;
+                }
+                layer.runtime.insert(key.to_string(), value.to_string());
             }
-            layer.runtime.insert(key.to_string(), value.to_string());
-        }
 
-        conn.close()?;
-        Ok(layer)
-    }) {
-        Ok(layer) => layer,
-        Err(err) => {
-            debug!(
-                path = %paths.db_path.display(),
-                error = %err,
-                "Skipping DB config layer because the database could not be snapshotted for read-only access"
-            );
-            ConfigLayer::default()
-        }
-    }
+            conn.close()?;
+            Ok(layer)
+        });
+        Ok(match loaded {
+            Ok(layer) => layer,
+            Err(err) => {
+                debug!(
+                    path = %paths.db_path.display(),
+                    error = %err,
+                    "Skipping DB config layer because the database could not be snapshotted for read-only access"
+                );
+                ConfigLayer::default()
+            }
+        })
+    })
 }
 
 fn merge_layers(layers: &[LayerWithSource]) -> ConfigLayer {

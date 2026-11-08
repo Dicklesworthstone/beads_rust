@@ -909,6 +909,16 @@ the recovery protocol verifies its live and retained generations. New plans
 carry the stronger source proof; earlier installed receipts retain their
 original semantics for guarded recovery and undo.
 
+If an upgrade or undo is interrupted, finish the explicit recovery command
+reported by the retained receipts before ordinary database operations. A new
+`apply` cannot supersede an unfinished undo, even if the original main file has
+already been restored. `info` remains available for paths and engine details;
+its `database_inspection_error` explains why database-derived details are
+omitted. `config get` and `config list` refuse while that database generation is
+incomplete, so a missing WAL cannot silently replace database configuration
+with defaults. These checks preserve the live family and retained recovery
+files.
+
 **Replacing only the executable is not a safe downgrade.** The upgraded
 layout is incompatible with v0.7.6 despite the unchanged version. Preview and
 run the receipt's guarded undo before subsequent changes:

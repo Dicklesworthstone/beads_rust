@@ -433,6 +433,8 @@ mod incomplete_transitions {
     use std::path::{Path, PathBuf};
 
     const SENTINEL: &str = "Acknowledged issue title retained only in the original migration WAL";
+    const CONFIG_KEY: &str = "operator_wal_configuration";
+    const CONFIG_SENTINEL: &str = "Authoritative configuration retained only in the migration WAL";
     const FAMILY_SUFFIXES: &[&str] = &["", "-wal", "-shm", "-journal"];
 
     struct AppliedWalFixture {
@@ -465,17 +467,39 @@ mod incomplete_transitions {
                     &[SENTINEL.into()],
                 )
                 .unwrap();
+            connection
+                .execute_with_params(
+                    "INSERT INTO config (key, value) VALUES (?, ?)",
+                    &[CONFIG_KEY.into(), CONFIG_SENTINEL.into()],
+                )
+                .unwrap();
             connection.close_without_checkpoint_in_place().unwrap();
             drop(connection);
             assert_eq!(fs::read(&db).unwrap(), main);
             assert!(!contains_sentinel(&main));
+            assert!(
+                !main
+                    .windows(CONFIG_SENTINEL.len())
+                    .any(|part| part == CONFIG_SENTINEL.as_bytes())
+            );
             assert!(contains_sentinel(
                 &fs::read(beads.join("beads.db-wal")).unwrap()
             ));
             assert!(
+                fs::read(beads.join("beads.db-wal"))
+                    .unwrap()
+                    .windows(CONFIG_SENTINEL.len())
+                    .any(|part| part == CONFIG_SENTINEL.as_bytes())
+            );
+            assert!(
                 !fs::read_to_string(beads.join("issues.jsonl"))
                     .unwrap()
                     .contains(SENTINEL)
+            );
+            assert!(
+                !fs::read_to_string(beads.join("config.yaml"))
+                    .unwrap()
+                    .contains(CONFIG_KEY)
             );
             let source_rows = schema19_authority_rows(&db, None);
             let source_files = schema19_tracker_files(&beads);
@@ -527,6 +551,7 @@ mod incomplete_transitions {
                 schema19_authority_rows(&self.db, Some(&self.source_rows)),
                 self.source_rows
             );
+            self.assert_diagnostic_access_after_recovery();
             schema19_json(&run_br(
                 &self.workspace,
                 ["stats", "--json"],
@@ -564,6 +589,36 @@ mod incomplete_transitions {
                     .any(|issue| { issue["id"] == "rel19-local" && issue["title"] == SENTINEL })
             );
         }
+
+        fn assert_diagnostic_access_after_recovery(&self) {
+            let before = schema19_tracker_files(&self.beads);
+            let info = schema19_json(&run_br(
+                &self.workspace,
+                ["info", "--schema", "--projections", "--json"],
+                "completed_transition_info",
+            ));
+            assert_eq!(info["issue_count"], 4);
+            assert_eq!(info["config"][CONFIG_KEY], CONFIG_SENTINEL);
+            assert_eq!(info["schema"]["schema_version"], "19");
+            assert!(info["projections"].is_object());
+            assert!(info.get("database_inspection_error").is_none());
+            assert_eq!(schema19_tracker_files(&self.beads), before);
+
+            let configured = schema19_json(&run_br(
+                &self.workspace,
+                ["config", "get", CONFIG_KEY, "--json"],
+                "completed_transition_config_get",
+            ));
+            assert_eq!(configured["value"], CONFIG_SENTINEL);
+            assert_eq!(schema19_tracker_files(&self.beads), before);
+            let merged = schema19_json(&run_br(
+                &self.workspace,
+                ["config", "list", "--json"],
+                "completed_transition_config_list",
+            ));
+            assert_eq!(merged[CONFIG_KEY], CONFIG_SENTINEL);
+            assert_eq!(schema19_tracker_files(&self.beads), before);
+        }
     }
 
     fn contains_sentinel(bytes: &[u8]) -> bool {
@@ -586,6 +641,10 @@ mod incomplete_transitions {
                 "--json",
             ],
             vec!["sync", "--import-only", "--json"],
+            vec!["config", "get", CONFIG_KEY, "--json"],
+            vec!["config", "list", "--json"],
+            vec!["--no-db", "config", "get", CONFIG_KEY, "--json"],
+            vec!["--no-db", "config", "list", "--json"],
             vec!["doctor", "--json"],
             vec!["doctor", "--repair", "--json"],
             vec!["--no-db", "doctor", "--repair", "--json"],
@@ -632,8 +691,10 @@ mod incomplete_transitions {
         // These modes intentionally diagnose paths or the explicit JSONL
         // source. They must stay usable without admitting the SQLite family.
         for (index, args) in [
-            vec!["info", "--json"],
+            vec!["info", "--schema", "--projections", "--json"],
             vec!["--no-db", "list", "--all", "--json"],
+            vec!["config", "path", "--json"],
+            vec!["config", "schema", "--json"],
         ]
         .into_iter()
         .enumerate()
@@ -649,6 +710,23 @@ mod incomplete_transitions {
                 inspected.stdout,
                 inspected.stderr
             );
+            if index == 0 {
+                let report: Value = serde_json::from_str(&inspected.stdout).unwrap();
+                assert!(report["database_path"].is_string());
+                assert!(report["engine"].is_object());
+                for field in ["issue_count", "config", "schema", "projections"] {
+                    assert!(
+                        report.get(field).is_none(),
+                        "info must not publish {field} from an unfinished database generation: {report}"
+                    );
+                }
+                let error = report["database_inspection_error"].as_str().unwrap();
+                assert!(error.contains(&fixture.run_id), "{error}");
+                assert!(
+                    error.contains(&format!("migrate-schema {recovery}")),
+                    "{error}"
+                );
+            }
             assert_eq!(schema19_tracker_files(&fixture.beads), interrupted);
         }
     }
@@ -783,6 +861,7 @@ mod incomplete_transitions {
                 fixture.source_files.get(Path::new(name))
             );
         }
+        fixture.assert_diagnostic_access_after_recovery();
         // Undo restores the released layout. Its completed receipt must allow
         // a fresh explicit upgrade and subsequent ordinary reads and writes.
         let replanned = schema19_json(&run_br(

@@ -2,6 +2,7 @@
 
 use crate::cli::InfoArgs;
 use crate::cli::commands::doctor_subsystems::engine::{EngineBlock, engine_block};
+use crate::cli::commands::doctor_subsystems::schema_migration::with_database_transition_observation;
 use crate::config;
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
@@ -80,6 +81,8 @@ struct InfoOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    database_inspection_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     issue_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     config: Option<HashMap<String, String>>,
@@ -97,6 +100,7 @@ struct InfoOutput {
 
 #[derive(Default)]
 struct InfoSnapshot {
+    database_inspection_error: Option<String>,
     issue_count: Option<usize>,
     config_map: Option<HashMap<String, String>>,
     detected_prefix: Option<String>,
@@ -175,6 +179,7 @@ fn collect_info_output(args: &InfoArgs, cli: &config::CliOverrides) -> Result<In
         resolved_prefix,
         daemon_fallback_reason: Some("no-daemon".to_string()),
         daemon_detail: Some("br runs in direct mode only".to_string()),
+        database_inspection_error: snapshot.database_inspection_error,
         issue_count: snapshot.issue_count,
         config: snapshot.config_map,
         schema: snapshot.schema,
@@ -193,16 +198,22 @@ fn load_info_snapshot_without_recovery(
     args: &InfoArgs,
     paths: &config::ConfigPaths,
 ) -> InfoSnapshot {
-    if !paths.db_path.is_file() {
-        return InfoSnapshot::default();
-    }
-
-    match config::with_database_family_snapshot(&paths.db_path, |snapshot_db_path| {
-        let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
-        let snapshot = collect_info_snapshot(args, &conn);
-        conn.close()?;
-        Ok(snapshot)
-    }) {
+    // Path and engine diagnostics remain available during interrupted apply or
+    // undo, but a stable copy of that interval can still contain a mixed
+    // main/WAL generation. Only publish database details after the receipt
+    // generation proves that the entire observation was complete and stable.
+    let inspected = with_database_transition_observation(&paths.beads_dir, &paths.db_path, || {
+        if !paths.db_path.is_file() {
+            return Ok(InfoSnapshot::default());
+        }
+        config::with_database_family_snapshot(&paths.db_path, |snapshot_db_path| {
+            let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+            let snapshot = collect_info_snapshot(args, &conn);
+            conn.close()?;
+            Ok(snapshot)
+        })
+    });
+    match inspected {
         Ok(snapshot) => snapshot,
         Err(err) => {
             debug!(
@@ -210,7 +221,10 @@ fn load_info_snapshot_without_recovery(
                 error = %err,
                 "Skipping DB-backed info details because the database could not be snapshotted for read-only access"
             );
-            InfoSnapshot::default()
+            InfoSnapshot {
+                database_inspection_error: Some(err.to_string()),
+                ..InfoSnapshot::default()
+            }
         }
     }
 }
@@ -231,6 +245,7 @@ fn collect_info_snapshot(args: &InfoArgs, conn: &Connection) -> InfoSnapshot {
     let projections = args.projections.then(|| build_projection_info(conn));
 
     InfoSnapshot {
+        database_inspection_error: None,
         issue_count,
         config_map,
         detected_prefix,
@@ -457,6 +472,10 @@ fn print_human(info: &InfoOutput) {
         println!("Issue count: {count}");
     }
 
+    if let Some(error) = &info.database_inspection_error {
+        println!("Database details unavailable: {}", info_display_text(error));
+    }
+
     if let Some(prefix) = info.resolved_prefix.as_deref() {
         println!("Issue prefix: {}", info_display_text(prefix));
     }
@@ -608,6 +627,12 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
         content.append_styled("  Issues    ", theme.dimmed.clone());
         content.append_styled(&format!("{count}"), theme.emphasis.clone());
         content.append_styled(" total\n", theme.dimmed.clone());
+    }
+
+    if let Some(error) = &info.database_inspection_error {
+        content.append_styled("  Details unavailable: ", theme.dimmed.clone());
+        content.append(&info_display_text(error));
+        content.append("\n");
     }
 
     // JSONL section

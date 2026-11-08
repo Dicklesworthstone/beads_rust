@@ -399,6 +399,27 @@ pub fn refuse_incomplete_database_transition(beads_dir: &Path, db_path: &Path) -
     Ok(())
 }
 
+/// Apply may resume its own unfinished installation, but must not supersede
+/// an unfinished undo. Restoring the original main can make its old plan token
+/// valid again before undo has restored the whole family and published its
+/// completion receipt. Reuse the startup chain validator, including canonical
+/// route matching, without requiring completed historical runs to describe
+/// today's live generation.
+fn refuse_apply_during_unfinished_undo(beads_dir: &Path, db_path: &Path) -> Result<()> {
+    let directories = migration_receipt_directories(beads_dir, db_path)?;
+    if directories.runs.is_empty() {
+        return Ok(());
+    }
+    let requested = crate::sync::canonical_database_authority_path(db_path)?;
+    for run_dir in directories.runs {
+        if secure_file_metadata(&run_dir.join("undo-prepared.json"))?.is_some() {
+            require_completed_migration_run(beads_dir, &requested, &run_dir)
+                .map_err(|error| migration_startup_refusal(db_path, &run_dir, error))?;
+        }
+    }
+    Ok(())
+}
+
 /// Observe a private database copy without creating any source lock files.
 ///
 /// A migration must publish its durable intent before moving live family
@@ -3540,6 +3561,7 @@ fn apply_with_plan_token(
             "schema migration apply requires a non-empty --plan-token",
         ));
     }
+    refuse_apply_during_unfinished_undo(&migration.beads_dir, &migration.db_path)?;
     // The br writer byte does not conflict with SQLite's native locks. Keep
     // sole-opener, engine-namespace and native exclusion from the first source
     // observation through installation/rollback and applied receipt durability.
@@ -8946,6 +8968,194 @@ mod tests {
             )
             .unwrap();
             assert!(run.refused_without_changes().contains("prepared family"));
+        }
+
+        #[test]
+        fn apply_admission_requires_completed_undo_for_every_matching_route() {
+            let (_temp, run) = fixture();
+            refuse_apply_during_unfinished_undo(&run.beads_dir, &run.db_path).unwrap();
+            run.commit_ready();
+            // Apply must still be able to resume its own unfinished intent.
+            refuse_apply_during_unfinished_undo(&run.beads_dir, &run.db_path).unwrap();
+            let applied = run.applied();
+            let mut receipt = run.undo_prepared(&applied);
+            let other = run.beads_dir.join("other.db");
+            fs::write(&other, b"unrelated database route").unwrap();
+            let equivalent = run.beads_dir.join(".").join("beads.db");
+            let before = file_bytes(&run.beads_dir);
+            for path in [&run.db_path, &equivalent] {
+                let error = refuse_apply_during_unfinished_undo(&run.beads_dir, path)
+                    .expect_err("apply must wait for the canonically routed undo");
+                assert!(matches!(&error, BeadsError::SyncConflict { .. }));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("migrate-schema undo receipt-run")
+                );
+            }
+            refuse_apply_during_unfinished_undo(&run.beads_dir, &other).unwrap();
+            assert_eq!(file_bytes(&run.beads_dir), before);
+
+            receipt.raw_restored = Some(receipt.raw_expected_before.clone());
+            receipt.logical_restored = Some(receipt.logical_expected_before.clone());
+            write_json_new(&run.run_dir.join("undone.json"), &receipt).unwrap();
+            fs::write(&run.db_path, b"a later generation after completed undo").unwrap();
+            refuse_apply_during_unfinished_undo(&run.beads_dir, &run.db_path).unwrap();
+            assert!(
+                !run.run_dir.join("before").exists(),
+                "historical completion admission must not inspect archived database payloads"
+            );
+        }
+
+        #[test]
+        fn apply_admission_refuses_orphan_and_inconsistent_undo_receipts() {
+            for damage in [
+                "missing-commit-ready",
+                "truncated-completion",
+                "different-quarantine",
+            ] {
+                let (_temp, run) = fixture();
+                run.commit_ready();
+                let applied = run.applied();
+                let mut receipt = run.undo_prepared(&applied);
+                match damage {
+                    "missing-commit-ready" => {
+                        fs::rename(
+                            run.run_dir.join("commit-ready.json"),
+                            run.run_dir.join("retained-commit-ready.json"),
+                        )
+                        .unwrap();
+                    }
+                    "truncated-completion" => {
+                        fs::write(run.run_dir.join("undone.json"), b"{").unwrap();
+                    }
+                    "different-quarantine" => {
+                        receipt.raw_restored = Some(receipt.raw_expected_before.clone());
+                        receipt.logical_restored = Some(receipt.logical_expected_before.clone());
+                        receipt.quarantine_path = run
+                            .run_dir
+                            .join("undo-quarantine/unrelated-undo")
+                            .display()
+                            .to_string();
+                        write_json_new(&run.run_dir.join("undone.json"), &receipt).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let before = file_bytes(&run.beads_dir);
+                let error = refuse_apply_during_unfinished_undo(&run.beads_dir, &run.db_path)
+                    .expect_err("unverifiable undo cannot authorize another apply");
+                assert!(
+                    matches!(&error, BeadsError::SyncConflict { .. }),
+                    "{damage}: {error}"
+                );
+                assert_eq!(file_bytes(&run.beads_dir), before, "{damage}");
+            }
+        }
+
+        #[test]
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[allow(
+            clippy::too_many_lines,
+            reason = "the real release apply/undo boundaries and preserved file families form one regression"
+        )]
+        fn schema19_apply_waits_for_undo_completion_before_reusing_original_plan() {
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            fs::create_dir(&beads_dir).unwrap();
+            let db_path = beads_dir.join("beads.db");
+            let fixture = include_bytes!(
+                "../../../../tests/fixtures/schema_migration/schema19_v076_workflows.db.gz"
+            );
+            let mut released = Vec::new();
+            flate2::read::GzDecoder::new(&fixture[..])
+                .read_to_end(&mut released)
+                .unwrap();
+            fs::write(&db_path, released).unwrap();
+            let migration = MigrationContext {
+                write_authority: Arc::new(
+                    crate::sync::blocking_database_family_write_lock_with_timeout(
+                        &beads_dir,
+                        &db_path,
+                        Some(1000),
+                    )
+                    .unwrap(),
+                ),
+                beads_dir,
+                db_path,
+            };
+            let plan = build_observational_plan(&migration.db_path).unwrap();
+            assert_eq!((plan.from_version, plan.to_version), (19, 19));
+            let token = plan.plan_token.as_deref().unwrap();
+            let (applied, _) = apply_with_plan_token(token, &migration).unwrap();
+            let run_dir = migration_runs_root(&migration.beads_dir).join(&applied.run_id);
+            let args = DoctorMigrateSchemaUndoArgs {
+                run_id: applied.run_id.clone(),
+                dry_run: false,
+                json: false,
+            };
+            let mut prepared =
+                build_undo_preview(&args, &migration.beads_dir, &migration.db_path).unwrap();
+            prepared.dry_run = false;
+            write_json_new(&run_dir.join("undo-prepared.json"), &prepared).unwrap();
+
+            // Exercise both the still-applied and fully restored generations.
+            // The second boundary is after byte restoration but before the
+            // durable terminal receipt; its old plan token is valid again.
+            for restored in [false, true] {
+                if restored {
+                    execute_undo(&args, &migration).unwrap();
+                    assert_eq!(
+                        raw_family_witness(&migration.db_path).unwrap(),
+                        applied.raw_before
+                    );
+                    fs::rename(
+                        run_dir.join("undone.json"),
+                        run_dir.join("undone.interruption-evidence.json"),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        build_observational_plan(&migration.db_path)
+                            .unwrap()
+                            .plan_token,
+                        plan.plan_token,
+                        "the restored generation must reproduce the original token to expose the bug"
+                    );
+                }
+                let before = file_bytes(&migration.beads_dir);
+                let raw = raw_family_witness(&migration.db_path).unwrap();
+                for requested in [token, "unrelated-precomputed-plan-token"] {
+                    let error = apply_with_plan_token(requested, &migration)
+                        .expect_err("unfinished undo must precede every apply token");
+                    assert!(matches!(&error, BeadsError::SyncConflict { .. }));
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("migrate-schema undo {}", applied.run_id)),
+                        "{error}"
+                    );
+                    assert_eq!(file_bytes(&migration.beads_dir), before);
+                    assert_eq!(raw_family_witness(&migration.db_path).unwrap(), raw);
+                    assert_eq!(
+                        migration_receipt_directories(&migration.beads_dir, &migration.db_path)
+                            .unwrap()
+                            .runs,
+                        vec![run_dir.clone()],
+                        "refused apply must not allocate a second run"
+                    );
+                }
+            }
+
+            execute_undo(&args, &migration).unwrap();
+            assert_eq!(
+                raw_family_witness(&migration.db_path).unwrap(),
+                applied.raw_before
+            );
+            let (reapplied, _) = apply_with_plan_token(token, &migration).unwrap();
+            assert_ne!(reapplied.run_id, applied.run_id);
+            assert_eq!(reapplied.logical_before, plan.logical_witness);
+            assert!(reapplied.attested);
+            refuse_incomplete_database_transition(&migration.beads_dir, &migration.db_path)
+                .expect("completed undo must not strand the subsequent upgrade");
         }
 
         #[test]
