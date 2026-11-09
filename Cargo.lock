@@ -297,7 +297,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.1",
- "signal-hook 0.4.5",
+ "signal-hook 0.4.6",
  "slab",
  "smallvec",
  "socket2",
@@ -447,7 +447,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.1",
  "shell-words",
- "signal-hook 0.4.5",
+ "signal-hook 0.4.6",
  "similar 3.2.1",
  "tar",
  "tempfile",
@@ -1706,9 +1706,9 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "flate2"
-version = "1.1.10"
+version = "1.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+checksum = "626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4"
 dependencies = [
  "crc32fast",
  "miniz_oxide 0.9.1",
@@ -1825,9 +1825,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.4.10"
+version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6814e841996523e99c2257f48d58e68a8fa5593c425ad9efaa3ea56937c88bb"
+checksum = "e8ce68594eb3707d596ffc77a6b8fd22940e06a900f288032ce28d7eff153639"
 dependencies = [
  "foldhash",
  "fsqlite-error",
@@ -1883,9 +1883,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.4.12"
+version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4031411660377c42ab229ca0be487b29ecfb19edef77087c9275a23ec1c57ef"
+checksum = "7e1e699677e339165ca5413f5b0f38e0d6e6a15be5c81c8a6bbefabadda10dbf"
 dependencies = [
  "thiserror",
 ]
@@ -1968,9 +1968,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.4.10"
+version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74f0dfe11319cca8fed29465f16829417337881c5830eefba4c740395d452528"
+checksum = "6e47de50c66b2dea8f88716a85a70a3879409c77f58b984267db45a95fe99fee"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2006,9 +2006,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.4.10"
+version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb05e2c01912488876ca881fd89c8063bdf82595462c692dd557efe0c57b88cd"
+checksum = "b894ad524e1f528d1a4f2e618ff6094d7ab930f8e5d6d66115b4a61433bf31e5"
 dependencies = [
  "argon2",
  "asupersync",
@@ -2325,7 +2325,7 @@ dependencies = [
  "gix-zlib",
  "nonempty",
  "parking_lot",
- "signal-hook 0.4.5",
+ "signal-hook 0.4.6",
  "smallvec",
  "thiserror",
 ]
@@ -3017,7 +3017,7 @@ dependencies = [
  "gix-fs",
  "libc",
  "parking_lot",
- "signal-hook 0.4.5",
+ "signal-hook 0.4.6",
  "signal-hook-registry",
  "tempfile",
 ]
@@ -5312,9 +5312,9 @@ dependencies = [
 
 [[package]]
 name = "signal-hook"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b29ffa27d3d59a049bb328258de100f8012848d1b08d444e08bbc02ac468435e"
+checksum = "49f7447afd772ca79ad17ae0a3972a6b0df0cb4b80990fd82707593e9e012a74"
 dependencies = [
  "libc",
  "signal-hook-registry",
