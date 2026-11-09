@@ -1,0 +1,115 @@
+{
+  "archive": {
+    "bytes": 114863,
+    "file": "reproduction.tar.gz",
+    "file_count": 459,
+    "sha256": "f4931db161b7458a3c7746c4abe6cc4db8611e777c95df63a8b212905a508e72",
+    "uncompressed_file_bytes": 3269509
+  },
+  "counter": {
+    "calibration": "pread + pread64, four threads x ten reads, exact -wal-cert exclusion; success 5424 returned bytes; separate failing-read/errno preservation control.",
+    "mechanism": "Separate untimed Linux/glibc pread/pread64 LD_PRELOAD instrumentation; counts successful reads of exact -wal basenames, with failed/overflow calls separate. Not strace.",
+    "shared_library_sha256": "f320fd75db19d48252fd31f520fc31ed6ceadaa642533496ccd4ac8693ee5bdd",
+    "source_sha256": "16331fd4d3edba7e31e11f5695ec7335b9e3ffa3dc0d1f0afe0b74b07741f64f"
+  },
+  "created_utc": "2026-11-09T20:02:02.892870+00:00",
+  "excludes": [
+    "executables and shared libraries",
+    "database fixtures",
+    "toolchain",
+    "unrelated files"
+  ],
+  "fresh_causal_replay": {
+    "final_full_row_and_export_validation": true,
+    "fixture_frames": 28,
+    "results": [
+      {
+        "file": "wal-replay-restored/commands/000015-replay-1-baseline-default.stderr",
+        "rebuild_frame_decisions": 0,
+        "startup_open_frame_decisions": 56,
+        "wal_file_opened_events": 2
+      },
+      {
+        "file": "wal-replay-restored/commands/000017-replay-1-baseline-explicit-no-sync.stderr",
+        "rebuild_frame_decisions": 0,
+        "startup_open_frame_decisions": 56,
+        "wal_file_opened_events": 2
+      }
+    ]
+  },
+  "fresh_reproduction": {
+    "all_commands_correct": true,
+    "commands": 109,
+    "correctness_scope": "Every show matched expected issue fields. Initial/final doctor integrity and DB/JSONL count checks passed; only explicitly accepted initial recovery/large-JSONL warnings remained, with identical recovery inventory.",
+    "description_bytes": 25000,
+    "held_shared_opener_lease": true,
+    "issues": 5000,
+    "measured_samples": 70,
+    "ok": true,
+    "peak": {
+      "default": {
+        "frame_zero_reads": 4,
+        "frames": 11841,
+        "header_reads": 6,
+        "overflow_calls": 0,
+        "pread_bytes_returned": 98171408,
+        "pread_calls_by_requested_bytes": {
+          "24": 23684,
+          "32": 6,
+          "4120": 23690
+        },
+        "pread_failed_calls": 0,
+        "wal_bytes": 48784952
+      },
+      "explicit-no-sync": {
+        "frame_zero_reads": 4,
+        "frames": 11841,
+        "header_reads": 6,
+        "overflow_calls": 0,
+        "pread_bytes_returned": 98171408,
+        "pread_calls_by_requested_bytes": {
+          "24": 23684,
+          "32": 6,
+          "4120": 23690
+        },
+        "pread_failed_calls": 0,
+        "wal_bytes": 48784952
+      }
+    },
+    "terminal_checkpoint_frames": 0,
+    "wal_bytes": [
+      4152,
+      9760312,
+      19949072,
+      29610472,
+      39214192,
+      48784952,
+      32
+    ],
+    "warmup_samples": 14
+  },
+  "included_groups": [
+    "official-release: release/issue JSON, binary/archive identity receipt, published SHA256 sidecar",
+    "wal-official-counted-restored: metadata, summary, observations, stage/family/recovery receipts, exact harness snapshot, all related raw command outputs/records and read-count diagnostics",
+    "wal-replay-restored: metadata, summary, observations, stage/family/recovery receipts, exact harness snapshot, all related raw command outputs/records including both 28-frame replay logs",
+    "counter: calibrated C counter source, calibration C source, successful and failing-read control JSON"
+  ],
+  "issue": "https://github.com/Dicklesworthstone/beads_rust/issues/598",
+  "official_release": {
+    "archive_sha256": "56baae2df5e7cc6f6537e05fd5f560192a9d5ceb02659c61b10b9610b45eb3ef",
+    "binary_sha256": "73cbef7f11680b8349ef5b465d002e404272cc6c06b0f95a86035b488b1844b9",
+    "commit": "ad4212f562ca59864946b8620c1361f0933ee4a8",
+    "fsqlite_wal_version": "0.4.10",
+    "verified_against": "official release asset digest and SHA256 sidecar",
+    "version": "0.7.6"
+  },
+  "original_raw_directories_unchanged": true,
+  "schema": "beads_rust.wal_reopen_598.reproduction.v1",
+  "source_scope": {
+    "beads_main_base": "117f81de0d5dae007d972a9ff7f1d73c392d8822",
+    "main_fsqlite_wal_pin": "=0.4.12",
+    "main_source_binary_measured": false,
+    "source_candidate_speedup_measured": false
+  },
+  "timing_status": "CONTENDED: source compilation overlapped these runs. Stored CPU/wall observations are not uncontended performance or source-candidate speedup evidence."
+}

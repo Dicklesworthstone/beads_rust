@@ -1,0 +1,165 @@
+{
+  "archive": {
+    "bytes": 365280,
+    "file": "build-validation.tar.gz",
+    "file_count": 22,
+    "sha256": "2eebf1859a2ef23666432b68ea76b19f8239ea5a0183314f00ae30f7734ae447",
+    "uncompressed_file_bytes": 15264379
+  },
+  "attempts": [
+    {
+      "elapsed_seconds": 1127.562161013,
+      "failure": "asupersync 0.5.0 rustc process received SIGKILL; Beads application code and proposed changes were not compiled/type-checked by this attempt",
+      "log": "builds/br-main-baseline-build.log",
+      "max_rss_kib": 4941464,
+      "receipt": "builds/br-main-baseline-build-receipt.json",
+      "returncode": 101,
+      "source_changed_during_build": false,
+      "source_commit": "117f81de0d5dae007d972a9ff7f1d73c392d8822"
+    },
+    {
+      "elapsed_seconds": 187.67740858200023,
+      "failure": "asupersync 0.5.0 rustc process received SIGKILL; Beads application code and proposed changes were not compiled/type-checked by this attempt",
+      "log": "builds/br-main-baseline-fallback-build.log",
+      "max_rss_kib": 2443640,
+      "receipt": "builds/br-main-baseline-fallback-build-receipt.json",
+      "returncode": 101,
+      "source_changed_during_build": false,
+      "source_commit": "117f81de0d5dae007d972a9ff7f1d73c392d8822"
+    },
+    {
+      "elapsed_seconds": 223.0336037070001,
+      "failure": "asupersync 0.5.0 rustc process received SIGKILL; Beads application code and proposed changes were not compiled/type-checked by this attempt",
+      "log": "builds/br-main-baseline-resume-build.log",
+      "max_rss_kib": 2014372,
+      "receipt": "builds/br-main-baseline-resume-build-receipt.json",
+      "returncode": 101,
+      "source_changed_during_build": false,
+      "source_commit": "117f81de0d5dae007d972a9ff7f1d73c392d8822"
+    }
+  ],
+  "configuration_scope": "Actual commands, flags, package configuration and unchanged source hashes are captured in each receipt. The lower-resource profiles differ from the distributed release profile. The legacy-solver selector chooses the official compiler legacy solver; it does not bypass type/borrow/coherence checking.",
+  "created_utc": "2026-11-09T20:10:21.050532+00:00",
+  "excludes": [
+    "compiler/tool binaries",
+    "build caches",
+    "database fixtures",
+    "unrelated artifacts"
+  ],
+  "files": [
+    {
+      "bytes": 163249,
+      "path": "baseline/Cargo.lock",
+      "sha256": "f07d07949dd9c6c4f265718762b6e31c5af2ad07514ce8210c811619fb8eab94"
+    },
+    {
+      "bytes": 9609,
+      "path": "baseline/Cargo.toml",
+      "sha256": "84bb3bb535f237c9280f0eb47619742a82ac754ac8a3f42d13f2d29d8449b94e"
+    },
+    {
+      "bytes": 78,
+      "path": "baseline/rust-toolchain.toml",
+      "sha256": "6b42b786db58642d173380292dc24d3600d24ed1fc651a3d4a50cec9dc1b17bf"
+    },
+    {
+      "bytes": 2380,
+      "path": "builds/br-main-baseline-build-receipt.json",
+      "sha256": "11ce10990161c52db9fe46d79958e3d0e484d1ed60a3d86aca763fbe9d3cb0f1"
+    },
+    {
+      "bytes": 5029320,
+      "path": "builds/br-main-baseline-build.log",
+      "sha256": "f6a89d90f33de3aa4641b165eda5034e497270c3567f8f6e8d614bcd54912217"
+    },
+    {
+      "bytes": 0,
+      "path": "builds/br-main-baseline-build.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 3249,
+      "path": "builds/br-main-baseline-fallback-build-receipt.json",
+      "sha256": "f203ea0f48651ddc32c09357abf18ee9315c30419d030ee96c0d53818fe9dedb"
+    },
+    {
+      "bytes": 5026994,
+      "path": "builds/br-main-baseline-fallback-build.log",
+      "sha256": "9ee561a08e272635d78fb9ffa1bc6555864c8f63d07cbaca79967d67a29dc601"
+    },
+    {
+      "bytes": 0,
+      "path": "builds/br-main-baseline-fallback-build.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 3248,
+      "path": "builds/br-main-baseline-resume-build-receipt.json",
+      "sha256": "ff89c1f62147d2c5797f4b48295c9a60c0b879b9d91fcee0c46b185bff6003f6"
+    },
+    {
+      "bytes": 5015581,
+      "path": "builds/br-main-baseline-resume-build.log",
+      "sha256": "3cf5a27182ce4c9c8edf60fc5ad54c4faf7326c929e6134c6083a1742aeb9e11"
+    },
+    {
+      "bytes": 0,
+      "path": "builds/br-main-baseline-resume-build.patch",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 286,
+      "path": "resources/br-main-baseline-resume-resource-after.json",
+      "sha256": "d3bec403a59de6d13a1a96da9f2a8f85a2ebed4ce27d8d3a2b558667c2db1c8a"
+    },
+    {
+      "bytes": 286,
+      "path": "resources/br-main-baseline-resume-resource-before.json",
+      "sha256": "d6ce9d0d6f8ebcadfe45041476cc5dce631d696cb705630213d2bc35783fd851"
+    },
+    {
+      "bytes": 446,
+      "path": "toolchain/asupersync-low-memory.toml",
+      "sha256": "d602b4faba767ff6fca06f1a8cce7c910a969ea322042c04e2cec3c1b1d99480"
+    },
+    {
+      "bytes": 781,
+      "path": "toolchain/beads-build-env.sh",
+      "sha256": "e57862d90debd14ca93f194bf9174a2c08a55a52a75ff2049bcf01e3e23a0ddf"
+    },
+    {
+      "bytes": 204,
+      "path": "toolchain/env.sh",
+      "sha256": "42c5753a6fbedb6d8701bff5114cabe274470af0c9f17fd1cf9022859153ef1e"
+    },
+    {
+      "bytes": 2000,
+      "path": "toolchain/install.log",
+      "sha256": "50fc5ef2addae51a6732bb3eb565a7875397aa2b8e697eae4d1f5311b427fb5e"
+    },
+    {
+      "bytes": 778,
+      "path": "toolchain/installation-receipt.json",
+      "sha256": "1e44417b8c7c064939c58990178f7cf8886220f951e3e5bafd985a18f69bb986"
+    },
+    {
+      "bytes": 1322,
+      "path": "toolchain/legacy-solver-provenance.json",
+      "sha256": "a71e916121238970a7f627fa61285746c2d94104fd9e9a66fa8e0ed69183bf87"
+    },
+    {
+      "bytes": 4488,
+      "path": "toolchain/run_beads_build.py",
+      "sha256": "01dcc230083346a02d2f52547893fa19916bf8087074ccd6647d2088ae09677a"
+    },
+    {
+      "bytes": 80,
+      "path": "toolchain/rustup-init.sha256",
+      "sha256": "d1d6bdab8155ccade0f7d267a05bd4968e78bd420b45f13787d927d9ff539c1b"
+    }
+  ],
+  "original_raw_files_unchanged": true,
+  "resource_scope": "Before/after resource snapshots are available for the third attempt only. The system oom_kill counter rose from 3 to 8 during that attempt; this is host-wide evidence, not attribution of every kill to this build.",
+  "schema": "beads_rust.wal_reopen_598.blocked_build_validation.v1",
+  "validation_status": "BLOCKED: three fresh builds of unchanged Beads main failed in the asupersync dependency. No candidate binary, candidate timing, source-test pass, cargo-check pass, or clippy pass is claimed."
+}

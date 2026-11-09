@@ -324,6 +324,118 @@ const SNAPSHOT_PROBE_LOG: &str = "error,br::read_snapshot=info";
 /// The event a read-only open logs when it copies the family to a snapshot.
 const SNAPSHOT_MARKER: &str = "reading a private snapshot";
 
+/// GH #598: the pending-merge advisory and the command must share the
+/// admitted snapshot. A WAL-only edit and an unusable derived index force
+/// actual private recovery, so counting a startup log alone cannot pass.
+#[test]
+fn read_startup_reuses_one_private_wal_recovery_for_pending_merge_inspection() {
+    use beads_rust::franken_sync::{Connection, SqliteValue};
+
+    for receipt in ["absent", "legacy", "malformed"] {
+        for no_auto_sync in [false, true] {
+            let workspace = settled_workspace();
+            let listed = run_br(&workspace, ["list", "--all", "--json"], "find_issue");
+            assert!(listed.status.success(), "{}", listed.stderr);
+            let json: Value = serde_json::from_str(&extract_json_payload(&listed.stdout)).unwrap();
+            let id = json["issues"][0]["id"].as_str().unwrap();
+            let sentinel = format!("WAL-only {receipt} {no_auto_sync}");
+            let db = beads_file(&workspace, "beads.db");
+            let mut writer = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            writer.execute("PRAGMA wal_autocheckpoint=0").unwrap();
+            writer
+                .execute_with_params(
+                    "UPDATE issues SET title=?1 WHERE id=?2",
+                    &[SqliteValue::from(sentinel.as_str()), SqliteValue::from(id)],
+                )
+                .unwrap();
+            if receipt != "absent" {
+                let key = if receipt == "legacy" {
+                    "sync_merge_pending_v1"
+                } else {
+                    "sync_merge_pending_v2"
+                };
+                writer
+                    .execute_with_params(
+                        "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+                        &[
+                            SqliteValue::from(key),
+                            SqliteValue::from("not-a-valid-receipt"),
+                        ],
+                    )
+                    .unwrap();
+            }
+            writer.close_without_checkpoint_in_place().unwrap();
+            drop(writer);
+            install_legacy_index(&workspace);
+            if receipt != "absent" {
+                // The pending verdict must precede freshness. Without that
+                // ordering, this newer source would refuse the read or sync
+                // it, rather than preserve the committed WAL-only title.
+                let jsonl = beads_file(&workspace, "issues.jsonl");
+                let changed = fs::read_to_string(&jsonl)
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        let mut issue: Value = serde_json::from_str(line).unwrap();
+                        issue["title"] = "New JSONL must not supersede pending merge".into();
+                        issue["updated_at"] = "2999-01-01T00:00:00Z".into();
+                        serde_json::to_string(&issue).unwrap()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                fs::write(jsonl, format!("{changed}\n")).unwrap();
+            }
+            let before = family_bytes(&workspace);
+            let jsonl_before = fs::read(beads_file(&workspace, "issues.jsonl")).unwrap();
+            assert!(before[1].len() > 32, "fixture must contain WAL frames");
+            assert!(
+                !before[0]
+                    .windows(sentinel.len())
+                    .any(|bytes| bytes == sentinel.as_bytes()),
+                "the main file must not contain the WAL-only title"
+            );
+            assert!(
+                before[1]
+                    .windows(sentinel.len())
+                    .any(|bytes| bytes == sentinel.as_bytes()),
+                "the committed WAL must contain the title"
+            );
+            let mut args = vec!["show", id, "--json"];
+            if no_auto_sync {
+                args.extend(["--no-auto-import", "--no-auto-flush"]);
+            }
+            let run = run_br_with_env(
+                &workspace,
+                args,
+                [("RUST_LOG", SNAPSHOT_PROBE_LOG)],
+                &format!("reused_recovery_{receipt}_{no_auto_sync}"),
+            );
+            assert!(run.status.success(), "{} {}", run.stdout, run.stderr);
+            let shown: Value = serde_json::from_str(&run.stdout).expect("complete show JSON");
+            assert_eq!(shown[0]["id"], id);
+            assert_eq!(shown[0]["title"], sentinel);
+            assert_eq!(
+                run.stderr.matches(SNAPSHOT_MARKER).count(),
+                1,
+                "one private WAL recovery must serve both inspection and show: {}",
+                run.stderr
+            );
+            if receipt != "absent" {
+                assert!(run.stderr.contains(receipt), "{}", run.stderr);
+                assert!(run.stderr.contains("pending"), "{}", run.stderr);
+            }
+            assert_eq!(family_bytes(&workspace), before, "live family changed");
+            assert_eq!(
+                fs::read(beads_file(&workspace, "issues.jsonl")).unwrap(),
+                jsonl_before,
+                "read startup must not synchronize the WAL-only edit"
+            );
+            assert_eq!(migration_run_count(&workspace), 0);
+            assert_eq!(wal_index_quarantine_count(&workspace), 0);
+        }
+    }
+}
+
 fn wal_index_quarantine_count(workspace: &BrWorkspace) -> usize {
     fs::read_dir(workspace.root.join(".beads"))
         .expect(".beads")

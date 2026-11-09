@@ -285,12 +285,31 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     }
     let mut pending_merge_warning_emitted = false;
     let mut deferred_pending_merge_warning = None;
-    if ctx.is_initialized()
+    let mut deferred_pending_merge_inspection_error = None;
+    let pending_merge_advisory_required = ctx.is_initialized()
         && !ctx.no_db()
         && (command_needs_write_lock || should_preopen_storage)
         && pending_merge_disposition == PendingMergeStartupDisposition::ReadOnlyNoAutoSync
         && !matches!(cli.command, Commands::Doctor(_))
-        && !inspects_legacy_database_without_recovery(&cli.command)
+        && !inspects_legacy_database_without_recovery(&cli.command);
+    // Strict observational startup cannot recover, migrate, or import into
+    // the live family during its storage open. Inspect its retained private
+    // snapshot below, before freshness, instead of opening another family.
+    // Mutations and other startup lanes retain the pre-open authority gates.
+    // Commands with their own freshness/storage lifecycle (Sync, Orphans)
+    // must keep the original advisory path and command-local admission.
+    let inspect_pending_merge_in_preopened_read = pending_merge_advisory_required
+        && ctx.overrides.read_only_storage
+        && supports_read_only_fast_open(&cli.command)
+        && command_supports_auto_import;
+    if inspect_pending_merge_in_preopened_read {
+        // Explicit no-auto-sync reads used to discard the advisory connection
+        // and open storage again in the command. Retain that required read
+        // even when no freshness/import/flush work needs a startup context.
+        should_preopen_storage = true;
+    }
+    if pending_merge_advisory_required
+        && !inspect_pending_merge_in_preopened_read
         && let Some(paths) = ctx.paths.as_ref()
     {
         match inspect_pending_sync_merge_for_startup(&paths.beads_dir, &paths.db_path) {
@@ -487,10 +506,11 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         && pending_merge_disposition != PendingMergeStartupDisposition::Resume
         && !matches!(cli.command, Commands::Doctor(_))
         && !inspects_legacy_database_without_recovery(&cli.command)
-        // Read-only fast-open runs without the family authority; the
-        // advisory path-only inspection above already classified pending
-        // state for it, and a fast-open miss reacquires the authority (and
-        // with it this definitive gate) before any writable fallback.
+        // Observational startup runs without family write authority. Its
+        // advisory inspection either ran above or uses the retained strict
+        // read-only snapshot below, before freshness. A strict read cannot
+        // enter writable recovery; other fast-open misses reacquire authority
+        // and this definitive gate before any writable fallback.
         && !(write_lock.is_none()
             && (ctx.overrides.read_only_fast_open || ctx.overrides.read_only_storage))
         && let Some(paths) = ctx.paths.as_ref()
@@ -564,6 +584,26 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         match open_storage_from_ctx(&mut ctx, write_lock.as_ref()) {
             Ok(res) => Some(res),
             Err(e) => {
+                if inspect_pending_merge_in_preopened_read && let Some(paths) = ctx.paths.as_ref() {
+                    // A routed read can succeed without local storage. On
+                    // this exceptional path, retain the original advisory
+                    // verdict and preopen-error policy: missing storage is
+                    // distinct from unknown receipt state. Never turn an
+                    // inspection error into permission to auto-sync.
+                    match inspect_pending_sync_merge_for_startup(&paths.beads_dir, &paths.db_path) {
+                        Ok(Some(state)) => {
+                            deferred_pending_merge_warning = Some(state);
+                            should_auto_import_now = false;
+                            force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            deferred_pending_merge_inspection_error = Some(error);
+                            should_auto_import_now = false;
+                            force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
+                        }
+                    }
+                }
                 if should_auto_import_now {
                     return Err(e);
                 }
@@ -573,6 +613,26 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
     } else {
         None
     };
+
+    if inspect_pending_merge_in_preopened_read && let Some(read_storage) = storage_result.as_ref() {
+        tracing::debug!(
+            target: "br::startup",
+            "Pending sync-merge inspection reuses read-only startup storage"
+        );
+        match commands::doctor::inspect_pending_sync_merge_in_storage(&read_storage.storage) {
+            Ok(Some(state)) => {
+                deferred_pending_merge_warning = Some(state);
+                should_auto_import_now = false;
+                force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                deferred_pending_merge_inspection_error = Some(error);
+                should_auto_import_now = false;
+                force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
+            }
+        }
+    }
 
     // Phase 3: Freshness and Auto-Import. Mutating startup can refresh witnesses
     // and import. Read-only startup checks content freshness without changing
@@ -847,6 +907,9 @@ fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
         // has already disabled every mutation; publish its warning only after
         // all startup authority has ended, including the context's Arc owners.
         emit_pending_sync_merge_warning(&state, json_error_mode);
+    }
+    if let Some(error) = deferred_pending_merge_inspection_error {
+        emit_pending_sync_merge_inspection_warning(&error, json_error_mode);
     }
     // The diagnostic flush or pending warning may itself have waited on a
     // stopped consumer after handoff. Honor signals received during that wait

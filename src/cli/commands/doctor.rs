@@ -1442,6 +1442,23 @@ pub fn inspect_pending_sync_merge_at_path(db_path: &Path) -> Result<Option<Pendi
             ),
         });
     };
+    inspect_pending_sync_merge_in_storage(&storage)
+}
+
+/// Inspect pending sync-merge metadata in an already admitted storage snapshot.
+///
+/// Read startup can retain this same snapshot for command execution instead of
+/// opening and recovering the WAL twice. The underlying inspection still reads
+/// both metadata keys in one coherent transaction, and query failures remain
+/// errors. This is advisory only: mutation gates must use
+/// [`inspect_pending_sync_merge_under_authority`].
+///
+/// # Errors
+///
+/// Returns an error if pending sync-merge metadata cannot be read coherently.
+pub fn inspect_pending_sync_merge_in_storage(
+    storage: &SqliteStorage,
+) -> Result<Option<PendingSyncMergeState>> {
     Ok(PendingSyncMergeState::from_inspection(
         storage.inspect_pending_sync_merge()?,
     ))
@@ -17139,6 +17156,23 @@ mod tests {
         assert!(
             diffs.is_empty(),
             "{context}: read-only contract violated: {diffs:#?}"
+        );
+    }
+
+    #[test]
+    fn retained_pending_sync_merge_inspection_preserves_query_errors() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert!(
+            inspect_pending_sync_merge_in_storage(&storage)
+                .unwrap()
+                .is_none()
+        );
+        storage.execute_test_sql("DROP TABLE metadata").unwrap();
+        assert!(
+            inspect_pending_sync_merge_in_storage(&storage).is_err(),
+            "an unreadable receipt must never become a safe absent receipt"
         );
     }
 

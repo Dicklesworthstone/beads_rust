@@ -661,6 +661,192 @@ fn e2e_routing_explicit_read_only_commands_preserve_external_family() {
     }
 }
 
+/// GH #598: a failed optional local preopen must not prevent an observational
+/// command from routing to a healthy external tracker. Missing local storage
+/// remains distinct from an unknown pending-merge receipt in corrupt storage.
+#[allow(clippy::too_many_lines)]
+fn routed_reads_preserve_unavailable_local_database(corrupt: bool) {
+    let condition = if corrupt { "corrupt" } else { "missing" };
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+    init_workspace(&main_workspace, "init_unavailable_local");
+    init_workspace(&external_workspace, "init_healthy_external");
+    configure_external_route(&main_workspace, &external_workspace);
+    let local_id = create_issue_and_get_id(
+        &main_workspace,
+        "Local issue whose JSONL must not rebuild the database",
+        "create_local_refusal_control",
+    );
+    let external_title = "External issue available despite local open failure";
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        external_title,
+        "create_external_open_failure_target",
+    );
+    let dependency_id = create_issue_and_get_id(
+        &external_workspace,
+        "External dependency",
+        "create_external_open_failure_dependency",
+    );
+    let comment = run_br(
+        &external_workspace,
+        [
+            "comments",
+            "add",
+            &external_id,
+            "Retained external comment",
+            "--json",
+        ],
+        "seed_external_comment",
+    );
+    assert!(comment.status.success(), "{}", comment.stderr);
+    let dependency = run_br(
+        &external_workspace,
+        ["dep", "add", &external_id, &dependency_id, "--json"],
+        "seed_external_dependency",
+    );
+    assert!(dependency.status.success(), "{}", dependency.stderr);
+
+    // Changed external JSONL proves that the unknown local receipt disables
+    // automatic sync in the routed fallback, including a default invocation.
+    let jsonl = external_workspace.root.join(".beads/issues.jsonl");
+    let rows = fs::read_to_string(&jsonl)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut issue: Value = serde_json::from_str(line).unwrap();
+            if issue["id"] == external_id {
+                issue["title"] = "Changed JSONL requires explicit synchronization".into();
+                issue["updated_at"] = "2999-01-01T00:00:00Z".into();
+            }
+            format!("{}\n", serde_json::to_string(&issue).unwrap())
+        })
+        .collect::<String>();
+    fs::write(&jsonl, rows).unwrap();
+
+    // Preserve the initialized family outside discovery instead of deleting
+    // it. Metadata, routes, and local JSONL still identify this workspace.
+    let beads_dir = main_workspace.root.join(".beads");
+    let preserved = main_workspace.root.join("preserved-local-family");
+    fs::create_dir(&preserved).unwrap();
+    let family: Vec<_> = fs::read_dir(&beads_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("beads.db"))
+        .collect();
+    for entry in family {
+        fs::rename(entry.path(), preserved.join(entry.file_name())).unwrap();
+    }
+    let local_database = beads_dir.join("beads.db");
+    assert!(!local_database.exists());
+    if corrupt {
+        fs::write(&local_database, b"not a SQLite database\n").unwrap();
+    }
+    let local_before = tracker_artifacts(&main_workspace);
+    let external_before = tracker_artifacts(&external_workspace);
+
+    for explicit_no_sync in [true, false] {
+        for (label, command) in [
+            ("show", vec!["show", external_id.as_str()]),
+            ("comments", vec!["comments", "list", external_id.as_str()]),
+            ("dep_list", vec!["dep", "list", external_id.as_str()]),
+            ("dep_tree", vec!["dep", "tree", external_id.as_str()]),
+        ] {
+            let mut args = vec!["--json"];
+            if explicit_no_sync {
+                args.extend(["--no-auto-import", "--no-auto-flush"]);
+            }
+            args.extend(command);
+            let result = run_br(
+                &main_workspace,
+                args,
+                &format!("{condition}_{label}_no_sync_{explicit_no_sync}"),
+            );
+            let expected_success = corrupt || explicit_no_sync;
+            assert_eq!(
+                result.status.success(),
+                expected_success,
+                "{condition}/{label}/no_sync={explicit_no_sync}: {result:?}"
+            );
+            let unknown_warnings = result
+                .stderr
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|warning| warning["code"] == "sync_merge_pending_unknown")
+                .count();
+            assert_eq!(unknown_warnings, if corrupt { 1 } else { 0 }, "{result:?}");
+            if expected_success {
+                let rows: Vec<Value> =
+                    serde_json::from_str(&extract_json_payload(&result.stdout)).unwrap();
+                match label {
+                    "show" => {
+                        assert_eq!(rows.len(), 1);
+                        assert_eq!(rows[0]["id"], external_id);
+                        assert_eq!(rows[0]["title"], external_title);
+                    }
+                    "comments" => {
+                        assert_eq!(rows.len(), 1);
+                        assert_eq!(rows[0]["issue_id"], external_id);
+                        assert_eq!(rows[0]["text"], "Retained external comment");
+                    }
+                    "dep_list" => assert!(rows.iter().any(|row| {
+                        row["issue_id"] == external_id && row["depends_on_id"] == dependency_id
+                    })),
+                    "dep_tree" => {
+                        assert!(rows.iter().any(|row| row["id"] == external_id));
+                        assert!(rows.iter().any(|row| row["id"] == dependency_id));
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                // A missing database has no receipt. It must not suppress
+                // the default startup policy that requires local storage.
+                assert!(
+                    result.stdout.contains("Read-only storage open refused"),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(tracker_artifacts(&main_workspace), local_before);
+            assert_eq!(tracker_artifacts(&external_workspace), external_before);
+        }
+    }
+
+    // Local targets still require the unavailable database. The surviving
+    // JSONL and a failed advisory are never permission to reconstruct it.
+    for (label, command) in [
+        ("show", vec!["show", local_id.as_str()]),
+        ("comments", vec!["comments", "list", local_id.as_str()]),
+        ("dep_list", vec!["dep", "list", local_id.as_str()]),
+    ] {
+        let result = run_br(
+            &main_workspace,
+            ["--json", "--no-auto-import", "--no-auto-flush"]
+                .into_iter()
+                .chain(command),
+            &format!("{condition}_local_{label}_refuses"),
+        );
+        assert!(!result.status.success(), "{result:?}");
+        assert!(
+            result.stdout.contains("Read-only storage open refused"),
+            "{result:?}"
+        );
+        assert_eq!(tracker_artifacts(&main_workspace), local_before);
+        assert_eq!(tracker_artifacts(&external_workspace), external_before);
+    }
+}
+
+#[test]
+fn e2e_598_routed_reads_survive_missing_optional_local_database() {
+    let _log = common::test_log("e2e_598_routed_reads_survive_missing_optional_local_database");
+    routed_reads_preserve_unavailable_local_database(false);
+}
+
+#[test]
+fn e2e_598_routed_reads_survive_corrupt_optional_local_database() {
+    let _log = common::test_log("e2e_598_routed_reads_survive_corrupt_optional_local_database");
+    routed_reads_preserve_unavailable_local_database(true);
+}
+
 #[test]
 fn e2e_routing_show_format_json_routes_external_issue() {
     let _log = common::test_log("e2e_routing_show_format_json_routes_external_issue");
