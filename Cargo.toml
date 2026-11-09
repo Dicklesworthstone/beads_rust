@@ -87,7 +87,7 @@ fsqlite-observability = { version = "=0.4.12" }
 # Match the SQLite family and the pinned FastMCP main revision so `--features
 # mcp` builds retain one Asupersync type identity at the server context boundary.
 # default-features = false mirrors fsqlite's own spec.
-asupersync = { version = "=0.5.0", default-features = false }
+asupersync = { version = "=0.6.2", default-features = false }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
