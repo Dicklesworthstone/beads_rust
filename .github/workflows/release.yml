@@ -109,13 +109,13 @@ jobs:
 
       - name: Install Rust toolchain
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: nightly-2026-08-31
 
       - name: Cache cargo
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # upstream snapshot 2026-08-17
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # upstream snapshot 2026-08-17
 
       # A release must not ship with a red unit suite or clippy: the v0.5.x
       # line shipped eleven lib-test failures because only the four targeted
@@ -280,7 +280,7 @@ jobs:
           fetch-depth: 0  # Full history for vergen
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: nightly-2026-08-31
           targets: ${{ matrix.target }}
@@ -321,7 +321,7 @@ jobs:
           esac
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # upstream snapshot 2026-08-17
+        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # upstream snapshot 2026-08-17
         with:
           key: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}
 
@@ -812,7 +812,7 @@ jobs:
             artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.zip
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3.0.4
         with:
           name: br ${{ steps.asset_version.outputs.release_tag }}
           tag_name: ${{ steps.asset_version.outputs.release_tag }}
@@ -845,7 +845,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: nightly-2026-08-31
 
