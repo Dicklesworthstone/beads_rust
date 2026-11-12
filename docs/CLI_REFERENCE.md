@@ -2781,22 +2781,24 @@ source-path migration planning use the same protection without requiring the
 flag pair. If a safe snapshot cannot be read, the command refuses instead of
 opening the original database for recovery.
 
-A mutating command may upgrade the attested schema-4 layout from released
-`br 0.1.27`, or reviewed source schemas 13-18, through the migration below.
+The explicit migrator can upgrade the attested schema-4 layout from released
+`br 0.1.27`, or reviewed source schemas 13-19, through the migration below.
 The migrator witnesses the complete database and retains a recovery bundle
 and undo receipt. A version stamp alone does not establish eligibility:
 unreviewed core columns, constraints, indexes, or reserved destination tables
 stop the command. Unsupported versions, including 0 and 7, remain refused. A
 refused migration never falls through to automatic JSONL reconstruction, and
 the error preserves its specific refusal reason.
-The schema-19 runtime-layout transition described below requires an explicit
+The schema-19 to schema-20 transition described below requires an explicit
 `migrate-schema apply` or `heal`. Ordinary writes, including
 `sync --import-only`, refuse a database that needs that transition and name
-the inspection command; they do not install its missing structures.
+the inspection command; they do not install its missing structures. Generic
+`doctor --repair` also refuses a readable schema-19 source before creating a
+repair session or reconstructing data from JSONL.
 
 **Current-version maintenance also requires an admitted layout.** A database
-already containing both schema-19 additions does not authorize generic table
-reconstruction. Before ordinary schema maintenance, br checks the declared
+must satisfy the complete schema-20 contract, including the gate reporter audit
+fields. A current version stamp does not authorize generic table reconstruction. Before ordinary schema maintenance, br checks the declared
 columns, constraints, primary and foreign keys, and existing indexes of its
 core and workflow tables. Extra authoritative columns, changed constraints,
 missing authoritative tables, and unknown index definitions refuse before
@@ -2864,7 +2866,7 @@ bound to the original database path and state. Previewing undo still validates
 the receipt, backup, and preservation proofs; actual apply or undo repeats its
 checks under exclusive write authority.
 
-**v0.7.6 schema-19 layout upgrade.** A database can declare schema 19 while
+**v0.7.6 schema-19 to schema-20 upgrade.** A database can declare schema 19 while
 still lacking the indexed JSONL receipt table and durable close attribution.
 Main introduced those requirements in
 [`6b8fd6c9`](https://github.com/Dicklesworthstone/beads_rust/commit/6b8fd6c90d1ac2cc746f2dc07e14aa2a11ae8d03)
@@ -2876,17 +2878,22 @@ checked the runtime layout. That produced the read refusal and contradictory
 `heal_needed: false` reported in
 [#596](https://github.com/Dicklesworthstone/beads_rust/issues/596).
 
-`doctor --json` reports this as `schema.runtime`; `plan` and `heal --dry-run`
-inspect the actual layout rather than treating the version stamp as proof that
-no work is needed. The reviewed plan exposes
-`forecast.schema19_runtime_upgrade.jsonl_row_receipts_created` and
-`closed_by_column_added`. It accepts only those two known additive differences,
-including a database where one addition is already present. Unrelated layout
-differences are refused before a token is issued. Pending merge metadata also
+`doctor --json` reports the required migration as `schema.runtime`; `plan` and
+`heal --dry-run` inspect the source layout. Fresh plans now target schema 20 and
+report `forecast.gate_reporter_columns_added: true`. The reviewed migration
+adds nullable `gate_result_history.assignee_at_report` and `override_reason`,
+plus either of the older runtime additions when still absent. These known
+additions do not authorize arbitrary schema repair. Pending merge metadata
 refuses the transition, including an empty or malformed receipt. Preserve the
 database family and complete or diagnose the pending merge against its
 original schema with a compatible binary; deleting its metadata does not
 resolve the merge.
+
+Previously installed same-version schema-19 receipts retain their original
+`schema19_runtime_upgrade.jsonl_row_receipts_created` and
+`closed_by_column_added` meanings for guarded recovery and undo. Fresh plans
+use the versioned 19-to-20 migration; historical receipt compatibility does
+not admit a schema-19 database to ordinary schema-20 operation.
 
 Apply the plan token using the lifecycle below, or run
 `br doctor migrate-schema heal` to plan and apply the same reviewed upgrade.
@@ -2901,14 +2908,15 @@ change future ID allocation, so a rowid-independent preservation proof is
 insufficient. Keep the original database and resolve that allocation state
 explicitly; the migrator does not discard or merge sequence reservations.
 New receipts start empty and newly
-added `closed_by` values start `NULL`; existing receipt rows and known closing
-actors remain exact. Event history, configuration and metadata, workflow and
+added `closed_by`, `assignee_at_report`, and `override_reason` values start
+`NULL`; existing receipt rows, known closing actors, and every historical gate
+verdict remain exact. Event history, configuration and metadata, workflow and
 capacity records, relations, dirty/export bookkeeping, child allocation
 reservations and extension-table records remain in active storage. No audit
 actor is guessed and no issue is reconstructed from JSONL. JSONL and
 configuration files remain untouched.
 
-New schema-19 layout plans also include `forecast.schema19_preservation`:
+New plans from schema 19 also include `forecast.schema19_preservation`:
 
 ```json
 {
@@ -2933,9 +2941,9 @@ same stricter live schema comparison before restoring any database files.
 An earlier uninstalled layout-upgrade plan must be regenerated to obtain the
 new source proof.
 
-This transition leaves `PRAGMA user_version` at 19, but the upgraded
-`close_metadata` layout is incompatible with v0.7.6. **An executable-only
-downgrade is unsafe.** Keep the full recovery bundle. The upgraded binary's
+Fresh migration sets `PRAGMA user_version` to 20. The new gate audit layout
+and the earlier `close_metadata` addition are incompatible with v0.7.6.
+**An executable-only downgrade is unsafe.** Keep the full recovery bundle. The upgraded binary's
 receipt-bound `undo` restores the original database family only while the
 applied state is unchanged; it refuses to discard subsequent writes. Undo
 restores the actual source layout. If an earlier main build had already added
@@ -2986,8 +2994,8 @@ A failed JSONL audit does not make an eligible raw-record migration unavailable:
 the dry run reports its planner result and audit error separately. An audit
 cannot turn a refused migration into an eligible one.
 
-The explicit receipt-bound lifecycle is available for supported older versions
-and the reviewed schema-19 layout transition:
+The explicit receipt-bound lifecycle is available for supported older versions,
+including the reviewed schema-19 to schema-20 transition:
 
 ```bash
 # Read-only inspection. Save and review the complete JSON receipt.
@@ -3012,7 +3020,8 @@ br doctor migrate-schema undo \
 `plan` accepts the explicitly reviewed transitions from source schema 4 (the
 released `br 0.1.27` layout), 13, 14, 15 (the #388 gate-history schema), 16 (the
 #384 capacity-exemptions schema created by the released v0.2.19 binary), 17
-(capacity occupancy), and 18 (prerequisites) to the current schema 19. The
+(capacity occupancy), 18 (prerequisites), and 19 (typed dependency identity)
+to the current schema 20. The
 schema-4 profile appends the
 local provenance, agent context, prerequisite, and event attribution columns,
 creates the missing empty workflow tables, and refreshes only the derived
@@ -3035,8 +3044,11 @@ already installed historical migrations remain available for verified undo.
 
 Each source runs exactly the version-gated step chain it is missing —
 content-hash rebuild (13→14), transition-scoped gate history (→15), capacity exemptions (→16), and
-capacity occupancy (→17), the prerequisite field (→18), and typed dependency
-identity (→19). `prerequisites_column_added` reports the new field and preserves
+capacity occupancy (→17), the prerequisite field (→18), typed dependency
+identity (→19), and nullable gate reporter audit evidence (→20).
+`gate_reporter_columns_added` reports the last addition; historical assignment
+snapshots and override reasons remain unknown. `prerequisites_column_added`
+reports the prerequisite field and preserves
 existing issue values with an unset prerequisite field. The
 `dependency_type_key_added` step widens the dependency key to include its type,
 preserving existing rows and row IDs. Its deterministic token binds the absolute database
