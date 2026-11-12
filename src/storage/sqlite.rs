@@ -12,6 +12,9 @@ use crate::model::{
     Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
 };
 use crate::storage::events::get_events;
+use crate::storage::portable_history::{
+    GATE_HISTORY_CONFLICT_EVENT, GateHistoryConflictRecord, decode_gate_history_conflict,
+};
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
     apply_runtime_compatible_schema, apply_schema, attest_runtime_schema_cookie, execute_batch,
@@ -2420,7 +2423,7 @@ impl SqliteStorage {
         Ok(())
     }
 
-    fn with_connection_write_transaction<F, R>(&self, mut f: F) -> Result<R>
+    pub(super) fn with_connection_write_transaction<F, R>(&self, mut f: F) -> Result<R>
     where
         F: FnMut(&Connection) -> Result<R>,
     {
@@ -4881,6 +4884,27 @@ impl SqliteStorage {
                     recorded_by,
                     &assignees,
                 )?;
+                if passed {
+                    let conflicts = Self::gate_history_conflicts_in_tx(
+                        conn,
+                        issue_id,
+                        status_revision,
+                        true,
+                    )?;
+                    if let Some(violation) = gate_history_conflict_violation(
+                        issue_id,
+                        &from_status,
+                        &to_status,
+                        gate,
+                        &conflicts,
+                    ) {
+                        return Err(BeadsError::PolicyViolation {
+                            issue_id: issue_id.to_owned(),
+                            summary: violation.message.clone(),
+                            violations: vec![violation],
+                        });
+                    }
+                }
                 let history = Self::get_scoped_gate_result_history_in_tx(
                     conn,
                     issue_id,
@@ -5037,6 +5061,63 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn status_revision(&self, issue_id: &str) -> Result<i64> {
         Self::status_revision_in_tx(&self.conn, issue_id)
+    }
+
+    /// Read retained verification-history conflicts and their current activity.
+    /// A real status change supersedes an earlier conflict; the audit event and
+    /// its original incoming evidence remain available after rework.
+    ///
+    /// # Errors
+    /// Returns an error if a conflict's evidence is malformed or cannot be read.
+    pub(crate) fn get_gate_history_conflicts(
+        &self,
+        issue_id: &str,
+    ) -> Result<Vec<GateHistoryConflictRecord>> {
+        Self::gate_history_conflicts_in_tx(
+            &self.conn,
+            issue_id,
+            Self::status_revision_in_tx(&self.conn, issue_id)?,
+            false,
+        )
+    }
+
+    fn gate_history_conflicts_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        status_revision: i64,
+        active_only: bool,
+    ) -> Result<Vec<GateHistoryConflictRecord>> {
+        let sql = if active_only {
+            "SELECT id, comment FROM events WHERE issue_id = ? AND event_type = ? AND id > ? ORDER BY id"
+        } else {
+            "SELECT id, comment FROM events WHERE issue_id = ? AND event_type = ? ORDER BY id"
+        };
+        let mut params = vec![
+            SqliteValue::from(issue_id),
+            SqliteValue::from(GATE_HISTORY_CONFLICT_EVENT),
+        ];
+        if active_only {
+            params.push(SqliteValue::from(status_revision));
+        }
+        conn.query_with_params(sql, &params)?
+            .iter()
+            .map(|row| {
+                let id = row
+                    .get(0)
+                    .and_then(SqliteValue::as_integer)
+                    .ok_or_else(|| {
+                        BeadsError::Config(format!(
+                            "verification-history conflict for {issue_id} has no event ID"
+                        ))
+                    })?;
+                let comment = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+                    BeadsError::Config(format!(
+                        "verification-history conflict event {id} for {issue_id} has no evidence"
+                    ))
+                })?;
+                decode_gate_history_conflict(id, issue_id, comment, status_revision)
+            })
+            .collect()
     }
 
     /// Return every verdict for the exact current transition attempt, including
@@ -8124,6 +8205,24 @@ impl SqliteStorage {
                 let mut gate_violations = crate::close_policy::evaluate_scoped_gates(
                     workflow, id, from, to, &labels, priority, &history, &assignees,
                 );
+                if required_gates
+                    .iter()
+                    .any(|spec| workflow.gate_policy(spec.id()).is_some())
+                {
+                    let conflicts =
+                        Self::gate_history_conflicts_in_tx(conn, id, status_revision, true)?;
+                    for spec in &required_gates {
+                        if workflow.gate_policy(spec.id()).is_none() {
+                            continue;
+                        }
+                        if let Some(violation) =
+                            gate_history_conflict_violation(id, from, to, spec.id(), &conflicts)
+                        {
+                            gate_violations.retain(|existing| existing.gate != violation.gate);
+                            gate_violations.push(violation);
+                        }
+                    }
+                }
                 for violation in &mut gate_violations {
                     let Some(gate_id) = violation.gate.strip_prefix("gate_") else {
                         continue;
@@ -24086,6 +24185,38 @@ fn gate_report_policy_error(issue_id: &str, gate: &str, reason: &str, message: &
     }
 }
 
+fn gate_history_conflict_violation(
+    issue_id: &str,
+    from: &str,
+    to: &str,
+    gate: &str,
+    conflicts: &[GateHistoryConflictRecord],
+) -> Option<crate::close_policy::PolicyViolation> {
+    let conflicts = conflicts
+        .iter()
+        .filter(|record| record.active && record.affects(from, to, gate))
+        .collect::<Vec<_>>();
+    if conflicts.is_empty() {
+        return None;
+    }
+    Some(crate::close_policy::PolicyViolation {
+        gate: format!("gate_{gate}"),
+        message: format!(
+            "gate '{gate}' for {issue_id} [{from} -> {to}] has divergent verification history; complete a real rework transition before recording fresh approval. An ordinary failure override cannot resolve divergent history"
+        ),
+        detail: Some(serde_json::json!({
+            "reason": "divergent_gate_history",
+            "issue_id": issue_id,
+            "gate": gate,
+            "from": from,
+            "to": to,
+            "conflict_event_ids": conflicts.iter().map(|record| record.id).collect::<Vec<_>>(),
+            "source_digests": conflicts.iter().map(|record| record.conflict.source_digest.as_str()).collect::<Vec<_>>(),
+            "identity_kind": "declared",
+        })),
+    })
+}
+
 fn gate_result_record_from_row(row: &Row) -> Result<crate::close_policy::GateResultRecord> {
     let required_text = |index: usize, name: &str| {
         row.get(index)
@@ -27324,6 +27455,235 @@ required_fields:
                 "worker",
             )
             .unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn malformed_gate_history_conflict_blocks_approval_until_real_rework() {
+        let snapshot = |storage: &SqliteStorage| {
+            let mut tables = AUXILIARY_HISTORY_TABLES.to_vec();
+            tables.extend(["issues", "dirty_issues", "metadata"]);
+            tables
+                .into_iter()
+                .map(|table| {
+                    (
+                        table,
+                        storage
+                            .execute_raw_query(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for comment in [None, Some("{"), Some("{}")] {
+            let mut storage = independent_validation_storage();
+            storage
+                .record_scoped_gate_result(
+                    "bd-independent",
+                    "in_progress",
+                    0,
+                    "closed",
+                    "validation",
+                    "verifier",
+                    true,
+                    None,
+                    "verifier",
+                    None,
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute_with_params(
+                    "INSERT INTO events (issue_id, event_type, actor, comment) VALUES (?, ?, ?, ?)",
+                    &[
+                        SqliteValue::from("bd-independent"),
+                        SqliteValue::from(GATE_HISTORY_CONFLICT_EVENT),
+                        SqliteValue::from("history-import"),
+                        comment.map_or(SqliteValue::Null, SqliteValue::from),
+                    ],
+                )
+                .unwrap();
+            assert!(
+                storage.all_portable_history().is_err(),
+                "malformed conflict evidence must not be published as valid portable history"
+            );
+            let before = snapshot(&storage);
+            let override_request = crate::close_policy::GateOverride {
+                expected_history_id: 1,
+                reason: "an ordinary override must not erase a history conflict".to_owned(),
+            };
+            for gate_override in [None, Some(&override_request)] {
+                assert!(matches!(
+                    storage.record_scoped_gate_result(
+                        "bd-independent",
+                        "in_progress",
+                        0,
+                        "closed",
+                        "validation",
+                        "lead",
+                        true,
+                        None,
+                        "lead",
+                        gate_override,
+                    ),
+                    Err(BeadsError::Config(_))
+                ));
+            }
+            assert!(matches!(
+                storage.update_issue(
+                    "bd-independent",
+                    &IssueUpdate {
+                        status: Some(Status::Closed),
+                        title: Some("must not commit".to_owned()),
+                        ..IssueUpdate::default()
+                    },
+                    "worker",
+                ),
+                Err(BeadsError::Config(_))
+            ));
+            assert_eq!(snapshot(&storage), before);
+
+            // A conflict prevents new authority, not recording further FAIL
+            // evidence or reporting a gate outside the protected policy.
+            storage
+                .record_scoped_gate_result(
+                    "bd-independent",
+                    "in_progress",
+                    0,
+                    "closed",
+                    "validation",
+                    "verifier",
+                    false,
+                    Some("failure remains observable"),
+                    "verifier",
+                    None,
+                )
+                .unwrap();
+            storage
+                .record_scoped_gate_result(
+                    "bd-independent",
+                    "in_progress",
+                    0,
+                    "closed",
+                    "unprotected",
+                    "worker",
+                    true,
+                    None,
+                    "worker",
+                    None,
+                )
+                .unwrap();
+            for status in [Status::Open, Status::InProgress] {
+                storage
+                    .update_issue(
+                        "bd-independent",
+                        &IssueUpdate {
+                            status: Some(status),
+                            ..IssueUpdate::default()
+                        },
+                        "worker",
+                    )
+                    .unwrap();
+            }
+            let revision = storage.status_revision("bd-independent").unwrap();
+            assert!(revision > 0);
+            storage
+                .record_scoped_gate_result(
+                    "bd-independent",
+                    "in_progress",
+                    revision,
+                    "closed",
+                    "validation",
+                    "verifier",
+                    true,
+                    Some("fresh review after rework"),
+                    "verifier",
+                    None,
+                )
+                .unwrap();
+            storage
+                .update_issue(
+                    "bd-independent",
+                    &IssueUpdate {
+                        status: Some(Status::Closed),
+                        ..IssueUpdate::default()
+                    },
+                    "worker",
+                )
+                .unwrap();
+            assert_eq!(
+                storage
+                    .conn
+                    .query_with_params(
+                        "SELECT comment FROM events WHERE issue_id = ? AND event_type = ?",
+                        &[
+                            SqliteValue::from("bd-independent"),
+                            SqliteValue::from(GATE_HISTORY_CONFLICT_EVENT),
+                        ],
+                    )
+                    .unwrap()[0]
+                    .get(0)
+                    .and_then(SqliteValue::as_text),
+                comment,
+                "rework must retain the original malformed audit evidence"
+            );
+            assert_eq!(
+                storage
+                    .get_gate_result_history("bd-independent")
+                    .unwrap()
+                    .len(),
+                4
+            );
+            assert!(
+                storage.all_portable_history().is_err(),
+                "rework supersedes enforcement but does not repair malformed audit evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_gate_history_conflict_does_not_change_unprotected_policies() {
+        let mut storage = independent_validation_storage();
+        let mut workflow = independent_validation_workflow();
+        workflow.gate_policies.clear();
+        storage.set_workflow_policy(workflow);
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO events (issue_id, event_type, actor, comment) VALUES (?, ?, ?, ?)",
+                &[
+                    SqliteValue::from("bd-independent"),
+                    SqliteValue::from(GATE_HISTORY_CONFLICT_EVENT),
+                    SqliteValue::from("history-import"),
+                    SqliteValue::from("{}"),
+                ],
+            )
+            .unwrap();
+        storage
+            .record_scoped_gate_result(
+                "bd-independent",
+                "in_progress",
+                0,
+                "closed",
+                "validation",
+                "worker",
+                true,
+                None,
+                "worker",
+                None,
+            )
+            .unwrap();
+        let closed = storage
+            .update_issue(
+                "bd-independent",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "worker",
+            )
+            .unwrap();
+        assert_eq!(closed.status, Status::Closed);
     }
 
     #[test]

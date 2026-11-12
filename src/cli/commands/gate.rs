@@ -19,6 +19,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::output::OutputContext;
+use crate::storage::portable_history::GateHistoryConflictRecord;
 use crate::util::id::{IdResolver, ResolverConfig};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -49,6 +50,8 @@ struct GateReportOutput {
 struct RequiredGateStatus {
     gate: String,
     satisfied: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    history_conflict_ids: Vec<i64>,
 }
 
 /// One guarded transition out of the issue's current status, with the
@@ -69,6 +72,10 @@ struct GateListOutput {
     current_status: Option<String>,
     identity_kind: &'static str,
     history: Vec<GateResultRecord>,
+    /// Imported branches retained as audit evidence without granting their
+    /// PASS or override records authority over the local verification attempt.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    history_conflicts: Vec<GateHistoryConflictRecord>,
     /// Pre-v15 unscoped verdicts retained for audit display only. They never
     /// satisfy a transition.
     legacy_results: Vec<GateResult>,
@@ -332,6 +339,7 @@ fn execute_list(
     let issue = storage_ctx.storage.get_issue(&issue_id)?;
     let current_status = issue.as_ref().map(|i| i.status.as_str().to_string());
     let history = storage_ctx.storage.get_gate_result_history(&issue_id)?;
+    let history_conflicts = storage_ctx.storage.get_gate_history_conflicts(&issue_id)?;
     // GitHub #466: `gate_results` now mirrors every scoped report's latest
     // (gate, provider) verdict. Rows whose (gate, provider) pair already
     // appears in the scoped history are that mirror, not legacy data — keep
@@ -385,6 +393,7 @@ fn execute_list(
         priority,
         &results_by_target,
         &assignees,
+        &history_conflicts,
     );
 
     let output = GateListOutput {
@@ -392,6 +401,7 @@ fn execute_list(
         current_status,
         identity_kind: "declared",
         history,
+        history_conflicts,
         legacy_results,
         gated_transitions,
     };
@@ -410,6 +420,7 @@ fn execute_list(
 /// current status, the satisfaction of every gate that rule requires for this
 /// issue. Returns an empty vec when gates are not configured or the current
 /// status is unknown.
+#[allow(clippy::too_many_arguments)]
 fn compute_gated_transitions(
     workflow: &Workflow,
     issue_id: &str,
@@ -418,6 +429,7 @@ fn compute_gated_transitions(
     priority: i32,
     results_by_target: &BTreeMap<String, Vec<GateResultRecord>>,
     assignees: &[&str],
+    history_conflicts: &[GateHistoryConflictRecord],
 ) -> Vec<GatedTransitionStatus> {
     let Some(from) = current_status else {
         return Vec::new();
@@ -450,17 +462,30 @@ fn compute_gated_transitions(
             .iter()
             .map(|spec| {
                 let id = spec.id();
-                let satisfied = !violations.iter().any(|v| v.gate == format!("gate_{id}"));
+                let history_conflict_ids = if workflow.gate_policy(id).is_some() {
+                    history_conflicts
+                        .iter()
+                        .filter(|conflict| {
+                            conflict.issue_id == issue_id && conflict.affects(from, rule_to, id)
+                        })
+                        .map(|conflict| conflict.id)
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let satisfied = history_conflict_ids.is_empty()
+                    && !violations.iter().any(|v| v.gate == format!("gate_{id}"));
                 RequiredGateStatus {
                     gate: id.to_string(),
                     satisfied,
+                    history_conflict_ids,
                 }
             })
             .collect();
         out.push(GatedTransitionStatus {
             from: from.to_string(),
             to: rule_to.to_string(),
-            satisfied: violations.is_empty(),
+            satisfied: gates.iter().all(|gate| gate.satisfied),
             gates,
         });
     }
@@ -469,7 +494,10 @@ fn compute_gated_transitions(
 
 fn print_gate_list_human(ctx: &OutputContext, output: &GateListOutput) {
     let id = sanitize_terminal_inline(&output.issue_id);
-    if output.history.is_empty() && output.legacy_results.is_empty() {
+    if output.history.is_empty()
+        && output.legacy_results.is_empty()
+        && output.history_conflicts.is_empty()
+    {
         ctx.info(&format!("No gate results recorded for {id}."));
     } else {
         ctx.print_line(&format!("Scoped gate history for {id}:"));
@@ -512,6 +540,26 @@ fn print_gate_list_human(ctx: &OutputContext, output: &GateListOutput) {
         }
     }
 
+    if !output.history_conflicts.is_empty() {
+        ctx.print_line("Imported gate-history conflicts:");
+        for conflict in &output.history_conflicts {
+            let state = if conflict.active {
+                "active; protected gates require rework"
+            } else {
+                "historical; retained for audit"
+            };
+            ctx.print_line(&format!("  #{}: {state}", conflict.id));
+            for scope in &conflict.conflict.scopes {
+                ctx.print_line(&format!(
+                    "    {} [{} -> {}]",
+                    sanitize_terminal_inline(&scope.gate),
+                    sanitize_terminal_inline(&scope.from_status),
+                    sanitize_terminal_inline(&scope.to_status),
+                ));
+            }
+        }
+    }
+
     if !output.gated_transitions.is_empty() {
         ctx.newline();
         ctx.print_line("Required gates for next transitions:");
@@ -528,7 +576,9 @@ fn print_gate_list_human(ctx: &OutputContext, output: &GateListOutput) {
                 marker,
             ));
             for gate in &transition.gates {
-                let status = if gate.satisfied {
+                let status = if !gate.history_conflict_ids.is_empty() {
+                    "blocked by imported history conflict; rework required"
+                } else if gate.satisfied {
                     "satisfied"
                 } else {
                     "missing"
@@ -827,6 +877,7 @@ mod tests {
             2,
             &no_results,
             &[],
+            &[],
         );
         assert_eq!(transitions.len(), 1);
         let t = &transitions[0];
@@ -850,6 +901,7 @@ mod tests {
             &[],
             2,
             &results_by_target,
+            &[],
             &[],
         );
         assert!(transitions[0].satisfied);
@@ -898,6 +950,7 @@ gates:
                     2,
                     &results_by_target,
                     &[],
+                    &[],
                 );
                 assert_eq!(transitions.len(), 1);
                 let transition = &transitions[0];
@@ -921,6 +974,7 @@ gates:
                 2,
                 &baseline_results,
                 &[],
+                &[],
             );
             assert_eq!(baseline.len(), 1);
             assert!(baseline[0].gates[0].satisfied);
@@ -938,6 +992,7 @@ gates:
             &[],
             2,
             &BTreeMap::new(),
+            &[],
             &[],
         );
         assert!(transitions.is_empty());
@@ -979,6 +1034,7 @@ gates:
                 2,
                 &by_target,
                 &["worker"],
+                &[],
             );
             assert_eq!(transitions.len(), 1);
             assert_eq!(transitions[0].gates.len(), 1);

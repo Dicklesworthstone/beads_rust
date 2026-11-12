@@ -10,7 +10,9 @@
 //! describe (a hand-edited or older-release issues.jsonl, or a row import kept
 //! over a newer one the workflow policy could not reach, GitHub #540) simply
 //! gets no evidence, and the gap is recorded as a coverage warning instead of
-//! being fabricated. Only a damaged companion file is an error.
+//! being fabricated. Conflicting gate branches are retained in separate audit
+//! receipts that block affected protected gates until rework. Only a damaged
+//! companion file is an error.
 
 use crate::error::{BeadsError, Result};
 use crate::storage::{
@@ -33,7 +35,7 @@ use std::path::{Path, PathBuf};
 pub const WARNINGS_KEY: &str = "portable_history_warnings";
 const LEGACY_WARNING: &str = "Portable workflow history is unavailable for this issue source. Earlier events, gate results, close metadata, and capacity evidence cannot be verified or reconstructed from issues.jsonl alone. Existing local evidence is preserved; missing evidence has not been fabricated.";
 const ENROLLMENT_WARNING: &str = "This tracker predates portable workflow history. Available database evidence was exported, but completeness of earlier audit history cannot be verified.";
-const DIVERGED_WARNING: &str = "Portable workflow history for some issues diverged between clones. Each clone kept its own evidence for those issues; the other clone's diverging events, gate results, close metadata, or capacity evidence were not merged.";
+const DIVERGED_WARNING: &str = "Portable workflow history for some issues diverged between clones. Local rows were retained. Conflicting incoming gate branches are preserved in audit-conflict receipts; affected protected gates require rework while a conflict is active. Other diverging events, close metadata, and capacity evidence were not merged.";
 const DAMAGED_HINT: &str = "restore .beads/issues.history.jsonl from version control, or move it aside to re-enroll (missing evidence is then reported, never fabricated)";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -341,6 +343,12 @@ fn publish(storage: &SqliteStorage, jsonl: &Path, source: Option<&str>) -> Resul
     let old_histories: Vec<&PortableHistorySnapshot> =
         old_newest_first.iter().map(|cp| &cp.history).collect();
 
+    // An explicit flush may run without importing first. Preserve any known
+    // conflicting gate branch before replacing the companion, and make its
+    // restriction durable in the database as well as in the publication.
+    for history in &old_histories {
+        storage.retain_portable_gate_conflicts(history)?;
+    }
     let database = storage.all_portable_history()?;
     let database_warnings = database_warnings(storage, &database)?;
     let carried = database.carry_forward(&old_histories)?;
@@ -351,7 +359,7 @@ fn publish(storage: &SqliteStorage, jsonl: &Path, source: Option<&str>) -> Resul
     if !carried.diverged.is_empty() {
         tracing::warn!(
             issues = ?carried.diverged,
-            "Workflow history diverged from the published companion; this database's evidence is published for these issues"
+            "Workflow history diverged from the published companion; local rows and retained gate-conflict receipts are published"
         );
         next_warnings = union(next_warnings, &[DIVERGED_WARNING.to_owned()]);
     }
@@ -443,8 +451,9 @@ pub fn preflight_import(jsonl: &Path) -> Result<()> {
 /// Evidence is replayed per issue, and only onto a database row at the
 /// anchor it describes, so a row import kept (for example one the workflow
 /// policy protected, GitHub #540) keeps its own evidence untouched. Applied
-/// rows without evidence, and diverged histories, become durable coverage
-/// warnings rather than fabricated events or gate approvals.
+/// rows without evidence become durable coverage warnings. Divergent gate
+/// branches are retained as typed conflict receipts, without fabricating a
+/// verifier verdict or giving imported approvals authority over local FAILs.
 pub fn replay_after_import(storage: &mut SqliteStorage, jsonl: &Path) -> Result<Vec<String>> {
     let rows = source_anchors(jsonl)?;
     if rows.is_empty() {
@@ -481,7 +490,7 @@ pub fn replay_after_import(storage: &mut SqliteStorage, jsonl: &Path) -> Result<
     if !replay.diverged.is_empty() {
         tracing::warn!(
             issues = ?replay.diverged,
-            "Workflow history in the companion diverged from this database; local evidence kept"
+            "Workflow history in the companion diverged from this database; local rows and incoming gate-conflict evidence retained"
         );
         warnings = union(warnings, &[DIVERGED_WARNING.to_owned()]);
     }

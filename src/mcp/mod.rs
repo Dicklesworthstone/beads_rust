@@ -550,6 +550,17 @@ impl BeadsState {
             Ok(inspection) => return Err(pending_sync_merge_mcp_error(&inspection)),
             Err(err) => return Err(pending_sync_merge_unknown_mcp_error(err)),
         }
+        // A peer can publish a gate verdict without changing any issue row.
+        // Observe matching companion evidence under the request's existing
+        // database and sync locks before admitting protected mutations.
+        if !policy.workflow.gate_policies.is_empty() {
+            for warning in
+                crate::portable_history::replay_after_import(&mut storage, &self.jsonl_path)
+                    .map_err(to_mcp)?
+            {
+                tracing::warn!(warning = %warning, "Workflow history coverage is incomplete");
+            }
+        }
         let dirty_before_mutation = storage.get_dirty_issue_metadata().map_err(to_mcp)?;
         let (_, _, previous_sync_pending) =
             crate::sync::pending_export_state(&storage, self.jsonl_path.exists())
@@ -846,6 +857,102 @@ mod tests {
             state.open_read_storage().unwrap().count_issues().unwrap(),
             2
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn protected_mutation_observes_companion_only_failed_verification() {
+        for diverged in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let state = test_state(&temp, temp.path().join(".beads/issues.jsonl"));
+            fs::write(
+                state.beads_dir.join("policy.yaml"),
+                "workflow:\n  strict: true\n  gates:\n    'open -> closed':\n      require_all: [validation]\n  gate_policies:\n    validation:\n      allowed_reporters: [verifier, peer]\n      forbid_self_approval: true\n",
+            )
+            .unwrap();
+            let policy = crate::close_policy::load_for_beads_dir(&state.beads_dir).unwrap();
+            let mut local = SqliteStorage::open(&state.db_path).unwrap();
+            local.set_workflow_policy(policy.workflow.clone());
+            local
+                .create_issue(&test_issue("br-companion", "Unchanged issue"), "worker")
+                .unwrap();
+            let issue = local.get_issue("br-companion").unwrap().unwrap();
+            let base = local.all_portable_history().unwrap();
+            local
+                .record_scoped_gate_result(
+                    &issue.id,
+                    "open",
+                    0,
+                    "closed",
+                    "validation",
+                    "verifier",
+                    true,
+                    None,
+                    "verifier",
+                    None,
+                )
+                .unwrap();
+
+            let mut peer = SqliteStorage::open_memory().unwrap();
+            peer.set_workflow_policy(policy.workflow);
+            peer.upsert_issue_for_import(&issue).unwrap();
+            peer.restore_portable_history(&if diverged {
+                base
+            } else {
+                local.all_portable_history().unwrap()
+            })
+            .unwrap();
+            peer.record_scoped_gate_result(
+                &issue.id,
+                "open",
+                0,
+                "closed",
+                "validation",
+                "peer",
+                false,
+                Some("peer verification failed"),
+                "peer",
+                None,
+            )
+            .unwrap();
+            let jsonl = format!("{}\n", serde_json::to_string(&issue).unwrap());
+            fs::write(&state.jsonl_path, &jsonl).unwrap();
+            crate::portable_history::publish_before_export(&peer, &state.jsonl_path).unwrap();
+            drop(local);
+
+            for _ in 0..2 {
+                let error = state
+                    .with_mutation(|storage, _| {
+                        storage
+                            .update_issue(
+                                &issue.id,
+                                &crate::storage::IssueUpdate {
+                                    status: Some(crate::model::Status::Closed),
+                                    ..crate::storage::IssueUpdate::default()
+                                },
+                                &state.actor,
+                            )
+                            .map_err(to_mcp)
+                    })
+                    .unwrap_err();
+                assert!(error.message.contains("gate"), "{error}");
+                let stored = state.open_read_storage().unwrap();
+                assert_eq!(stored.get_issue(&issue.id).unwrap().unwrap(), issue);
+                assert_eq!(fs::read_to_string(&state.jsonl_path).unwrap(), jsonl);
+                let conflicts = stored.get_gate_history_conflicts(&issue.id).unwrap();
+                if diverged {
+                    assert_eq!(conflicts.len(), 1, "repeat observation must deduplicate");
+                    assert!(conflicts[0].affects("open", "closed", "validation"));
+                    assert_eq!(stored.get_gate_result_history(&issue.id).unwrap().len(), 1);
+                } else {
+                    assert!(conflicts.is_empty());
+                    let history = stored.get_gate_result_history(&issue.id).unwrap();
+                    assert_eq!(history.len(), 2);
+                    assert!(history[0].passed);
+                    assert!(!history[1].passed);
+                }
+            }
+        }
     }
 
     fn install_valid_pending_merge_receipt(

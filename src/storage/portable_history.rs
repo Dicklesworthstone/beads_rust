@@ -13,8 +13,9 @@ use crate::franken_sync::SqliteValue;
 use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 // Items here are `pub`, not `pub(crate)`: this module is `pub(crate)` in
 // src/storage/mod.rs, so they stay crate-visible either way and `pub(crate)`
@@ -57,6 +58,88 @@ pub struct PortableHistoryTable {
 pub struct PortableHistorySnapshot {
     pub issues: BTreeMap<String, PortableHistoryIssue>,
     pub tables: Vec<PortableHistoryTable>,
+}
+
+/// An audit receipt for incompatible verification branches, not a verifier's
+/// verdict. Existing event portability carries these receipts between clones.
+pub const GATE_HISTORY_CONFLICT_EVENT: &str = "workflow_gate_history_conflict";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateHistoryConflictScope {
+    pub from_status: String,
+    pub to_status: String,
+    pub gate: String,
+}
+
+/// The incoming branch is retained verbatim in portable sequence space. Only
+/// referenced status events are embedded: conflict receipts never recursively
+/// contain other receipts or invent authentication for recorded actor names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateHistoryConflictEvidence {
+    pub anchor: PortableHistoryIssue,
+    pub gate_history: PortableHistoryTable,
+    pub status_events: PortableHistoryTable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateHistoryConflict {
+    pub version: u32,
+    pub source_digest: String,
+    /// False archives evidence that its source had already resolved by a real
+    /// status transition. Moving that receipt to a new local event ID must not
+    /// reactivate it.
+    pub blocking: bool,
+    pub scopes: Vec<GateHistoryConflictScope>,
+    pub evidence: GateHistoryConflictEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateHistoryConflictRecord {
+    pub id: i64,
+    pub issue_id: String,
+    pub active: bool,
+    #[serde(flatten)]
+    pub conflict: GateHistoryConflict,
+}
+
+impl GateHistoryConflictRecord {
+    #[must_use]
+    pub fn affects(&self, from: &str, to: &str, gate: &str) -> bool {
+        self.active
+            && self.conflict.scopes.iter().any(|scope| {
+                scope.from_status == canonical_status(from)
+                    && scope.to_status == canonical_status(to)
+                    && scope.gate == gate.trim().to_ascii_lowercase()
+            })
+    }
+}
+
+/// Decode typed conflict evidence. A malformed active receipt must not become
+/// an absent restriction at the protected report/transition chokepoints.
+///
+/// # Errors
+/// Returns an error for malformed, mismatched, or unsupported audit evidence.
+pub fn decode_gate_history_conflict(
+    id: i64,
+    issue_id: &str,
+    comment: &str,
+    status_revision: i64,
+) -> Result<GateHistoryConflictRecord> {
+    let conflict: GateHistoryConflict = serde_json::from_str(comment)
+        .map_err(|error| invalid(format!("invalid gate-history conflict receipt: {error}")))?;
+    validate_gate_history_conflict(issue_id, &conflict)?;
+    if id <= 0 {
+        return Err(invalid("gate-history conflict event has no positive id"));
+    }
+    Ok(GateHistoryConflictRecord {
+        id,
+        issue_id: issue_id.to_owned(),
+        active: conflict.blocking && id > status_revision,
+        conflict,
+    })
 }
 
 /// Evidence chosen per issue from several snapshots.
@@ -305,6 +388,116 @@ fn to_sql(value: &Value) -> Result<SqliteValue> {
     }
 }
 
+fn canonical_status(value: &str) -> String {
+    value.trim().parse::<crate::model::Status>().map_or_else(
+        |_| value.trim().to_ascii_lowercase(),
+        |status| status.as_str().to_ascii_lowercase(),
+    )
+}
+
+fn conflict_scopes(evidence: &GateHistoryConflictEvidence) -> Vec<GateHistoryConflictScope> {
+    let from = canonical_status(&evidence.anchor.status);
+    evidence
+        .gate_history
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let from_status = canonical_status(row.get(2)?.as_str()?);
+            let to_status = canonical_status(row.get(3)?.as_str()?);
+            let gate = row.get(5)?.as_str()?.trim().to_ascii_lowercase();
+            (from_status == from && !to_status.is_empty() && !gate.is_empty()).then_some(
+                GateHistoryConflictScope {
+                    from_status,
+                    to_status,
+                    gate,
+                },
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn conflict_digest(evidence: &GateHistoryConflictEvidence) -> Result<String> {
+    Ok(crate::util::hex_encode(&Sha256::digest(
+        serde_json::to_vec(&(
+            &evidence.anchor.created_at,
+            &evidence.gate_history,
+            &evidence.status_events,
+        ))?,
+    )))
+}
+
+fn validate_conflict_table<'a>(
+    issue_id: &str,
+    table: &'a PortableHistoryTable,
+    spec: &Spec,
+) -> Result<Vec<&'a Vec<Value>>> {
+    if table.table != spec.name || table.columns != spec.names() {
+        return Err(invalid("noncanonical gate-history conflict evidence table"));
+    }
+    for row in &table.rows {
+        if row.len() != spec.columns.len()
+            || spec
+                .columns
+                .iter()
+                .zip(row)
+                .any(|((_, kind), value)| !valid(*kind, value))
+            || owner(spec, row) != issue_id
+        {
+            return Err(invalid("invalid gate-history conflict evidence row"));
+        }
+    }
+    Ok(table.rows.iter().collect())
+}
+
+fn validate_gate_history_conflict(issue_id: &str, conflict: &GateHistoryConflict) -> Result<()> {
+    let evidence = &conflict.evidence;
+    if conflict.version != 1
+        || issue_id.is_empty()
+        || canonical_time(&evidence.anchor.created_at).as_deref()
+            != Some(evidence.anchor.created_at.as_str())
+        || canonical_time(&evidence.anchor.updated_at).as_deref()
+            != Some(evidence.anchor.updated_at.as_str())
+    {
+        return Err(invalid("invalid gate-history conflict version or anchor"));
+    }
+    let events = validate_conflict_table(issue_id, &evidence.status_events, &SPECS[0])?;
+    let mut event_ids = BTreeSet::new();
+    let mut previous = 0;
+    for row in events {
+        let id = row[0].as_i64().unwrap_or_default();
+        if id <= previous || row[2].as_str() != Some("status_changed") {
+            return Err(invalid("invalid conflict status-event reference"));
+        }
+        previous = id;
+        event_ids.insert(id);
+    }
+    let gates = validate_conflict_table(issue_id, &evidence.gate_history, &SPECS[1])?;
+    let mut referenced = BTreeSet::new();
+    for (index, row) in gates.iter().enumerate() {
+        let expected = i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1);
+        let revision = row[4].as_i64().unwrap_or(-1);
+        if row[0].as_i64() != Some(expected)
+            || revision < 0
+            || (revision > 0 && !event_ids.contains(&revision))
+        {
+            return Err(invalid("invalid conflict gate sequence or status revision"));
+        }
+        if revision > 0 {
+            referenced.insert(revision);
+        }
+    }
+    if referenced != event_ids
+        || (conflict.blocking && conflict.scopes.is_empty())
+        || conflict.scopes != conflict_scopes(evidence)
+        || conflict.source_digest != conflict_digest(evidence)?
+    {
+        return Err(invalid("gate-history conflict evidence or digest mismatch"));
+    }
+    Ok(())
+}
+
 pub fn validate(snapshot: &PortableHistorySnapshot) -> Result<()> {
     if snapshot.tables.len() != SPECS.len() {
         return Err(invalid("checkpoint must contain all seven history tables"));
@@ -371,6 +564,16 @@ pub fn validate(snapshot: &PortableHistorySnapshot) -> Result<()> {
                 }
                 if spec.name == "events" {
                     events.insert((issue, *seq), row);
+                    if row[2].as_str() == Some(GATE_HISTORY_CONFLICT_EVENT) {
+                        decode_gate_history_conflict(
+                            *seq,
+                            issue,
+                            row[6].as_str().ok_or_else(|| {
+                                invalid("gate-history conflict event has no receipt")
+                            })?,
+                            0,
+                        )?;
+                    }
                 }
             }
             if spec.name == "gate_result_history" {
@@ -538,6 +741,154 @@ impl<'a> SnapshotIndex<'a> {
             (true, true) => Lineage::Diverged,
         }
     }
+
+    fn gate_conflict_evidence(&self, id: &str) -> Result<GateHistoryConflictEvidence> {
+        let gate_rows = self.rows(1, id);
+        let revisions: HashSet<i64> = gate_rows
+            .iter()
+            .filter_map(|row| row[4].as_i64().filter(|revision| *revision > 0))
+            .collect();
+        Ok(GateHistoryConflictEvidence {
+            anchor: self
+                .snapshot
+                .issues
+                .get(id)
+                .ok_or_else(|| invalid("gate-history conflict has no issue anchor"))?
+                .clone(),
+            gate_history: PortableHistoryTable {
+                table: SPECS[1].name.to_owned(),
+                columns: SPECS[1].names(),
+                rows: gate_rows.iter().map(|row| (*row).clone()).collect(),
+            },
+            status_events: PortableHistoryTable {
+                table: SPECS[0].name.to_owned(),
+                columns: SPECS[0].names(),
+                rows: self
+                    .rows(0, id)
+                    .iter()
+                    .filter(|row| row[0].as_i64().is_some_and(|id| revisions.contains(&id)))
+                    .map(|row| (*row).clone())
+                    .collect(),
+            },
+        })
+    }
+
+    /// A known prefix adds no new verification evidence. Compare referenced
+    /// status events too: equal numeric revisions on divergent event branches
+    /// are not evidence of the same review attempt.
+    fn gate_branch_known_by(&self, other: &SnapshotIndex<'_>, id: &str) -> bool {
+        let incoming = self.rows(1, id);
+        let local = other.rows(1, id);
+        incoming.len() <= local.len()
+            && incoming.iter().zip(local).all(|(a, b)| a == b)
+            && incoming.iter().all(|row| {
+                let revision = row[4].as_i64().unwrap_or_default();
+                revision == 0
+                    || self
+                        .rows(0, id)
+                        .iter()
+                        .find(|row| row[0].as_i64() == Some(revision))
+                        .is_some_and(|event| other.rows(0, id).contains(event))
+            })
+    }
+
+    /// Carry receipts separately from branch evidence to avoid recursively
+    /// nesting snapshots. A receipt resolved in its source remains archival
+    /// even if its copied local event ID is newer than local status events.
+    fn gate_conflict_receipts(&self, id: &str) -> Result<Vec<GateHistoryConflict>> {
+        let status_revision = self
+            .rows(0, id)
+            .iter()
+            .filter(|row| row[2].as_str() == Some("status_changed"))
+            .filter_map(|row| row[0].as_i64())
+            .max()
+            .unwrap_or_default();
+        self.rows(0, id)
+            .iter()
+            .filter(|row| row[2].as_str() == Some(GATE_HISTORY_CONFLICT_EVENT))
+            .map(|row| {
+                let mut record = decode_gate_history_conflict(
+                    row[0].as_i64().unwrap_or_default(),
+                    id,
+                    row[6]
+                        .as_str()
+                        .ok_or_else(|| invalid("gate-history conflict event has no receipt"))?,
+                    status_revision,
+                )?;
+                record.conflict.blocking = record.active;
+                Ok(record.conflict)
+            })
+            .collect()
+    }
+}
+
+fn gate_history_conflicts_to_retain(
+    id: &str,
+    incoming: &SnapshotIndex<'_>,
+    local: &SnapshotIndex<'_>,
+) -> Result<Vec<GateHistoryConflict>> {
+    let mut known = local
+        .gate_conflict_receipts(id)?
+        .into_iter()
+        .map(|receipt| receipt.source_digest)
+        .collect::<HashSet<_>>();
+    let mut candidates = incoming.gate_conflict_receipts(id)?;
+    if !incoming.gate_branch_known_by(local, id) && !incoming.rows(1, id).is_empty() {
+        let evidence = incoming.gate_conflict_evidence(id)?;
+        let scopes = conflict_scopes(&evidence);
+        candidates.push(GateHistoryConflict {
+            version: 1,
+            source_digest: conflict_digest(&evidence)?,
+            blocking: !scopes.is_empty(),
+            scopes,
+            evidence,
+        });
+    }
+    let mut retained = Vec::new();
+    for receipt in candidates {
+        validate_gate_history_conflict(id, &receipt)?;
+        if known.insert(receipt.source_digest.clone()) {
+            retained.push(receipt);
+        }
+    }
+    Ok(retained)
+}
+
+/// A pending merge's database witness is frozen. Even an idempotent REPLACE
+/// can change row IDs, so publication must take a read-only path when all
+/// evidence is already present and refuse before any otherwise-needed write.
+fn preflight_pending_history_observation(
+    incoming: &SnapshotIndex<'_>,
+    local: &SnapshotIndex<'_>,
+    protected: bool,
+) -> Result<Vec<String>> {
+    let mut diverged = Vec::new();
+    for (id, anchor) in &incoming.snapshot.issues {
+        if local.snapshot.issues.get(id) != Some(anchor) {
+            continue;
+        }
+        let needs_write = match incoming.lineage(local, id) {
+            Lineage::Behind => false,
+            Lineage::Same => {
+                protected
+                    && (0..SPECS.len())
+                        .any(|index| incoming.rows(index, id) != local.rows(index, id))
+            }
+            Lineage::Ahead => protected,
+            Lineage::Diverged => {
+                diverged.push(id.clone());
+                !gate_history_conflicts_to_retain(id, incoming, local)?.is_empty()
+            }
+        };
+        if needs_write {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Pending sync merge owns the database witness; newly observed workflow history for {id} cannot be applied during publication. The companion and pending receipt were left intact. Complete or diagnose the pending merge against its original evidence before importing the new history"
+                ),
+            });
+        }
+    }
+    Ok(diverged)
 }
 
 impl PortableHistorySnapshot {
@@ -679,6 +1030,76 @@ impl PortableHistorySnapshot {
 }
 
 impl SqliteStorage {
+    /// Retain observed incompatible gate branches before a publication can
+    /// replace the companion that contains them. This uses the same writer
+    /// transaction as import quarantine and never applies incoming issue rows.
+    /// With protected gates, compatible evidence is replayed too: a peer's
+    /// later FAIL must reach enforcement before publication acknowledges it.
+    /// Unprotected publication keeps its existing current-state behavior.
+    ///
+    /// # Errors
+    /// Returns an error if evidence is malformed or its audit write fails.
+    pub fn retain_portable_gate_conflicts(
+        &self,
+        incoming: &PortableHistorySnapshot,
+    ) -> Result<Vec<String>> {
+        let canonical = canonical_snapshot(incoming)?;
+        let incoming = canonical.as_ref();
+        let ids = incoming.issues.keys().cloned().collect::<HashSet<_>>();
+        self.with_connection_write_transaction(|conn| {
+            let protected = !self.workflow_policy().gate_policies.is_empty();
+            if crate::storage::schema::has_pending_sync_merge_metadata(conn)? {
+                let local = self.snapshot_portable_history(Some(&ids))?;
+                return preflight_pending_history_observation(
+                    &SnapshotIndex::new(incoming),
+                    &SnapshotIndex::new(&local),
+                    protected,
+                );
+            }
+            if protected {
+                return Ok(self.restore_portable_history_in_tx(incoming)?.diverged);
+            }
+            let local = self.snapshot_portable_history(Some(&ids))?;
+            let local_index = SnapshotIndex::new(&local);
+            let incoming_index = SnapshotIndex::new(incoming);
+            let mut diverged = Vec::new();
+            for (id, anchor) in &incoming.issues {
+                if local.issues.get(id) == Some(anchor)
+                    && incoming_index.lineage(&local_index, id) == Lineage::Diverged
+                {
+                    self.retain_gate_history_conflicts(id, &incoming_index, &local_index)?;
+                    diverged.push(id.clone());
+                }
+            }
+            Ok(diverged)
+        })
+    }
+
+    /// Keep an incompatible branch as typed audit evidence. No imported PASS
+    /// or override is made authoritative by choosing an arbitrary ordering of
+    /// concurrent results. Protected gates inspect these events transactionally;
+    /// unprotected gates retain their existing verdict projection.
+    fn retain_gate_history_conflicts(
+        &self,
+        id: &str,
+        incoming: &SnapshotIndex<'_>,
+        local: &SnapshotIndex<'_>,
+    ) -> Result<()> {
+        for receipt in gate_history_conflicts_to_retain(id, incoming, local)? {
+            self.execute_raw_with_params(
+                "INSERT INTO events (issue_id, event_type, actor, comment, created_at) \
+                 VALUES (?, ?, 'br:portable-history', ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(id),
+                    SqliteValue::from(GATE_HISTORY_CONFLICT_EVENT),
+                    SqliteValue::from(serde_json::to_string(&receipt)?),
+                ],
+            )?;
+            self.set_metadata_in_tx("needs_flush", "true")?;
+        }
+        Ok(())
+    }
+
     /// The evidence of every exportable issue, or of the exportable issues
     /// in `ids`, with per-issue sequence numbers and canonical anchors.
     pub fn snapshot_portable_history(
@@ -753,100 +1174,113 @@ impl SqliteStorage {
     /// and only when it extends (or equals) the database's own append-only
     /// history: missing rows are appended with gate revisions remapped to the
     /// local event ids, and the current-state rows are replaced. A row at
-    /// another revision, and a diverged history, are left alone and reported.
+    /// another revision is left alone. A diverged history retains local rows
+    /// and records incompatible incoming gate evidence as typed conflict
+    /// events, so acknowledging a remote failure cannot silently retain an
+    /// effective local PASS. This does not provide consensus for unseen peers.
     pub fn restore_portable_history(
         &mut self,
         incoming: &PortableHistorySnapshot,
     ) -> Result<PortableHistoryReplay> {
         let canonical = canonical_snapshot(incoming)?;
-        let incoming = canonical.as_ref();
-        let ids = incoming.issues.keys().cloned().collect::<HashSet<_>>();
         self.with_write_transaction(|storage| {
-            let local = storage.snapshot_portable_history(Some(&ids))?;
-            let local_index = SnapshotIndex::new(&local);
-            let incoming_index = SnapshotIndex::new(incoming);
-            let mut report = PortableHistoryReplay::default();
-            let mut eligible = HashSet::new();
-            for (id, anchor) in &incoming.issues {
-                if local.issues.get(id) != Some(anchor) {
-                    report.other_revision.push(id.clone());
-                    continue;
-                }
-                match incoming_index.lineage(&local_index, id) {
-                    Lineage::Diverged => report.diverged.push(id.clone()),
-                    // The database already holds everything and more; its
-                    // current-state rows are the newer ones.
-                    Lineage::Behind => report.replayed.push(id.clone()),
-                    Lineage::Same | Lineage::Ahead => {
-                        eligible.insert(id.as_str());
-                        report.replayed.push(id.clone());
-                    }
-                }
-            }
-            if eligible.is_empty() {
-                return Ok(report);
-            }
+            storage.restore_portable_history_in_tx(canonical.as_ref())
+        })
+    }
 
-            // Per-issue sequence -> local event id, numbered exactly as
-            // `snapshot_portable_history` numbers them.
-            let mut event_ids = HashMap::<(String, i64), i64>::new();
-            let mut sequences = HashMap::<String, i64>::new();
-            for row in storage.execute_raw_query("SELECT id, issue_id FROM events ORDER BY id")? {
-                let (Some(event_id), Some(issue)) = (
-                    row.first().and_then(SqliteValue::as_integer),
-                    row.get(1).and_then(SqliteValue::as_text),
-                ) else {
-                    continue;
-                };
+    fn restore_portable_history_in_tx(
+        &self,
+        incoming: &PortableHistorySnapshot,
+    ) -> Result<PortableHistoryReplay> {
+        let storage = self;
+        let ids = incoming.issues.keys().cloned().collect::<HashSet<_>>();
+        let local = storage.snapshot_portable_history(Some(&ids))?;
+        let local_index = SnapshotIndex::new(&local);
+        let incoming_index = SnapshotIndex::new(incoming);
+        let mut report = PortableHistoryReplay::default();
+        let mut eligible = HashSet::new();
+        for (id, anchor) in &incoming.issues {
+            if local.issues.get(id) != Some(anchor) {
+                report.other_revision.push(id.clone());
+                continue;
+            }
+            match incoming_index.lineage(&local_index, id) {
+                Lineage::Diverged => {
+                    storage.retain_gate_history_conflicts(id, &incoming_index, &local_index)?;
+                    report.diverged.push(id.clone());
+                }
+                // The database already holds everything and more; its
+                // current-state rows are the newer ones.
+                Lineage::Behind => report.replayed.push(id.clone()),
+                Lineage::Same | Lineage::Ahead => {
+                    eligible.insert(id.as_str());
+                    report.replayed.push(id.clone());
+                }
+            }
+        }
+        if eligible.is_empty() {
+            return Ok(report);
+        }
+
+        // Per-issue sequence -> local event id, numbered exactly as
+        // `snapshot_portable_history` numbers them.
+        let mut event_ids = HashMap::<(String, i64), i64>::new();
+        let mut sequences = HashMap::<String, i64>::new();
+        for row in storage.execute_raw_query("SELECT id, issue_id FROM events ORDER BY id")? {
+            let (Some(event_id), Some(issue)) = (
+                row.first().and_then(SqliteValue::as_integer),
+                row.get(1).and_then(SqliteValue::as_text),
+            ) else {
+                continue;
+            };
+            if !eligible.contains(issue) {
+                continue;
+            }
+            let seq = sequences.entry(issue.to_owned()).or_default();
+            *seq += 1;
+            event_ids.insert((issue.to_owned(), *seq), event_id);
+        }
+
+        for (index, spec) in SPECS.iter().enumerate() {
+            for row in &incoming.tables[index].rows {
+                let issue = owner(spec, row);
                 if !eligible.contains(issue) {
                     continue;
                 }
-                let seq = sequences.entry(issue.to_owned()).or_default();
-                *seq += 1;
-                event_ids.insert((issue.to_owned(), *seq), event_id);
-            }
-
-            for (index, spec) in SPECS.iter().enumerate() {
-                for row in &incoming.tables[index].rows {
-                    let issue = owner(spec, row);
-                    if !eligible.contains(issue) {
-                        continue;
-                    }
-                    if !spec.append {
-                        insert(storage, spec, row, false)?;
-                        continue;
-                    }
-                    let seq = row[0]
-                        .as_i64()
-                        .ok_or_else(|| invalid("non-integer history id"))?;
-                    let present = local_index.rows(index, issue).len();
-                    if usize::try_from(seq).is_ok_and(|seq| seq <= present) {
-                        continue;
-                    }
-                    let mut values = row[1..].to_vec();
-                    if spec.name == "gate_result_history" {
-                        let revision = row[4].as_i64().unwrap_or_default();
-                        if revision != 0 {
-                            let event_id = event_ids
-                                .get(&(issue.to_owned(), revision))
-                                .ok_or_else(|| invalid("gate revision mapping is absent"))?;
-                            values[3] = Value::from(*event_id);
-                        }
-                    }
-                    insert(storage, spec, &values, true)?;
-                    if spec.name == "events" {
-                        let event_id = storage
-                            .execute_raw_query("SELECT last_insert_rowid()")?
-                            .first()
-                            .and_then(|row| row.first())
-                            .and_then(SqliteValue::as_integer)
-                            .ok_or_else(|| invalid("event insert returned no id"))?;
-                        event_ids.insert((issue.to_owned(), seq), event_id);
+                if !spec.append {
+                    insert(storage, spec, row, false)?;
+                    continue;
+                }
+                let seq = row[0]
+                    .as_i64()
+                    .ok_or_else(|| invalid("non-integer history id"))?;
+                let present = local_index.rows(index, issue).len();
+                if usize::try_from(seq).is_ok_and(|seq| seq <= present) {
+                    continue;
+                }
+                let mut values = row[1..].to_vec();
+                if spec.name == "gate_result_history" {
+                    let revision = row[4].as_i64().unwrap_or_default();
+                    if revision != 0 {
+                        let event_id = event_ids
+                            .get(&(issue.to_owned(), revision))
+                            .ok_or_else(|| invalid("gate revision mapping is absent"))?;
+                        values[3] = Value::from(*event_id);
                     }
                 }
+                insert(storage, spec, &values, true)?;
+                if spec.name == "events" {
+                    let event_id = storage
+                        .execute_raw_query("SELECT last_insert_rowid()")?
+                        .first()
+                        .and_then(|row| row.first())
+                        .and_then(SqliteValue::as_integer)
+                        .ok_or_else(|| invalid("event insert returned no id"))?;
+                    event_ids.insert((issue.to_owned(), seq), event_id);
+                }
             }
-            Ok(report)
-        })
+        }
+        Ok(report)
     }
 }
 
@@ -968,6 +1402,513 @@ mod tests {
             )
             .unwrap();
         (storage, workflow)
+    }
+
+    const GATE_ISSUE: &str = "bd-portable-gate";
+
+    fn gate_transition(storage: &mut SqliteStorage, status: Status) -> Result<Issue> {
+        storage.update_issue(
+            GATE_ISSUE,
+            &IssueUpdate {
+                status: Some(status),
+                ..IssueUpdate::default()
+            },
+            "worker",
+        )
+    }
+
+    fn forkable_gate_source() -> (SqliteStorage, crate::close_policy::Workflow) {
+        let (mut storage, workflow) = gate_source();
+        gate_transition(&mut storage, Status::Open).unwrap();
+        gate_transition(&mut storage, Status::InProgress).unwrap();
+        (storage, workflow)
+    }
+
+    fn fork_gate_store(
+        source: &SqliteStorage,
+        workflow: &crate::close_policy::Workflow,
+    ) -> SqliteStorage {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .upsert_issue_for_import(&source.get_issue(GATE_ISSUE).unwrap().unwrap())
+            .unwrap();
+        storage
+            .restore_portable_history(&source.all_portable_history().unwrap())
+            .unwrap();
+        storage.set_workflow_policy(workflow.clone());
+        storage
+    }
+
+    fn fork_gate_report(
+        storage: &SqliteStorage,
+        actor: &str,
+        passed: bool,
+    ) -> Result<crate::close_policy::GateResultRecord> {
+        storage.record_scoped_gate_result(
+            GATE_ISSUE,
+            "in_progress",
+            storage.status_revision(GATE_ISSUE)?,
+            "closed",
+            "validation",
+            actor,
+            passed,
+            Some("independent branch verdict"),
+            actor,
+            None,
+        )
+    }
+
+    fn commit_pending_gate_merge(
+        storage: &mut SqliteStorage,
+    ) -> crate::sync::SyncMergePendingReceipt {
+        let intent = crate::sync::SyncMergeIntent {
+            schema_version: 2,
+            database_authority_sha256: "11".repeat(32),
+            jsonl_authority_sha256: "22".repeat(32),
+            jsonl_path_sha256: "33".repeat(32),
+            jsonl_before: crate::sync::JsonlSourceStateWitness::Missing,
+            jsonl_before_content_sha256: None,
+            base_authority_sha256: "44".repeat(32),
+            base_before: crate::sync::JsonlSourceStateWitness::Missing,
+            base_before_content_sha256: None,
+            resolution: "manual".to_owned(),
+            actor: "merge-agent".to_owned(),
+            event_attribution: storage.pending_event_attribution_for_review(),
+            capacity_policy: storage.workflow_capacity_policy_for_review(),
+            retention_days: None,
+            export_as_of: chrono::DateTime::parse_from_rfc3339("2026-11-12T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            changed_kept_issue_ids: Vec::new(),
+            kept_issue_witnesses: Vec::new(),
+            deleted_issue_ids: Vec::new(),
+            note_witnesses: Vec::new(),
+            database_before: crate::sync::capture_sync_database_witness(storage).unwrap(),
+        };
+        storage
+            .apply_sync_merge_atomically(&[], &[], &[], &intent)
+            .unwrap()
+    }
+
+    #[test]
+    fn portable_gate_divergence_blocks_pass_and_preserves_both_branches() {
+        for local_passed in [true, false] {
+            let (remote, workflow) = forkable_gate_source();
+            let mut local = fork_gate_store(&remote, &workflow);
+            fork_gate_report(&remote, "verifier", !local_passed).unwrap();
+            fork_gate_report(&local, "lead", local_passed).unwrap();
+            let incoming = remote.all_portable_history().unwrap();
+            let original_local = local.get_gate_result_history(GATE_ISSUE).unwrap();
+            let revision = local.status_revision(GATE_ISSUE).unwrap();
+
+            // JSONL-only startup installs policy after replay. Capturing the
+            // evidence must not depend on the policy already being loaded.
+            local.set_workflow_policy(crate::close_policy::Workflow::default());
+            let replay = local.restore_portable_history(&incoming).unwrap();
+            local.set_workflow_policy(workflow);
+            assert_eq!(replay.diverged, [GATE_ISSUE]);
+            assert_eq!(
+                local.get_gate_result_history(GATE_ISSUE).unwrap(),
+                original_local,
+                "neither local results nor imported overrides are rewritten"
+            );
+            assert_eq!(local.status_revision(GATE_ISSUE).unwrap(), revision);
+            let conflicts = local.get_gate_history_conflicts(GATE_ISSUE).unwrap();
+            assert_eq!(conflicts.len(), 1);
+            assert!(conflicts[0].affects("IN_PROGRESS", "closed", "validation"));
+            assert!(!conflicts[0].affects("in_progress", "open", "validation"));
+            assert_eq!(
+                conflicts[0].conflict.evidence.gate_history,
+                incoming.tables[1]
+            );
+            assert!(!conflicts[0].conflict.evidence.status_events.rows.is_empty());
+            assert_eq!(
+                local.get_metadata("needs_flush").unwrap().as_deref(),
+                Some("true")
+            );
+
+            let error = fork_gate_report(&local, "lead", true).unwrap_err();
+            assert!(error.to_string().contains("divergent verification history"));
+            let error = gate_transition(&mut local, Status::Closed).unwrap_err();
+            assert!(error.to_string().contains("divergent verification history"));
+            assert_eq!(
+                local.get_gate_history_conflicts(GATE_ISSUE).unwrap(),
+                conflicts
+            );
+            assert_eq!(
+                local.get_gate_result_history(GATE_ISSUE).unwrap(),
+                original_local
+            );
+        }
+    }
+
+    #[test]
+    fn portable_gate_divergence_deduplicates_old_evidence_after_real_rework() {
+        let (remote, workflow) = forkable_gate_source();
+        let mut local = fork_gate_store(&remote, &workflow);
+        fork_gate_report(&remote, "verifier", false).unwrap();
+        fork_gate_report(&local, "lead", true).unwrap();
+        let incoming = remote.all_portable_history().unwrap();
+        local.restore_portable_history(&incoming).unwrap();
+        let original_conflict = local.get_gate_history_conflicts(GATE_ISSUE).unwrap();
+        local.restore_portable_history(&incoming).unwrap();
+        local.retain_portable_gate_conflicts(&incoming).unwrap();
+        assert_eq!(
+            local.get_gate_history_conflicts(GATE_ISSUE).unwrap(),
+            original_conflict
+        );
+
+        gate_transition(&mut local, Status::Open).unwrap();
+        let reworked = gate_transition(&mut local, Status::InProgress).unwrap();
+        // A peer can receive the reworked issue row without reconciling its
+        // old branch. Rebinding the same verdicts to that mutable anchor is
+        // not new evidence and must not reactivate the acknowledged conflict.
+        remote.upsert_issue_for_import(&reworked).unwrap();
+        let rebound = remote.all_portable_history().unwrap();
+        local.restore_portable_history(&rebound).unwrap();
+        let historical = local.get_gate_history_conflicts(GATE_ISSUE).unwrap();
+        assert_eq!(historical.len(), 1);
+        assert!(!historical[0].active);
+        assert_eq!(historical[0].conflict, original_conflict[0].conflict);
+        fork_gate_report(&local, "verifier", true).unwrap();
+        gate_transition(&mut local, Status::Closed).unwrap();
+        assert_eq!(
+            local.get_gate_history_conflicts(GATE_ISSUE).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn portable_gate_divergence_does_not_authorize_a_remote_override() {
+        let (common, workflow) = forkable_gate_source();
+        let failed = fork_gate_report(&common, "verifier", false).unwrap();
+        let remote = fork_gate_store(&common, &workflow);
+        let mut local = fork_gate_store(&common, &workflow);
+        let remote_failure = remote
+            .get_gate_result_history(GATE_ISSUE)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(remote_failure.note, failed.note);
+        remote
+            .record_scoped_gate_result(
+                GATE_ISSUE,
+                "in_progress",
+                remote.status_revision(GATE_ISSUE).unwrap(),
+                "closed",
+                "validation",
+                "lead",
+                true,
+                None,
+                "lead",
+                Some(&crate::close_policy::GateOverride {
+                    expected_history_id: remote_failure.id,
+                    reason: "reviewed the shared failure only".to_owned(),
+                }),
+            )
+            .unwrap();
+        let later_failure = fork_gate_report(&local, "verifier", false).unwrap();
+        let local_before = local.get_gate_result_history(GATE_ISSUE).unwrap();
+        local
+            .restore_portable_history(&remote.all_portable_history().unwrap())
+            .unwrap();
+        let conflicts = local.get_gate_history_conflicts(GATE_ISSUE).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0]
+                .conflict
+                .evidence
+                .gate_history
+                .rows
+                .last()
+                .unwrap()[12],
+            "reviewed the shared failure only"
+        );
+        assert_eq!(
+            local.get_gate_result_history(GATE_ISSUE).unwrap(),
+            local_before
+        );
+        let error = local
+            .record_scoped_gate_result(
+                GATE_ISSUE,
+                "in_progress",
+                local.status_revision(GATE_ISSUE).unwrap(),
+                "closed",
+                "validation",
+                "lead",
+                true,
+                None,
+                "lead",
+                Some(&crate::close_policy::GateOverride {
+                    expected_history_id: later_failure.id,
+                    reason: "ordinary override cannot resolve an ambiguous fork".to_owned(),
+                }),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("divergent verification history"));
+    }
+
+    #[test]
+    fn portable_gate_conflict_roundtrip_keeps_active_and_resolved_evidence_distinct() {
+        let (remote, workflow) = forkable_gate_source();
+        let mut local = fork_gate_store(&remote, &workflow);
+        fork_gate_report(&remote, "verifier", false).unwrap();
+        fork_gate_report(&local, "lead", true).unwrap();
+        let mut diverged = fork_gate_store(&local, &workflow);
+        diverged
+            .update_issue(
+                GATE_ISSUE,
+                &IssueUpdate {
+                    title: Some("independent local edit".to_owned()),
+                    ..IssueUpdate::default()
+                },
+                "worker",
+            )
+            .unwrap();
+        local
+            .restore_portable_history(&remote.all_portable_history().unwrap())
+            .unwrap();
+        let source_conflict = local
+            .get_gate_history_conflicts(GATE_ISSUE)
+            .unwrap()
+            .remove(0);
+        let mut third = fork_gate_store(&local, &workflow);
+        let copied = third.get_gate_history_conflicts(GATE_ISSUE).unwrap();
+        assert_eq!(copied.len(), 1);
+        assert!(copied[0].active);
+        assert_eq!(copied[0].conflict, source_conflict.conflict);
+        assert!(fork_gate_report(&third, "lead", true).is_err());
+
+        gate_transition(&mut third, Status::Open).unwrap();
+        let reworked = gate_transition(&mut third, Status::InProgress).unwrap();
+        let resolved = third.all_portable_history().unwrap();
+        diverged.upsert_issue_for_import(&reworked).unwrap();
+        let replay = diverged.restore_portable_history(&resolved).unwrap();
+        assert_eq!(replay.diverged, [GATE_ISSUE]);
+        let archived = diverged.get_gate_history_conflicts(GATE_ISSUE).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0].id > diverged.status_revision(GATE_ISSUE).unwrap());
+        assert!(
+            !archived[0].active,
+            "new local event order must not reactivate resolved peer evidence"
+        );
+        assert!(!archived[0].conflict.blocking);
+        assert_eq!(
+            archived[0].conflict.source_digest,
+            source_conflict.conflict.source_digest
+        );
+        assert_eq!(
+            archived[0].conflict.evidence,
+            source_conflict.conflict.evidence
+        );
+        diverged.restore_portable_history(&resolved).unwrap();
+        assert_eq!(
+            diverged.get_gate_history_conflicts(GATE_ISSUE).unwrap(),
+            archived
+        );
+        validate(&diverged.all_portable_history().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn portable_gate_divergence_does_not_change_unprotected_gate_evaluation() {
+        let (remote, mut workflow) = forkable_gate_source();
+        let mut local = fork_gate_store(&remote, &workflow);
+        fork_gate_report(&remote, "verifier", false).unwrap();
+        fork_gate_report(&local, "lead", true).unwrap();
+        workflow.gate_policies.clear();
+        local.set_workflow_policy(workflow);
+        let local_before = local.get_gate_result_history(GATE_ISSUE).unwrap();
+        local
+            .restore_portable_history(&remote.all_portable_history().unwrap())
+            .unwrap();
+        assert_eq!(
+            local.get_gate_result_history(GATE_ISSUE).unwrap(),
+            local_before
+        );
+        assert!(local.get_gate_history_conflicts(GATE_ISSUE).unwrap()[0].active);
+        gate_transition(&mut local, Status::Closed).unwrap();
+    }
+
+    #[test]
+    fn portable_gate_publication_observation_replays_compatible_failure() {
+        for protected in [true, false] {
+            let (mut local, mut workflow) = forkable_gate_source();
+            fork_gate_report(&local, "lead", true).unwrap();
+            let remote = fork_gate_store(&local, &workflow);
+            fork_gate_report(&remote, "verifier", false).unwrap();
+            let incoming = remote.all_portable_history().unwrap();
+            let before = local.all_portable_history().unwrap();
+            if !protected {
+                workflow.gate_policies.clear();
+                local.set_workflow_policy(workflow);
+            }
+            assert!(
+                local
+                    .retain_portable_gate_conflicts(&incoming)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                local
+                    .get_gate_history_conflicts(GATE_ISSUE)
+                    .unwrap()
+                    .is_empty()
+            );
+            if protected {
+                let history = local.get_gate_result_history(GATE_ISSUE).unwrap();
+                let failed = history.last().unwrap();
+                assert!(!failed.passed);
+                assert_eq!(failed.recorded_by.as_deref(), Some("verifier"));
+                assert_eq!(
+                    failed.status_revision,
+                    local.status_revision(GATE_ISSUE).unwrap()
+                );
+                let error = gate_transition(&mut local, Status::Closed).unwrap_err();
+                assert!(error.to_string().contains("failed verification"));
+                // This branch is causally compatible, so the existing explicit
+                // override remains available after inspecting the real FAIL.
+                local
+                    .record_scoped_gate_result(
+                        GATE_ISSUE,
+                        "in_progress",
+                        failed.status_revision,
+                        "closed",
+                        "validation",
+                        "lead",
+                        true,
+                        None,
+                        "lead",
+                        Some(&crate::close_policy::GateOverride {
+                            expected_history_id: failed.id,
+                            reason: "reviewed the subsequently imported failure".to_owned(),
+                        }),
+                    )
+                    .unwrap();
+            } else {
+                assert_eq!(local.all_portable_history().unwrap(), before);
+            }
+            gate_transition(&mut local, Status::Closed).unwrap();
+        }
+    }
+
+    #[test]
+    fn pending_merge_history_observation_preserves_witness_or_refuses_new_evidence() {
+        for compatible in [true, false] {
+            let (mut local, workflow) = forkable_gate_source();
+            let remote = if compatible {
+                fork_gate_report(&local, "lead", true).unwrap();
+                fork_gate_store(&local, &workflow)
+            } else {
+                let remote = fork_gate_store(&local, &workflow);
+                fork_gate_report(&local, "lead", true).unwrap();
+                remote
+            };
+            fork_gate_report(&remote, "verifier", false).unwrap();
+            let incoming = remote.all_portable_history().unwrap();
+            let known = local.all_portable_history().unwrap();
+            let receipt = commit_pending_gate_merge(&mut local);
+            let before = crate::sync::capture_sync_database_witness(&local).unwrap();
+            let mirror_before = local
+                .execute_raw_query("SELECT rowid, * FROM gate_results ORDER BY rowid")
+                .unwrap();
+            assert!(
+                local
+                    .retain_portable_gate_conflicts(&known)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                crate::sync::capture_sync_database_witness(&local).unwrap(),
+                before
+            );
+            assert_eq!(
+                local
+                    .execute_raw_query("SELECT rowid, * FROM gate_results ORDER BY rowid")
+                    .unwrap(),
+                mirror_before
+            );
+
+            let error = local.retain_portable_gate_conflicts(&incoming).unwrap_err();
+            assert!(matches!(error, BeadsError::SyncConflict { .. }));
+            assert!(error.to_string().contains("Pending sync merge owns"));
+            assert_eq!(
+                crate::sync::capture_sync_database_witness(&local).unwrap(),
+                before
+            );
+            assert_eq!(local.pending_sync_merge_receipt().unwrap(), Some(receipt));
+            assert!(
+                local
+                    .get_gate_history_conflicts(GATE_ISSUE)
+                    .unwrap()
+                    .is_empty()
+            );
+
+            // Equal append-only rows do not authorize replacing different
+            // current-state rows while the pending receipt freezes them.
+            let mut changed_projection = known.clone();
+            changed_projection.tables[3].rows[0][3] = Value::from(1);
+            if changed_projection.tables[3] == known.tables[3] {
+                changed_projection.tables[3].rows[0][3] = Value::from(0);
+            }
+            assert!(
+                local
+                    .retain_portable_gate_conflicts(&changed_projection)
+                    .is_err()
+            );
+            assert_eq!(
+                crate::sync::capture_sync_database_witness(&local).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn pending_merge_history_observation_deduplicates_known_conflicts_and_guards_opaque_markers() {
+        for marker in [
+            crate::sync::METADATA_SYNC_MERGE_PENDING,
+            crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY,
+        ] {
+            let (remote, workflow) = forkable_gate_source();
+            let mut local = fork_gate_store(&remote, &workflow);
+            fork_gate_report(&remote, "verifier", false).unwrap();
+            fork_gate_report(&local, "lead", true).unwrap();
+            let incoming = remote.all_portable_history().unwrap();
+            local
+                .set_metadata(marker, "opaque pending authority")
+                .unwrap();
+            let before = crate::sync::capture_sync_database_witness(&local).unwrap();
+            assert!(local.retain_portable_gate_conflicts(&incoming).is_err());
+            assert_eq!(
+                crate::sync::capture_sync_database_witness(&local).unwrap(),
+                before
+            );
+            assert_eq!(
+                local.get_metadata(marker).unwrap().as_deref(),
+                Some("opaque pending authority")
+            );
+
+            // A second database captures the conflict before the merge. The
+            // same already-retained evidence must remain a no-op while pending.
+            let mut known_local = fork_gate_store(&local, &workflow);
+            known_local.restore_portable_history(&incoming).unwrap();
+            assert!(
+                !known_local
+                    .get_gate_history_conflicts(GATE_ISSUE)
+                    .unwrap()
+                    .is_empty()
+            );
+            known_local
+                .set_metadata(marker, "opaque pending authority")
+                .unwrap();
+            let before = crate::sync::capture_sync_database_witness(&known_local).unwrap();
+            known_local
+                .retain_portable_gate_conflicts(&incoming)
+                .unwrap();
+            assert_eq!(
+                crate::sync::capture_sync_database_witness(&known_local).unwrap(),
+                before
+            );
+        }
     }
 
     #[test]

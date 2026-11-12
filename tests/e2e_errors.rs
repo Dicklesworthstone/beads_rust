@@ -6384,6 +6384,163 @@ fn e2e_independent_gate_audit_survives_portable_history_roundtrip() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_independent_gate_known_peer_fail_blocks_local_pass_until_rework() {
+    for receive_mode in ["--import-only", "--flush-only", "auto-close"] {
+        let (local, id) = independent_gate_workspace(INDEPENDENT_GATE_POLICY);
+        independent_gate_json(&local, &["sync", "--flush-only"]);
+
+        // Both clones start from the same issue and audit history. Gate reports
+        // leave the issue anchor unchanged, so these are concurrent branches of
+        // one verification attempt, without editing any database or audit rows.
+        let peer = BrWorkspace::new();
+        independent_gate_json(&peer, &["init", "--prefix", "verify"]);
+        for name in ["issues.jsonl", "issues.history.jsonl", "policy.yaml"] {
+            fs::copy(
+                local.root.join(".beads").join(name),
+                peer.root.join(".beads").join(name),
+            )
+            .unwrap();
+        }
+        independent_gate_json(&peer, &["sync", "--import-only"]);
+        let local_pass =
+            independent_gate_json(&local, &independent_gate_report(&id, "verifier-c", "pass"));
+        let peer_fail =
+            independent_gate_json(&peer, &independent_gate_report(&id, "verifier-b", "fail"));
+        independent_gate_json(&peer, &["sync", "--flush-only"]);
+        for name in ["issues.jsonl", "issues.history.jsonl"] {
+            if receive_mode == "auto-close" && name == "issues.jsonl" {
+                continue;
+            }
+            fs::copy(
+                peer.root.join(".beads").join(name),
+                local.root.join(".beads").join(name),
+            )
+            .unwrap();
+        }
+        if receive_mode == "auto-close" {
+            let refused = run_br(
+                &local,
+                ["close", &id, "--json"],
+                "observe_peer_gate_conflict",
+            );
+            assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+            let error: Value = serde_json::from_str(&refused.stdout).unwrap();
+            assert_eq!(error["error"]["code"], "POLICY_VIOLATION");
+            assert_eq!(
+                independent_gate_json(&local, &["show", &id])[0]["status"],
+                "in_progress"
+            );
+        } else if receive_mode == "--flush-only" {
+            independent_gate_json(&local, &["sync", receive_mode, "--force"]);
+        } else {
+            independent_gate_json(&local, &["sync", receive_mode]);
+        }
+
+        let list = independent_gate_json(&local, &["gate", "list", &id]);
+        assert_eq!(list["history"].as_array().unwrap().len(), 1);
+        assert_eq!(list["history"][0]["id"], local_pass["id"]);
+        assert_eq!(list["history"][0]["passed"], true);
+        let conflicts = list["history_conflicts"].as_array().unwrap();
+        assert_eq!(conflicts.len(), 1, "{list}");
+        assert_eq!(conflicts[0]["active"], true);
+        assert_eq!(list["gated_transitions"][0]["satisfied"], false);
+        assert_eq!(
+            list["gated_transitions"][0]["gates"][0]["history_conflict_ids"][0],
+            conflicts[0]["id"]
+        );
+        let evidence = conflicts[0]["evidence"].clone();
+        let gate_table = &evidence["gate_history"];
+        let incoming_row = &gate_table["rows"][0];
+        for field in [
+            "issue_id",
+            "from_status",
+            "to_status",
+            "gate",
+            "provider",
+            "passed",
+            "recorded_by",
+            "recorded_at",
+            "assignee_at_report",
+            "override_reason",
+        ] {
+            let column = gate_table["columns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|name| name.as_str() == Some(field))
+                .unwrap();
+            let expected = if field == "passed" {
+                Value::from(i64::from(peer_fail[field].as_bool().unwrap()))
+            } else {
+                peer_fail[field].clone()
+            };
+            assert_eq!(incoming_row[column], expected, "lost field {field}");
+        }
+        assert!(
+            !evidence["status_events"]["rows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        // Replay is idempotent. The refusal is durable in storage even when the
+        // caller explicitly disables automatic import for a later operation.
+        independent_gate_json(&local, &["sync", "--import-only"]);
+        let repeated = independent_gate_json(&local, &["gate", "list", &id]);
+        assert_eq!(repeated["history_conflicts"], list["history_conflicts"]);
+        independent_gate_refusal(&local, &["close", &id, "--no-auto-import"]);
+        let mut pass = independent_gate_report(&id, "verifier-b", "pass");
+        pass.push("--no-auto-import");
+        independent_gate_refusal(&local, &pass);
+
+        // A new FAIL is still reportable, but even an otherwise authorized
+        // override cannot settle the ordering of two independent histories.
+        let failed =
+            independent_gate_json(&local, &independent_gate_report(&id, "verifier-c", "fail"));
+        let failed_id = failed["id"].as_i64().unwrap().to_string();
+        let mut override_args = independent_gate_report(&id, "lead", "pass");
+        override_args.extend([
+            "--override-failure",
+            &failed_id,
+            "--override-reason",
+            "Reviewed local failure only",
+            "--no-auto-import",
+        ]);
+        independent_gate_refusal(&local, &override_args);
+
+        // A subsequent publication and third clone retain both the incoming
+        // verdict's complete attribution and the unresolved conflict barrier.
+        independent_gate_json(&local, &["sync", "--flush-only"]);
+        let restored = BrWorkspace::new();
+        independent_gate_json(&restored, &["init", "--prefix", "verify"]);
+        for name in ["issues.jsonl", "issues.history.jsonl", "policy.yaml"] {
+            fs::copy(
+                local.root.join(".beads").join(name),
+                restored.root.join(".beads").join(name),
+            )
+            .unwrap();
+        }
+        independent_gate_json(&restored, &["sync", "--import-only"]);
+        let imported = independent_gate_json(&restored, &["gate", "list", &id]);
+        assert_eq!(imported["history_conflicts"][0]["evidence"], evidence);
+        assert_eq!(imported["history_conflicts"][0]["active"], true);
+        assert_eq!(imported["gated_transitions"][0]["satisfied"], false);
+        independent_gate_refusal(&restored, &["close", &id, "--no-auto-import"]);
+
+        independent_gate_json(&local, &["update", &id, "--status", "rework"]);
+        independent_gate_json(&local, &["update", &id, "--status", "in_progress"]);
+        independent_gate_json(&local, &independent_gate_report(&id, "verifier-b", "pass"));
+        let reworked = independent_gate_json(&local, &["gate", "list", &id]);
+        assert_eq!(reworked["history_conflicts"][0]["active"], false);
+        assert_eq!(reworked["history_conflicts"][0]["evidence"], evidence);
+        assert_eq!(reworked["history"].as_array().unwrap().len(), 3);
+        assert_eq!(reworked["gated_transitions"][0]["satisfied"], true);
+        independent_gate_json(&local, &["close", &id]);
+    }
+}
+
+#[test]
 fn e2e_independent_gate_policy_tightening_rejects_old_self_approval_and_reassignment() {
     let unrestricted = INDEPENDENT_GATE_POLICY
         .split("  gate_policies:")

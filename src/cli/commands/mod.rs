@@ -454,8 +454,29 @@ pub(super) fn auto_import_storage_ctx_if_stale(
         allow_external_jsonl,
         cli.allow_stale.unwrap_or(false),
         no_auto_import,
-    )
-    .map(|_| ())
+    )?;
+    // Gate reports do not change the issue JSONL anchor. Its unchanged hash
+    // therefore cannot establish that verification evidence is current. The
+    // caller's existing write authority also protects this companion replay;
+    // observe both extending and diverging histories before a protected
+    // mutation can use a local PASS. Explicit stale/import overrides retain
+    // their existing meaning, and cannot remove conflicts already recorded.
+    if !no_auto_import
+        && !cli.allow_stale.unwrap_or(false)
+        && !storage_ctx
+            .storage
+            .workflow_policy()
+            .gate_policies
+            .is_empty()
+    {
+        for warning in crate::portable_history::replay_after_import(
+            &mut storage_ctx.storage,
+            &storage_ctx.paths.jsonl_path,
+        )? {
+            tracing::warn!(warning = %warning, "Workflow history coverage is incomplete");
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn cli_for_routed_workspace(
@@ -1127,6 +1148,45 @@ mod tests {
             );
             assert_eq!(fs::read(&paths.jsonl_path).unwrap(), jsonl_before);
         }
+    }
+
+    #[test]
+    fn protected_companion_observation_preserves_explicit_startup_overrides() {
+        let (_temp, mut storage_ctx) = storage_ctx_with_exported_issue();
+        let workflow: crate::close_policy::Workflow = serde_yml::from_str(
+            "strict: true\ngates:\n  'open -> closed':\n    require_all: [validation]\ngate_policies:\n  validation:\n    allowed_reporters: [verifier]\n",
+        )
+        .unwrap();
+        storage_ctx.storage.set_workflow_policy(workflow.clone());
+        fs::write(
+            crate::portable_history::sidecar_path(&storage_ctx.paths.jsonl_path),
+            "malformed incoming companion\n",
+        )
+        .unwrap();
+        let before = raw_storage_record_state(&storage_ctx.storage);
+        for read_only_storage in [false, true] {
+            for allow_stale in [false, true] {
+                let cli = CliOverrides {
+                    read_only_storage,
+                    allow_stale: Some(allow_stale),
+                    no_auto_import: Some(!allow_stale),
+                    ..CliOverrides::default()
+                };
+                auto_import_storage_ctx_if_stale(&mut storage_ctx, &cli)
+                    .expect("explicit stale/import overrides must not observe the companion");
+                assert_eq!(raw_storage_record_state(&storage_ctx.storage), before);
+            }
+        }
+        let issue_before = storage_ctx.storage.get_issue("bd-1").unwrap();
+        auto_import_storage_ctx_if_stale(&mut storage_ctx, &CliOverrides::default())
+            .expect_err("protected default startup must validate companion-only evidence");
+        assert_eq!(storage_ctx.storage.get_issue("bd-1").unwrap(), issue_before);
+
+        let mut legacy_workflow = workflow;
+        legacy_workflow.gate_policies.clear();
+        storage_ctx.storage.set_workflow_policy(legacy_workflow);
+        auto_import_storage_ctx_if_stale(&mut storage_ctx, &CliOverrides::default())
+            .expect("unprotected workflows retain the existing freshness behavior");
     }
 
     #[test]

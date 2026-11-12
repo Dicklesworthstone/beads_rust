@@ -1792,6 +1792,45 @@ threshold. New records also retain
 `assignee_at_report`; a missing legacy assignment snapshot cannot prove
 independence when self-approval is forbidden, so collect a fresh report.
 
+**Conflicting verification from another clone.** If two clones report different
+results for the same issue revision, importing the companion must not leave a
+local PASS effective while silently discarding a peer's FAIL. Beads retains the
+local verdict history and records the incoming gate branch separately as a
+`workflow_gate_history_conflict` audit event. The receipt preserves the source
+issue anchor, original gate rows and their referenced status events, including
+declared actors, assignee snapshots, notes and override reasons. It describes an
+audit conflict; it is not a new verdict attributed to a verifier.
+
+`br gate list --json` exposes these receipts in `history_conflicts`, with an
+`active` flag, affected transition/gate scopes and the preserved evidence.
+Affected protected gates report `satisfied: false` and identify the conflict in
+`history_conflict_ids`. A matching active conflict blocks a new PASS and closure
+inside the storage transaction, including when automatic import is disabled.
+Authorized FAIL reports remain recordable. Gates without a reporter policy keep
+their existing evaluation behavior.
+
+Protected CLI mutations with automatic import enabled and protected MCP
+mutations inspect matching companion evidence before making the change, even
+when `issues.jsonl` itself is unchanged. This also imports a later FAIL that
+extends the local history without a conflict. Explicit `--no-auto-import` and
+`--allow-stale` retain their existing choice to use local state; neither flag
+removes an already recorded conflict. An explicit export preserves conflicting
+gate evidence already present in the companion before replacing that file.
+
+Complete a permitted rework transition, return to review and obtain fresh
+independent approval to proceed. An ordinary `--override-failure` cannot settle
+the ordering of two divergent histories: a peer's override may have been
+prepared without seeing the local failure. Rework supersedes the conflict for
+the new status revision and keeps its evidence in the audit. Reimporting the
+same branch does not create duplicate receipts or reactivate a conflict already
+superseded by rework. Later exports and imports carry the receipts, including
+the incoming branch's original evidence.
+
+This restriction applies once a clone has observed conflicting evidence. Beads
+does not coordinate simultaneous offline clones or establish that an imported
+actor declaration was authenticated. A clone cannot enforce a verdict it has
+not received.
+
 `--bypass-policy` is a separate whole-policy escape hatch. Set top-level
 `allow_bypass: false`, as above, when closure must require these gates. If bypass
 is enabled, an explicit close bypass with its reason can still bypass them and
