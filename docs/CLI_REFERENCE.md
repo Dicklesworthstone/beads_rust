@@ -1697,6 +1697,12 @@ ordinary PASS from replacing a FAIL in the same transition attempt. A configured
 gate policy requires `workflow.strict: true`. Gates without such an entry retain
 their existing behavior.
 
+When reporter restrictions are configured, every `workflow.gates` key must be
+one nonempty `from -> to` transition. Duplicate transitions after trimming and
+case normalization are rejected, and endpoints must belong to
+`workflow.statuses` when that vocabulary is configured. These checks prevent a
+misspelled or shadowed rule from silently omitting a protected gate.
+
 The audit fields use database schema 20. An existing schema-19 workspace requires
 the explicit reviewed migration: inspect `br doctor migrate-schema plan --json`,
 then use its apply token or `br doctor migrate-schema heal` after reviewing the
@@ -1739,7 +1745,10 @@ policy is applied when reporting and again when a transition is evaluated;
 removing authorization can invalidate old approvals without erasing their
 history. A protected `min_reviewers` threshold counts distinct authorized
 declared actors on that gate, so multiple provider aliases for one actor cannot
-supply multiple independent approvals.
+supply multiple independent approvals. Distinct authorized actors reporting
+through the same mapped service each count once. Matching `min_reviewers`
+requirements take the highest threshold regardless of declaration order; the
+bare protected gate name means one reviewer.
 
 **Identity boundary:** `--actor`, actor configuration, and the `$USER` fallback
 are declarations. They are not authenticated identities, signatures, or proof
@@ -1776,7 +1785,10 @@ The history-ID check is atomic with the report: a concurrent report makes an
 override prepared from older evidence stale and it is refused. Refusal adds no
 verdict and does not change the current projection. A successful override adds a
 new PASS with its actor and `override_reason`; the FAIL and every earlier report
-remain in history and in the portable companion. New records also retain
+remain in history and in the portable companion. A failure invalidates all
+earlier approvals for that attempt. An override contributes only its own
+reporter's approval; additional reviewers must report again to meet a larger
+threshold. New records also retain
 `assignee_at_report`; a missing legacy assignment snapshot cannot prove
 independence when self-approval is forbidden, so collect a fresh report.
 

@@ -6493,6 +6493,110 @@ workflow:
 }
 
 #[test]
+fn e2e_independent_gate_shared_provider_retains_each_reviewers_approval() {
+    let policy = r#"
+allow_bypass: false
+workflow:
+  strict: true
+  gates:
+    "in_progress -> closed":
+      require_all: [min_reviewers, {min_reviewers: 2}]
+  gate_policies:
+    min_reviewers:
+      allowed_reporters: [alice, bob, lead]
+      forbid_self_approval: true
+      provider_reporters:
+        review-service: [alice, bob, lead]
+        reviewer:alice-alias: [alice]
+      override_reporters: [lead]
+"#;
+    let (workspace, id) = independent_gate_workspace(policy);
+    let report = |actor, verdict| {
+        let mut args = independent_gate_report(&id, actor, verdict);
+        args[4] = "min_reviewers";
+        args[6] = "review-service";
+        independent_gate_json(&workspace, &args)
+    };
+    report("alice", "pass");
+    let mut alias = independent_gate_report(&id, "alice", "pass");
+    alias[4] = "min_reviewers";
+    alias[6] = "reviewer:alice-alias";
+    independent_gate_json(&workspace, &alias);
+    independent_gate_refusal(&workspace, &["close", &id]);
+    report("bob", "pass");
+    let approved = independent_gate_json(&workspace, &["gate", "list", &id]);
+    assert_eq!(approved["gated_transitions"][0]["satisfied"], true);
+    assert_eq!(approved["history"].as_array().unwrap().len(), 3);
+
+    let failure = report("bob", "fail");
+    independent_gate_refusal(&workspace, &["close", &id]);
+    let latest = failure["id"].as_i64().unwrap().to_string();
+    let mut override_args = independent_gate_report(&id, "lead", "pass");
+    override_args[4] = "min_reviewers";
+    override_args[6] = "review-service";
+    override_args.extend([
+        "--override-failure",
+        &latest,
+        "--override-reason",
+        "Reviewed failure; prior votes must remain invalidated",
+    ]);
+    independent_gate_json(&workspace, &override_args);
+    independent_gate_refusal(&workspace, &["close", &id]);
+    report("bob", "pass");
+    let after = independent_gate_json(&workspace, &["gate", "list", &id]);
+    let history = after["history"].as_array().unwrap();
+    assert_eq!(history.len(), 6);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|record| record["passed"] == false)
+            .count(),
+        1
+    );
+    assert_eq!(after["gated_transitions"][0]["satisfied"], true);
+    independent_gate_json(&workspace, &["close", &id]);
+}
+
+#[test]
+fn e2e_independent_gate_rejects_shadowed_and_unreachable_rules_before_mutation() {
+    let (workspace, id) = independent_gate_workspace(INDEPENDENT_GATE_POLICY);
+    let policy_path = workspace.root.join(".beads/policy.yaml");
+    let history_path = workspace.root.join(".beads/issues.history.jsonl");
+    let mut invalid_policies = [
+        "in_progress closed",
+        "in_progress -> closed -> archived",
+        " -> closed",
+        "in_progress -> ",
+        "in_progress -> clsoed",
+    ]
+    .into_iter()
+    .map(|key| INDEPENDENT_GATE_POLICY.replace("in_progress -> closed", key))
+    .collect::<Vec<_>>();
+    invalid_policies.push(INDEPENDENT_GATE_POLICY.replace(
+        "  gates:\n",
+        "  gates:\n    '  IN_PROGRESS  ->  CLOSED  ': {}\n",
+    ));
+    for policy in invalid_policies {
+        fs::write(&policy_path, &policy).unwrap();
+        let before = prerequisite_database_state(&workspace);
+        let history_before = fs::read(&history_path).ok();
+        for args in [
+            vec!["close", &id, "--json"],
+            vec!["update", &id, "--status", "closed", "--json"],
+        ] {
+            let refused = run_br(&workspace, args, "invalid_independent_gate_rule");
+            assert_eq!(refused.status.code(), Some(7), "{policy}\n{refused:?}");
+            let error: Value = serde_json::from_str(&refused.stdout).unwrap();
+            assert_eq!(error["error"]["code"], "CONFIG_ERROR", "{refused:?}");
+            assert_eq!(prerequisite_database_state(&workspace), before);
+            assert_eq!(fs::read(&history_path).ok(), history_before);
+        }
+    }
+    fs::write(policy_path, INDEPENDENT_GATE_POLICY).unwrap();
+    independent_gate_refusal(&workspace, &["close", &id]);
+}
+
+#[test]
 fn e2e_independent_gate_unrestricted_policy_preserves_legacy_overwrite_behavior() {
     let unrestricted = INDEPENDENT_GATE_POLICY
         .split("  gate_policies:")

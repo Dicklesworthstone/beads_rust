@@ -1163,7 +1163,7 @@ pub fn protected_gate_state(
         .collect::<Vec<_>>();
     scoped.sort_unstable_by_key(|record| record.id);
     let mut state = ProtectedGateState::default();
-    let mut passing = std::collections::BTreeMap::new();
+    let mut passing = std::collections::BTreeSet::new();
     for record in scoped {
         state.latest_history_id = Some(record.id);
         if !record.passed {
@@ -1210,16 +1210,11 @@ pub fn protected_gate_state(
         } else if state.unresolved_failure {
             continue;
         }
-        passing.insert(
-            record.provider.trim().to_ascii_lowercase(),
-            actor.trim().to_ascii_lowercase(),
-        );
+        // Provider aliases must not inflate one actor's approvals, and a
+        // shared service provider must not collapse distinct actors' votes.
+        passing.insert(actor.trim().to_ascii_lowercase());
     }
-    state.passing_reporters = passing
-        .into_values()
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    state.passing_reporters = passing.into_iter().collect();
     state
 }
 
@@ -1300,6 +1295,29 @@ impl Workflow {
                 "workflow.gate_policies requires workflow.strict: true".to_owned(),
             ));
         }
+        let mut transitions = std::collections::BTreeSet::new();
+        for key in self.gates.keys() {
+            let malformed = || {
+                BeadsError::Config(format!(
+                    "workflow.gates has malformed transition '{key}'; protected gates require exactly one non-empty 'from -> to' transition"
+                ))
+            };
+            if key.match_indices("->").count() != 1 {
+                return Err(malformed());
+            }
+            let (from, to) = parse_transition_key(key).ok_or_else(malformed)?;
+            if !transitions.insert((from.to_ascii_lowercase(), to.to_ascii_lowercase())) {
+                return Err(BeadsError::Config(format!(
+                    "workflow.gates has duplicate transition '{key}'; protected gates cannot use shadowed transition rules"
+                )));
+            }
+            if self.is_enforced() && (!self.allows(from) || !self.allows(to)) {
+                return Err(BeadsError::Config(format!(
+                    "workflow.gates transition '{key}' references a status outside the configured workflow: {}",
+                    self.allowed_list()
+                )));
+            }
+        }
         let mut gates = std::collections::BTreeSet::new();
         for (gate, policy) in &self.gate_policies {
             let canonical = gate.trim().to_ascii_lowercase();
@@ -1377,18 +1395,29 @@ impl Workflow {
             return Vec::new();
         };
         let mut out: Vec<GateSpec> = Vec::new();
+        let protected_reviewers = self.gate_policy(GATE_MIN_REVIEWERS).is_some();
         let merge_required = |spec: &GateSpec, out: &mut Vec<GateSpec>| {
+            // A bare protected reviewer gate means one actor. Normalize it
+            // before merging so it cannot hide a larger explicit threshold.
+            let spec = match spec {
+                GateSpec::Named(name)
+                    if protected_reviewers && same_declared_identity(name, GATE_MIN_REVIEWERS) =>
+                {
+                    GateSpec::MinReviewers(1)
+                }
+                _ => spec.clone(),
+            };
             if let Some(existing) = out
                 .iter_mut()
                 .find(|seen| seen.id().eq_ignore_ascii_case(spec.id()))
             {
                 if let (GateSpec::MinReviewers(current), GateSpec::MinReviewers(required)) =
-                    (existing, spec)
+                    (existing, &spec)
                 {
                     *current = (*current).max(*required);
                 }
             } else {
-                out.push(spec.clone());
+                out.push(spec);
             }
         };
         for spec in &rule.require_all {
@@ -6019,6 +6048,21 @@ workflow:
             label: "bug".to_string(),
             to: "open".to_string(),
         });
+        workflow.gates.insert(
+            "open -> closed".to_owned(),
+            GateRule {
+                require_all: vec![GateSpec::Named("independent_validation".to_owned())],
+                ..Default::default()
+            },
+        );
+        workflow.gate_policies.insert(
+            "independent_validation".to_owned(),
+            GateReporterPolicy {
+                allowed_reporters: Some(vec!["reviewer".to_owned()]),
+                forbid_self_approval: true,
+                ..Default::default()
+            },
+        );
         workflow
     }
 
@@ -6963,6 +7007,71 @@ workflow:
     }
 
     #[test]
+    fn gate_policies_reject_unreachable_or_shadowed_transition_rules() {
+        let base = independent_gate_workflow();
+        for key in [
+            "in_review => closed",
+            "in_review -> ",
+            " -> closed",
+            "in_review -> closed -> archived",
+        ] {
+            let mut malformed = base.clone();
+            let rule = malformed.gates.remove("in_review -> closed").unwrap();
+            malformed.gates.insert(key.to_owned(), rule);
+            assert!(malformed.validate_gate_policies().is_err(), "{key}");
+            malformed.gate_policies.clear();
+            assert!(
+                malformed.validate_gate_policies().is_ok(),
+                "legacy policy parsing stays permissive"
+            );
+        }
+        let mut shadowed = base.clone();
+        shadowed
+            .gates
+            .insert(" IN_REVIEW -> CLOSED ".to_owned(), GateRule::default());
+        assert!(
+            shadowed
+                .required_gates_for("in_review", "closed", &[], 2)
+                .is_empty(),
+            "negative control: the first canonical match can hide a protected rule"
+        );
+        assert!(shadowed.validate_gate_policies().is_err());
+
+        let mut declared = base.clone();
+        declared.statuses = vec!["open".to_owned(), "closed".to_owned()];
+        assert!(
+            declared.validate_gate_policies().is_err(),
+            "unknown source status"
+        );
+        declared.statuses = vec!["in_review".to_owned(), "open".to_owned()];
+        assert!(
+            declared.validate_gate_policies().is_err(),
+            "unknown target status"
+        );
+        declared.statuses = vec!["in_review".to_owned(), "closed".to_owned()];
+        assert!(declared.validate_gate_policies().is_ok());
+        assert!(
+            base.validate_gate_policies().is_ok(),
+            "status enumeration is optional"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join(POLICY_FILE_NAME),
+            serde_yml::to_string(&PolicyDocument {
+                workflow: shadowed,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            load_for_beads_dir(temp.path()).is_err(),
+            "loading must reject the shadowed rule before use"
+        );
+    }
+
+    #[test]
     fn gate_report_authorization_binds_provider_and_denies_explicit_empty_list() {
         let mut policy = GateReporterPolicy::default();
         assert!(
@@ -7270,6 +7379,181 @@ workflow:
             &["worker"],
         );
         assert_eq!(state.passing_reporters, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn gate_protected_min_reviewers_merges_named_minimum_in_both_orders() {
+        let mut base = independent_gate_workflow();
+        let policy = base.gate_policies.remove("independent_validation").unwrap();
+        base.gate_policies
+            .insert("min_reviewers".to_owned(), policy);
+        for (threshold, expected) in [(0, 1), (2, 2), (3, 3)] {
+            for named_first in [false, true] {
+                let mut workflow = base.clone();
+                let named = GateSpec::Named("min_reviewers".to_owned());
+                let mut specs = vec![GateSpec::MinReviewers(threshold), named.clone()];
+                if named_first {
+                    specs.reverse();
+                }
+                workflow
+                    .gates
+                    .get_mut("in_review -> closed")
+                    .unwrap()
+                    .require_all = specs;
+                workflow.validate_gate_policies().unwrap();
+                assert_eq!(
+                    workflow.required_gates_for("in_review", "closed", &[], 2),
+                    vec![GateSpec::MinReviewers(expected)],
+                    "threshold={threshold}, named_first={named_first}"
+                );
+                workflow.gate_policies.clear();
+                let legacy = if named_first {
+                    named
+                } else {
+                    GateSpec::MinReviewers(threshold)
+                };
+                assert_eq!(
+                    workflow.required_gates_for("in_review", "closed", &[], 2),
+                    vec![legacy],
+                    "unprotected gate aggregation must retain its existing behavior"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_protected_min_reviewers_merges_only_matching_conditions() {
+        let mut workflow = independent_gate_workflow();
+        let policy = workflow
+            .gate_policies
+            .remove("independent_validation")
+            .unwrap();
+        workflow
+            .gate_policies
+            .insert("min_reviewers".to_owned(), policy);
+        let named = ConditionalGate {
+            label: Some("named".to_owned()),
+            gate: GateSpec::Named("min_reviewers".to_owned()),
+            ..Default::default()
+        };
+        let counted = ConditionalGate {
+            label: Some("counted".to_owned()),
+            gate: GateSpec::MinReviewers(2),
+            ..Default::default()
+        };
+        for reverse in [false, true] {
+            let rule = workflow.gates.get_mut("in_review -> closed").unwrap();
+            rule.require_all.clear();
+            rule.require_if = vec![named.clone(), counted.clone()];
+            if reverse {
+                rule.require_if.reverse();
+            }
+            for (labels, expected) in [
+                (vec![], None),
+                (vec!["named".to_owned()], Some(1)),
+                (vec!["counted".to_owned()], Some(2)),
+                (vec!["named".to_owned(), "counted".to_owned()], Some(2)),
+            ] {
+                assert_eq!(
+                    workflow.required_gates_for("in_review", "closed", &labels, 2),
+                    expected
+                        .map(GateSpec::MinReviewers)
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    "labels={labels:?}, reversed={reverse}"
+                );
+            }
+        }
+        let rule = workflow.gates.get_mut("in_review -> closed").unwrap();
+        rule.require_all = vec![GateSpec::MinReviewers(0)];
+        rule.require_if = vec![named];
+        assert_eq!(
+            workflow.required_gates_for("in_review", "closed", &[], 2),
+            vec![GateSpec::MinReviewers(0)],
+            "an unmatched named requirement must not raise the zero threshold"
+        );
+        assert_eq!(
+            workflow.required_gates_for("in_review", "closed", &["named".to_owned()], 2),
+            vec![GateSpec::MinReviewers(1)]
+        );
+    }
+
+    #[test]
+    fn gate_shared_provider_counts_reporters_and_resets_after_failure() {
+        let mut workflow = independent_gate_workflow();
+        workflow
+            .gates
+            .get_mut("in_review -> closed")
+            .unwrap()
+            .require_all = vec![GateSpec::MinReviewers(2)];
+        let mut policy = workflow
+            .gate_policies
+            .remove("independent_validation")
+            .unwrap();
+        policy.provider_reporters = std::collections::BTreeMap::from([
+            (
+                "review-service".to_owned(),
+                vec!["alice".to_owned(), "bob".to_owned(), "lead".to_owned()],
+            ),
+            ("alice-alias".to_owned(), vec!["alice".to_owned()]),
+        ]);
+        workflow
+            .gate_policies
+            .insert("min_reviewers".to_owned(), policy);
+        let policy = workflow.gate_policy("min_reviewers").unwrap();
+        let review = |id, provider, actor, passed| {
+            let mut record = independent_gate_record(id, provider, actor, passed);
+            record.gate = "min_reviewers".to_owned();
+            record
+        };
+        let state = |records: &[GateResultRecord]| {
+            protected_gate_state(policy, "min_reviewers", records, &["worker"])
+        };
+        let satisfied = |records: &[GateResultRecord]| {
+            evaluate_scoped_gates(
+                &workflow,
+                "bd-602",
+                "in_review",
+                "closed",
+                &[],
+                2,
+                records,
+                &["worker"],
+            )
+            .is_empty()
+        };
+        let alice = review(1, "review-service", "alice", true);
+        let aliases = [alice.clone(), review(2, "alice-alias", "ALICE", true)];
+        assert_eq!(state(&aliases).passing_reporters, vec!["alice"]);
+        assert!(!satisfied(&aliases));
+
+        let mut history = vec![alice, review(2, "review-service", "bob", true)];
+        assert_eq!(state(&history).passing_reporters, vec!["alice", "bob"]);
+        assert!(
+            satisfied(&history),
+            "a mapped service may carry distinct reviewers' approvals"
+        );
+
+        history.push(review(3, "review-service", "bob", false));
+        history.push(review(4, "review-service", "alice", true));
+        let failed = state(&history);
+        assert!(failed.unresolved_failure);
+        assert!(failed.passing_reporters.is_empty());
+        assert!(!satisfied(&history));
+
+        let mut override_pass = review(5, "review-service", "lead", true);
+        override_pass.override_reason = Some("Reviewed the failed verification".to_owned());
+        history.push(override_pass);
+        let overridden = state(&history);
+        assert!(!overridden.unresolved_failure);
+        assert_eq!(overridden.passing_reporters, vec!["lead"]);
+        assert!(
+            !satisfied(&history),
+            "the override must not resurrect pre-failure approvals"
+        );
+        history.push(review(6, "review-service", "alice", true));
+        assert_eq!(state(&history).passing_reporters, vec!["alice", "lead"]);
+        assert!(satisfied(&history));
     }
 
     #[test]
