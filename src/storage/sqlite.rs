@@ -8024,7 +8024,12 @@ impl SqliteStorage {
                 // reload has made the stored, same-status value obsolete.
                 workflow.validate_status(to_status.as_str())?;
             }
-            if issue.status == *to_status {
+            let current_status = if workflow.gate_policies.is_empty() {
+                issue.status.clone()
+            } else {
+                issue.status.as_str().trim().parse()?
+            };
+            if current_status == *to_status {
                 if update.transition_comment.is_some()
                     || update.workflow_policy_bypass_reason.is_some()
                 {
@@ -8048,7 +8053,7 @@ impl SqliteStorage {
                 continue;
             }
 
-            let from = issue.status.as_str();
+            let from = current_status.as_str();
             let to = to_status.as_str();
 
             // GitHub #399: enforce `workflow.transitions` at the storage
@@ -8234,6 +8239,28 @@ impl SqliteStorage {
             }
         }
 
+        // Public storage callers can construct Custom values without using
+        // Status's parser. Protected workflows normalize once before every
+        // transition decision, write, and audit event so spelling changes
+        // cannot mint a fresh gate revision. Other workflows retain their
+        // historical status spelling and event semantics. Keep canonical
+        // batches borrowed and resolve Custom aliases of built-in statuses.
+        let canonicalize_status = !self.workflow_transition_policy.gate_policies.is_empty();
+        let mut canonical_updates: Option<Vec<(String, IssueUpdate)>> = None;
+        if canonicalize_status {
+            for (index, (_, update)) in updates.iter().enumerate() {
+                if let Some(Status::Custom(value)) = &update.status {
+                    let canonical: Status = value.trim().parse()?;
+                    if update.status.as_ref() != Some(&canonical) {
+                        canonical_updates.get_or_insert_with(|| updates.to_vec())[index]
+                            .1
+                            .status = Some(canonical);
+                    }
+                }
+            }
+        }
+        let updates = canonical_updates.as_deref().unwrap_or(updates);
+
         if dependency_unblock_guard.is_none() && updates.iter().all(|(_, update)| update.is_empty())
         {
             // This path does not call `mutate()`, so explicitly consume staged
@@ -8267,18 +8294,23 @@ impl SqliteStorage {
                 for (id, update) in updates {
                     let issue = Self::get_issue_from_conn(conn, id)?
                         .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
-                    if issue.status == Status::Tombstone && !update.is_empty() {
+                    let current_status = if canonicalize_status {
+                        issue.status.as_str().trim().parse()?
+                    } else {
+                        issue.status.clone()
+                    };
+                    if current_status == Status::Tombstone && !update.is_empty() {
                         return Err(BeadsError::Validation {
                             field: "issue_id".to_string(),
                             reason: format!("cannot update tombstone issue: {id}"),
                         });
                     }
                     if let Some(status) = &update.status
-                        && (issue.status != *status || update.reclaim.is_some())
+                        && (current_status != *status || update.reclaim.is_some())
                     {
                         transitions.push(CapacityBatchTransition {
                             issue_id: id.clone(),
-                            from: Some(issue.status.as_str().to_string()),
+                            from: Some(current_status.as_str().to_string()),
                             to: status.as_str().to_string(),
                             issue_type: update
                                 .issue_type
@@ -8329,7 +8361,14 @@ impl SqliteStorage {
                         dependency_repair::check_repair_interruption()?;
                     }
                     if !update.is_empty() {
-                        Self::update_issue_in_tx(conn, ctx, id, update, actor)?;
+                        Self::update_issue_in_tx(
+                            conn,
+                            ctx,
+                            id,
+                            update,
+                            actor,
+                            canonicalize_status,
+                        )?;
                     }
                     if let Some(proof) = dependency_block_proofs.remove(id) {
                         Self::record_dependency_block_proof_in_tx(conn, ctx, id, proof)?;
@@ -8567,6 +8606,7 @@ impl SqliteStorage {
         id: &str,
         updates: &IssueUpdate,
         actor: &str,
+        canonicalize_status: bool,
     ) -> Result<()> {
         let mut issue = Self::get_issue_from_conn(conn, id)?.ok_or_else(|| {
             // Issue #245: if `get_issue` (read path) can find the row but
@@ -8581,9 +8621,14 @@ impl SqliteStorage {
             BeadsError::IssueNotFound { id: id.to_string() }
         })?;
 
+        let current_status = if canonicalize_status {
+            issue.status.as_str().trim().parse()?
+        } else {
+            issue.status.clone()
+        };
         let reclaim_assessment = Self::validate_reclaim_guard(&issue, updates, actor)?;
 
-        if issue.status == Status::Tombstone {
+        if current_status == Status::Tombstone {
             return Err(BeadsError::Validation {
                 field: "issue_id".to_string(),
                 reason: format!("cannot update tombstone issue: {id}"),
@@ -8727,13 +8772,17 @@ impl SqliteStorage {
 
         // Status
         if let Some(ref status) = updates.status {
-            let old_status_obj = issue.status.clone();
-            let old_status = old_status_obj.as_str().to_string();
-            let was_terminal = old_status_obj.is_terminal();
+            let old_status = issue.status.as_str().to_string();
+            let was_terminal = current_status.is_terminal();
             issue.status.clone_from(status);
             add_update("status", SqliteValue::from(status.as_str()));
 
-            if status.as_str() != old_status {
+            let status_changed = if canonicalize_status {
+                *status != current_status
+            } else {
+                status.as_str() != old_status
+            };
+            if status_changed {
                 ctx.record_field_change(
                     EventType::StatusChanged,
                     id,
@@ -26786,6 +26835,252 @@ required_fields:
             )
             .unwrap();
         storage
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn gate_status_spelling_cannot_reset_failed_verification() {
+        for (initial, spellings) in [
+            ("in_review", ["in_review", "IN_REVIEW", " in_review "]),
+            ("IN_REVIEW", ["in_review", "IN_REVIEW", " in_review "]),
+            (" IN_REVIEW ", ["in_review", "IN_REVIEW", " in_review "]),
+            ("INPROGRESS", ["in_progress", "INPROGRESS", " inprogress "]),
+        ] {
+            let canonical: Status = initial.trim().parse().unwrap();
+            let from = canonical.as_str().to_owned();
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            // A library caller may have created the issue before the strict
+            // policy was installed. Exercise that public path without SQL
+            // writes, including legacy whitespace and a built-in alias.
+            storage
+                .create_issue(
+                    &make_issue(
+                        "bd-status-spelling",
+                        "Status spelling is not rework",
+                        Status::Custom(initial.to_owned()),
+                        2,
+                        Some("worker"),
+                        Utc.with_ymd_and_hms(2026, 11, 12, 0, 0, 0).unwrap(),
+                        None,
+                    ),
+                    "creator",
+                )
+                .unwrap();
+            let mut workflow = independent_validation_workflow();
+            let rule = workflow.gates.remove("in_progress -> closed").unwrap();
+            workflow.gates.insert(format!("{from} -> closed"), rule);
+            workflow.statuses = vec![from.clone(), "closed".to_owned()];
+            workflow.transitions = BTreeMap::from([
+                (from.clone(), vec!["closed".to_owned()]),
+                ("closed".to_owned(), Vec::new()),
+            ]);
+            storage.set_workflow_policy(workflow);
+            let revision = storage.status_revision("bd-status-spelling").unwrap();
+            let failed = storage
+                .record_scoped_gate_result(
+                    "bd-status-spelling",
+                    &from,
+                    revision,
+                    " CLOSED ",
+                    "validation",
+                    "verifier",
+                    false,
+                    Some("original verification failure"),
+                    "verifier",
+                    None,
+                )
+                .unwrap();
+            let original_history = vec![failed];
+            let assert_failed_gate = |error| {
+                let BeadsError::PolicyViolation { violations, .. } = error else {
+                    panic!(
+                        "expected the original failed gate to block the operation, got {error:?}"
+                    );
+                };
+                assert_eq!(violations.len(), 1);
+                assert_eq!(
+                    violations[0].detail.as_ref().unwrap()["reason"],
+                    "unresolved_gate_failure"
+                );
+            };
+
+            for spelling in spellings {
+                let updated = storage
+                    .update_issue(
+                        "bd-status-spelling",
+                        &IssueUpdate {
+                            status: Some(Status::Custom(spelling.to_owned())),
+                            ..Default::default()
+                        },
+                        "worker",
+                    )
+                    .unwrap();
+                assert_eq!(
+                    updated.status, canonical,
+                    "initial={initial}, update={spelling}"
+                );
+                assert_eq!(
+                    storage
+                        .execute_raw_query(
+                            "SELECT status FROM issues WHERE id = 'bd-status-spelling'"
+                        )
+                        .unwrap(),
+                    vec![vec![SqliteValue::from(from.as_str())]],
+                    "the stored value must agree with the canonical transition decision"
+                );
+                assert_eq!(
+                    storage.status_revision("bd-status-spelling").unwrap(),
+                    revision,
+                    "status spelling must not mint a new verification attempt"
+                );
+                assert_failed_gate(
+                    storage
+                        .record_scoped_gate_result(
+                            "bd-status-spelling",
+                            &from,
+                            revision,
+                            "closed",
+                            "validation",
+                            "verifier",
+                            true,
+                            None,
+                            "verifier",
+                            None,
+                        )
+                        .unwrap_err(),
+                );
+                assert_failed_gate(
+                    storage
+                        .update_issue(
+                            "bd-status-spelling",
+                            &IssueUpdate {
+                                status: Some(Status::Custom(" CLOSED ".to_owned())),
+                                ..Default::default()
+                            },
+                            "worker",
+                        )
+                        .unwrap_err(),
+                );
+                assert_eq!(
+                    storage
+                        .get_gate_result_history("bd-status-spelling")
+                        .unwrap(),
+                    original_history,
+                    "refused PASS and close must preserve the complete original FAIL"
+                );
+                assert_eq!(
+                    storage
+                        .get_scoped_gate_result_history("bd-status-spelling", &from, "CLOSED")
+                        .unwrap(),
+                    original_history
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_update_status_spelling_and_revision_semantics_remain_unchanged() {
+        for (initial, spelling, changes_revision) in [
+            ("in_review", "IN_REVIEW", true),
+            ("in_review", " in_review ", true),
+            ("in_progress", "in_progress", false),
+            ("in_progress", "INPROGRESS", true),
+        ] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            storage
+                .create_issue(
+                    &make_issue(
+                        "bd-legacy-spelling",
+                        "Legacy status spelling",
+                        initial.parse().unwrap(),
+                        2,
+                        None,
+                        Utc.with_ymd_and_hms(2026, 11, 12, 0, 0, 0).unwrap(),
+                        None,
+                    ),
+                    "creator",
+                )
+                .unwrap();
+            let revision = storage.status_revision("bd-legacy-spelling").unwrap();
+            let updated = storage
+                .update_issue(
+                    "bd-legacy-spelling",
+                    &IssueUpdate {
+                        status: Some(Status::Custom(spelling.to_owned())),
+                        ..Default::default()
+                    },
+                    "worker",
+                )
+                .unwrap();
+            assert_eq!(updated.status, spelling.parse::<Status>().unwrap());
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT status FROM issues WHERE id = 'bd-legacy-spelling'")
+                    .unwrap(),
+                vec![vec![SqliteValue::from(spelling)]]
+            );
+            assert_eq!(
+                storage.status_revision("bd-legacy-spelling").unwrap() > revision,
+                changes_revision,
+                "legacy revision decisions must compare status strings, including enum aliases"
+            );
+            let changes = storage
+                .get_events("bd-legacy-spelling", 0)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.event_type == EventType::StatusChanged)
+                .collect::<Vec<_>>();
+            assert_eq!(changes.len(), usize::from(changes_revision));
+            if let Some(change) = changes.first() {
+                assert_eq!(change.old_value.as_deref(), Some(initial));
+                assert_eq!(change.new_value.as_deref(), Some(spelling));
+            }
+        }
+    }
+
+    #[test]
+    fn gate_protected_status_normalization_preserves_legacy_tombstones() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-spelled-tombstone",
+                    "Legacy tombstone spelling",
+                    Status::Custom(" TOMBSTONE ".to_owned()),
+                    2,
+                    None,
+                    Utc.with_ymd_and_hms(2026, 11, 12, 0, 0, 0).unwrap(),
+                    None,
+                ),
+                "creator",
+            )
+            .unwrap();
+        storage.set_workflow_policy(independent_validation_workflow());
+        let before = storage.get_issue("bd-spelled-tombstone").unwrap().unwrap();
+        let events_before = storage.get_events("bd-spelled-tombstone", 0).unwrap();
+        for update in [
+            IssueUpdate {
+                title: Some("changed".to_owned()),
+                ..Default::default()
+            },
+            IssueUpdate {
+                status: Some(Status::Custom("in_progress".to_owned())),
+                ..Default::default()
+            },
+        ] {
+            let error = storage
+                .update_issue("bd-spelled-tombstone", &update, "worker")
+                .unwrap_err();
+            assert!(error.to_string().contains("cannot update tombstone issue"));
+            assert_eq!(
+                storage.get_issue("bd-spelled-tombstone").unwrap().unwrap(),
+                before
+            );
+            assert_eq!(
+                storage.get_events("bd-spelled-tombstone", 0).unwrap(),
+                events_before
+            );
+        }
     }
 
     #[test]
