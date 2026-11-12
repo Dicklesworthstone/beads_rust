@@ -44485,97 +44485,91 @@ required_fields:
     fn closure_attribution_schema_upgrade_waits_for_pending_merge_cleanup() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pending-close-schema.db");
-        {
-            let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
-            let legacy_schema =
-                crate::storage::schema::SCHEMA_SQL.replace("        closed_by TEXT,\n", "");
-            execute_batch(&conn, &legacy_schema).unwrap();
-            conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-                .unwrap();
-            execute_batch(
-                &conn,
-                "INSERT INTO issues (id, title, status, closed_at) VALUES \
-                 ('bd-pending-close', 'Legacy close', 'closed', '2026-01-01T00:00:00Z');
-                 INSERT INTO close_metadata (issue_id, closed_by_agent_name, bypassed_policy) \
-                 VALUES ('bd-pending-close', 'legacy-agent', 1);",
-            )
-            .unwrap();
-            conn.execute_with_params(
-                "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                &[
-                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
-                    SqliteValue::from(""),
-                ],
-            )
-            .unwrap();
-        }
-        let (metadata_before, catalog_before) = {
-            let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+        let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+        let legacy_schema = crate::storage::schema::SCHEMA_SQL
+            .replace("        closed_by TEXT,\n", "")
+            .replace(
+                "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                "",
+            );
+        execute_batch(&conn, &legacy_schema).unwrap();
+        execute_batch(
+            &conn,
+            "PRAGMA user_version = 19;
+             INSERT INTO issues (id, title, status, closed_at) VALUES \
+             ('bd-pending-close', 'Legacy close', 'closed', '2026-01-01T00:00:00Z');
+             INSERT INTO close_metadata (issue_id, closed_by_agent_name, bypassed_policy) \
+             VALUES ('bd-pending-close', 'legacy-agent', 1);",
+        )
+        .unwrap();
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES (?, '')",
+            &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING)],
+        )
+        .unwrap();
+        let rows = |sql: &str| {
+            conn.query(sql)
+                .unwrap()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
+        };
+        let state = || {
             (
-                conn.query("SELECT rowid, key, value FROM metadata ORDER BY rowid").unwrap().iter().map(|row| row.values().to_vec()).collect::<Vec<_>>(),
-                conn.query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap().iter().map(|row| row.values().to_vec()).collect::<Vec<_>>(),
+                rows("SELECT rowid, key, value FROM metadata ORDER BY rowid"),
+                rows(
+                    "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name",
+                ),
+                rows(
+                    "SELECT issue_id, closed_by_agent_name, bypassed_policy FROM close_metadata ORDER BY issue_id",
+                ),
             )
         };
-        {
-            let mut storage = SqliteStorage::open(&path).unwrap();
-            assert!(!storage.close_metadata_has_closed_by().unwrap());
-            assert_eq!(
-                storage
-                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
-                    .unwrap(),
-                metadata_before
-            );
-            assert_eq!(storage.execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap(), catalog_before);
-            let exported = storage
-                .get_issue_for_export("bd-pending-close")
-                .unwrap()
-                .unwrap();
-            assert!(exported.closed_by.is_none());
-            assert!(
-                exported.closed_by_agent_name.is_none(),
-                "pending generation must keep its old projection"
-            );
-            assert_eq!(exported.bypassed_policy, Some(true));
-            let raw = storage
-                .get_close_metadata("bd-pending-close")
-                .unwrap()
-                .unwrap();
-            assert!(raw.closed_by.is_none());
-            assert_eq!(raw.closed_by_agent_name.as_deref(), Some("legacy-agent"));
-            storage
-                .delete_metadata(METADATA_SYNC_MERGE_PENDING)
-                .unwrap();
-            let metadata_after_cleanup = storage
-                .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
-                .unwrap();
-            let error = SqliteStorage::open(&path).unwrap_err();
-            assert!(error.to_string().contains("explicit reviewed"), "{error}");
-            assert_eq!(
-                storage
-                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
-                    .unwrap(),
-                metadata_after_cleanup
-            );
-            assert_eq!(storage.execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap(), catalog_before);
-            let upgrade = crate::storage::schema::reviewed_runtime_schema_upgrade(&storage.conn)
-                .unwrap()
-                .unwrap();
-            storage.conn.execute("BEGIN IMMEDIATE").unwrap();
-            crate::storage::schema::apply_reviewed_runtime_schema_upgrade_in_transaction(
-                &storage.conn,
-                upgrade,
-            )
-            .unwrap();
-            storage.conn.execute("COMMIT").unwrap();
-            assert_eq!(connection_user_version(&storage.conn), Some(19));
-            assert_eq!(
-                storage
-                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
-                    .unwrap(),
-                metadata_after_cleanup,
-                "the explicit layout transition must not seed or replace metadata"
-            );
-        }
+        let before = state();
+        let raw_before = database_family_snapshot(&path).unwrap();
+        let error = SqliteStorage::open(&path).unwrap_err();
+        assert!(
+            matches!(&error, BeadsError::Config(message) if message.contains("explicit reviewed")),
+            "{error}"
+        );
+        let target = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap();
+        let error = crate::storage::schema::run_migrations_atomic(&conn, 19, target).unwrap_err();
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert_eq!(state(), before);
+        let diffs =
+            database_family_read_only_diffs(&raw_before, &database_family_snapshot(&path).unwrap());
+        assert!(
+            diffs.is_empty(),
+            "pending refusal changed database bytes: {diffs:?}"
+        );
+
+        // Simulate terminal cleanup by a compatible legacy recovery authority.
+        // The current runtime must not open schema19 to perform that recovery.
+        conn.execute_with_params(
+            "DELETE FROM metadata WHERE key = ?",
+            &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING)],
+        )
+        .unwrap();
+        let after_cleanup = state();
+        let error = SqliteStorage::open(&path).unwrap_err();
+        assert!(
+            matches!(&error, BeadsError::Config(message) if message.contains("explicit reviewed")),
+            "{error}"
+        );
+        assert_eq!(state(), after_cleanup);
+        crate::storage::schema::run_migrations_atomic(&conn, 19, target).unwrap();
+        assert_eq!(connection_user_version(&conn), Some(target));
+        assert_eq!(
+            state().0,
+            after_cleanup.0,
+            "the explicit migration must not seed or replace metadata"
+        );
+        assert_eq!(
+            state().2,
+            before.2,
+            "legacy attribution must survive the migration"
+        );
+        conn.close().unwrap();
         let storage = SqliteStorage::open(&path).unwrap();
         assert!(storage.close_metadata_has_closed_by().unwrap());
         let exported = storage
@@ -44595,76 +44589,73 @@ required_fields:
     fn jsonl_row_receipts_schema_upgrade_waits_for_pending_merge_cleanup() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pending-receipt-schema.db");
-        let (metadata_before, catalog_before) = {
-            let mut storage = SqliteStorage::open(&path).unwrap();
-            storage
-                .conn
-                .execute("DROP TABLE jsonl_row_receipts")
-                .unwrap();
-            storage
-                .set_metadata("runtime_schema_witness_v1", "legacy-witness")
-                .unwrap();
-            storage
-                .set_metadata(METADATA_SYNC_MERGE_PENDING, "")
-                .unwrap();
-            // Presence, not a successful receipt parse, must preserve the
-            // frozen state. Even default seeding would change its witness.
-            storage.delete_metadata(METADATA_JSONL_SIZE).unwrap();
+        let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
+        let legacy_schema = crate::storage::schema::SCHEMA_SQL.replace(
+            "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+            "",
+        );
+        execute_batch(&conn, &legacy_schema).unwrap();
+        conn.execute("PRAGMA user_version = 19").unwrap();
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES ('runtime_schema_witness_v1', 'legacy-witness'), (?, '')",
+            &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING)],
+        ).unwrap();
+        // Presence, not a successful receipt parse, freezes the raw metadata;
+        // no JSONL-size default or receipt table exists in this source.
+        let rows = |sql: &str| {
+            conn.query(sql)
+                .unwrap()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
+        };
+        let state = || {
             (
-                storage.execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid").unwrap(),
-                storage.execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap(),
+                rows("SELECT rowid, key, value FROM metadata ORDER BY rowid"),
+                rows(
+                    "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name",
+                ),
             )
         };
-        {
-            let mut storage = SqliteStorage::open(&path).unwrap();
-            assert!(!storage.jsonl_row_receipts_table_exists().unwrap());
-            assert_eq!(
-                storage
-                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
-                    .unwrap(),
-                metadata_before,
-                "opening a legacy pending merge must preserve every raw metadata row"
-            );
-            assert_eq!(
-                storage.execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap(),
-                catalog_before,
-                "installing the receipt table must wait until the frozen merge catalog is released"
-            );
-            assert!(storage.fast_open_runtime_schema_is_compatible());
-            storage
-                .delete_metadata(METADATA_SYNC_MERGE_PENDING)
-                .unwrap();
-            let metadata_after_cleanup = storage
-                .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
-                .unwrap();
-            let error = SqliteStorage::open(&path).unwrap_err();
-            assert!(error.to_string().contains("explicit reviewed"), "{error}");
-            assert_eq!(
-                storage
-                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
-                    .unwrap(),
-                metadata_after_cleanup
-            );
-            assert_eq!(storage.execute_raw_query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name").unwrap(), catalog_before);
-            let upgrade = crate::storage::schema::reviewed_runtime_schema_upgrade(&storage.conn)
-                .unwrap()
-                .unwrap();
-            storage.conn.execute("BEGIN IMMEDIATE").unwrap();
-            crate::storage::schema::apply_reviewed_runtime_schema_upgrade_in_transaction(
-                &storage.conn,
-                upgrade,
-            )
-            .unwrap();
-            storage.conn.execute("COMMIT").unwrap();
-            assert_eq!(connection_user_version(&storage.conn), Some(19));
-            assert_eq!(
-                storage
-                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
-                    .unwrap(),
-                metadata_after_cleanup,
-                "default seeding must wait for a subsequent canonical open"
-            );
-        }
+        let before = state();
+        let raw_before = database_family_snapshot(&path).unwrap();
+        let error = SqliteStorage::open(&path).unwrap_err();
+        assert!(
+            matches!(&error, BeadsError::Config(message) if message.contains("explicit reviewed")),
+            "{error}"
+        );
+        let target = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap();
+        let error = crate::storage::schema::run_migrations_atomic(&conn, 19, target).unwrap_err();
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert_eq!(state(), before);
+        let diffs =
+            database_family_read_only_diffs(&raw_before, &database_family_snapshot(&path).unwrap());
+        assert!(
+            diffs.is_empty(),
+            "pending refusal changed database bytes: {diffs:?}"
+        );
+
+        // Only the compatible legacy recovery authority may clear this marker.
+        conn.execute_with_params(
+            "DELETE FROM metadata WHERE key = ?",
+            &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING)],
+        )
+        .unwrap();
+        let after_cleanup = state();
+        let error = SqliteStorage::open(&path).unwrap_err();
+        assert!(
+            matches!(&error, BeadsError::Config(message) if message.contains("explicit reviewed")),
+            "{error}"
+        );
+        assert_eq!(state(), after_cleanup);
+        crate::storage::schema::run_migrations_atomic(&conn, 19, target).unwrap();
+        assert_eq!(connection_user_version(&conn), Some(target));
+        assert_eq!(
+            state().0,
+            after_cleanup.0,
+            "default seeding must wait for a subsequent canonical open"
+        );
+        conn.close().unwrap();
         let storage = SqliteStorage::open(&path).unwrap();
         assert!(storage.jsonl_row_receipts_table_exists().unwrap());
         assert!(runtime_schema_witness_matches(&storage.conn));

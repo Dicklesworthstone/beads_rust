@@ -6421,20 +6421,7 @@ mod tests {
 
     #[test]
     fn closure_attribution_schema_upgrade_keeps_historical_actor_unknown() {
-        let temp = TempDir::new().unwrap();
-        let conn = Connection::open(
-            temp.path()
-                .join("legacy-close.db")
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
-        let legacy_schema = SCHEMA_SQL.replace("        closed_by TEXT,\n", "");
-        assert_ne!(legacy_schema, SCHEMA_SQL);
-        execute_batch(&conn, &legacy_schema).unwrap();
-        apply_jsonl_row_receipts_schema(&conn).unwrap();
-        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-            .unwrap();
+        let (_temp, conn) = historical_runtime_upgrade_fixture(true, false);
         execute_batch(
             &conn,
             "INSERT INTO issues (id, title, status, closed_at) VALUES \
@@ -6444,17 +6431,19 @@ mod tests {
              INSERT INTO events (issue_id, event_type, actor) VALUES \
              ('bd-legacy-close', 'updated', 'unrelated-editor');",
         ).unwrap();
+        assert!(!reviewed_schema19_runtime_compatible(&conn));
         assert!(!runtime_schema_compatible(&conn));
         assert!(apply_schema(&conn).is_err());
         let upgrade = reviewed_runtime_schema_upgrade(&conn).unwrap().unwrap();
         conn.execute("BEGIN IMMEDIATE").unwrap();
         apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, upgrade).unwrap();
         conn.execute("COMMIT").unwrap();
-        assert!(runtime_schema_compatible(&conn));
-        let row = conn.query_row(
-            "SELECT closed_by, closed_by_agent_name, bypassed_policy, bypass_reason, recorded_at \
-             FROM close_metadata WHERE issue_id = 'bd-legacy-close'",
-        ).unwrap();
+        assert_eq!(connection_user_version(&conn).unwrap(), 19);
+        assert!(reviewed_schema19_runtime_compatible(&conn));
+        assert!(!runtime_schema_compatible(&conn));
+        let attribution_query = "SELECT closed_by, closed_by_agent_name, bypassed_policy, bypass_reason, recorded_at \
+             FROM close_metadata WHERE issue_id = 'bd-legacy-close'";
+        let row = conn.query_row(attribution_query).unwrap();
         assert_eq!(row.get(0), Some(&SqliteValue::Null));
         assert_eq!(
             row.get(1).and_then(SqliteValue::as_text),
@@ -6466,8 +6455,15 @@ mod tests {
             row.get(4).and_then(SqliteValue::as_text),
             Some("2026-01-01T00:00:00Z")
         );
+        assert!(apply_schema(&conn).is_err());
+        run_migrations_atomic(&conn, 19, current_schema_version_u32().unwrap()).unwrap();
         apply_schema(&conn).unwrap();
         assert!(runtime_schema_compatible(&conn));
+        assert_eq!(
+            conn.query_row(attribution_query).unwrap().values(),
+            row.values(),
+            "the schema20 migration must retain unknown attribution and the complete legacy close evidence"
+        );
     }
 
     #[test]
