@@ -3456,6 +3456,12 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     refuse_schema_repair_during_pending_merge(&conn)?;
     require_source_tables(&conn, from)?;
     let legacy_v15 = attest_reviewed_migration_source_core_tables(&conn)?;
+    if from == 19 {
+        // Core tables alone do not establish the source's authoritative gate
+        // and capacity history. Refuse an unsupported schema19 before issuing
+        // any migration token, as the former same-version upgrade did.
+        let _ = reviewed_runtime_schema_upgrade(&conn)?;
+    }
     let legacy_v15_conversion = legacy_v15
         .then(|| legacy_v15_projection(&conn, true, true, true))
         .transpose()?;
@@ -12263,6 +12269,45 @@ mod tests {
                     .to_string()
                     .contains(&format!("table {table} changed"))
             );
+        }
+    }
+
+    #[test]
+    fn schema19_plan_refuses_missing_or_malformed_runtime_history_without_changes() {
+        for drift in [
+            "DROP TABLE gate_result_history",
+            "ALTER TABLE gate_result_history ADD COLUMN operator_evidence BLOB",
+            "DROP INDEX idx_gate_result_history_scope; \
+             CREATE INDEX idx_gate_result_history_scope ON gate_result_history(provider)",
+            "DROP TABLE gate_results",
+            "DROP TABLE capacity_exemption_history",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db = temp.path().join("beads.db");
+            let fixture = include_bytes!(
+                "../../../../tests/fixtures/schema_migration/schema19_v076_release.db.gz"
+            );
+            let mut released = Vec::new();
+            flate2::read::GzDecoder::new(&fixture[..])
+                .read_to_end(&mut released)
+                .unwrap();
+            fs::write(&db, released).unwrap();
+            let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+            crate::storage::schema::execute_batch(&conn, drift).unwrap();
+            assert!(
+                attest_reviewed_migration_source_core_tables(&conn).is_ok(),
+                "negative control: core admission alone does not inspect {drift}"
+            );
+            close_connection(conn).unwrap();
+            let before = raw_family_witness(&db).unwrap();
+
+            let error = build_observational_plan(&db)
+                .expect_err("an unsupported history layout must not receive a migration token");
+            assert!(
+                error.to_string().contains("runtime layout"),
+                "{drift}: {error}"
+            );
+            assert_eq!(raw_family_witness(&db).unwrap(), before, "{drift}");
         }
     }
 

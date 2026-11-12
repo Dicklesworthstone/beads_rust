@@ -1027,6 +1027,9 @@ fn validate_reviewed_schema_migration(
     marked_at: &str,
 ) -> Result<()> {
     refuse_persistent_triggers(conn, "reviewed schema migration")?;
+    // A pending receipt binds the original catalog and root pages. Every
+    // reviewed entry point must enforce that freeze, including library callers.
+    refuse_schema_repair_during_pending_merge(conn)?;
 
     let supported_target = current_schema_version_u32()?;
     if target_version != supported_target {
@@ -1052,6 +1055,12 @@ fn validate_reviewed_schema_migration(
         return Err(BeadsError::internal(format!(
             "schema migrate refused — user_version mismatch (expected {from}, got {current})"
         )));
+    }
+    if from == 19 {
+        // Moving the version boundary must not weaken the complete runtime
+        // admission that schema19 previously required for its additive upgrade.
+        // Both canonical19 and its precisely reviewed missing additions qualify.
+        let _ = reviewed_runtime_schema_upgrade(conn)?;
     }
     Ok(())
 }
@@ -8196,6 +8205,88 @@ mod tests {
                     .and_then(SqliteValue::as_text),
                 Some("false")
             );
+        }
+    }
+
+    #[test]
+    fn reviewed_schema19_migration_refuses_pending_merge_before_writes() {
+        for key in [
+            crate::sync::METADATA_SYNC_MERGE_PENDING,
+            crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY,
+        ] {
+            let (_temp, conn) = historical_runtime_upgrade_fixture(true, true);
+            assert!(reviewed_schema19_runtime_compatible(&conn));
+            // Presence freezes the catalog, even when the receipt is empty or
+            // malformed; parsing/recovery belongs to the merge coordinator.
+            conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, '')",
+                &[SqliteValue::from(key)],
+            )
+            .unwrap();
+            let before = legacy_v15_test_state(&conn);
+            let target = current_schema_version_u32().unwrap();
+            let (result, statements) = crate::franken_sync::statement_log::capture(|| {
+                run_migrations_atomic(&conn, 19, target)
+            });
+            assert!(matches!(result, Err(BeadsError::SyncConflict { .. })));
+            assert!(
+                !statements.iter().any(|sql| sql == "BEGIN IMMEDIATE"),
+                "the public atomic entry must refuse before opening a writer transaction"
+            );
+            assert_eq!(legacy_v15_test_state(&conn), before);
+
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            let (result, statements) = crate::franken_sync::statement_log::capture(|| {
+                run_reviewed_schema_migration_steps_in_transaction(
+                    &conn,
+                    19,
+                    target,
+                    "2026-11-12T00:00:00Z",
+                )
+            });
+            assert!(matches!(result, Err(BeadsError::SyncConflict { .. })));
+            assert!(conn.as_async().in_transaction());
+            assert!(statements.iter().all(|sql| !sql.starts_with("ALTER ")
+                && !sql.starts_with("CREATE ")
+                && !sql.starts_with("INSERT ")
+                && !sql.starts_with("UPDATE ")
+                && !sql.starts_with("DELETE ")
+                && sql != "COMMIT"
+                && sql != "ROLLBACK"));
+            assert_eq!(legacy_v15_test_state(&conn), before);
+            conn.execute("ROLLBACK").unwrap();
+
+            conn.execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )
+            .unwrap();
+            run_migrations_atomic(&conn, 19, target).unwrap();
+            assert!(runtime_schema_compatible(&conn));
+        }
+    }
+
+    #[test]
+    fn reviewed_schema19_migration_refuses_missing_runtime_history_without_changes() {
+        for table in [
+            "gate_results",
+            "gate_result_history",
+            "capacity_exemption_history",
+        ] {
+            let (_temp, conn) = historical_runtime_upgrade_fixture(true, true);
+            conn.execute(&format!("DROP TABLE {table}")).unwrap();
+            assert!(
+                attest_reviewed_migration_source_core_tables(&conn).is_ok(),
+                "negative control: core admission alone does not inspect {table}"
+            );
+            let before = legacy_v15_test_state(&conn);
+            let error = run_migrations_atomic(&conn, 19, current_schema_version_u32().unwrap())
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("runtime layout"),
+                "{table}: {error}"
+            );
+            assert_eq!(legacy_v15_test_state(&conn), before, "{table}");
         }
     }
 
