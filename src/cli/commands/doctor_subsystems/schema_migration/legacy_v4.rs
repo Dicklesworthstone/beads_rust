@@ -308,6 +308,7 @@ mod tests {
             content_hash_rows_rebuilt: 2,
             gate_result_history_created: true,
             prerequisites_column_added: true,
+            gate_reporter_columns_added: true,
             dependency_type_key_added: true,
             legacy_v15_conversion: None,
             legacy_v4_conversion: Some(projection(&conn, true).unwrap()),

@@ -47,8 +47,8 @@ use crate::storage::schema::{
     apply_reviewed_runtime_schema_upgrade_in_transaction,
     attest_reviewed_migration_source_core_tables, is_reviewed_dependency_retired_index,
     is_reviewed_migration_managed_index, refuse_schema_repair_during_pending_merge,
-    reviewed_runtime_schema_upgrade, run_reviewed_schema_migration_steps_in_transaction,
-    runtime_schema_compatible,
+    reviewed_runtime_schema_upgrade, reviewed_schema19_runtime_compatible,
+    run_reviewed_schema_migration_steps_in_transaction, runtime_schema_compatible,
 };
 use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
 
@@ -147,6 +147,7 @@ struct ReviewedStatePreservation {
     schema: Vec<ReviewedSchemaObjectPreservation>,
     added_empty_sequences: Vec<String>,
     close_metadata_column_added: bool,
+    gate_reporter_columns_added: bool,
 }
 
 /// The expected destination, computed from the admitted source before any
@@ -158,6 +159,8 @@ struct LegacyV15Projection {
     // witness. New plans bind the nullable addition in the existing token.
     #[serde(default, skip_serializing_if = "is_false")]
     closed_by_column_added: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    gate_reporter_columns_added: bool,
     tables: Vec<LegacyTableProjection>,
     preserved_schema_sha256: String,
     retired_indexes: Vec<String>,
@@ -190,6 +193,8 @@ pub(super) struct MigrationForecast {
     to_version: u32,
     content_hash_rows_rebuilt: usize,
     gate_result_history_created: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    gate_reporter_columns_added: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     prerequisites_column_added: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -322,6 +327,8 @@ struct ReviewedSchemaMigrationEffectsReceipt {
     content_hash_rows_rebuilt: usize,
     gate_result_history_created: bool,
     #[serde(default, skip_serializing_if = "is_false")]
+    gate_reporter_columns_added: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     prerequisites_column_added: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     dependency_type_key_added: bool,
@@ -340,6 +347,7 @@ impl From<ReviewedSchemaMigrationEffects> for ReviewedSchemaMigrationEffectsRece
             to_version: value.to_version,
             content_hash_rows_rebuilt: value.content_hash_rows_rebuilt,
             gate_result_history_created: value.gate_result_history_created,
+            gate_reporter_columns_added: value.gate_reporter_columns_added,
             prerequisites_column_added: value.prerequisites_column_added,
             dependency_type_key_added: value.dependency_type_key_added,
             legacy_v15_tables_converted: false,
@@ -3348,6 +3356,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 to_version: target,
                 content_hash_rows_rebuilt: 0,
                 gate_result_history_created: false,
+                gate_reporter_columns_added: false,
                 prerequisites_column_added: false,
                 dependency_type_key_added: false,
                 legacy_v15_conversion: None,
@@ -3428,7 +3437,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     }
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
-            "reviewed schema migration is available only from source schemas 4, 13, 14, 15, 16, 17, and 18 \
+            "reviewed schema migration is available only from source schemas 4, 13, 14, 15, 16, 17, 18, and 19 \
              to {target}; observed unsupported source version {from}. The original database \
              remains authoritative: JSONL reconstruction cannot establish lossless preservation. \
              Use `br doctor migrate-schema heal --dry-run` to audit this tracker, then use a \
@@ -3448,7 +3457,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     require_source_tables(&conn, from)?;
     let legacy_v15 = attest_reviewed_migration_source_core_tables(&conn)?;
     let legacy_v15_conversion = legacy_v15
-        .then(|| legacy_v15_projection(&conn, true, true))
+        .then(|| legacy_v15_projection(&conn, true, true, true))
         .transpose()?;
     let legacy_v4_conversion = (from == 4)
         .then(|| legacy_v4::projection(&conn, true))
@@ -3459,7 +3468,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     let application_id = query_application_id(&conn)?;
     close_connection(conn)?;
 
-    let forecast = MigrationForecast {
+    let mut forecast = MigrationForecast {
         from_version: from,
         to_version: target,
         content_hash_rows_rebuilt: if matches!(from, 4 | 13) {
@@ -3472,8 +3481,9 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
             0
         },
         gate_result_history_created,
+        gate_reporter_columns_added: true,
         prerequisites_column_added: from < 18,
-        dependency_type_key_added: !legacy_v15,
+        dependency_type_key_added: from < 19 && !legacy_v15,
         legacy_v15_conversion,
         legacy_v4_conversion,
         content_hash_refresh_profile,
@@ -3482,6 +3492,19 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
         application_id: Some(application_id),
         post_migration_maintenance: true,
     };
+    if from == 19 {
+        let preservation =
+            capture_reviewed_state_preservation(db_path, &forecast)?.ok_or_else(|| {
+                BeadsError::internal("schema19 plan omitted its preservation witness")
+            })?;
+        forecast.schema19_preservation = Some(Schema19PreservationProfile {
+            profile: SCHEMA19_PRESERVATION_PROFILE.to_owned(),
+            source_sha256: schema19_preservation_digest(
+                &preservation,
+                SCHEMA19_PRESERVATION_PROFILE,
+            )?,
+        });
+    }
     let plan_token = compute_plan_token(&database_path, &logical_witness, &forecast)?;
 
     Ok(MigrationPlanReceipt {
@@ -3510,6 +3533,15 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
              strictly decoded values; the versioned forecast binds this behavior into the token. \
              Apply retains the complete original SQLite family and verifies the exact projected \
              state before installation, recovery, and undo"
+                .to_string()
+        } else if from == 19 {
+            "the schema-19 to schema-20 upgrade adds nullable gate reporter audit fields and \
+             any missing reviewed v0.7.6 runtime additions. Every existing verdict, raw value, \
+             hidden rowid, sequence reservation, and operator schema is preserved; historical \
+             assignees and overrides remain unknown. The token binds the complete source \
+             preservation witness. Replacing only the executable is not a safe downgrade: \
+             use receipt-bound undo before further writes or restore the complete pre-upgrade \
+             database family"
                 .to_string()
         } else if integrity_clean {
             "review the forecast and retain this receipt; apply will recompute the complete \
@@ -3714,6 +3746,7 @@ fn apply_with_plan_token(
         || effects.to_version != forecast.to_version
         || effects.content_hash_rows_rebuilt != forecast.content_hash_rows_rebuilt
         || effects.gate_result_history_created != forecast.gate_result_history_created
+        || effects.gate_reporter_columns_added != forecast.gate_reporter_columns_added
         || effects.prerequisites_column_added != forecast.prerequisites_column_added
         || effects.dependency_type_key_added != forecast.dependency_type_key_added
         || effects.legacy_v15_tables_converted != forecast.legacy_v15_conversion.is_some()
@@ -3913,6 +3946,7 @@ fn validate_commit_ready_marker(
         || marker.effects.to_version != marker.forecast.to_version
         || marker.effects.content_hash_rows_rebuilt != marker.forecast.content_hash_rows_rebuilt
         || marker.effects.gate_result_history_created != marker.forecast.gate_result_history_created
+        || marker.effects.gate_reporter_columns_added != marker.forecast.gate_reporter_columns_added
         || marker.effects.prerequisites_column_added != marker.forecast.prerequisites_column_added
         || marker.effects.dependency_type_key_added != marker.forecast.dependency_type_key_added
         || marker.effects.legacy_v15_tables_converted
@@ -4173,7 +4207,7 @@ fn resume_commit_ready_migration(
             &marker.raw_before,
             &marker.forecast,
         )?;
-        if !current_runtime_shape_is_canonical(snapshot)? {
+        if !reviewed_target_shape_is_canonical(snapshot, marker.forecast.to_version)? {
             return Err(BeadsError::internal(format!(
                 "commit-ready schema migration {} matches logically but not the canonical runtime shape",
                 marker.run_id
@@ -4614,6 +4648,7 @@ fn run_post_migration_maintenance(
             to_version: to,
             content_hash_rows_rebuilt: 0,
             gate_result_history_created: false,
+            gate_reporter_columns_added: false,
             prerequisites_column_added: false,
             dependency_type_key_added: false,
             legacy_v15_tables_converted: false,
@@ -4633,6 +4668,7 @@ fn run_post_migration_maintenance(
                     to_version: to,
                     content_hash_rows_rebuilt: 0,
                     gate_result_history_created: false,
+                    gate_reporter_columns_added: false,
                     prerequisites_column_added: false,
                     dependency_type_key_added: false,
                     legacy_v15_tables_converted: false,
@@ -4733,13 +4769,13 @@ fn run_post_migration_maintenance(
     verify_reviewed_profile(&candidate_path, forecast, false)?;
     let candidate_logical = logical_witness(&candidate_path)?;
     verify_reviewed_state_preservation(&candidate_path, source_preservation.as_ref(), true)?;
-    let candidate_matches_reviewed_operation = if from == to
-        && forecast.schema19_runtime_upgrade.is_none()
-    {
-        logical_witnesses_match_except_integrity(&source_logical, &candidate_logical)
-    } else {
-        candidate_logical.user_version == to && current_runtime_shape_is_canonical(&candidate_path)?
-    };
+    let candidate_matches_reviewed_operation =
+        if from == to && forecast.schema19_runtime_upgrade.is_none() {
+            logical_witnesses_match_except_integrity(&source_logical, &candidate_logical)
+        } else {
+            candidate_logical.user_version == to
+                && reviewed_target_shape_is_canonical(&candidate_path, to)?
+        };
     if !integrity_check_is_clean(&candidate_logical.integrity_check)
         || !candidate_matches_reviewed_operation
     {
@@ -6621,9 +6657,21 @@ fn query_count(conn: &Connection, sql: &str) -> Result<u64> {
 }
 
 fn current_runtime_shape_is_canonical(db_path: &Path) -> Result<bool> {
+    reviewed_target_shape_is_canonical(db_path, current_schema_version()?)
+}
+
+/// Installed historical receipts retain their exact schema-19 target. This
+/// narrowly scoped recovery check does not admit that layout to normal opens.
+fn reviewed_target_shape_is_canonical(db_path: &Path, target: u32) -> Result<bool> {
     let conn = open_read_only(db_path)?;
-    let canonical =
-        query_user_version(&conn)? == current_schema_version()? && runtime_schema_compatible(&conn);
+    let canonical = query_user_version(&conn)? == target
+        && if target == current_schema_version()? {
+            runtime_schema_compatible(&conn)
+        } else if target == 19 {
+            reviewed_schema19_runtime_compatible(&conn)
+        } else {
+            false
+        };
     close_connection(conn)?;
     Ok(canonical)
 }
@@ -6754,9 +6802,10 @@ fn capture_reviewed_state_preservation_with_text_encoding(
         Ok(Some(ReviewedStatePreservation {
             application_id: query_application_id(conn)?,
             tables,
-            schema: reviewed_schema_objects(conn, false)?,
+            schema: reviewed_schema_objects(conn, false, false)?,
             added_empty_sequences,
             close_metadata_column_added,
+            gate_reporter_columns_added: forecast.gate_reporter_columns_added,
         }))
     })
 }
@@ -6824,6 +6873,7 @@ fn reviewed_table_projection(
 fn reviewed_schema_objects(
     conn: &Connection,
     project_close_metadata_addition: bool,
+    project_gate_reporter_addition: bool,
 ) -> Result<Vec<ReviewedSchemaObjectPreservation>> {
     let mut objects = Vec::new();
     for row in conn.query(
@@ -6849,13 +6899,20 @@ fn reviewed_schema_objects(
         let projects_close_metadata = project_close_metadata_addition
             && object_type == "table"
             && table == "close_metadata";
+        let projects_gate_reporters = project_gate_reporter_addition
+            && object_type == "table"
+            && table == "gate_result_history";
         let fingerprint = if projects_close_metadata {
             legacy_close_metadata_schema_fingerprint(&sql, false)?
+        } else if projects_gate_reporters {
+            legacy_gate_history_schema_fingerprint(&sql, false)?
         } else {
             ddl_token_fingerprint(&sql, true)
         };
         let quoted_fingerprint = if projects_close_metadata {
             legacy_close_metadata_schema_fingerprint(&sql, true)?
+        } else if projects_gate_reporters {
+            legacy_gate_history_schema_fingerprint(&sql, true)?
         } else {
             quoted_ddl_fingerprint(&sql)
         };
@@ -6913,8 +6970,22 @@ fn verify_reviewed_state_preservation(
                 )));
             }
         }
-        let observed =
-            reviewed_schema_objects(conn, candidate && expected.close_metadata_column_added)?;
+        if candidate
+            && expected.gate_reporter_columns_added
+            && query_count(
+                conn,
+                "SELECT COUNT(*) FROM gate_result_history WHERE assignee_at_report IS NOT NULL OR override_reason IS NOT NULL",
+            )? != 0
+        {
+            return Err(BeadsError::Config(
+                "reviewed migration preservation refused: historical gate assignees and overrides must remain unknown".to_owned(),
+            ));
+        }
+        let observed = reviewed_schema_objects(
+            conn,
+            candidate && expected.close_metadata_column_added,
+            candidate && expected.gate_reporter_columns_added,
+        )?;
         for object in &expected.schema {
             if !observed.contains(object) {
                 return Err(BeadsError::Config(format!(
@@ -6955,7 +7026,7 @@ fn verify_retained_migration_preservation_at(
     forecast: &MigrationForecast,
     scratch_parent: Option<&Path>,
 ) -> Result<()> {
-    if forecast.schema19_runtime_upgrade.is_some() {
+    if forecast.schema19_runtime_upgrade.is_some() || forecast.schema19_preservation.is_some() {
         verify_reviewed_profile(db_path, forecast, false)?;
     }
     let before_dir = run_dir.join("before");
@@ -6985,7 +7056,7 @@ fn verify_retained_migration_preservation_at(
         verify_backup_family(db_path, &before_dir, raw_before)?;
         return verified;
     }
-    if forecast.schema19_runtime_upgrade.is_some() {
+    if forecast.schema19_runtime_upgrade.is_some() || forecast.schema19_preservation.is_some() {
         verify_reviewed_profile(&private_source, forecast, true)?;
     }
     let expected = capture_reviewed_state_preservation(&private_source, forecast)?;
@@ -7042,15 +7113,21 @@ fn validate_schema19_preservation_profile(forecast: &MigrationForecast) -> Resul
         // old unexecuted plan cannot match a freshly recomputed apply token.
         return Ok(());
     };
-    if forecast.from_version != 19
-        || forecast.to_version != 19
-        || forecast.schema19_runtime_upgrade.is_none()
-        || !matches!(
+    let historical = forecast.to_version == 19
+        && forecast.schema19_runtime_upgrade.is_some()
+        && !forecast.gate_reporter_columns_added
+        && matches!(
             profile.profile.as_str(),
             LEGACY_SCHEMA19_PRESERVATION_PROFILE
                 | PREVIOUS_SCHEMA19_PRESERVATION_PROFILE
                 | SCHEMA19_PRESERVATION_PROFILE
-        )
+        );
+    let reporter_upgrade = forecast.to_version == 20
+        && forecast.schema19_runtime_upgrade.is_none()
+        && forecast.gate_reporter_columns_added
+        && profile.profile == SCHEMA19_PRESERVATION_PROFILE;
+    if forecast.from_version != 19
+        || !(historical || reporter_upgrade)
         || !recovery_pruning_hash_is_valid(&profile.source_sha256)
     {
         return Err(BeadsError::Config(
@@ -7138,6 +7215,7 @@ fn legacy_table_projection(
     table: &str,
     project_source: bool,
     closed_by_column_added: bool,
+    gate_reporter_columns_added: bool,
 ) -> Result<LegacyTableProjection> {
     let rowid = legacy_projection_rowid(conn, table)?;
     let prefix = rowid.map_or_else(String::new, |alias| format!("{alias}, "));
@@ -7145,6 +7223,7 @@ fn legacy_table_projection(
         (_, "sqlite_sequence") => "name, seq",
         (true, "issues") => "*, ''",
         (true, "close_metadata") if closed_by_column_added => "*, NULL",
+        (true, "gate_result_history") if gate_reporter_columns_added => "*, NULL, NULL",
         (true, "dirty_issues") => "issue_id, marked_at",
         (true, "child_counters") => "parent_id, last_child",
         _ => "*",
@@ -7289,10 +7368,62 @@ fn legacy_close_metadata_schema_fingerprint(sql: &str, preserve_quoting: bool) -
     Ok(tokens.join(" "))
 }
 
+/// Project only the two reviewed nullable audit additions. Historical rows
+/// must separately retain NULL in both columns; no attribution is invented.
+fn legacy_gate_history_schema_fingerprint(sql: &str, preserve_quoting: bool) -> Result<String> {
+    let mut tokens = ddl_tokens(sql, true, preserve_quoting);
+    for column in ["assignee_at_report", "override_reason"] {
+        let names = [
+            column.to_owned(),
+            quoted_identifier_token('"', column),
+            quoted_identifier_token('`', column),
+            quoted_identifier_token('[', column),
+        ];
+        let mut depth = 0_usize;
+        let mut addition = None;
+        for (index, token) in tokens.iter().enumerate() {
+            let previous = index.checked_sub(1).and_then(|index| tokens.get(index));
+            if depth == 1
+                && names.contains(token)
+                && previous.is_some_and(|token| matches!(token.as_str(), "(" | ","))
+            {
+                let delimiter = tokens.get(index + 2).map(String::as_str);
+                if addition.is_some()
+                    || tokens.get(index + 1).map(String::as_str) != Some("text")
+                    || !matches!(delimiter, Some("," | ")"))
+                    || (previous.is_some_and(|token| token == "(") && delimiter == Some(")"))
+                {
+                    return Err(BeadsError::internal(format!(
+                        "legacy gate history projection requires exactly one nullable {column} TEXT addition without defaults or constraints"
+                    )));
+                }
+                addition = Some(if previous.is_some_and(|token| token == ",") {
+                    index - 1..index + 2
+                } else {
+                    index..index + 3
+                });
+            }
+            match token.as_str() {
+                "(" => depth += 1,
+                ")" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        let addition = addition.ok_or_else(|| {
+            BeadsError::internal(format!(
+                "legacy gate history projection is missing {column} TEXT"
+            ))
+        })?;
+        drop(tokens.drain(addition));
+    }
+    Ok(tokens.join(" "))
+}
+
 fn legacy_preserved_schema_witness(
     conn: &Connection,
     project_source: bool,
     closed_by_column_added: bool,
+    gate_reporter_columns_added: bool,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     for row in conn.query(
@@ -7333,6 +7464,12 @@ fn legacy_preserved_schema_witness(
             && table == "close_metadata"
         {
             legacy_close_metadata_schema_fingerprint(sql, false)?
+        } else if gate_reporter_columns_added
+            && !project_source
+            && object_type == "table"
+            && table == "gate_result_history"
+        {
+            legacy_gate_history_schema_fingerprint(sql, false)?
         } else {
             ddl_token_fingerprint(sql, true)
         };
@@ -7345,6 +7482,7 @@ fn legacy_v15_projection(
     conn: &Connection,
     project_source: bool,
     closed_by_column_added: bool,
+    gate_reporter_columns_added: bool,
 ) -> Result<LegacyV15Projection> {
     if !project_source {
         for row in conn.query("SELECT name FROM main.sqlite_schema WHERE type='index'")? {
@@ -7368,6 +7506,7 @@ fn legacy_v15_projection(
             name,
             project_source,
             closed_by_column_added,
+            gate_reporter_columns_added,
         )?);
     }
     if project_source {
@@ -7379,11 +7518,13 @@ fn legacy_v15_projection(
     Ok(LegacyV15Projection {
         profile: LEGACY_V15_PROFILE.to_owned(),
         closed_by_column_added,
+        gate_reporter_columns_added,
         tables,
         preserved_schema_sha256: legacy_preserved_schema_witness(
             conn,
             project_source,
             closed_by_column_added,
+            gate_reporter_columns_added,
         )?,
         retired_indexes: REVIEWED_LEGACY_V15_RETIRED_INDEXES
             .iter()
@@ -7401,7 +7542,12 @@ fn verify_legacy_v15_projection(
         return Ok(());
     };
     let conn = open_read_only(db_path)?;
-    let observed = legacy_v15_projection(&conn, project_source, expected.closed_by_column_added);
+    let observed = legacy_v15_projection(
+        &conn,
+        project_source,
+        expected.closed_by_column_added,
+        expected.gate_reporter_columns_added,
+    );
     let closed = close_connection(conn);
     let observed = observed?;
     closed?;
@@ -7434,6 +7580,7 @@ fn verify_reviewed_profile(
             || forecast.content_hash_refresh_profile.is_some()
             || forecast.content_hash_rows_rebuilt != 0
             || forecast.gate_result_history_created
+            || forecast.gate_reporter_columns_added
             || forecast.prerequisites_column_added
             || forecast.dependency_type_key_added
             || !forecast.post_migration_maintenance
@@ -7452,7 +7599,7 @@ fn verify_reviewed_profile(
                             .to_owned(),
                     ));
                 }
-            } else if !runtime_schema_compatible(conn)
+            } else if !reviewed_schema19_runtime_compatible(conn)
                 || (upgrade.jsonl_row_receipts_created
                     && query_count(conn, "SELECT COUNT(*) FROM jsonl_row_receipts")? != 0)
                 || (upgrade.closed_by_column_added
@@ -7469,35 +7616,31 @@ fn verify_reviewed_profile(
             }
             Ok(())
         })?;
-        if project_source && let Some(profile) = &forecast.schema19_preservation {
-            let text_encoding = match profile.profile.as_str() {
-                LEGACY_SCHEMA19_PRESERVATION_PROFILE => PreservationTextEncoding::LegacyLossyUtf8,
-                PREVIOUS_SCHEMA19_PRESERVATION_PROFILE | SCHEMA19_PRESERVATION_PROFILE => {
-                    PreservationTextEncoding::ExactBytes
-                }
-                _ => {
-                    return Err(BeadsError::internal(
-                        "unvalidated schema19 preservation profile",
-                    ));
-                }
-            };
-            let preservation = capture_reviewed_state_preservation_with_text_encoding(
-                db_path,
-                forecast,
-                text_encoding,
-            )?
-            .ok_or_else(|| {
-                BeadsError::internal("schema19 source preservation witness is absent")
-            })?;
-            if schema19_preservation_digest(&preservation, &profile.profile)?
-                != profile.source_sha256
-            {
-                return Err(BeadsError::Config(
+    }
+    if project_source && let Some(profile) = &forecast.schema19_preservation {
+        let text_encoding = match profile.profile.as_str() {
+            LEGACY_SCHEMA19_PRESERVATION_PROFILE => PreservationTextEncoding::LegacyLossyUtf8,
+            PREVIOUS_SCHEMA19_PRESERVATION_PROFILE | SCHEMA19_PRESERVATION_PROFILE => {
+                PreservationTextEncoding::ExactBytes
+            }
+            _ => {
+                return Err(BeadsError::internal(
+                    "unvalidated schema19 preservation profile",
+                ));
+            }
+        };
+        let preservation = capture_reviewed_state_preservation_with_text_encoding(
+            db_path,
+            forecast,
+            text_encoding,
+        )?
+        .ok_or_else(|| BeadsError::internal("schema19 source preservation witness is absent"))?;
+        if schema19_preservation_digest(&preservation, &profile.profile)? != profile.source_sha256 {
+            return Err(BeadsError::Config(
                     "schema19 source preservation witness changed: authoritative values, rowids, \
                      sequences, or schema differ from the reviewed plan; preserve the original and re-plan"
                         .to_owned(),
                 ));
-            }
         }
     }
     if (forecast.from_version == 4) != forecast.legacy_v4_conversion.is_some()
@@ -8822,6 +8965,7 @@ mod tests {
                         content_hash_rows_rebuilt: 0,
                         gate_result_history_created: false,
                         prerequisites_column_added: false,
+                        gate_reporter_columns_added: false,
                         dependency_type_key_added: false,
                         legacy_v15_tables_converted: false,
                         schema19_runtime_upgrade: None,
@@ -9424,7 +9568,10 @@ mod tests {
                 db_path,
             };
             let plan = build_observational_plan(&migration.db_path).unwrap();
-            assert_eq!((plan.from_version, plan.to_version), (19, 19));
+            assert_eq!(
+                (plan.from_version, plan.to_version),
+                (19, u32::try_from(CURRENT_SCHEMA_VERSION).unwrap())
+            );
             let token = plan.plan_token.as_deref().unwrap();
             let (applied, _) = apply_with_plan_token(token, &migration).unwrap();
             let run_dir = migration_runs_root(&migration.beads_dir).join(&applied.run_id);
@@ -11267,6 +11414,7 @@ mod tests {
             content_hash_rows_rebuilt: 0,
             gate_result_history_created: true,
             prerequisites_column_added: false,
+            gate_reporter_columns_added: false,
             dependency_type_key_added: false,
             legacy_v15_conversion: None,
             legacy_v4_conversion: None,
@@ -11414,6 +11562,7 @@ mod tests {
             }],
             added_empty_sequences: Vec::new(),
             close_metadata_column_added: false,
+            gate_reporter_columns_added: false,
         };
         let historical = [
             (
@@ -11639,6 +11788,10 @@ mod tests {
             "PRIMARY KEY (issue_id, depends_on_id, type)",
             "PRIMARY KEY (issue_id, depends_on_id)",
         );
+        source_schema = source_schema.replace(
+            "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+            "",
+        );
         if version < 18 {
             source_schema =
                 source_schema.replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "");
@@ -11780,6 +11933,7 @@ mod tests {
             content_hash_rows_rebuilt: 0,
             gate_result_history_created: true,
             prerequisites_column_added: true,
+            gate_reporter_columns_added: false,
             dependency_type_key_added: true,
             legacy_v15_conversion: None,
             legacy_v4_conversion: None,
@@ -11902,7 +12056,7 @@ mod tests {
         conn.execute("UPDATE sqlite_sequence SET rowid = rowid + 100")
             .unwrap();
         assert_eq!(
-            legacy_table_projection(&conn, "sqlite_sequence", false, false).unwrap(),
+            legacy_table_projection(&conn, "sqlite_sequence", false, false, false).unwrap(),
             historical,
             "historical receipts must retain their rowid-free sequence serialization"
         );
@@ -12113,6 +12267,54 @@ mod tests {
     }
 
     #[test]
+    fn historical_schema19_destination_is_receipt_compatible_without_runtime_admission() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("historical-destination.db");
+        let fixture = include_bytes!(
+            "../../../../tests/fixtures/schema_migration/schema19_v076_release.db.gz"
+        );
+        let mut released = Vec::new();
+        flate2::read::GzDecoder::new(&fixture[..])
+            .read_to_end(&mut released)
+            .unwrap();
+        fs::write(&db, released).unwrap();
+        assert!(!reviewed_target_shape_is_canonical(&db, 19).unwrap());
+
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        let upgrade = reviewed_runtime_schema_upgrade(&conn).unwrap().unwrap();
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, upgrade).unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(query_user_version(&conn).unwrap(), 19);
+        close_connection(conn).unwrap();
+
+        assert!(
+            reviewed_target_shape_is_canonical(&db, 19).unwrap(),
+            "an installed historical receipt must remain eligible for guarded recovery"
+        );
+        assert!(
+            !current_runtime_shape_is_canonical(&db).unwrap(),
+            "historical receipt compatibility never admits schema19 to the current runtime"
+        );
+        assert!(
+            !reviewed_target_shape_is_canonical(&db, 20).unwrap(),
+            "old gate history cannot satisfy a schema20 destination"
+        );
+
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA user_version = 20").unwrap();
+        close_connection(conn).unwrap();
+        assert!(
+            !reviewed_target_shape_is_canonical(&db, 19).unwrap(),
+            "the actual version must match the historical receipt target"
+        );
+        assert!(
+            !reviewed_target_shape_is_canonical(&db, 20).unwrap(),
+            "changing only user_version cannot invent schema20 audit columns"
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn schema19_legacy_text_profile_keeps_its_digest_but_checks_exact_retained_rows() {
         let temp = TempDir::new().unwrap();
@@ -12142,6 +12344,10 @@ mod tests {
         verify_reviewed_profile(&db, current, true).unwrap();
 
         let mut historical = current.clone();
+        historical.to_version = 19;
+        historical.gate_reporter_columns_added = false;
+        historical.schema19_runtime_upgrade =
+            with_preservation_snapshot(&db, reviewed_runtime_schema_upgrade).unwrap();
         let legacy_proof = capture_reviewed_state_preservation_with_text_encoding(
             &db,
             &historical,
@@ -12267,6 +12473,10 @@ mod tests {
             let plan = build_plan(&db).unwrap();
             let current = plan.forecast.as_ref().unwrap();
             let mut historical = current.clone();
+            historical.to_version = 19;
+            historical.gate_reporter_columns_added = false;
+            historical.schema19_runtime_upgrade =
+                with_preservation_snapshot(&db, reviewed_runtime_schema_upgrade).unwrap();
             let proof =
                 capture_reviewed_state_preservation_with_text_encoding(&db, &historical, encoding)
                     .unwrap()
@@ -12750,6 +12960,10 @@ mod tests {
             &conn,
             &crate::storage::schema::SCHEMA_SQL
                 .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
+                .replace(
+                    "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                    "",
+                )
                 .replace("        closed_by TEXT,\n", ""),
         )
         .unwrap();
@@ -12804,7 +13018,11 @@ mod tests {
         let plan = build_plan(&migration.db_path).expect("plan the reviewed legacy profile");
         assert!(plan.eligible);
         let forecast = plan.forecast.as_ref().unwrap();
-        assert_eq!((forecast.from_version, forecast.to_version), (15, 19));
+        assert_eq!(
+            (forecast.from_version, forecast.to_version),
+            (15, u32::try_from(CURRENT_SCHEMA_VERSION).unwrap())
+        );
+        assert!(forecast.gate_reporter_columns_added);
         assert!(!forecast.dependency_type_key_added);
         assert!(forecast.prerequisites_column_added);
         assert_eq!(forecast.content_hash_rows_rebuilt, 0);
@@ -12869,12 +13087,14 @@ mod tests {
     fn legacy_close_attribution_projection_is_receipt_bound_and_backward_compatible() {
         let (_temp, migration) = legacy_v15_migration_context();
         let conn = open_read_only(&migration.db_path).unwrap();
-        let historical = legacy_v15_projection(&conn, true, false).unwrap();
+        let historical = legacy_v15_projection(&conn, true, false, false).unwrap();
         close_connection(conn).unwrap();
         let historical_json = serde_json::to_value(&historical).unwrap();
         assert!(historical_json.get("closed_by_column_added").is_none());
+        assert!(historical_json.get("gate_reporter_columns_added").is_none());
         let restored: LegacyV15Projection = serde_json::from_value(historical_json).unwrap();
         assert!(!restored.closed_by_column_added);
+        assert!(!restored.gate_reporter_columns_added);
         assert_eq!(restored, historical);
         verify_legacy_v15_projection(&migration.db_path, Some(&restored), true).unwrap();
 
@@ -13392,7 +13612,7 @@ mod tests {
         for (statements, expected_error) in [
             (
                 vec!["PRAGMA user_version = 19"],
-                "runtime layout is neither current nor the reviewed v0.7.6 layout",
+                "unsupported historical shape for core table issues",
             ),
             (
                 vec!["ALTER TABLE issues ADD COLUMN prerequisites TEXT NOT NULL DEFAULT ''"],
@@ -13403,7 +13623,7 @@ mod tests {
                     "ALTER TABLE issues ADD COLUMN prerequisites TEXT DEFAULT ''",
                     "PRAGMA user_version = 19",
                 ],
-                "runtime layout is neither current nor the reviewed v0.7.6 layout",
+                "unsupported historical shape for core table issues",
             ),
         ] {
             let (_temp, migration) = reviewed_source_migration_context("beads.db", 17);
@@ -13843,7 +14063,10 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(observed, expected, "schema {version}: {query}");
             }
-            assert_eq!(query_user_version(&conn).unwrap(), 19);
+            assert_eq!(
+                query_user_version(&conn).unwrap(),
+                u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()
+            );
             close_connection(conn).unwrap();
         }
     }
@@ -14382,6 +14605,7 @@ mod tests {
                 content_hash_rows_rebuilt: forecast.content_hash_rows_rebuilt,
                 gate_result_history_created: forecast.gate_result_history_created,
                 prerequisites_column_added: forecast.prerequisites_column_added,
+                gate_reporter_columns_added: forecast.gate_reporter_columns_added,
                 dependency_type_key_added: forecast.dependency_type_key_added,
                 legacy_v15_tables_converted: forecast.legacy_v15_conversion.is_some(),
                 schema19_runtime_upgrade: forecast.schema19_runtime_upgrade,
@@ -15239,8 +15463,8 @@ mod tests {
             with_migration_read_snapshot(db, |snapshot, _| {
                 with_preservation_snapshot(snapshot, |connection| {
                     Ok((
-                        legacy_table_projection(connection, "events", false, false)?,
-                        legacy_table_projection(connection, "config", false, false)?,
+                        legacy_table_projection(connection, "events", false, false, false)?,
+                        legacy_table_projection(connection, "config", false, false, false)?,
                     ))
                 })
             })
@@ -15290,7 +15514,10 @@ mod tests {
                 db_path,
             };
             let plan = build_observational_plan(&migration.db_path).unwrap();
-            assert_eq!((plan.from_version, plan.to_version), (19, 19));
+            assert_eq!(
+                (plan.from_version, plan.to_version),
+                (19, u32::try_from(CURRENT_SCHEMA_VERSION).unwrap())
+            );
             let original = plan.raw_witness.clone();
             let original_wal = component_for_suffix(&original, "-wal").unwrap();
             assert!(original_wal.length.unwrap() > 64);

@@ -5,16 +5,16 @@
 //! the project configures `workflow.gates`, the computed required-gate status
 //! for each guarded transition out of the issue's current status.
 //!
-//! Gate results are auxiliary, project-local metadata (like `close_metadata`):
-//! they are not synced through JSONL. Enforcement at the close/transition
-//! chokepoint lives in `close_policy::evaluate_gates`, hooked from
-//! `commands::update` and `commands::close`.
+//! Gate history is portable through the `issues.history.jsonl` companion;
+//! ordinary issue JSONL does not contain it. Reporting and transition checks
+//! use the shared storage policy. Actor/provider names are declared identities,
+//! not authenticated principals.
 
 use super::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale, resolve_issue_id,
 };
 use crate::cli::{GateCommands, GateListArgs, GateReportArgs, GateStatus};
-use crate::close_policy::{self, GateResult, GateResultRecord, Workflow};
+use crate::close_policy::{self, GateOverride, GateResult, GateResultRecord, Workflow};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
@@ -37,6 +37,11 @@ struct GateReportOutput {
     passed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    recorded_by: Option<String>,
+    recorded_at: String,
+    identity_kind: &'static str,
+    assignee_at_report: Option<String>,
+    override_reason: Option<String>,
 }
 
 /// Computed status of one required gate for a guarded transition.
@@ -62,6 +67,7 @@ struct GatedTransitionStatus {
 struct GateListOutput {
     issue_id: String,
     current_status: Option<String>,
+    identity_kind: &'static str,
     history: Vec<GateResultRecord>,
     /// Pre-v15 unscoped verdicts retained for audit display only. They never
     /// satisfy a transition.
@@ -107,8 +113,9 @@ fn execute_report(
             "--provider must not be empty",
         ));
     }
+    let gate_override = failure_override(args)?;
 
-    // Gate results are local auxiliary metadata; take the workspace write lock
+    // Gate results are portable audit evidence; take the workspace write lock
     // so a concurrent flush/import doesn't race the write, mirroring the other
     // mutating commands.
     let _lock = acquire_routed_workspace_write_lock(beads_dir, false, cli.lock_timeout)?;
@@ -128,6 +135,9 @@ fn execute_report(
                 id: issue_id.clone(),
             })?;
     let policy = close_policy::load_for_beads_dir(beads_dir)?;
+    storage_ctx
+        .storage
+        .set_workflow_policy(policy.workflow.clone());
     let labels = storage_ctx.storage.get_labels(&issue_id)?;
     let from_status = issue.status.as_str();
     let status_revision = storage_ctx.storage.status_revision(&issue_id)?;
@@ -157,12 +167,11 @@ fn execute_report(
         passed,
         note,
         &actor,
+        gate_override.as_ref(),
     )?;
 
     crate::util::set_last_touched_id(beads_dir, &issue_id);
-    // Gate verdicts are portable audit evidence even though they do not
-    // mutate the issue row itself. Force the normal persistence path.
-    storage_ctx.storage.set_metadata("needs_flush", "true")?;
+    // The verdict transaction already marked the portable audit as dirty.
     storage_ctx.flush_no_db_if_dirty()?;
     storage_ctx.auto_flush_if_enabled()?;
 
@@ -176,6 +185,11 @@ fn execute_report(
         provider: provider.to_string(),
         passed,
         note: note.map(str::to_string),
+        recorded_by: record.recorded_by,
+        recorded_at: record.recorded_at,
+        identity_kind: "declared",
+        assignee_at_report: record.assignee_at_report,
+        override_reason: record.override_reason,
     };
 
     if ctx.is_toon() {
@@ -185,17 +199,60 @@ fn execute_report(
     } else {
         let verdict = if passed { "pass" } else { "fail" };
         ctx.success(&format!(
-            "Recorded gate '{}' = {} (provider {}) for {} [{} -> {}, revision {}]",
+            "Recorded gate '{}' = {} (provider {}, declared actor {}) for {} [{} -> {}, revision {}, history #{}]",
             sanitize_terminal_inline(gate),
             verdict,
             sanitize_terminal_inline(provider),
+            sanitize_terminal_inline(&actor),
             sanitize_terminal_inline(&issue_id),
             sanitize_terminal_inline(&output.from_status),
             sanitize_terminal_inline(&output.to_status),
             output.status_revision,
+            output.id,
         ));
+        if let Some(reason) = &output.override_reason {
+            ctx.info(&format!(
+                "Failure override: {}",
+                sanitize_terminal_inline(reason)
+            ));
+        }
     }
     Ok(())
+}
+
+fn failure_override(args: &GateReportArgs) -> Result<Option<GateOverride>> {
+    match (args.override_failure, args.override_reason.as_deref()) {
+        (None, None) => Ok(None),
+        (Some(expected_history_id), Some(reason)) => {
+            if args.status != GateStatus::Pass {
+                return Err(BeadsError::validation(
+                    "override_failure",
+                    "--override-failure requires --status pass",
+                ));
+            }
+            if expected_history_id <= 0 {
+                return Err(BeadsError::validation(
+                    "override_failure",
+                    "--override-failure must name a positive history ID",
+                ));
+            }
+            let reason = reason.trim();
+            if reason.is_empty() {
+                return Err(BeadsError::validation(
+                    "override_reason",
+                    "--override-reason must not be empty",
+                ));
+            }
+            Ok(Some(GateOverride {
+                expected_history_id,
+                reason: reason.to_owned(),
+            }))
+        }
+        _ => Err(BeadsError::validation(
+            "override_failure",
+            "--override-failure and --override-reason require each other",
+        )),
+    }
 }
 
 fn resolve_gate_target(
@@ -306,13 +363,20 @@ fn execute_list(
             if rule_from.trim().eq_ignore_ascii_case(from) {
                 results_by_target.insert(
                     rule_to.trim().to_ascii_lowercase(),
-                    storage_ctx
-                        .storage
-                        .get_scoped_gate_results(&issue_id, from, rule_to.trim())?,
+                    storage_ctx.storage.get_scoped_gate_result_history(
+                        &issue_id,
+                        from,
+                        rule_to.trim(),
+                    )?,
                 );
             }
         }
     }
+    let assignees = issue
+        .as_ref()
+        .and_then(|issue| issue.assignee.as_deref())
+        .into_iter()
+        .collect::<Vec<_>>();
     let gated_transitions = compute_gated_transitions(
         &policy.workflow,
         &issue_id,
@@ -320,11 +384,13 @@ fn execute_list(
         &labels,
         priority,
         &results_by_target,
+        &assignees,
     );
 
     let output = GateListOutput {
         issue_id: issue_id.clone(),
         current_status,
+        identity_kind: "declared",
         history,
         legacy_results,
         gated_transitions,
@@ -350,7 +416,8 @@ fn compute_gated_transitions(
     current_status: Option<&str>,
     labels: &[String],
     priority: i32,
-    results_by_target: &BTreeMap<String, Vec<GateResult>>,
+    results_by_target: &BTreeMap<String, Vec<GateResultRecord>>,
+    assignees: &[&str],
 ) -> Vec<GatedTransitionStatus> {
     let Some(from) = current_status else {
         return Vec::new();
@@ -375,8 +442,8 @@ fn compute_gated_transitions(
             .get(&rule_to.to_ascii_lowercase())
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let violations = close_policy::evaluate_gates(
-            workflow, issue_id, from, rule_to, labels, priority, results,
+        let violations = close_policy::evaluate_scoped_gates(
+            workflow, issue_id, from, rule_to, labels, priority, results, assignees,
         );
         let required = workflow.required_gates_for(from, rule_to, labels, priority);
         let gates: Vec<RequiredGateStatus> = required
@@ -411,13 +478,21 @@ fn print_gate_list_human(ctx: &OutputContext, output: &GateListOutput) {
             let gate = sanitize_terminal_inline(&result.gate);
             let provider = sanitize_terminal_inline(&result.provider);
             let mut line = format!(
-                "  {gate} [{provider}]: {verdict} ({} -> {}, revision {})",
+                "  #{} {gate} [{provider}]: {verdict} ({} -> {}, revision {}, declared actor {})",
+                result.id,
                 sanitize_terminal_inline(&result.from_status),
                 sanitize_terminal_inline(&result.to_status),
                 result.status_revision,
+                sanitize_terminal_inline(result.recorded_by.as_deref().unwrap_or("unknown")),
             );
             if let Some(note) = &result.note {
                 line.push_str(&format!(" — {}", sanitize_terminal_inline(note)));
+            }
+            if let Some(reason) = &result.override_reason {
+                line.push_str(&format!(
+                    " [failure override: {}]",
+                    sanitize_terminal_inline(reason)
+                ));
             }
             ctx.print_line(&line);
         }
@@ -476,7 +551,7 @@ fn build_resolver(config_layer: &config::ConfigLayer) -> IdResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::close_policy::{ConditionalGate, GateRule, GateSpec};
+    use crate::close_policy::{ConditionalGate, GateReporterPolicy, GateRule, GateSpec};
     use crate::config::CliOverrides;
     use crate::model::{Issue, IssueType, Priority, Status};
     use std::fs;
@@ -514,6 +589,31 @@ mod tests {
         }
     }
 
+    fn make_gate_record(
+        issue_id: &str,
+        id: i64,
+        gate: &str,
+        provider: &str,
+        actor: &str,
+        passed: bool,
+    ) -> GateResultRecord {
+        GateResultRecord {
+            id,
+            issue_id: issue_id.to_owned(),
+            from_status: "in_review".to_owned(),
+            to_status: "closed".to_owned(),
+            status_revision: 0,
+            gate: gate.to_owned(),
+            provider: provider.to_owned(),
+            passed,
+            note: None,
+            recorded_by: Some(actor.to_owned()),
+            recorded_at: "2026-11-12T00:00:00Z".to_owned(),
+            assignee_at_report: Some(String::new()),
+            override_reason: None,
+        }
+    }
+
     #[test]
     fn report_records_result_and_list_reads_it_back() {
         let temp = TempDir::new().unwrap();
@@ -534,6 +634,8 @@ mod tests {
             status: GateStatus::Pass,
             to: Some("closed".to_string()),
             note: Some("build #42".to_string()),
+            override_failure: None,
+            override_reason: None,
             robot: true,
         };
         let ctx = OutputContext::from_flags(true, false, true);
@@ -571,6 +673,8 @@ mod tests {
             status: GateStatus::Fail,
             to: Some("closed".to_string()),
             note: None,
+            override_failure: None,
+            override_reason: None,
             robot: true,
         };
         execute_report(&base, &CliOverrides::default(), &ctx, &beads_dir).unwrap();
@@ -610,9 +714,60 @@ mod tests {
             status: GateStatus::Pass,
             to: None,
             note: None,
+            override_failure: None,
+            override_reason: None,
             robot: true,
         };
         assert!(execute_report(&empty_gate, &CliOverrides::default(), &ctx, &beads_dir).is_err());
+    }
+
+    #[test]
+    fn report_rejects_malformed_overrides_before_opening_storage() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let ctx = OutputContext::from_flags(true, false, true);
+        let base = GateReportArgs {
+            id: "bd-1".to_owned(),
+            gate: "ci_green".to_owned(),
+            provider: "verifier".to_owned(),
+            status: GateStatus::Pass,
+            to: Some("closed".to_owned()),
+            note: None,
+            override_failure: Some(1),
+            override_reason: Some("reviewed false negative".to_owned()),
+            robot: true,
+        };
+        for invalid in [
+            GateReportArgs {
+                status: GateStatus::Fail,
+                ..base.clone()
+            },
+            GateReportArgs {
+                override_failure: Some(0),
+                ..base.clone()
+            },
+            GateReportArgs {
+                override_reason: Some("  ".to_owned()),
+                ..base.clone()
+            },
+            GateReportArgs {
+                override_failure: None,
+                ..base.clone()
+            },
+            GateReportArgs {
+                override_reason: None,
+                ..base.clone()
+            },
+        ] {
+            assert!(execute_report(&invalid, &CliOverrides::default(), &ctx, &beads_dir).is_err());
+            assert!(
+                !beads_dir.exists(),
+                "invalid override must fail before storage opens"
+            );
+        }
+        let parsed = failure_override(&base).unwrap().unwrap();
+        assert_eq!(parsed.expected_history_id, 1);
+        assert_eq!(parsed.reason, "reviewed false negative");
     }
 
     #[test]
@@ -664,8 +819,15 @@ mod tests {
 
         // No results yet: ci_green + min_reviewers required, security not (no label).
         let no_results = BTreeMap::new();
-        let transitions =
-            compute_gated_transitions(&workflow, "bd-1", Some("in_review"), &[], 2, &no_results);
+        let transitions = compute_gated_transitions(
+            &workflow,
+            "bd-1",
+            Some("in_review"),
+            &[],
+            2,
+            &no_results,
+            &[],
+        );
         assert_eq!(transitions.len(), 1);
         let t = &transitions[0];
         assert_eq!(t.to, "closed");
@@ -677,18 +839,8 @@ mod tests {
 
         // With ci pass + one reviewer pass, both satisfied.
         let results = vec![
-            GateResult {
-                gate: "ci_green".to_string(),
-                provider: "ci".to_string(),
-                passed: true,
-                note: None,
-            },
-            GateResult {
-                gate: "min_reviewers".to_string(),
-                provider: "reviewer:alice".to_string(),
-                passed: true,
-                note: None,
-            },
+            make_gate_record("bd-1", 1, "ci_green", "ci", "ci", true),
+            make_gate_record("bd-1", 2, "min_reviewers", "reviewer:alice", "alice", true),
         ];
         let results_by_target = BTreeMap::from([("closed".to_string(), results)]);
         let transitions = compute_gated_transitions(
@@ -698,6 +850,7 @@ mod tests {
             &[],
             2,
             &results_by_target,
+            &[],
         );
         assert!(transitions[0].satisfied);
     }
@@ -717,13 +870,11 @@ gates:
         gate: {min_reviewers: 3}
 "#;
         let labels = vec!["auth".to_string(), "security".to_string()];
-        let reviews: Vec<GateResult> = ["reviewer:alice", "reviewer:bob", "reviewer:carol"]
+        let reviews: Vec<GateResultRecord> = ["reviewer:alice", "reviewer:bob", "reviewer:carol"]
             .into_iter()
-            .map(|provider| GateResult {
-                gate: "min_reviewers".to_string(),
-                provider: provider.to_string(),
-                passed: true,
-                note: None,
+            .zip(1_i64..)
+            .map(|(provider, id)| {
+                make_gate_record("bd-513", id, "min_reviewers", provider, provider, true)
             })
             .collect();
         for reverse in [false, true] {
@@ -746,6 +897,7 @@ gates:
                     &labels,
                     2,
                     &results_by_target,
+                    &[],
                 );
                 assert_eq!(transitions.len(), 1);
                 let transition = &transitions[0];
@@ -768,6 +920,7 @@ gates:
                 &[],
                 2,
                 &baseline_results,
+                &[],
             );
             assert_eq!(baseline.len(), 1);
             assert!(baseline[0].gates[0].satisfied);
@@ -785,7 +938,93 @@ gates:
             &[],
             2,
             &BTreeMap::new(),
+            &[],
         );
         assert!(transitions.is_empty());
+    }
+
+    #[test]
+    fn list_protected_gate_uses_reporter_identity_and_complete_history() {
+        let workflow = Workflow {
+            strict: true,
+            gates: BTreeMap::from([(
+                "in_review -> closed".to_owned(),
+                GateRule {
+                    require_all: vec![GateSpec::Named("independent_validation".to_owned())],
+                    ..Default::default()
+                },
+            )]),
+            gate_policies: BTreeMap::from([(
+                "independent_validation".to_owned(),
+                GateReporterPolicy {
+                    allowed_reporters: Some(vec![
+                        "worker".to_owned(),
+                        "verifier".to_owned(),
+                        "lead".to_owned(),
+                    ]),
+                    forbid_self_approval: true,
+                    override_reporters: vec!["lead".to_owned()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let satisfied = |records: Vec<GateResultRecord>| {
+            let by_target = BTreeMap::from([("closed".to_owned(), records)]);
+            let transitions = compute_gated_transitions(
+                &workflow,
+                "bd-602",
+                Some("in_review"),
+                &[],
+                2,
+                &by_target,
+                &["worker"],
+            );
+            assert_eq!(transitions.len(), 1);
+            assert_eq!(transitions[0].gates.len(), 1);
+            assert_eq!(transitions[0].satisfied, transitions[0].gates[0].satisfied);
+            transitions[0].satisfied
+        };
+        let self_pass = make_gate_record(
+            "bd-602",
+            1,
+            "independent_validation",
+            "worker",
+            "worker",
+            true,
+        );
+        assert!(!satisfied(vec![self_pass]));
+        let pass = make_gate_record(
+            "bd-602",
+            2,
+            "independent_validation",
+            "verifier",
+            "verifier",
+            true,
+        );
+        assert!(satisfied(vec![pass.clone()]));
+        let failed = make_gate_record(
+            "bd-602",
+            3,
+            "independent_validation",
+            "verifier",
+            "verifier",
+            false,
+        );
+        let repeated_pass = make_gate_record(
+            "bd-602",
+            4,
+            "independent_validation",
+            "verifier",
+            "verifier",
+            true,
+        );
+        let mut records = vec![pass, failed, repeated_pass];
+        assert!(!satisfied(records.clone()));
+        let mut override_pass =
+            make_gate_record("bd-602", 5, "independent_validation", "lead", "lead", true);
+        override_pass.override_reason = Some("Reviewed false negative".to_owned());
+        records.push(override_pass);
+        assert!(satisfied(records));
     }
 }

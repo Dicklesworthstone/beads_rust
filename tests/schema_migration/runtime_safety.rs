@@ -1,7 +1,7 @@
 //! Release-layout incompatibility must never authorize generic reconstruction.
 
 use super::{
-    TableRows, edit_schema19_fixture, engine_rows, header_user_version,
+    TableRows, current_schema_version, edit_schema19_fixture, engine_rows, header_user_version,
     released_schema19_workspace, run_br, schema19_authority_rows, schema19_json,
     schema19_tracker_files, seed_schema19_database_authority,
     seed_workflow_schema19_operator_state, workflow_schema19_authority,
@@ -55,10 +55,6 @@ fn generic_repair_refuses_release_upgrade_before_any_rebuild_or_session() {
     let before = schema19_tracker_files(&beads);
     let rows = schema19_authority_rows(&db, None);
     let runs = workspace.root.join("repair-run-artifacts");
-    let additions = json!({
-        "jsonl_row_receipts_created": true,
-        "closed_by_column_added": true,
-    });
     let variants: &[&[&str]] = &[
         &[],
         &["--dry-run"],
@@ -86,8 +82,16 @@ fn generic_repair_refuses_release_upgrade_before_any_rebuild_or_session() {
         let report: Value = serde_json::from_str(&refused.stdout).expect("whole refusal JSON");
         assert_eq!(report["ok"], false);
         assert_eq!(report["code"], "refused_unsafe");
-        assert_eq!(report["gate"], "schema19_runtime_upgrade");
-        assert_eq!(report["evidence"]["schema19_runtime_upgrade"], additions);
+        assert_eq!(report["gate"], "schema_version_upgrade");
+        assert_eq!(report["evidence"]["user_version"], 19);
+        assert_eq!(
+            report["evidence"]["target_version"],
+            current_schema_version()
+        );
+        assert_eq!(
+            report["evidence"]["layout_classification"],
+            "schema_version_upgrade"
+        );
         assert_eq!(report["evidence"]["dry_run"], extra.contains(&"--dry-run"));
         assert_eq!(
             report["evidence"]["recommended_fix"],
@@ -112,22 +116,33 @@ fn generic_repair_refuses_release_upgrade_before_any_rebuild_or_session() {
         "release_plan_after_generic_refusal",
     ));
     assert_eq!(plan["eligible"], true);
-    assert_eq!(plan["forecast"]["schema19_runtime_upgrade"], additions);
+    assert_eq!(plan["from_version"], 19);
+    assert_eq!(plan["to_version"], current_schema_version());
+    assert_eq!(plan["forecast"]["gate_reporter_columns_added"], true);
     assert_eq!(schema19_tracker_files(&beads), before);
 }
 
 fn current_release_workflow_workspace() -> BrWorkspace {
     let workspace = workflow_schema19_workspace();
     seed_workflow_schema19_operator_state(&workspace);
-    // Start with the real release database and install exactly the two known
-    // additions. The unsupported-layout tests must not pass only because the
-    // older, missing-additions gate already refuses this source.
+    // Exercise the actual migration from the real release database. The
+    // current-layout tests must not pass only because the older version gate
+    // already refuses the source, and setup must not create recovery sessions.
+    let connection = Connection::open(
+        workspace
+            .root
+            .join(".beads/beads.db")
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .unwrap();
+    beads_rust::storage::schema::run_migrations_atomic(&connection, 19, current_schema_version())
+        .unwrap();
+    connection.close().unwrap();
     edit_schema19_fixture(
         &workspace,
         &[
-            "ALTER TABLE close_metadata ADD COLUMN closed_by TEXT",
             "UPDATE close_metadata SET closed_by = 'preserved close actor'",
-            "CREATE TABLE jsonl_row_receipts (issue_id TEXT PRIMARY KEY, row_hash TEXT NOT NULL)",
             "INSERT INTO jsonl_row_receipts (rowid, issue_id, row_hash) VALUES (77, 'release-66o', 'preserved receipt')",
             "INSERT INTO config (rowid, key, value) VALUES (101, 'operator_duplicate', 'older'), (207, 'operator_duplicate', 'newer')",
             "INSERT INTO metadata (rowid, key, value) VALUES (173, 'operator_duplicate', 'older'), (277, 'operator_duplicate', 'newer')",
@@ -161,7 +176,7 @@ fn generic_repair_refuses_readable_unreviewed_current_layout_before_any_mutation
         );
         let beads = workspace.root.join(".beads");
         let db = beads.join("beads.db");
-        assert_eq!(header_user_version(&db), 19);
+        assert_eq!(header_user_version(&db), current_schema_version());
         let rows = workflow_schema19_authority(&db);
         let (columns, records) = &rows[table];
         let payload = columns
@@ -232,7 +247,7 @@ fn generic_repair_refuses_readable_unreviewed_current_layout_before_any_mutation
             assert_eq!(report["gate"], GATE);
             assert_eq!(report["evidence"]["gate"], GATE);
             assert_eq!(report["evidence"]["finding"], "schema.runtime");
-            assert_eq!(report["evidence"]["user_version"], 19);
+            assert_eq!(report["evidence"]["user_version"], current_schema_version());
             assert_eq!(report["evidence"]["runtime_compatible"], false);
             assert_eq!(
                 report["evidence"]["layout_classification"],
@@ -371,7 +386,7 @@ fn generic_repair_restores_current_owned_index_without_jsonl_reconstruction() {
             after_artifacts.remove(Path::new(name));
         }
         assert_eq!(after_artifacts, source_artifacts);
-        assert_eq!(header_user_version(&db), 19);
+        assert_eq!(header_user_version(&db), current_schema_version());
         assert!(!beads.join(".br_recovery").exists());
 
         // Unrelated findings in this deliberately rich tracker may remain.
@@ -423,8 +438,9 @@ fn generic_repair_restores_current_owned_index_without_jsonl_reconstruction() {
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 mod incomplete_transitions {
     use super::{
-        Connection, TableRows, released_schema19_workspace, run_br, schema19_authority_rows,
-        schema19_json, schema19_tracker_files, seed_schema19_database_authority,
+        Connection, TableRows, current_schema_version, released_schema19_workspace, run_br,
+        schema19_authority_rows, schema19_json, schema19_tracker_files,
+        seed_schema19_database_authority,
     };
     use crate::common::cli::BrWorkspace;
     use serde_json::{Value, json};
@@ -599,7 +615,10 @@ mod incomplete_transitions {
             ));
             assert_eq!(info["issue_count"], 4);
             assert_eq!(info["config"][CONFIG_KEY], CONFIG_SENTINEL);
-            assert_eq!(info["schema"]["schema_version"], "19");
+            assert_eq!(
+                info["schema"]["schema_version"],
+                current_schema_version().to_string()
+            );
             assert!(info["projections"].is_object());
             assert!(info.get("database_inspection_error").is_none());
             assert_eq!(schema19_tracker_files(&self.beads), before);

@@ -3320,6 +3320,125 @@ fn configure_external_route(main_root: &Path, external_root: &Path) {
     create_routes_file(main_root, &[("ext-", external_root)]);
 }
 
+#[cfg(unix)]
+fn independent_gate_race_workspace() -> (common::cli::BrWorkspace, String) {
+    let workspace = common::cli::BrWorkspace::new();
+    let init = run_br_in_dir(&workspace.root, ["init", "--prefix", "verify"]);
+    assert!(init.success, "{init:?}");
+    let created = run_br_in_dir(
+        &workspace.root,
+        [
+            "create",
+            "Concurrent independent verification",
+            "--assignee",
+            "worker",
+            "--json",
+        ],
+    );
+    assert!(created.success, "{created:?}");
+    let issue: serde_json::Value = serde_json::from_str(&created.stdout).unwrap();
+    let id = issue["id"].as_str().unwrap().to_owned();
+    let active = run_br_in_dir(&workspace.root, ["update", &id, "--status", "in_progress"]);
+    assert!(active.success, "{active:?}");
+    fs::write(
+        workspace.root.join(".beads/policy.yaml"),
+        r#"
+workflow:
+  strict: true
+  gates:
+    "in_progress -> closed":
+      require_all: [independent_validation]
+  gate_policies:
+    independent_validation:
+      allowed_reporters: [verifier-a, verifier-b]
+      forbid_self_approval: true
+"#,
+    )
+    .unwrap();
+    (workspace, id)
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_independent_gate_concurrent_pass_and_fail_preserve_failure_and_complete_audit() {
+    for order in [["pass", "fail"], ["fail", "pass"]] {
+        let (workspace, id) = independent_gate_race_workspace();
+        let root = &workspace.root;
+        let owner = beads_rust::sync::blocking_write_lock(&root.join(".beads")).unwrap();
+        let mut writers = QueuedBrChildren::default();
+        for (index, verdict) in order.iter().enumerate() {
+            let actor = if *verdict == "pass" {
+                "verifier-a"
+            } else {
+                "verifier-b"
+            };
+            writers.0.push(spawn_br_child_in_dir(
+                root,
+                [
+                    "gate",
+                    "report",
+                    &id,
+                    "--gate",
+                    "independent_validation",
+                    "--provider",
+                    actor,
+                    "--actor",
+                    actor,
+                    "--status",
+                    verdict,
+                    "--to",
+                    "closed",
+                    "--lock-timeout",
+                    "30000",
+                    "--json",
+                ],
+            ));
+            wait_for_workspace_waiters(root, index + 1);
+            wait_for_child_to_block_on_write_lock(&mut writers.0[index], verdict);
+        }
+        drop(owner);
+        let results = writers.finish(Duration::from_secs(30));
+        let mut acknowledged_ids = Vec::new();
+        for (verdict, output) in order.iter().zip(results) {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if output.status.success() {
+                assert_eq!(value["passed"], *verdict == "pass");
+                assert_eq!(value["identity_kind"], "declared");
+                acknowledged_ids.push(value["id"].as_i64().unwrap());
+            } else {
+                assert_eq!(*verdict, "pass", "FAIL must commit: {output:?}");
+                assert_eq!(output.status.code(), Some(4), "{output:?}");
+                assert_eq!(value["error"]["code"], "POLICY_VIOLATION");
+            }
+        }
+        let listed = run_br_in_dir(root, ["gate", "list", &id, "--json"]);
+        assert!(listed.success, "{listed:?}");
+        let list: serde_json::Value = serde_json::from_str(&listed.stdout).unwrap();
+        let history = list["history"].as_array().unwrap();
+        let mut persisted_ids = history
+            .iter()
+            .map(|record| record["id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        acknowledged_ids.sort_unstable();
+        persisted_ids.sort_unstable();
+        assert_eq!(persisted_ids, acknowledged_ids);
+        let unique_count = persisted_ids.len();
+        persisted_ids.dedup();
+        assert_eq!(persisted_ids.len(), unique_count);
+        assert!(
+            history
+                .iter()
+                .any(|record| record["recorded_by"] == "verifier-b" && record["passed"] == false)
+        );
+        assert_eq!(list["gated_transitions"][0]["satisfied"], false);
+        let close = run_br_in_dir(root, ["close", &id, "--json"]);
+        assert_eq!(close.exit_code, Some(4), "{close:?}");
+        let refused: serde_json::Value = serde_json::from_str(&close.stdout).unwrap();
+        assert_eq!(refused["error"]["code"], "POLICY_VIOLATION");
+        assert!(wait_for_workspace_waiters(root, 0).is_empty());
+    }
+}
+
 /// A writer process killed while waiting for `.write.lock` must not leave a
 /// ghost mutation or poison the advisory lock for subsequent writers.
 #[test]

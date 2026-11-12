@@ -14,7 +14,7 @@ pub(crate) mod legacy_v4;
 #[cfg(test)]
 pub(crate) use tests::LEGACY_V15_TEST_CORE_SQL;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 19;
+pub const CURRENT_SCHEMA_VERSION: i32 = 20;
 const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 
 // Persisted witnesses are valid only for this exact compatibility predicate.
@@ -24,7 +24,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
 const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str =
-    "v19-durable-close-attribution-jsonl-row-receipts-exact-ddl-cookie-fenced";
+    "v20-independent-gate-reporters-exact-ddl-cookie-fenced";
 // Keep this additive receipt table outside SCHEMA_SQL. A pending merge binds
 // the exact schema catalog and must finish against its original layout before
 // an older database can install the indexed receipts (#559).
@@ -205,7 +205,11 @@ const GATE_RESULT_HISTORY_COLUMNS: &[ExpectedSchemaColumn] = &[
         default_value: Some("CURRENT_TIMESTAMP"),
         primary_key_position: 0,
     },
+    schema_column("assignee_at_report", "TEXT", false, None, 0),
+    schema_column("override_reason", "TEXT", false, None, 0),
 ];
+
+const LEGACY_GATE_RESULT_HISTORY_COLUMN_COUNT: usize = 11;
 
 const GATE_RESULT_HISTORY_INDEXES: &[(&str, &[&str])] = &[
     ("idx_gate_result_history_issue", &["issue_id", "id"]),
@@ -241,6 +245,8 @@ pub struct ReviewedSchemaMigrationEffects {
     pub prerequisites_column_added: bool,
     /// Whether v19 added dependency type to the primary key without changing rows.
     pub dependency_type_key_added: bool,
+    /// Whether v20 added nullable assignee snapshots and explicit override reasons.
+    pub gate_reporter_columns_added: bool,
 }
 
 /// The only reviewed runtime-layout changes within schema 19.
@@ -563,6 +569,8 @@ pub const SCHEMA_SQL: &str = r"
         note TEXT,
         recorded_by TEXT,
         recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        assignee_at_report TEXT,
+        override_reason TEXT,
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_gate_result_history_issue
@@ -972,8 +980,9 @@ fn connection_user_version(conn: &Connection) -> Result<u32> {
 /// gate-history schema shipped in the v0.2.19-era line) and 16 (the #384
 /// capacity-exemptions schema created by the released v0.2.19 binary), and
 /// 17 (capacity occupancy) and 18 (prerequisite checklists, before typed
-/// dependency identity). See GitHub #398.
-pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 7] = [4, 13, 14, 15, 16, 17, 18];
+/// dependency identity), and 19 (before independent gate-reporter evidence).
+/// See GitHub #398.
+pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 8] = [4, 13, 14, 15, 16, 17, 18, 19];
 
 fn current_schema_version_u32() -> Result<u32> {
     u32::try_from(CURRENT_SCHEMA_VERSION).map_err(|_| {
@@ -1029,7 +1038,7 @@ fn validate_reviewed_schema_migration(
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
             "schema migrate refused — reviewed migrations are supported only from source \
-             schemas 4, 13, 14, 15, 16, 17, and 18 to {supported_target} (got {from}->{target_version})"
+             schemas 4, 13, 14, 15, 16, 17, 18, and 19 to {supported_target} (got {from}->{target_version})"
         )));
     }
     if marked_at.is_empty() {
@@ -1054,7 +1063,7 @@ fn validate_reviewed_schema_migration(
 /// `BEGIN IMMEDIATE` transaction before calling it. All validation occurs
 /// before the first migration write.
 ///
-/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (4 and 13 through 18) are
+/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (4 and 13 through 19) are
 /// accepted, each running exactly the version-gated step chain up to
 /// `CURRENT_SCHEMA_VERSION` (#398). Hash refreshes update only the derived
 /// issue hashes; every existing dirty marker and export receipt stays exact.
@@ -1090,7 +1099,10 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
         // A genuine v15/v16 database already carries the #388 gate-history
         // schema; attest it instead of re-running the migration so drift is
         // refused rather than silently papered over.
-        attest_gate_result_history_schema(conn)?;
+        attest_gate_result_history_schema_with_columns(
+            conn,
+            &GATE_RESULT_HISTORY_COLUMNS[..LEGACY_GATE_RESULT_HISTORY_COLUMN_COUNT],
+        )?;
     }
 
     if from < 16 {
@@ -1118,6 +1130,8 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
     let prerequisites_column_added = apply_prerequisites_migration_in_transaction(conn)?;
     tracing::info!("Migrating database to schema version 19 (typed dependency identity)");
     let dependency_type_key_added = apply_dependency_type_key_migration_in_transaction(conn, from)?;
+    tracing::info!("Migrating database to schema version 20 (independent gate reporter evidence)");
+    let gate_reporter_columns_added = apply_gate_reporter_columns_migration_in_transaction(conn)?;
     apply_jsonl_row_receipts_schema(conn)?;
     ensure_auxiliary_runtime_columns(conn, "close_metadata", CLOSE_METADATA_COLUMNS)?;
 
@@ -1138,6 +1152,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
         gate_result_history_created,
         prerequisites_column_added,
         dependency_type_key_added,
+        gate_reporter_columns_added,
     })
 }
 
@@ -3267,7 +3282,9 @@ fn attest_reviewed_source_core_tables(conn: &Connection, legacy_v15: bool) -> Re
         EVENTS_RUNTIME_COLUMNS
     };
     let mut source_dependency_columns = DEPENDENCIES_RUNTIME_COLUMNS.to_vec();
-    source_dependency_columns[2].primary_key_position = 0;
+    if from < 19 {
+        source_dependency_columns[2].primary_key_position = 0;
+    }
     for (table, columns, indexes) in [
         ("issues", source_issue_columns, ISSUES_RUNTIME_INDEXES),
         (
@@ -3570,7 +3587,10 @@ fn attest_reviewed_legacy_v15_source(conn: &Connection) -> Result<()> {
             return Err(legacy_v15_refusal(format!("{table} is not canonical")));
         }
     }
-    attest_gate_result_history_schema(conn)?;
+    attest_gate_result_history_schema_with_columns(
+        conn,
+        &GATE_RESULT_HISTORY_COLUMNS[..LEGACY_GATE_RESULT_HISTORY_COLUMN_COUNT],
+    )?;
     if !conn
         .query("SELECT 1 FROM main.sqlite_sequence WHERE name IN ('comments', 'events') LIMIT 1")?
         .is_empty()
@@ -4500,12 +4520,9 @@ fn apply_jsonl_row_receipts_schema(conn: &Connection) -> Result<()> {
 }
 
 pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
-    // A pending merge binds the original schema catalog. Its recovery path
-    // must continue to read the exact released layout until that merge ends.
-    runtime_schema_compatible_with_release_additions(
-        conn,
-        has_pending_sync_merge_metadata(conn).unwrap_or(false),
-    )
+    // Schema 20 always includes the prior release additions. A pending merge
+    // cannot turn missing authoritative fields into a supported current layout.
+    runtime_schema_compatible_with_release_additions(conn, false)
 }
 
 /// Distinguish readable, unsupported current layouts from damaged database
@@ -4536,7 +4553,8 @@ pub(crate) fn inspect_current_schema_for_repair(
             Ok(None) => CurrentSchemaRepairInspection::Compatible,
             Ok(Some(upgrade)) => CurrentSchemaRepairInspection::ReviewedUpgrade(upgrade),
             Err(error)
-                if runtime_schema_compatible_with_release_additions(conn, true)
+                if matches!(&error, BeadsError::SyncConflict { .. })
+                    && runtime_schema_compatible_with_release_additions(conn, true)
                     && (jsonl_row_receipts_schema_canonical(conn)
                         || runtime_schema_name_absent(conn, "jsonl_row_receipts")) =>
             {
@@ -4642,29 +4660,37 @@ fn inspect_runtime_schema_metadata(conn: &Connection) -> Result<bool> {
     Ok(has_triggers)
 }
 
-/// Inspect the complete current-version runtime contract without changing it.
-/// Only the two reviewed additive differences from v0.7.6 are eligible.
+/// Inspect the complete runtime contract without changing it. Canonical
+/// current layouts need no upgrade; only historical schema 19 may receive the
+/// two reviewed additive differences from v0.7.6 during receipt verification.
 pub(crate) fn reviewed_runtime_schema_upgrade(
     conn: &Connection,
 ) -> Result<Option<ReviewedRuntimeSchemaUpgrade>> {
     let version = connection_user_version(conn)?;
-    if version != current_schema_version_u32()? {
+    if version != 19 && version != current_schema_version_u32()? {
         return Err(BeadsError::Config(format!(
-            "schema-19 runtime upgrade requires schema {CURRENT_SCHEMA_VERSION}; observed {version}"
+            "reviewed runtime upgrade requires schema 19 or {CURRENT_SCHEMA_VERSION}; observed {version}"
         )));
     }
-    if runtime_schema_compatible_with_release_additions(conn, false) {
+    if runtime_schema_compatible_for_version(conn, false, version) {
         return Ok(None);
     }
     // Even malformed pending receipts freeze the catalog. They cannot be
     // bypassed by classifying the missing additions as ordinary maintenance.
     refuse_schema_repair_during_pending_merge(conn)?;
-    if !runtime_schema_compatible_with_release_additions(conn, true)
+    if version != 19 {
+        return Err(BeadsError::Config(format!(
+            "database declares schema {version} but its runtime layout is not canonical; \
+             historical schema-19 additions cannot repair a damaged current layout. \
+             Preserve the original database and inspect its authoritative schema"
+        )));
+    }
+    if !runtime_schema_compatible_for_version(conn, true, version)
         || (!jsonl_row_receipts_schema_canonical(conn)
             && !runtime_schema_name_absent(conn, "jsonl_row_receipts"))
     {
         return Err(BeadsError::Config(
-            "database declares schema 19 but its runtime layout is neither current nor the \
+            "database runtime layout is neither canonical nor the \
              reviewed v0.7.6 layout; only an absent jsonl_row_receipts table and a nullable \
              close_metadata.closed_by addition are supported. Preserve the original database; \
              an unknown layout cannot be safely rebuilt from JSONL"
@@ -4680,19 +4706,21 @@ pub(crate) fn reviewed_runtime_schema_upgrade(
 /// Ordinary startup and general maintenance must not consume the reviewed
 /// schema-19 transition before the operator has a preservation receipt.
 fn refuse_implicit_runtime_schema_upgrade(conn: &Connection, operation: &str) -> Result<()> {
-    // Attest before diagnosing the supported upgrade: a missing addition
-    // combined with unrelated drift must remain a refusal, not a repair.
+    if connection_user_version(conn)? == 19 && table_exists(conn, "issues") {
+        return Err(BeadsError::Config(format!(
+            "{operation} refused: schema 19 requires the explicit reviewed schema-20 \
+             migration; run `br doctor migrate-schema plan --json` and review its \
+             preservation and downgrade guarantees before applying it"
+        )));
+    }
+    // A current database cannot legitimately lack these authoritative fields.
+    // The historical helper refuses it without making any catalog changes.
     if current_schema_version_declared(conn)
         && table_exists(conn, "issues")
         && (!table_exists(conn, "jsonl_row_receipts")
             || !column_exists(conn, "close_metadata", "closed_by"))
-        && reviewed_runtime_schema_upgrade(conn)?.is_some()
     {
-        return Err(BeadsError::Config(format!(
-            "{operation} refused: schema 19 requires the explicit reviewed v0.7.6 runtime \
-             layout upgrade; run `br doctor migrate-schema plan --json` and review its \
-             preservation and downgrade guarantees before applying it"
-        )));
+        return reviewed_runtime_schema_upgrade(conn).map(|_| ());
     }
     // Bootstrap at version zero is handled separately. A current-version
     // missing core table still fails the maintenance admission that follows.
@@ -4705,6 +4733,7 @@ pub(crate) fn apply_reviewed_runtime_schema_upgrade_in_transaction(
     conn: &Connection,
     expected: ReviewedRuntimeSchemaUpgrade,
 ) -> Result<()> {
+    let version = connection_user_version(conn)?;
     if reviewed_runtime_schema_upgrade(conn)? != Some(expected) {
         return Err(BeadsError::Config(
             "schema-19 runtime upgrade refused: the runtime layout changed after inspection"
@@ -4719,7 +4748,7 @@ pub(crate) fn apply_reviewed_runtime_schema_upgrade_in_transaction(
         // from an issue's current assignee, owner, or other mutable state.
         conn.execute("ALTER TABLE close_metadata ADD COLUMN closed_by TEXT")?;
     }
-    if !runtime_schema_compatible_with_release_additions(conn, false) {
+    if !runtime_schema_compatible_for_version(conn, false, version) {
         return Err(BeadsError::Config(
             "schema-19 runtime upgrade post-check failed: the candidate layout is not canonical"
                 .to_owned(),
@@ -4736,12 +4765,30 @@ fn runtime_schema_name_absent(conn: &Connection, name: &str) -> bool {
     .is_ok_and(|rows| rows.is_empty())
 }
 
-#[allow(clippy::too_many_lines)]
 fn runtime_schema_compatible_with_release_additions(
     conn: &Connection,
     allow_release_additions: bool,
 ) -> bool {
-    let version_ok = current_schema_version_declared(conn);
+    let Ok(version) = current_schema_version_u32() else {
+        return false;
+    };
+    runtime_schema_compatible_for_version(conn, allow_release_additions, version)
+}
+
+/// Historical schema-19 receipts must remain verifiable for guarded undo.
+/// This predicate never admits an old database to the schema-20 runtime.
+pub(crate) fn reviewed_schema19_runtime_compatible(conn: &Connection) -> bool {
+    runtime_schema_compatible_for_version(conn, false, 19)
+}
+
+#[allow(clippy::too_many_lines)]
+fn runtime_schema_compatible_for_version(
+    conn: &Connection,
+    allow_release_additions: bool,
+    version: u32,
+) -> bool {
+    let version_ok =
+        runtime_user_version(conn).is_ok_and(|observed| observed == i64::from(version));
     let triggers_ok = runtime_has_no_persistent_triggers(conn);
     let issues_ok = core_runtime_table_canonical(
         conn,
@@ -4873,7 +4920,15 @@ fn runtime_schema_compatible_with_release_additions(
         GATE_RESULTS_COLUMNS,
         GATE_RESULTS_INDEXES,
     );
-    let gate_history_ok = attest_gate_result_history_schema(conn).is_ok();
+    let gate_history_ok = if version == 19 {
+        attest_gate_result_history_schema_with_columns(
+            conn,
+            &GATE_RESULT_HISTORY_COLUMNS[..LEGACY_GATE_RESULT_HISTORY_COLUMN_COUNT],
+        )
+        .is_ok()
+    } else {
+        attest_gate_result_history_schema(conn).is_ok()
+    };
     // v16/v17 capacity tables (#384) remain authoritative even when an older
     // migration stamped the current version without creating them. A missing
     // table invalidates runtime admission; ordinary startup cannot recreate
@@ -5394,6 +5449,13 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         }
     }
 
+    if user_version < 20 {
+        tracing::info!(
+            "Migrating database to schema version 20 (independent gate reporter evidence)"
+        );
+        apply_gate_reporter_columns_migration_in_transaction(conn)?;
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -5576,17 +5638,20 @@ fn sql_default_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
     }
 }
 
-fn attest_gate_result_history_columns(conn: &Connection) -> Result<()> {
+fn attest_gate_result_history_columns(
+    conn: &Connection,
+    columns: &[ExpectedSchemaColumn],
+) -> Result<()> {
     let rows = conn.query("PRAGMA table_xinfo('gate_result_history')")?;
-    if rows.len() != GATE_RESULT_HISTORY_COLUMNS.len() {
+    if rows.len() != columns.len() {
         return Err(schema_migration_shape_error(format!(
             "gate_result_history has {} columns, expected {}",
             rows.len(),
-            GATE_RESULT_HISTORY_COLUMNS.len()
+            columns.len()
         )));
     }
 
-    for (position, (row, expected)) in rows.iter().zip(GATE_RESULT_HISTORY_COLUMNS).enumerate() {
+    for (position, (row, expected)) in rows.iter().zip(columns).enumerate() {
         let name = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
             schema_migration_shape_error(format!(
                 "gate_result_history column {position} has no text name"
@@ -5735,14 +5800,17 @@ fn attest_gate_result_history_indexes(conn: &Connection) -> Result<()> {
 }
 
 fn attest_gate_result_history_schema(conn: &Connection) -> Result<()> {
-    attest_gate_result_history_columns(conn)?;
+    attest_gate_result_history_schema_with_columns(conn, GATE_RESULT_HISTORY_COLUMNS)
+}
+
+fn attest_gate_result_history_schema_with_columns(
+    conn: &Connection,
+    columns: &[ExpectedSchemaColumn],
+) -> Result<()> {
+    attest_gate_result_history_columns(conn, columns)?;
     attest_gate_result_history_foreign_key(conn)?;
     attest_gate_result_history_indexes(conn)?;
-    if !runtime_primary_key_shape_canonical(
-        conn,
-        "gate_result_history",
-        GATE_RESULT_HISTORY_COLUMNS,
-    ) {
+    if !runtime_primary_key_shape_canonical(conn, "gate_result_history", columns) {
         return Err(schema_migration_shape_error(
             "gate_result_history primary-key direction or collation is not canonical",
         ));
@@ -5772,7 +5840,35 @@ fn attest_gate_result_history_schema(conn: &Connection) -> Result<()> {
 
 fn apply_gate_result_history_migration_in_transaction(conn: &Connection) -> Result<()> {
     execute_batch(conn, GATE_RESULT_HISTORY_MIGRATION_SQL)?;
-    attest_gate_result_history_schema(conn)
+    // Keep the v15 step faithful to its released shape. A fresh table may
+    // already have the current columns when the general schema path created
+    // it before running historical migrations.
+    if column_exists(conn, "gate_result_history", "assignee_at_report") {
+        attest_gate_result_history_schema(conn)
+    } else {
+        attest_gate_result_history_schema_with_columns(
+            conn,
+            &GATE_RESULT_HISTORY_COLUMNS[..LEGACY_GATE_RESULT_HISTORY_COLUMN_COUNT],
+        )
+    }
+}
+
+/// v20 adds evidence without rewriting any historical verdict or inventing
+/// attribution. NULL denotes that the old binary never captured the assignee;
+/// a new report uses an empty string for a known unassigned issue.
+fn apply_gate_reporter_columns_migration_in_transaction(conn: &Connection) -> Result<bool> {
+    if column_exists(conn, "gate_result_history", "assignee_at_report") {
+        attest_gate_result_history_schema(conn)?;
+        return Ok(false);
+    }
+    attest_gate_result_history_schema_with_columns(
+        conn,
+        &GATE_RESULT_HISTORY_COLUMNS[..LEGACY_GATE_RESULT_HISTORY_COLUMN_COUNT],
+    )?;
+    conn.execute("ALTER TABLE gate_result_history ADD COLUMN assignee_at_report TEXT")?;
+    conn.execute("ALTER TABLE gate_result_history ADD COLUMN override_reason TEXT")?;
+    attest_gate_result_history_schema(conn)?;
+    Ok(true)
 }
 
 /// v16 (GitHub #384 phase 4) migration step: audited issue-specific capacity
@@ -6721,6 +6817,7 @@ mod tests {
                 gate_result_history_created: true,
                 prerequisites_column_added: false,
                 dependency_type_key_added: false,
+                gate_reporter_columns_added: true,
             }
         );
         let hash = conn
@@ -6818,6 +6915,7 @@ mod tests {
                 gate_result_history_created: true,
                 prerequisites_column_added: false,
                 dependency_type_key_added: false,
+                gate_reporter_columns_added: true,
             }
         );
         let issue = conn
@@ -7234,6 +7332,8 @@ mod tests {
         let db_path = temp.path().join("malformed-reviewed-v16.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         apply_schema(&conn).expect("apply current schema");
+        conn.execute("DROP TABLE gate_result_history").unwrap();
+        execute_batch(&conn, GATE_RESULT_HISTORY_MIGRATION_SQL).unwrap();
 
         conn.execute("DROP TABLE capacity_exemptions")
             .expect("remove canonical exemption state table");
@@ -7397,7 +7497,11 @@ mod tests {
             &conn,
             &SCHEMA_SQL
                 .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
-                .replace("        closed_by TEXT,\n", ""),
+                .replace("        closed_by TEXT,\n", "")
+                .replace(
+                    "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                    "",
+                ),
         )
         .unwrap();
         execute_batch(&conn, LEGACY_V15_TEST_CORE_SQL).unwrap();
@@ -7439,6 +7543,10 @@ mod tests {
             let schema = SCHEMA_SQL
                 .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
                 .replace("        closed_by TEXT,\n", "")
+                .replace(
+                    "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                    "",
+                )
                 .replace(
                     "PRIMARY KEY (issue_id, depends_on_id, type)",
                     "PRIMARY KEY (issue_id, depends_on_id)",
@@ -7778,6 +7886,10 @@ mod tests {
         let source_schema = SCHEMA_SQL
             .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
             .replace(
+                "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                "",
+            )
+            .replace(
                 "PRIMARY KEY (issue_id, depends_on_id, type)",
                 "PRIMARY KEY (issue_id, depends_on_id)",
             );
@@ -7910,10 +8022,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let source_schema = SCHEMA_SQL.replace(
-            "PRIMARY KEY (issue_id, depends_on_id, type)",
-            "PRIMARY KEY (issue_id, depends_on_id)",
-        );
+        let source_schema = SCHEMA_SQL
+            .replace(
+                "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                "",
+            )
+            .replace(
+                "PRIMARY KEY (issue_id, depends_on_id, type)",
+                "PRIMARY KEY (issue_id, depends_on_id)",
+            );
         execute_batch(&conn, &source_schema).unwrap();
         execute_batch(
             &conn,
@@ -7987,12 +8104,137 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn v20_gate_evidence_migration_preserves_v19_audit_and_rolls_back() {
+        for release_additions in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let conn = Connection::open(
+                temp.path()
+                    .join("gate-v19.db")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .unwrap();
+            let mut source = SCHEMA_SQL.replace(
+                "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                "",
+            );
+            if !release_additions {
+                source = source.replace("        closed_by TEXT,\n", "");
+            }
+            execute_batch(&conn, &source).unwrap();
+            if release_additions {
+                apply_jsonl_row_receipts_schema(&conn).unwrap();
+            }
+            execute_batch(&conn,
+                "INSERT INTO issues (id, title, status, assignee) \
+                 VALUES ('bd-gate-v19', 'Existing review', 'in_progress', 'worker');
+                 INSERT INTO events (id, issue_id, event_type, actor, old_value, new_value) \
+                 VALUES (17, 'bd-gate-v19', 'status_changed', 'worker', 'open', 'in_progress');
+                 INSERT INTO gate_result_history \
+                    (id, issue_id, from_status, to_status, status_revision, gate, provider, passed, note, recorded_by) \
+                 VALUES (41, 'bd-gate-v19', 'in_progress', 'closed', 17, 'validation', 'verifier', 0, 'Original FAIL', 'verifier'), \
+                        (42, 'bd-gate-v19', 'in_progress', 'closed', 17, 'validation', 'verifier', 1, 'Historical PASS', 'worker');
+                 UPDATE sqlite_sequence SET seq = 91 WHERE name = 'gate_result_history';
+                 INSERT INTO metadata (key, value) VALUES ('needs_flush', 'false');
+                 PRAGMA user_version = 19;",
+            ).unwrap();
+            attest_reviewed_migration_source_core_tables(&conn).unwrap();
+            let before = legacy_v15_test_state(&conn);
+            let old_rows_query = "SELECT id, issue_id, from_status, to_status, status_revision, \
+                                  gate, provider, passed, note, recorded_by, recorded_at \
+                                  FROM gate_result_history ORDER BY id";
+            let original = format!("{:?}", conn.query(old_rows_query).unwrap());
+            for repair in [
+                apply_schema as fn(&Connection) -> Result<()>,
+                apply_runtime_compatible_schema,
+            ] {
+                assert!(
+                    repair(&conn).is_err(),
+                    "source19 requires the explicit reviewed migration"
+                );
+                assert_eq!(legacy_v15_test_state(&conn), before);
+            }
+
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            let effects = run_reviewed_schema_migration_steps_in_transaction(
+                &conn,
+                19,
+                current_schema_version_u32().unwrap(),
+                "2026-11-12T00:00:00Z",
+            )
+            .unwrap();
+            assert!(effects.gate_reporter_columns_added);
+            assert!(!effects.gate_result_history_created);
+            assert!(!effects.dependency_type_key_added);
+            assert!(runtime_schema_compatible(&conn));
+            conn.execute("ROLLBACK").unwrap();
+            assert_eq!(legacy_v15_test_state(&conn), before);
+
+            run_migrations_atomic(&conn, 19, current_schema_version_u32().unwrap()).unwrap();
+            assert!(runtime_schema_compatible(&conn));
+            assert_eq!(
+                format!("{:?}", conn.query(old_rows_query).unwrap()),
+                original
+            );
+            for row in conn.query("SELECT assignee_at_report, override_reason FROM gate_result_history ORDER BY id").unwrap() {
+                assert_eq!(row.get(0), Some(&SqliteValue::Null));
+                assert_eq!(row.get(1), Some(&SqliteValue::Null));
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'gate_result_history'"
+                )
+                .unwrap()
+                .get(0),
+                Some(&SqliteValue::Integer(91))
+            );
+            assert_eq!(
+                conn.query_row("SELECT value FROM metadata WHERE key = 'needs_flush'")
+                    .unwrap()
+                    .get(0)
+                    .and_then(SqliteValue::as_text),
+                Some("false")
+            );
+        }
+    }
+
+    #[test]
+    fn historical_schema19_runtime_receipts_keep_their_original_contract() {
+        let (_temp, conn) = historical_runtime_upgrade_fixture(false, false);
+        let expected = ReviewedRuntimeSchemaUpgrade {
+            jsonl_row_receipts_created: true,
+            closed_by_column_added: true,
+        };
+        assert_eq!(
+            reviewed_runtime_schema_upgrade(&conn).unwrap(),
+            Some(expected)
+        );
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, expected).unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(connection_user_version(&conn).unwrap(), 19);
+        assert!(reviewed_schema19_runtime_compatible(&conn));
+        assert!(!runtime_schema_compatible(&conn));
+        assert!(!column_exists(
+            &conn,
+            "gate_result_history",
+            "assignee_at_report"
+        ));
+        assert!(reviewed_runtime_schema_upgrade(&conn).unwrap().is_none());
+    }
+
+    #[test]
     fn test_v18_prerequisites_require_explicit_upgrade_from_canonical_v17() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         let source_schema = SCHEMA_SQL
             .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
+            .replace(
+                "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                "",
+            )
             .replace(
                 "PRIMARY KEY (issue_id, depends_on_id, type)",
                 "PRIMARY KEY (issue_id, depends_on_id)",
@@ -9474,7 +9716,13 @@ mod tests {
         for repair in [
             apply_schema as fn(&Connection) -> Result<()>,
             apply_runtime_compatible_schema,
-            |conn| run_migrations_atomic(conn, 19, 19),
+            |conn| {
+                run_migrations_atomic(
+                    conn,
+                    current_schema_version_u32()?,
+                    current_schema_version_u32()?,
+                )
+            },
         ] {
             let (_temp, conn) = runtime_upgrade_fixture(true, true);
             execute_batch(
@@ -9597,7 +9845,10 @@ mod tests {
                 Some(&SqliteValue::Null)
             );
             assert!(runtime_schema_compatible(&conn));
-            assert_eq!(connection_user_version(&conn).unwrap(), 19);
+            assert_eq!(
+                connection_user_version(&conn).unwrap(),
+                current_schema_version_u32().unwrap()
+            );
         }
     }
 
@@ -9634,7 +9885,13 @@ mod tests {
             for repair in [
                 apply_schema as fn(&Connection) -> Result<()>,
                 apply_runtime_compatible_schema,
-                |conn| run_migrations_atomic(conn, 19, 19),
+                |conn| {
+                    run_migrations_atomic(
+                        conn,
+                        current_schema_version_u32()?,
+                        current_schema_version_u32()?,
+                    )
+                },
             ] {
                 let error = repair(&conn).unwrap_err();
                 assert!(error.to_string().contains("schema"), "{drift}: {error}");
@@ -9685,7 +9942,13 @@ mod tests {
                 for repair in [
                     apply_schema as fn(&Connection) -> Result<()>,
                     apply_runtime_compatible_schema,
-                    |conn| run_migrations_atomic(conn, 19, 19),
+                    |conn| {
+                        run_migrations_atomic(
+                            conn,
+                            current_schema_version_u32()?,
+                            current_schema_version_u32()?,
+                        )
+                    },
                 ] {
                     let (result, statements) =
                         crate::franken_sync::statement_log::capture(|| repair(&conn));
@@ -9794,7 +10057,13 @@ mod tests {
         for repair in [
             apply_schema as fn(&Connection) -> Result<()>,
             apply_runtime_compatible_schema,
-            |conn| run_migrations_atomic(conn, 19, 19),
+            |conn| {
+                run_migrations_atomic(
+                    conn,
+                    current_schema_version_u32()?,
+                    current_schema_version_u32()?,
+                )
+            },
         ] {
             let (result, statements) =
                 crate::franken_sync::statement_log::capture(|| repair(&conn));
@@ -9815,34 +10084,57 @@ mod tests {
         receipts_present: bool,
         attribution_present: bool,
     ) -> (tempfile::TempDir, Connection) {
+        runtime_upgrade_fixture_at_version(
+            receipts_present,
+            attribution_present,
+            CURRENT_SCHEMA_VERSION,
+        )
+    }
+
+    fn historical_runtime_upgrade_fixture(
+        receipts_present: bool,
+        attribution_present: bool,
+    ) -> (tempfile::TempDir, Connection) {
+        runtime_upgrade_fixture_at_version(receipts_present, attribution_present, 19)
+    }
+
+    fn runtime_upgrade_fixture_at_version(
+        receipts_present: bool,
+        attribution_present: bool,
+        version: i32,
+    ) -> (tempfile::TempDir, Connection) {
         let temp = tempfile::TempDir::new().unwrap();
         let conn =
             Connection::open(temp.path().join("beads.db").to_string_lossy().into_owned()).unwrap();
-        let schema = if attribution_present {
+        let mut schema = if attribution_present {
             SCHEMA_SQL.to_owned()
         } else {
             SCHEMA_SQL.replace("        closed_by TEXT,\n", "")
         };
+        if version == 19 {
+            schema = schema.replace(
+                "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                "",
+            );
+        }
         execute_batch(&conn, &schema).unwrap();
         if receipts_present {
             conn.execute(JSONL_ROW_RECEIPTS_SCHEMA_SQL).unwrap();
         }
-        conn.execute("PRAGMA user_version = 19").unwrap();
+        conn.execute(&format!("PRAGMA user_version = {version}"))
+            .unwrap();
         (temp, conn)
     }
 
     #[test]
-    fn repair_layout_inspection_distinguishes_current_upgrade_and_maintenance() {
+    fn repair_layout_inspection_distinguishes_current_audit_gaps_and_maintenance() {
         for (receipts, attribution) in [(false, false), (true, false), (false, true)] {
             let (_temp, conn) = runtime_upgrade_fixture(receipts, attribution);
             let before = legacy_v15_test_state(&conn);
-            assert_eq!(
+            assert!(matches!(
                 inspect_current_schema_for_repair(&conn).unwrap(),
-                CurrentSchemaRepairInspection::ReviewedUpgrade(ReviewedRuntimeSchemaUpgrade {
-                    jsonl_row_receipts_created: !receipts,
-                    closed_by_column_added: !attribution,
-                })
-            );
+                CurrentSchemaRepairInspection::Unsupported { .. }
+            ));
             assert_eq!(legacy_v15_test_state(&conn), before);
         }
 
@@ -9928,12 +10220,53 @@ mod tests {
     }
 
     #[test]
+    fn schema20_missing_release_evidence_cannot_use_historical_repair() {
+        for (receipts, attribution) in [(false, false), (true, false), (false, true)] {
+            let (temp, conn) = runtime_upgrade_fixture(receipts, attribution);
+            conn.execute(
+                "INSERT INTO issues (id, title) VALUES ('bd-current-gap', 'Preserve evidence')",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO close_metadata (issue_id, bypass_reason) VALUES ('bd-current-gap', 'original audit')").unwrap();
+            let before = legacy_v15_test_state(&conn);
+            assert!(!runtime_schema_compatible(&conn));
+            assert!(reviewed_runtime_schema_upgrade(&conn).is_err());
+            assert!(matches!(
+                inspect_current_schema_for_repair(&conn).unwrap(),
+                CurrentSchemaRepairInspection::Unsupported { .. }
+            ));
+            let expected = ReviewedRuntimeSchemaUpgrade {
+                jsonl_row_receipts_created: !receipts,
+                closed_by_column_added: !attribution,
+            };
+            assert!(apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, expected).is_err());
+            assert!(apply_schema(&conn).is_err());
+            assert!(apply_runtime_compatible_schema(&conn).is_err());
+            assert!(
+                run_migrations_atomic(
+                    &conn,
+                    current_schema_version_u32().unwrap(),
+                    current_schema_version_u32().unwrap()
+                )
+                .is_err()
+            );
+            assert!(crate::storage::SqliteStorage::open(&temp.path().join("beads.db")).is_err());
+            assert_eq!(
+                legacy_v15_test_state(&conn),
+                before,
+                "a schema20 declaration cannot authorize inventing lost historical evidence"
+            );
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn reviewed_schema19_runtime_upgrade_is_observational_and_additive() {
         for (receipts_present, attribution_present) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
-            let (temp, conn) = runtime_upgrade_fixture(receipts_present, attribution_present);
+            let (temp, conn) =
+                historical_runtime_upgrade_fixture(receipts_present, attribution_present);
             conn.execute("INSERT INTO issues (id, title) VALUES ('br-old', 'Release issue')")
                 .unwrap();
             conn.execute(
@@ -9959,6 +10292,11 @@ mod tests {
             );
             let inspected = reviewed_runtime_schema_upgrade(&conn).unwrap();
             assert_eq!(
+                inspect_current_schema_for_repair(&conn).unwrap(),
+                CurrentSchemaRepairInspection::NotCurrent
+            );
+            assert!(!runtime_schema_compatible(&conn));
+            assert_eq!(
                 format!("{:?}", conn.query("SELECT * FROM sqlite_schema").unwrap()),
                 schema_before,
                 "inspection must not alter the catalog"
@@ -9979,7 +10317,7 @@ mod tests {
                 apply_runtime_compatible_schema(&conn).unwrap_err(),
                 run_migrations_atomic(&conn, 19, 19).unwrap_err(),
             ] {
-                assert!(error.to_string().contains("explicit reviewed"), "{error}");
+                assert!(error.to_string().contains("schema"), "{error}");
             }
             assert_eq!(
                 format!("{:?}", conn.query("SELECT * FROM sqlite_schema").unwrap()),
@@ -9998,7 +10336,8 @@ mod tests {
             apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, expected).unwrap();
             conn.execute("COMMIT").unwrap();
             assert_eq!(connection_user_version(&conn).unwrap(), 19);
-            assert!(runtime_schema_compatible(&conn));
+            assert!(reviewed_schema19_runtime_compatible(&conn));
+            assert!(!runtime_schema_compatible(&conn));
             assert!(reviewed_runtime_schema_upgrade(&conn).unwrap().is_none());
             assert_eq!(
                 format!(
@@ -10042,7 +10381,8 @@ mod tests {
         for (receipts_present, attribution_present) in
             [(false, false), (true, false), (false, true)]
         {
-            let (_temp, conn) = runtime_upgrade_fixture(receipts_present, attribution_present);
+            let (_temp, conn) =
+                historical_runtime_upgrade_fixture(receipts_present, attribution_present);
             conn.execute("INSERT INTO issues (id, title) VALUES ('br-original', 'Original')")
                 .unwrap();
             conn.execute("INSERT INTO close_metadata (rowid, issue_id, bypass_reason) VALUES (47, 'br-original', X'00ff')").unwrap();
@@ -10063,7 +10403,7 @@ mod tests {
             let upgrade = reviewed_runtime_schema_upgrade(&conn).unwrap().unwrap();
             conn.execute("BEGIN IMMEDIATE").unwrap();
             apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, upgrade).unwrap();
-            assert!(runtime_schema_compatible(&conn));
+            assert!(reviewed_schema19_runtime_compatible(&conn));
             conn.execute("ROLLBACK").unwrap();
             assert_eq!(
                 format!(
@@ -10094,7 +10434,7 @@ mod tests {
             conn.execute("BEGIN IMMEDIATE").unwrap();
             apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, upgrade).unwrap();
             conn.execute("COMMIT").unwrap();
-            assert!(runtime_schema_compatible(&conn));
+            assert!(reviewed_schema19_runtime_compatible(&conn));
             assert!(reviewed_runtime_schema_upgrade(&conn).unwrap().is_none());
             assert_eq!(connection_user_version(&conn).unwrap(), 19);
         }
@@ -10111,7 +10451,7 @@ mod tests {
             "PRAGMA user_version = 18",
             "PRAGMA user_version = 20",
         ] {
-            let (_temp, conn) = runtime_upgrade_fixture(false, false);
+            let (_temp, conn) = historical_runtime_upgrade_fixture(false, false);
             conn.execute(drift).unwrap();
             let schema_before = format!("{:?}", conn.query("SELECT * FROM sqlite_schema").unwrap());
             assert!(
@@ -10138,7 +10478,7 @@ mod tests {
 
     #[test]
     fn reviewed_schema19_runtime_upgrade_refuses_pending_merges_and_stale_forecasts() {
-        let (_temp, conn) = runtime_upgrade_fixture(false, false);
+        let (_temp, conn) = historical_runtime_upgrade_fixture(false, false);
         let expected = reviewed_runtime_schema_upgrade(&conn).unwrap().unwrap();
         conn.execute_with_params(
             "INSERT INTO metadata (key, value) VALUES (?, '')",
@@ -10146,8 +10486,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            runtime_schema_compatible(&conn),
-            "merge recovery can read its original layout"
+            !runtime_schema_compatible(&conn),
+            "schema 19 must never enter the current runtime"
         );
         let error = reviewed_runtime_schema_upgrade(&conn).unwrap_err();
         assert!(error.to_string().contains("resume `br sync --merge`"));
@@ -10155,7 +10495,7 @@ mod tests {
         assert!(!table_exists(&conn, "jsonl_row_receipts"));
         assert!(!column_exists(&conn, "close_metadata", "closed_by"));
 
-        let (_temp, conn) = runtime_upgrade_fixture(false, false);
+        let (_temp, conn) = historical_runtime_upgrade_fixture(false, false);
         conn.execute(JSONL_ROW_RECEIPTS_SCHEMA_SQL).unwrap();
         assert!(apply_reviewed_runtime_schema_upgrade_in_transaction(&conn, expected).is_err());
         assert!(!column_exists(&conn, "close_metadata", "closed_by"));

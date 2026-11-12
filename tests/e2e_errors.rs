@@ -6108,3 +6108,406 @@ fn e2e_unknown_policy_key_warns_on_stderr_at_default_verbosity() {
         close.stderr
     );
 }
+
+const INDEPENDENT_GATE_POLICY: &str = r#"
+allow_bypass: false
+workflow:
+  strict: true
+  statuses: [open, in_progress, rework, closed]
+  transitions:
+    open: [in_progress]
+    in_progress: [rework, closed]
+    rework: [in_progress]
+  gates:
+    "in_progress -> closed":
+      require_all: [independent_validation]
+  gate_policies:
+    independent_validation:
+      allowed_reporters: [worker-a, verifier-b, verifier-c, lead]
+      forbid_self_approval: true
+      provider_reporters:
+        verification-service: [verifier-b]
+      override_reporters: [verifier-b, lead]
+"#;
+
+fn independent_gate_json(workspace: &BrWorkspace, args: &[&str]) -> Value {
+    let mut args = args.to_vec();
+    args.push("--json");
+    let run = run_br(workspace, args, "independent_gate_success");
+    assert!(run.status.success(), "{run:?}");
+    serde_json::from_str(&run.stdout).expect("one complete JSON document on stdout")
+}
+
+fn independent_gate_workspace(policy: &str) -> (BrWorkspace, String) {
+    let workspace = BrWorkspace::new();
+    independent_gate_json(&workspace, &["init", "--prefix", "verify"]);
+    let created = independent_gate_json(
+        &workspace,
+        &[
+            "create",
+            "Independently verified work",
+            "--assignee",
+            "worker-a",
+            "--actor",
+            "worker-a",
+        ],
+    );
+    let id = created["id"].as_str().unwrap().to_owned();
+    independent_gate_json(&workspace, &["update", &id, "--status", "in_progress"]);
+    fs::write(workspace.root.join(".beads/policy.yaml"), policy).unwrap();
+    (workspace, id)
+}
+
+fn independent_gate_refusal(workspace: &BrWorkspace, args: &[&str]) {
+    let before = prerequisite_database_state(workspace);
+    let history_path = workspace.root.join(".beads/issues.history.jsonl");
+    let history_before = fs::read(&history_path).ok();
+    let mut args = args.to_vec();
+    args.push("--json");
+    let run = run_br(workspace, args, "independent_gate_refused");
+    assert_eq!(run.status.code(), Some(4), "{run:?}");
+    let error: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "POLICY_VIOLATION", "{run:?}");
+    assert_eq!(prerequisite_database_state(workspace), before);
+    assert_eq!(fs::read(history_path).ok(), history_before);
+}
+
+fn independent_gate_report<'a>(id: &'a str, actor: &'a str, verdict: &'a str) -> Vec<&'a str> {
+    vec![
+        "gate",
+        "report",
+        id,
+        "--gate",
+        "independent_validation",
+        "--provider",
+        actor,
+        "--actor",
+        actor,
+        "--status",
+        verdict,
+        "--to",
+        "closed",
+    ]
+}
+
+#[test]
+fn e2e_independent_gate_refuses_self_approval_provider_impersonation_and_unauthorized_reporters() {
+    let (workspace, id) = independent_gate_workspace(INDEPENDENT_GATE_POLICY);
+    for actor in ["worker-a", "stranger"] {
+        independent_gate_refusal(&workspace, &independent_gate_report(&id, actor, "pass"));
+    }
+    let mut impersonation = independent_gate_report(&id, "verifier-c", "pass");
+    impersonation[6] = "verifier-b";
+    independent_gate_refusal(&workspace, &impersonation);
+    independent_gate_refusal(&workspace, &["close", &id]);
+
+    let mut mapped = independent_gate_report(&id, "verifier-b", "pass");
+    mapped[6] = "verification-service";
+    let report = independent_gate_json(&workspace, &mapped);
+    assert_eq!(report["identity_kind"], "declared");
+    assert_eq!(report["recorded_by"], "verifier-b");
+    assert_eq!(report["assignee_at_report"], "worker-a");
+    let list = independent_gate_json(&workspace, &["gate", "list", &id]);
+    assert_eq!(list["identity_kind"], "declared");
+    assert_eq!(list["history"].as_array().unwrap().len(), 1);
+    assert_eq!(list["gated_transitions"][0]["satisfied"], true);
+    independent_gate_json(&workspace, &["close", &id]);
+}
+
+#[test]
+fn e2e_independent_gate_fail_stays_effective_until_real_rework() {
+    let (workspace, id) = independent_gate_workspace(INDEPENDENT_GATE_POLICY);
+    let failed = independent_gate_json(
+        &workspace,
+        &independent_gate_report(&id, "verifier-b", "fail"),
+    );
+    for actor in ["verifier-b", "verifier-c"] {
+        independent_gate_refusal(&workspace, &independent_gate_report(&id, actor, "pass"));
+    }
+    independent_gate_json(
+        &workspace,
+        &["update", &id, "--title", "Edited, not reworked"],
+    );
+    independent_gate_refusal(
+        &workspace,
+        &independent_gate_report(&id, "verifier-b", "pass"),
+    );
+    independent_gate_refusal(&workspace, &["close", &id, "--force"]);
+    independent_gate_json(&workspace, &["update", &id, "--status", "rework"]);
+    independent_gate_json(&workspace, &["update", &id, "--status", "in_progress"]);
+    let passed = independent_gate_json(
+        &workspace,
+        &independent_gate_report(&id, "verifier-c", "pass"),
+    );
+    assert!(
+        passed["status_revision"].as_i64().unwrap() > failed["status_revision"].as_i64().unwrap()
+    );
+    let list = independent_gate_json(&workspace, &["gate", "list", &id]);
+    let history = list["history"].as_array().unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(
+        history
+            .iter()
+            .any(|record| record["id"] == failed["id"] && record["passed"] == false)
+    );
+    assert_eq!(list["gated_transitions"][0]["satisfied"], true);
+    independent_gate_json(&workspace, &["close", &id]);
+}
+
+fn assert_invalid_gate_override_arguments(workspace: &BrWorkspace, id: &str, failed_id: &str) {
+    for extra in [
+        vec!["--override-failure", failed_id],
+        vec!["--override-reason", "Reviewed exception"],
+        vec!["--override-failure", failed_id, "--override-reason", "  "],
+    ] {
+        let before = prerequisite_database_state(workspace);
+        let mut args = independent_gate_report(id, "lead", "pass");
+        args.extend(extra);
+        args.push("--json");
+        let refused = run_br(workspace, args, "independent_gate_invalid_override");
+        assert!(!refused.status.success(), "{refused:?}");
+        assert_eq!(prerequisite_database_state(workspace), before);
+    }
+}
+
+#[test]
+fn e2e_independent_gate_override_requires_authority_reason_and_fresh_history_head() {
+    let (workspace, id) = independent_gate_workspace(INDEPENDENT_GATE_POLICY);
+    let failed = independent_gate_json(
+        &workspace,
+        &independent_gate_report(&id, "verifier-b", "fail"),
+    );
+    let failed_id = failed["id"].as_i64().unwrap().to_string();
+    let mut unauthorized = independent_gate_report(&id, "verifier-c", "pass");
+    unauthorized.extend([
+        "--override-failure",
+        &failed_id,
+        "--override-reason",
+        "Reviewed",
+    ]);
+    independent_gate_refusal(&workspace, &unauthorized);
+    assert_invalid_gate_override_arguments(&workspace, &id, &failed_id);
+    let newer = independent_gate_json(
+        &workspace,
+        &independent_gate_report(&id, "verifier-c", "fail"),
+    );
+    let mut override_args = independent_gate_report(&id, "lead", "pass");
+    override_args.extend([
+        "--override-failure",
+        &failed_id,
+        "--override-reason",
+        "Reviewed exception",
+    ]);
+    independent_gate_refusal(&workspace, &override_args);
+    let newer_id = newer["id"].as_i64().unwrap().to_string();
+    override_args[14] = &newer_id;
+    override_args.extend(["--note", "Retain both failed observations"]);
+    let accepted = independent_gate_json(&workspace, &override_args);
+    assert_eq!(accepted["recorded_by"], "lead");
+    assert_eq!(accepted["override_reason"], "Reviewed exception");
+    let list = independent_gate_json(&workspace, &["gate", "list", &id]);
+    let history = list["history"].as_array().unwrap();
+    assert_eq!(history.len(), 3);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|record| record["passed"] == false)
+            .count(),
+        2
+    );
+    assert_eq!(list["gated_transitions"][0]["satisfied"], true);
+    independent_gate_json(
+        &workspace,
+        &independent_gate_report(&id, "verifier-b", "fail"),
+    );
+    independent_gate_refusal(&workspace, &["close", &id]);
+}
+
+#[test]
+fn e2e_independent_gate_audit_survives_portable_history_roundtrip() {
+    let (workspace, id) = independent_gate_workspace(INDEPENDENT_GATE_POLICY);
+    let failed = independent_gate_json(
+        &workspace,
+        &independent_gate_report(&id, "verifier-b", "fail"),
+    );
+    let failed_id = failed["id"].as_i64().unwrap().to_string();
+    let mut args = independent_gate_report(&id, "lead", "pass");
+    args.extend([
+        "--override-failure",
+        &failed_id,
+        "--override-reason",
+        "Documented exception",
+        "--note",
+        "External review record",
+    ]);
+    independent_gate_json(&workspace, &args);
+    independent_gate_json(&workspace, &["sync", "--flush-only"]);
+    let original = independent_gate_json(&workspace, &["gate", "list", &id]);
+
+    let restored = BrWorkspace::new();
+    independent_gate_json(&restored, &["init", "--prefix", "verify"]);
+    for name in ["issues.jsonl", "issues.history.jsonl", "policy.yaml"] {
+        fs::copy(
+            workspace.root.join(".beads").join(name),
+            restored.root.join(".beads").join(name),
+        )
+        .unwrap();
+    }
+    independent_gate_json(&restored, &["sync", "--import-only"]);
+    let imported = independent_gate_json(&restored, &["gate", "list", &id]);
+    let before = original["history"].as_array().unwrap();
+    let after = imported["history"].as_array().unwrap();
+    assert_eq!(before.len(), 2);
+    assert_eq!(after.len(), before.len());
+    for (source, destination) in before.iter().zip(after) {
+        for field in [
+            "issue_id",
+            "from_status",
+            "to_status",
+            "gate",
+            "provider",
+            "passed",
+            "note",
+            "recorded_by",
+            "recorded_at",
+            "assignee_at_report",
+            "override_reason",
+        ] {
+            assert_eq!(
+                destination[field], source[field],
+                "changed audit field {field}"
+            );
+        }
+    }
+    assert_eq!(imported["gated_transitions"][0]["satisfied"], true);
+    independent_gate_json(&restored, &["close", &id]);
+}
+
+#[test]
+fn e2e_independent_gate_policy_tightening_rejects_old_self_approval_and_reassignment() {
+    let unrestricted = INDEPENDENT_GATE_POLICY
+        .split("  gate_policies:")
+        .next()
+        .unwrap();
+    let (workspace, id) = independent_gate_workspace(unrestricted);
+    independent_gate_json(
+        &workspace,
+        &independent_gate_report(&id, "worker-a", "pass"),
+    );
+    fs::write(
+        workspace.root.join(".beads/policy.yaml"),
+        INDEPENDENT_GATE_POLICY,
+    )
+    .unwrap();
+    independent_gate_refusal(&workspace, &["close", &id]);
+    independent_gate_refusal(
+        &workspace,
+        &[
+            "update",
+            &id,
+            "--assignee",
+            "verifier-c",
+            "--status",
+            "closed",
+        ],
+    );
+    independent_gate_json(&workspace, &["update", &id, "--assignee", "verifier-c"]);
+    independent_gate_refusal(&workspace, &["close", &id]);
+    let list = independent_gate_json(&workspace, &["gate", "list", &id]);
+    assert_eq!(list["history"].as_array().unwrap().len(), 1);
+    assert_eq!(list["gated_transitions"][0]["satisfied"], false);
+}
+
+#[test]
+fn e2e_independent_gate_reevaluates_current_reporter_and_provider_authorization() {
+    let (workspace, id) = independent_gate_workspace(INDEPENDENT_GATE_POLICY);
+    let mut args = independent_gate_report(&id, "verifier-b", "pass");
+    args[6] = "verification-service";
+    independent_gate_json(&workspace, &args);
+    let policy_path = workspace.root.join(".beads/policy.yaml");
+    for policy in [
+        INDEPENDENT_GATE_POLICY.replace(
+            "verification-service: [verifier-b]",
+            "verification-service: [verifier-c]",
+        ),
+        INDEPENDENT_GATE_POLICY.replace(
+            "allowed_reporters: [worker-a, verifier-b, verifier-c, lead]",
+            "allowed_reporters: []",
+        ),
+    ] {
+        fs::write(&policy_path, policy).unwrap();
+        independent_gate_refusal(&workspace, &["close", &id]);
+        let list = independent_gate_json(&workspace, &["gate", "list", &id]);
+        assert_eq!(list["history"].as_array().unwrap().len(), 1);
+        assert_eq!(list["gated_transitions"][0]["satisfied"], false);
+    }
+    independent_gate_refusal(&workspace, &args);
+    fs::write(policy_path, INDEPENDENT_GATE_POLICY).unwrap();
+    independent_gate_refusal(
+        &workspace,
+        &[
+            "update",
+            &id,
+            "--assignee",
+            "verifier-b",
+            "--status",
+            "closed",
+        ],
+    );
+    independent_gate_json(&workspace, &["close", &id]);
+}
+
+#[test]
+fn e2e_independent_gate_reviewer_threshold_counts_declared_actors_on_the_right_gate() {
+    let policy = r#"
+workflow:
+  strict: true
+  gates:
+    "in_progress -> closed":
+      require_all: [{min_reviewers: 2}, ci_green]
+  gate_policies:
+    min_reviewers:
+      allowed_reporters: [alice, bob]
+      forbid_self_approval: true
+      provider_reporters:
+        reviewer:alice: [alice]
+        reviewer:alice-alias: [alice]
+        reviewer:bob: [bob]
+"#;
+    let (workspace, id) = independent_gate_workspace(policy);
+    for provider in ["reviewer:alice", "reviewer:alice-alias"] {
+        let mut args = independent_gate_report(&id, "alice", "pass");
+        args[4] = "min_reviewers";
+        args[6] = provider;
+        independent_gate_json(&workspace, &args);
+    }
+    let mut unrelated = independent_gate_report(&id, "bob", "pass");
+    unrelated[4] = "ci_green";
+    unrelated[6] = "reviewer:bob";
+    independent_gate_json(&workspace, &unrelated);
+    independent_gate_refusal(&workspace, &["close", &id]);
+    let mut reviewer = unrelated;
+    reviewer[4] = "min_reviewers";
+    independent_gate_json(&workspace, &reviewer);
+    independent_gate_json(&workspace, &["close", &id]);
+}
+
+#[test]
+fn e2e_independent_gate_unrestricted_policy_preserves_legacy_overwrite_behavior() {
+    let unrestricted = INDEPENDENT_GATE_POLICY
+        .split("  gate_policies:")
+        .next()
+        .unwrap();
+    let (workspace, id) = independent_gate_workspace(unrestricted);
+    independent_gate_json(
+        &workspace,
+        &independent_gate_report(&id, "verifier-b", "fail"),
+    );
+    let mut pass = independent_gate_report(&id, "worker-a", "pass");
+    pass[6] = "verifier-b";
+    independent_gate_json(&workspace, &pass);
+    let list = independent_gate_json(&workspace, &["gate", "list", &id]);
+    assert_eq!(list["history"].as_array().unwrap().len(), 2);
+    assert_eq!(list["gated_transitions"][0]["satisfied"], true);
+    independent_gate_json(&workspace, &["close", &id]);
+}

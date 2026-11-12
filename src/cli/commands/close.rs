@@ -213,8 +213,9 @@ pub(crate) fn evaluate_close_policy(
         ));
         if workflow.gates_enforced() && workflow.gate_rule_for(from, to).is_some() {
             let labels = storage.get_labels(issue_id)?;
-            let results = storage.get_scoped_gate_results(issue_id, from, to)?;
-            violations.extend(close_policy::evaluate_gates(
+            let results = storage.get_scoped_gate_result_history(issue_id, from, to)?;
+            let assignees = issue.assignee.as_deref().into_iter().collect::<Vec<_>>();
+            violations.extend(close_policy::evaluate_scoped_gates(
                 workflow,
                 issue_id,
                 from,
@@ -222,6 +223,7 @@ pub(crate) fn evaluate_close_policy(
                 &labels,
                 issue.priority.0,
                 &results,
+                &assignees,
             ));
         }
     }
@@ -3166,6 +3168,7 @@ mod tests {
                     true,
                     None,
                     "ci-bot",
+                    None,
                 )
                 .expect("record pass");
         }

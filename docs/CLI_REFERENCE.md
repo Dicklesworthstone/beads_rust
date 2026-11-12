@@ -1617,8 +1617,10 @@ conditions a project can require before a status transition is allowed, defined
 in `.beads/policy.yaml` under `workflow.gates` as a map of `"from -> to"`
 transitions to required gate conditions. Enforcement happens at the
 close/transition chokepoint: a move into a gated state is rejected until every
-required gate passes. Gate results are project-local metadata and are not synced
-through JSONL.
+required gate passes. Gate history is preserved in the portable
+`issues.history.jsonl` companion; ordinary issue JSONL alone does not contain
+these records. Report authorization and transition checks run in the same
+storage transaction as their respective mutations.
 
 ```bash
 br gate report <ID> --gate <NAME> --provider <NAME> --status pass|fail [OPTIONS]
@@ -1635,10 +1637,13 @@ br gate list <ID> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--gate <NAME>` | Gate name (e.g. `ci_green`, `security_sign_off`, `min_reviewers`) |
-| `--provider <NAME>` | Reporting provider (e.g. `ci`, `security`, `reviewer:alice`) |
+| `--provider <NAME>` | Declared provider (e.g. `ci`, `security`, `reviewer:alice`); protected gates require an authorized actor-to-provider binding |
 | `--status <pass\|fail>` | Result status |
 | `--to <STATUS>` | Target transition; optional only when exactly one configured target requires this gate |
 | `--note <TEXT>` | Optional free-form note recorded with the result |
+| `--override-failure <HISTORY_ID>` | Explicitly supersede a protected gate's failure; must name the latest record for this gate and exact transition attempt, and requires `--status pass` plus policy authorization |
+| `--override-reason <TEXT>` | Non-empty rationale preserved with an override; requires `--override-failure` |
+| `--actor <NAME>` | Declared reporting actor, stored as `recorded_by` (global option) |
 | `--robot` | Machine-readable JSON output |
 
 **`list` options:**
@@ -1646,14 +1651,15 @@ br gate list <ID> [OPTIONS]
 |--------|-------------|
 | `--robot` | Machine-readable JSON output |
 
-A re-report appends to immutable history; only the latest result from each
-`(gate, provider)` in the exact `(issue, source, target, status revision)` scope
-is effective. Leaving and later re-entering the source status creates a new
-revision, so an earlier review pass cannot authorize the new attempt. Legacy
-pre-v15 unscoped results remain audit-visible but never satisfy a transition.
-The built-in `min_reviewers` gate is satisfied by at least N distinct
-reviewer providers (provider name `reviewer`, or namespaced `reviewer:<who>` /
-`reviewer-<who>`) reporting `pass`. Example policy:
+A re-report appends to immutable history. For a gate without an entry in
+`workflow.gate_policies`, the latest result from each `(gate, provider)` in the
+exact `(issue, source, target, status revision)` scope is effective, preserving
+the existing behavior. Leaving and later re-entering the source status creates
+a new revision, so an earlier review pass cannot authorize the new attempt.
+Legacy pre-v15 unscoped results remain audit-visible but never satisfy a
+transition. Without a reporter policy, the built-in `min_reviewers` gate counts
+distinct passing reviewer providers (provider name `reviewer`, or namespaced
+`reviewer:<who>` / `reviewer-<who>`). Example policy:
 
 ```yaml
 workflow:
@@ -1682,6 +1688,102 @@ workflow:
         - priority: [0, 1]
           gate: security_sign_off
 ```
+
+#### Independent verification using declared actors
+
+Add a `workflow.gate_policies` entry for each gate that needs reporter
+restrictions. Its presence enables actor-to-provider binding and prevents an
+ordinary PASS from replacing a FAIL in the same transition attempt. A configured
+gate policy requires `workflow.strict: true`. Gates without such an entry retain
+their existing behavior.
+
+The audit fields use database schema 20. An existing schema-19 workspace requires
+the explicit reviewed migration: inspect `br doctor migrate-schema plan --json`,
+then use its apply token or `br doctor migrate-schema heal` after reviewing the
+preservation and downgrade guidance. Ordinary commands do not automatically
+upgrade the database, and generic `doctor --repair` refuses to reconstruct a
+readable schema-19 database from issue JSONL. Migration preserves old records
+with unknown assignment snapshots; it does not manufacture past verification
+attribution.
+
+```yaml
+allow_bypass: false
+workflow:
+  strict: true
+  statuses: [open, in_progress, rework, closed]
+  transitions:
+    open: [in_progress]
+    in_progress: [rework, closed]
+    rework: [in_progress]
+  gates:
+    "in_progress -> closed":
+      require_all: [independent_validation]
+  gate_policies:
+    independent_validation:
+      allowed_reporters: [verifier-b, review-lead]
+      forbid_self_approval: true
+      provider_reporters:
+        review-service: [verifier-b, review-lead]
+      override_reporters: [review-lead]
+```
+
+| Setting | Enforced behavior |
+|---------|-------------------|
+| `allowed_reporters` | Only these declared actors may report. Absent permits any actor subject to the other restrictions; an explicit empty list permits none. |
+| `forbid_self_approval: true` | A PASS cannot authorize closure when its actor matches the assignee recorded with the report, the current assignee, or an assignee being set by the same transition. FAIL remains available to authorized reporters. |
+| `provider_reporters` | Maps a provider name to its permitted declared actors. An unmapped provider must equal the actor. Naming another actor's provider does not grant that actor's authority. |
+| `override_reporters` | Actors allowed to explicitly override a failure. Defaults to none. Ordinary reporter authorization, provider binding, and the self-approval restriction still apply. |
+
+Names are trimmed and compared without ASCII case distinctions. The current
+policy is applied when reporting and again when a transition is evaluated;
+removing authorization can invalidate old approvals without erasing their
+history. A protected `min_reviewers` threshold counts distinct authorized
+declared actors on that gate, so multiple provider aliases for one actor cannot
+supply multiple independent approvals.
+
+**Identity boundary:** `--actor`, actor configuration, and the `$USER` fallback
+are declarations. They are not authenticated identities, signatures, or proof
+that separate people or processes performed the checks. Report/list structured
+output labels this provenance as `identity_kind: "declared"`; `recorded_by`
+records the resolved declaration. Use a trusted controller to bind those
+declarations to authenticated principals if that stronger guarantee is needed.
+Anyone able to choose another actor, modify policy, or directly modify the
+database remains outside this local enforcement boundary.
+
+For the policy above, the verifier can record a result through its mapped
+provider:
+
+```bash
+br gate report br-abc123 --gate independent_validation --provider review-service \
+  --status fail --to closed --actor verifier-b --json
+br gate list br-abc123 --json
+```
+
+A FAIL stays effective across every provider for that gate in this exact
+source/target/status-revision scope. Another PASS, including one from the
+original verifier, cannot silently clear it. Either take a permitted rework
+transition and collect a fresh result after returning, or have an authorized
+override reporter inspect the history and explicitly supersede the failure:
+
+```bash
+# Replace 42 with the latest history ID for this gate and transition attempt.
+br gate report br-abc123 --gate independent_validation --provider review-service \
+  --status pass --to closed --actor review-lead \
+  --override-failure 42 --override-reason "Reviewed false negative with verifier-b" --json
+```
+
+The history-ID check is atomic with the report: a concurrent report makes an
+override prepared from older evidence stale and it is refused. Refusal adds no
+verdict and does not change the current projection. A successful override adds a
+new PASS with its actor and `override_reason`; the FAIL and every earlier report
+remain in history and in the portable companion. New records also retain
+`assignee_at_report`; a missing legacy assignment snapshot cannot prove
+independence when self-approval is forbidden, so collect a fresh report.
+
+`--bypass-policy` is a separate whole-policy escape hatch. Set top-level
+`allow_bypass: false`, as above, when closure must require these gates. If bypass
+is enabled, an explicit close bypass with its reason can still bypass them and
+is audited as a bypass, not as a successful independent verification.
 
 For an issue type that needs an additional route, add exact edges under
 `class_transitions`. The global graph remains in effect for every type:

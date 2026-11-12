@@ -535,6 +535,7 @@ mod tests {
             true,
             None,
             "bot",
+            None,
         )?;
         publish_before_export(&storage, &jsonl)?;
         let active = storage.get_issue("ph-a")?.unwrap();
@@ -779,7 +780,7 @@ mod tests {
         storage.upsert_issue_for_import(&imported)?;
         let revision = storage.status_revision("ph-a")?;
         storage.record_scoped_gate_result(
-            "ph-a", "blocked", revision, "closed", "ci", "runner", true, None, "bot",
+            "ph-a", "blocked", revision, "closed", "ci", "runner", true, None, "bot", None,
         )?;
 
         publish_before_export(&storage, &jsonl)?;

@@ -265,6 +265,23 @@ capacity_exemption_history -- Append-only exemption audit
 The authoritative list is `src/storage/schema.rs` (`CREATE TABLE IF NOT EXISTS`
 statements); `CURRENT_SCHEMA_VERSION` is defined there.
 
+Workflow gate enforcement reads the append-only history for the exact issue,
+source status, target status, and current status revision. `gate_results` is a
+compatibility projection for external queries, not the authority for closure.
+Opt-in `workflow.gate_policies` bind declared reporters to providers, restrict
+assignee approvals, and retain failures until a new revision or an authorized,
+reasoned override. Reporting and transition enforcement use storage transactions;
+overrides compare the latest scoped history ID before appending. History retains
+reporter, assignment-at-report, and override rationale and is included in the
+portable `issues.history.jsonl` companion. Ordinary issue JSONL alone does not
+carry gate history. Actor strings remain declarations, not authentication.
+
+Schema 20 adds nullable assignment snapshots and override reasons. Existing
+schema-19 databases require the explicit reviewed `doctor migrate-schema`
+transition; runtime opens and generic doctor repair do not upgrade or reconstruct
+them automatically. Historical audit rows retain null for facts that were never
+recorded, and migration preserves the original database for guarded recovery.
+
 ### Dirty Tracking
 
 Issues are marked dirty when:

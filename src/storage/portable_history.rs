@@ -13,6 +13,7 @@ use crate::franken_sync::SqliteValue;
 use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 // Items here are `pub`, not `pub(crate)`: this module is `pub(crate)` in
@@ -163,6 +164,8 @@ const SPECS: &[Spec] = &[
             ("note", Kind::OptionalText),
             ("recorded_by", Kind::OptionalText),
             ("recorded_at", Kind::Timestamp),
+            ("assignee_at_report", Kind::OptionalText),
+            ("override_reason", Kind::OptionalText),
         ],
         key: &[1],
         append: true,
@@ -320,7 +323,9 @@ pub fn validate(snapshot: &PortableHistorySnapshot) -> Result<()> {
     }
     let mut events = HashMap::new();
     for (spec, table) in SPECS.iter().zip(&snapshot.tables) {
-        if table.table != spec.name || table.columns != spec.names() {
+        let legacy_gate_history =
+            spec.name == "gate_result_history" && table.columns == spec.names()[..11];
+        if table.table != spec.name || (table.columns != spec.names() && !legacy_gate_history) {
             return Err(invalid(format!(
                 "noncanonical history table {}",
                 table.table
@@ -329,7 +334,7 @@ pub fn validate(snapshot: &PortableHistorySnapshot) -> Result<()> {
         let mut sequences = HashMap::<&str, i64>::new();
         let mut previous: Option<Vec<String>> = None;
         for row in &table.rows {
-            if row.len() != spec.columns.len() {
+            if row.len() != table.columns.len() {
                 return Err(invalid(format!("{} row has wrong column count", spec.name)));
             }
             for ((name, kind), value) in spec.columns.iter().zip(row) {
@@ -393,6 +398,33 @@ pub fn validate(snapshot: &PortableHistorySnapshot) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Check old companion bytes before adding the two nullable v20 fields for
+/// comparisons/replay. Checkpoint checksum validation therefore still hashes
+/// the original v1 representation; absent evidence stays unknown rather than
+/// being inferred from a mutable issue or from the reporting actor.
+fn canonical_snapshot(
+    snapshot: &PortableHistorySnapshot,
+) -> Result<Cow<'_, PortableHistorySnapshot>> {
+    validate(snapshot)?;
+    let Some(index) = snapshot
+        .tables
+        .iter()
+        .position(|table| table.table == "gate_result_history" && table.columns.len() == 11)
+    else {
+        return Ok(Cow::Borrowed(snapshot));
+    };
+    let mut canonical = snapshot.clone();
+    let table = &mut canonical.tables[index];
+    table.columns.extend([
+        "assignee_at_report".to_owned(),
+        "override_reason".to_owned(),
+    ]);
+    for row in &mut table.rows {
+        row.extend([Value::Null, Value::Null]);
+    }
+    Ok(Cow::Owned(canonical))
 }
 
 /// Order each table by its key and, for append-only tables, by sequence.
@@ -560,7 +592,11 @@ impl PortableHistorySnapshot {
         sources: &[&Self],
         anchors: &BTreeMap<String, PortableHistoryIssue>,
     ) -> Result<PortableHistorySelection> {
-        let indexes: Vec<SnapshotIndex<'_>> = sources
+        let canonical = sources
+            .iter()
+            .map(|source| canonical_snapshot(source))
+            .collect::<Result<Vec<_>>>()?;
+        let indexes: Vec<SnapshotIndex<'_>> = canonical
             .iter()
             .map(|source| SnapshotIndex::new(source))
             .collect();
@@ -597,8 +633,13 @@ impl PortableHistorySnapshot {
     /// snapshot's own rows in place, and the issue set and anchors are always
     /// this snapshot's.
     pub fn carry_forward(&self, earlier: &[&Self]) -> Result<PortableHistoryCarry> {
-        let own = SnapshotIndex::new(self);
-        let indexes: Vec<SnapshotIndex<'_>> = earlier
+        let canonical_own = canonical_snapshot(self)?;
+        let own = SnapshotIndex::new(&canonical_own);
+        let canonical_earlier = earlier
+            .iter()
+            .map(|source| canonical_snapshot(source))
+            .collect::<Result<Vec<_>>>()?;
+        let indexes: Vec<SnapshotIndex<'_>> = canonical_earlier
             .iter()
             .map(|source| SnapshotIndex::new(source))
             .collect();
@@ -627,7 +668,7 @@ impl PortableHistorySnapshot {
                 diverged.push(id.clone());
             }
         }
-        let mut history = self.clone();
+        let mut history = canonical_own.into_owned();
         history.take_issues_from(&picks)?;
         Ok(PortableHistoryCarry {
             history,
@@ -717,7 +758,8 @@ impl SqliteStorage {
         &mut self,
         incoming: &PortableHistorySnapshot,
     ) -> Result<PortableHistoryReplay> {
-        validate(incoming)?;
+        let canonical = canonical_snapshot(incoming)?;
+        let incoming = canonical.as_ref();
         let ids = incoming.issues.keys().cloned().collect::<HashSet<_>>();
         self.with_write_transaction(|storage| {
             let local = storage.snapshot_portable_history(Some(&ids))?;
@@ -869,6 +911,194 @@ mod tests {
     use super::*;
     use crate::model::{Issue, Status};
     use crate::storage::{EventAttribution, IssueUpdate};
+
+    fn gate_source() -> (SqliteStorage, crate::close_policy::Workflow) {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let workflow: crate::close_policy::Workflow = serde_yml::from_str(
+            "strict: true\ngates:\n  'in_progress -> closed':\n    require_all: [validation]\ngate_policies:\n  validation:\n    allowed_reporters: [verifier, lead]\n    forbid_self_approval: true\n    override_reporters: [lead]\n",
+        ).unwrap();
+        storage.set_workflow_policy(workflow.clone());
+        let issue = Issue {
+            id: "bd-portable-gate".to_owned(),
+            title: "Portable independent verification".to_owned(),
+            assignee: Some("worker".to_owned()),
+            ..Issue::default()
+        };
+        storage.create_issue(&issue, "worker").unwrap();
+        storage
+            .update_issue(
+                &issue.id,
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "worker",
+            )
+            .unwrap();
+        let revision = storage.status_revision(&issue.id).unwrap();
+        let failed = storage
+            .record_scoped_gate_result(
+                &issue.id,
+                "in_progress",
+                revision,
+                "closed",
+                "validation",
+                "verifier",
+                false,
+                Some("original failure"),
+                "verifier",
+                None,
+            )
+            .unwrap();
+        storage
+            .record_scoped_gate_result(
+                &issue.id,
+                "in_progress",
+                revision,
+                "closed",
+                "validation",
+                "lead",
+                true,
+                Some("independent override evidence"),
+                "lead",
+                Some(&crate::close_policy::GateOverride {
+                    expected_history_id: failed.id,
+                    reason: "failure reviewed and explicitly accepted".to_owned(),
+                }),
+            )
+            .unwrap();
+        (storage, workflow)
+    }
+
+    #[test]
+    fn portable_gate_evidence_preserves_independence_and_override_across_id_remapping() {
+        let (source, workflow) = gate_source();
+        let issue = source.get_issue("bd-portable-gate").unwrap().unwrap();
+        let original = source.get_gate_result_history(&issue.id).unwrap();
+        let snapshot = source.all_portable_history().unwrap();
+        let mut target = SqliteStorage::open_memory().unwrap();
+        target
+            .create_issue(
+                &Issue {
+                    id: "bd-existing".to_owned(),
+                    title: "Shift local event sequence".to_owned(),
+                    ..Issue::default()
+                },
+                "other",
+            )
+            .unwrap();
+        target.upsert_issue_for_import(&issue).unwrap();
+        target.set_workflow_policy(workflow.clone());
+        let replay = target.restore_portable_history(&snapshot).unwrap();
+        assert_eq!(replay.replayed, [issue.id.clone()]);
+        let restored = target
+            .get_scoped_gate_result_history(&issue.id, "in_progress", "closed")
+            .unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_ne!(restored[0].status_revision, original[0].status_revision);
+        assert_eq!(
+            restored[0].status_revision,
+            target.status_revision(&issue.id).unwrap()
+        );
+        for (restored, original) in restored.iter().zip(&original) {
+            assert_eq!(restored.recorded_by, original.recorded_by);
+            assert_eq!(restored.assignee_at_report, original.assignee_at_report);
+            assert_eq!(restored.override_reason, original.override_reason);
+            assert_eq!(restored.note, original.note);
+            assert_eq!(restored.passed, original.passed);
+        }
+        let state = crate::close_policy::protected_gate_state(
+            workflow.gate_policy("validation").unwrap(),
+            "validation",
+            &restored,
+            &["worker"],
+        );
+        assert!(!state.unresolved_failure);
+        assert_eq!(state.passing_reporters, ["lead"]);
+        target
+            .update_issue(
+                &issue.id,
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "worker",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_portable_gate_columns_remain_unknown_and_do_not_invent_override_authority() {
+        let (source, workflow) = gate_source();
+        let issue = source.get_issue("bd-portable-gate").unwrap().unwrap();
+        let mut legacy = source.all_portable_history().unwrap();
+        let table = legacy
+            .tables
+            .iter_mut()
+            .find(|table| table.table == "gate_result_history")
+            .unwrap();
+        table.columns.truncate(11);
+        for row in &mut table.rows {
+            row.truncate(11);
+        }
+        validate(&legacy).unwrap();
+        let original_bytes = serde_json::to_vec(&legacy).unwrap();
+        let mut target = SqliteStorage::open_memory().unwrap();
+        target.upsert_issue_for_import(&issue).unwrap();
+        target.set_workflow_policy(workflow.clone());
+        target.restore_portable_history(&legacy).unwrap();
+        let restored = target
+            .get_scoped_gate_result_history(&issue.id, "in_progress", "closed")
+            .unwrap();
+        assert_eq!(restored.len(), 2);
+        assert!(
+            restored
+                .iter()
+                .all(|record| record.assignee_at_report.is_none()
+                    && record.override_reason.is_none())
+        );
+        let state = crate::close_policy::protected_gate_state(
+            workflow.gate_policy("validation").unwrap(),
+            "validation",
+            &restored,
+            &["worker"],
+        );
+        assert!(state.unresolved_failure);
+        assert!(state.passing_reporters.is_empty());
+        assert!(
+            target
+                .update_issue(
+                    &issue.id,
+                    &IssueUpdate {
+                        status: Some(Status::Closed),
+                        ..IssueUpdate::default()
+                    },
+                    "worker"
+                )
+                .is_err()
+        );
+        let current = target.all_portable_history().unwrap();
+        let selected = PortableHistorySnapshot::select(&[&legacy], &current.issues).unwrap();
+        assert_eq!(selected.history, current);
+        assert!(
+            current
+                .carry_forward(&[&legacy])
+                .unwrap()
+                .diverged
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::to_vec(&legacy).unwrap(),
+            original_bytes,
+            "compatibility normalization must not change the bytes covered by an old checkpoint checksum"
+        );
+        let mut malformed = current;
+        malformed.tables[1].columns.truncate(12);
+        assert!(
+            validate(&malformed).is_err(),
+            "only the exact released and current shapes are supported"
+        );
+    }
 
     fn closure_source() -> SqliteStorage {
         let mut storage = SqliteStorage::open_memory().unwrap();

@@ -2131,7 +2131,7 @@ pub struct GateReportArgs {
     #[arg(long)]
     pub gate: String,
 
-    /// Reporting provider (e.g. ci, security, reviewer:alice)
+    /// Declared provider (e.g. ci, security, reviewer:alice)
     #[arg(long)]
     pub provider: String,
 
@@ -2148,6 +2148,14 @@ pub struct GateReportArgs {
     /// Optional free-form note recorded with the result
     #[arg(long)]
     pub note: Option<String>,
+
+    /// Explicitly override a failure after reviewing this latest scoped history ID
+    #[arg(long, value_name = "HISTORY_ID", value_parser = clap::value_parser!(i64).range(1..), requires = "override_reason")]
+    pub override_failure: Option<i64>,
+
+    /// Non-empty rationale for an authorized failure override
+    #[arg(long, value_name = "TEXT", requires = "override_failure")]
+    pub override_reason: Option<String>,
 
     /// Emit machine-readable JSON
     #[arg(long)]
@@ -4001,6 +4009,54 @@ mod tests {
     use tempfile::TempDir;
 
     const CLI_REFERENCE: &str = include_str!("../../docs/CLI_REFERENCE.md");
+
+    #[test]
+    fn gate_override_flags_require_a_positive_history_id_and_reason() {
+        let base = [
+            "br",
+            "gate",
+            "report",
+            "bd-602",
+            "--gate",
+            "validation",
+            "--provider",
+            "lead",
+            "--status",
+            "pass",
+        ];
+        for suffix in [
+            vec!["--override-failure", "42"],
+            vec!["--override-reason", "Reviewed"],
+        ] {
+            let args: Vec<_> = base.into_iter().chain(suffix).collect();
+            let error = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+        let invalid: Vec<_> = base
+            .into_iter()
+            .chain(["--override-failure", "0", "--override-reason", "Reviewed"])
+            .collect();
+        assert_eq!(
+            Cli::try_parse_from(invalid).unwrap_err().kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        let valid: Vec<_> = base
+            .into_iter()
+            .chain(["--override-failure", "42", "--override-reason", "Reviewed"])
+            .collect();
+        let cli = Cli::try_parse_from(valid).unwrap();
+        let Commands::Gate {
+            command: super::GateCommands::Report(args),
+        } = cli.command
+        else {
+            panic!("expected gate report");
+        };
+        assert_eq!(args.override_failure, Some(42));
+        assert_eq!(args.override_reason.as_deref(), Some("Reviewed"));
+    }
 
     /// GitHub #516: clap turns every `///` paragraph on a subcommand variant
     /// into `--help` text, so implementation notes about the `Commands` enum

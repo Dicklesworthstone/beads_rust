@@ -238,6 +238,12 @@ pub struct Workflow {
     /// block behave exactly as before layer 2.
     #[serde(default)]
     pub gates: std::collections::BTreeMap<String, GateRule>,
+    /// Optional reporter restrictions for named gates, including
+    /// `min_reviewers`. Presence opts a gate into provider/actor binding and
+    /// failure protection. These checks use declared CLI identities, not
+    /// authenticated principals. Non-empty policies require `strict: true`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub gate_policies: std::collections::BTreeMap<String, GateReporterPolicy>,
     /// Fields that must be supplied or satisfied for a status transition
     /// (GitHub #388). Keys may be an exact `"from -> to"` transition or a
     /// bare target status that applies to every transition entering that
@@ -837,6 +843,125 @@ pub struct GateRule {
     pub require_if: Vec<ConditionalGate>,
 }
 
+/// Opt-in authorization of declared gate reporters (GitHub #602).
+///
+/// A provider is bound to the same actor name unless `provider_reporters`
+/// explicitly maps that provider to permitted actors. Every configured gate
+/// retains a failed verdict until a new status revision or an explicit,
+/// authorized override. Unknown fields are errors so a misspelled restriction
+/// cannot silently become permissive.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GateReporterPolicy {
+    /// Absent permits any declared actor; an explicit empty list permits none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_reporters: Option<Vec<String>>,
+    /// Refuse PASS from the assignee at report or transition time.
+    pub forbid_self_approval: bool,
+    /// Explicit provider-to-actor bindings. An empty binding permits nobody.
+    pub provider_reporters: std::collections::BTreeMap<String, Vec<String>>,
+    /// Actors allowed to override a failed gate. Ordinary reporter and
+    /// independence requirements still apply. Empty disables overrides.
+    pub override_reporters: Vec<String>,
+}
+
+/// An explicit override of the gate history the operator inspected.
+/// The expected id is checked transactionally; the reason is retained on the
+/// append-only verdict. The preceding verdict remains in the same history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateOverride {
+    pub expected_history_id: i64,
+    pub reason: String,
+}
+
+fn same_declared_identity(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+impl GateReporterPolicy {
+    /// Validate one report against declared identities. This is deliberately
+    /// not authentication: `--actor`, actor configuration, and `$USER` can all
+    /// be chosen by the local caller.
+    ///
+    /// # Errors
+    /// Returns a policy violation for a missing/unauthorized actor, an
+    /// unbound provider, or a prohibited self-approval.
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_report(
+        &self,
+        issue_id: &str,
+        gate: &str,
+        provider: &str,
+        passed: bool,
+        actor: &str,
+        assignees: &[&str],
+    ) -> Result<()> {
+        let reason = if actor.trim().is_empty() || same_declared_identity(actor, "unknown") {
+            Some("a non-empty declared reporter identity is required")
+        } else if self.allowed_reporters.as_ref().is_some_and(|allowed| {
+            !allowed
+                .iter()
+                .any(|name| same_declared_identity(name, actor))
+        }) {
+            Some("the declared actor is not an allowed reporter")
+        } else if !self.provider_allowed(provider, actor) {
+            Some("the provider is not bound to the declared actor")
+        } else if passed
+            && self.forbid_self_approval
+            && assignees
+                .iter()
+                .any(|assignee| same_declared_identity(assignee, actor))
+        {
+            Some("the issue assignee cannot approve their own work")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            let message = format!(
+                "gate '{gate}' report for {issue_id} refused: {reason} (declared actor '{actor}', provider '{provider}')"
+            );
+            return Err(BeadsError::PolicyViolation {
+                issue_id: issue_id.to_owned(),
+                summary: message.clone(),
+                violations: vec![PolicyViolation {
+                    gate: format!("gate_{gate}"),
+                    message,
+                    detail: Some(serde_json::json!({
+                        "reason": "reporter_authorization",
+                        "gate": gate,
+                        "recorded_by": actor,
+                        "provider": provider,
+                        "identity_kind": "declared",
+                    })),
+                }],
+            });
+        }
+        Ok(())
+    }
+
+    fn provider_allowed(&self, provider: &str, actor: &str) -> bool {
+        self.provider_reporters
+            .iter()
+            .find(|(name, _)| same_declared_identity(name, provider))
+            .map_or_else(
+                || same_declared_identity(provider, actor),
+                |(_, reporters)| {
+                    reporters
+                        .iter()
+                        .any(|reporter| same_declared_identity(reporter, actor))
+                },
+            )
+    }
+
+    /// Whether the declared actor may request an explicit failed-gate override.
+    #[must_use]
+    pub fn override_allowed(&self, actor: &str) -> bool {
+        self.override_reporters
+            .iter()
+            .any(|reporter| same_declared_identity(reporter, actor))
+    }
+}
+
 /// A field that workflow policy may require for a status transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1000,6 +1125,102 @@ pub struct GateResultRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_by: Option<String>,
     pub recorded_at: String,
+    /// Assignee snapshot at report time. `None` denotes legacy evidence whose
+    /// assignee is unknown; an empty string denotes a known unassigned issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_at_report: Option<String>,
+    /// Explicit, authorized failure override rationale. Never inferred from
+    /// free-form `note` text. Earlier failed records remain in the history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_reason: Option<String>,
+}
+
+/// Replay outcome for one protected gate in an exact transition/revision scope.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ProtectedGateState {
+    pub unresolved_failure: bool,
+    pub latest_history_id: Option<i64>,
+    /// Distinct normalized declared actors, never provider aliases.
+    pub passing_reporters: Vec<String>,
+}
+
+/// Replay complete scoped history under the current reporter policy.
+///
+/// A FAIL remains blocking even when a later historical/imported PASS would
+/// have overwritten its provider slot. Only an authorized typed override can
+/// clear it. Invalid PASS evidence is retained in history but has no authority.
+/// Callers supply a single issue/from/to/status-revision scope.
+#[must_use]
+pub fn protected_gate_state(
+    policy: &GateReporterPolicy,
+    gate: &str,
+    records: &[GateResultRecord],
+    assignees: &[&str],
+) -> ProtectedGateState {
+    let mut scoped = records
+        .iter()
+        .filter(|record| same_declared_identity(&record.gate, gate))
+        .collect::<Vec<_>>();
+    scoped.sort_unstable_by_key(|record| record.id);
+    let mut state = ProtectedGateState::default();
+    let mut passing = std::collections::BTreeMap::new();
+    for record in scoped {
+        state.latest_history_id = Some(record.id);
+        if !record.passed {
+            // Historical failures are conservative barriers, even when their
+            // attribution is incomplete. Policy changes must not erase FAIL.
+            state.unresolved_failure = true;
+            passing.clear();
+            continue;
+        }
+        let Some(actor) = record.recorded_by.as_deref() else {
+            continue;
+        };
+        if policy.forbid_self_approval && record.assignee_at_report.is_none() {
+            // Old records cannot establish who owned the work when approved.
+            // Require fresh evidence rather than guessing at independence.
+            continue;
+        }
+        let report_assignees = assignees
+            .iter()
+            .copied()
+            .chain(record.assignee_at_report.as_deref())
+            .collect::<Vec<_>>();
+        if policy
+            .validate_report(
+                &record.issue_id,
+                gate,
+                &record.provider,
+                true,
+                actor,
+                &report_assignees,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        if let Some(reason) = record.override_reason.as_deref() {
+            if reason.trim().is_empty()
+                || !state.unresolved_failure
+                || !policy.override_allowed(actor)
+            {
+                continue;
+            }
+            state.unresolved_failure = false;
+        } else if state.unresolved_failure {
+            continue;
+        }
+        passing.insert(
+            record.provider.trim().to_ascii_lowercase(),
+            actor.trim().to_ascii_lowercase(),
+        );
+    }
+    state.passing_reporters = passing
+        .into_values()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    state
 }
 
 /// The latest capacity-exemption state for one `(issue, capacity)` pair
@@ -1056,6 +1277,66 @@ pub struct CapacityExemptionHistoryRecord {
 }
 
 impl Workflow {
+    /// Reporter policy for a gate, using the same canonical name matching as
+    /// workflow gate requirements.
+    #[must_use]
+    pub fn gate_policy(&self, gate: &str) -> Option<&GateReporterPolicy> {
+        self.gate_policies
+            .iter()
+            .find_map(|(name, policy)| same_declared_identity(name, gate).then_some(policy))
+    }
+
+    /// Validate opt-in reporter restrictions before they can be used.
+    ///
+    /// # Errors
+    /// Returns a configuration error for advisory-only enforcement, an
+    /// unknown/ambiguous gate name, or empty/ambiguous declared identities.
+    pub fn validate_gate_policies(&self) -> Result<()> {
+        if self.gate_policies.is_empty() {
+            return Ok(());
+        }
+        if !self.strict {
+            return Err(BeadsError::Config(
+                "workflow.gate_policies requires workflow.strict: true".to_owned(),
+            ));
+        }
+        let mut gates = std::collections::BTreeSet::new();
+        for (gate, policy) in &self.gate_policies {
+            let canonical = gate.trim().to_ascii_lowercase();
+            if canonical.is_empty() || !gates.insert(canonical) {
+                return Err(BeadsError::Config(format!(
+                    "workflow.gate_policies has an empty or duplicate gate name '{gate}'"
+                )));
+            }
+            if !self.gates.values().any(|rule| {
+                rule.require_all
+                    .iter()
+                    .chain(rule.require_if.iter().map(|condition| &condition.gate))
+                    .any(|spec| same_declared_identity(spec.id(), gate))
+            }) {
+                return Err(BeadsError::Config(format!(
+                    "workflow.gate_policies.{gate} must name a gate required by workflow.gates"
+                )));
+            }
+            if let Some(reporters) = &policy.allowed_reporters {
+                validate_reporter_names(gate, "allowed_reporters", reporters)?;
+            }
+            validate_reporter_names(gate, "override_reporters", &policy.override_reporters)?;
+            let mut providers = std::collections::BTreeSet::new();
+            for (provider, reporters) in &policy.provider_reporters {
+                if provider.trim().is_empty()
+                    || !providers.insert(provider.trim().to_ascii_lowercase())
+                {
+                    return Err(BeadsError::Config(format!(
+                        "workflow.gate_policies.{gate}.provider_reporters has an empty or duplicate provider '{provider}'"
+                    )));
+                }
+                validate_reporter_names(gate, "provider_reporters", reporters)?;
+            }
+        }
+        Ok(())
+    }
+
     /// True when gate enforcement is configured: `strict` is on *and* at least
     /// one `"from -> to"` gate rule is listed. Enforcement short-circuits on
     /// `false`, so projects with no `gates:` block are unaffected.
@@ -1213,6 +1494,19 @@ impl Workflow {
         }
         Ok(())
     }
+}
+
+fn validate_reporter_names(gate: &str, field: &str, reporters: &[String]) -> Result<()> {
+    let mut names = std::collections::BTreeSet::new();
+    for reporter in reporters {
+        let name = reporter.trim().to_ascii_lowercase();
+        if name.is_empty() || name == "unknown" || !names.insert(name) {
+            return Err(BeadsError::Config(format!(
+                "workflow.gate_policies.{gate}.{field} has an empty, unknown, or duplicate reporter '{reporter}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Evaluate policy-required fields against the prospective issue state and
@@ -1406,6 +1700,23 @@ pub fn evaluate_gates(
     let required = workflow.required_gates_for(from, to, labels, priority);
     let mut violations = Vec::new();
     for spec in &required {
+        if workflow.gate_policy(spec.id()).is_some() {
+            // This legacy projection deliberately has no actor or complete
+            // history. It must never authorize a protected gate.
+            violations.push(PolicyViolation {
+                gate: format!("gate_{}", spec.id()),
+                message: format!(
+                    "gate '{}' for {issue_id} requires complete reporter history",
+                    spec.id()
+                ),
+                detail: Some(serde_json::json!({
+                    "reason": "reporter_history_required",
+                    "gate": spec.id(),
+                    "identity_kind": "declared",
+                })),
+            });
+            continue;
+        }
         match spec {
             GateSpec::Named(name) => {
                 let passed = gate_spec_satisfied(spec, results);
@@ -1467,6 +1778,97 @@ pub fn evaluate_gates(
                 }
             }
         }
+    }
+    violations
+}
+
+/// Evaluate complete history for the current status revision under the
+/// current reporter policy. Callers must select that revision transactionally;
+/// records for other issues or transition endpoints are ignored defensively.
+/// Unprotected gates retain the existing latest-provider behavior.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_scoped_gates(
+    workflow: &Workflow,
+    issue_id: &str,
+    from: &str,
+    to: &str,
+    labels: &[String],
+    priority: i32,
+    records: &[GateResultRecord],
+    assignees: &[&str],
+) -> Vec<PolicyViolation> {
+    let mut scoped = records
+        .iter()
+        .filter(|record| {
+            record.issue_id == issue_id
+                && record.from_status.eq_ignore_ascii_case(from)
+                && record.to_status.eq_ignore_ascii_case(to)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    scoped.sort_unstable_by_key(|record| record.id);
+    let mut latest = std::collections::BTreeMap::new();
+    for record in &scoped {
+        latest.insert(
+            (
+                record.gate.to_ascii_lowercase(),
+                record.provider.to_ascii_lowercase(),
+            ),
+            GateResult {
+                gate: record.gate.clone(),
+                provider: record.provider.clone(),
+                passed: record.passed,
+                note: record.note.clone(),
+            },
+        );
+    }
+    let projected = latest.into_values().collect::<Vec<_>>();
+    let mut violations = evaluate_gates(workflow, issue_id, from, to, labels, priority, &projected);
+    for spec in workflow.required_gates_for(from, to, labels, priority) {
+        let Some(policy) = workflow.gate_policy(spec.id()) else {
+            continue;
+        };
+        let key = format!("gate_{}", spec.id());
+        violations.retain(|violation| violation.gate != key);
+        let state = protected_gate_state(policy, spec.id(), &scoped, assignees);
+        let required = match &spec {
+            GateSpec::Named(_) => 1,
+            GateSpec::MinReviewers(count) => *count,
+        };
+        let actual = u32::try_from(state.passing_reporters.len()).unwrap_or(u32::MAX);
+        if !state.unresolved_failure && actual >= required {
+            continue;
+        }
+        let reason = if state.unresolved_failure {
+            "unresolved_gate_failure"
+        } else {
+            "independent_verification_required"
+        };
+        let explanation = if state.unresolved_failure {
+            "a failed verification requires rework at a new status revision or an authorized explicit override".to_owned()
+        } else {
+            format!("requires {required} authorized independent reporter(s), but has {actual}")
+        };
+        violations.push(PolicyViolation {
+            gate: key,
+            message: format!(
+                "transition '{from}' -> '{to}' is blocked for {issue_id}: gate '{}' {explanation}",
+                spec.id()
+            ),
+            detail: Some(serde_json::json!({
+                "reason": reason,
+                "issue_id": issue_id,
+                "gate": spec.id(),
+                "from": from,
+                "to": to,
+                "required": required,
+                "actual": actual,
+                "reporters": state.passing_reporters,
+                "latest_history_id": state.latest_history_id,
+                "identity_kind": "declared",
+            })),
+        });
     }
     violations
 }
@@ -3038,6 +3440,7 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
     document.workflow.validate_required_fields()?;
     document.workflow.validate_class_transitions()?;
     document.workflow.validate_entry_routes()?;
+    document.workflow.validate_gate_policies()?;
 
     // Re-parse the raw YAML into a free-form value tree so we can diff it
     // against the typed schema and surface unknown fields without failing
@@ -3199,6 +3602,8 @@ impl PolicyNode {
                 // silently drops the gate; descend so it is reported (GH #515).
                 // `GateSpec` itself rejects unknown map keys at parse time.
                 ("gates", Self::Gates),
+                // Reporter policies reject unknown nested restriction keys.
+                ("gate_policies", Self::Scalar),
                 ("required_fields", Self::Scalar),
                 ("status_groups", Self::StatusGroups),
                 // Capacity owns a strict typed schema with
@@ -6423,5 +6828,484 @@ workflow:
 "#;
         let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
         assert!(detect_unknown_policy_fields(&raw).is_empty());
+    }
+
+    fn independent_gate_workflow() -> Workflow {
+        Workflow {
+            strict: true,
+            gates: std::collections::BTreeMap::from([(
+                "in_review -> closed".to_owned(),
+                GateRule {
+                    require_all: vec![GateSpec::Named("independent_validation".to_owned())],
+                    ..Default::default()
+                },
+            )]),
+            gate_policies: std::collections::BTreeMap::from([(
+                "independent_validation".to_owned(),
+                GateReporterPolicy {
+                    allowed_reporters: Some(
+                        ["worker", "alice", "bob", "lead"]
+                            .map(str::to_owned)
+                            .to_vec(),
+                    ),
+                    forbid_self_approval: true,
+                    override_reporters: vec!["lead".to_owned()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    fn independent_gate_record(
+        id: i64,
+        provider: &str,
+        actor: &str,
+        passed: bool,
+    ) -> GateResultRecord {
+        GateResultRecord {
+            id,
+            issue_id: "bd-602".to_owned(),
+            from_status: "in_review".to_owned(),
+            to_status: "closed".to_owned(),
+            status_revision: 7,
+            gate: "independent_validation".to_owned(),
+            provider: provider.to_owned(),
+            passed,
+            note: None,
+            recorded_by: Some(actor.to_owned()),
+            recorded_at: "2026-11-12T00:00:00Z".to_owned(),
+            assignee_at_report: Some("worker".to_owned()),
+            override_reason: None,
+        }
+    }
+
+    #[test]
+    fn gate_policies_parse_and_validation_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let document = |restriction: &str| {
+            format!(
+                "workflow:\n  strict: true\n  gates:\n    \"in_review -> closed\":\n      require_all: [independent_validation]\n  gate_policies:\n    independent_validation:\n      {restriction}\n"
+            )
+        };
+        for invalid in [
+            "forbid_self_aproval: true",
+            "allowed_reporters: alice",
+            "forbid_self_approval: [true]",
+            "provider_reporters: {ci: alice}",
+            "override_reporters: {alice: true}",
+        ] {
+            fs::write(temp.path().join(POLICY_FILE_NAME), document(invalid)).unwrap();
+            assert!(load_for_beads_dir(temp.path()).is_err(), "{invalid}");
+        }
+        let valid = document("allowed_reporters: []");
+        fs::write(temp.path().join(POLICY_FILE_NAME), &valid).unwrap();
+        let loaded = load_for_beads_dir(temp.path()).unwrap();
+        assert_eq!(
+            loaded
+                .workflow
+                .gate_policy("independent_validation")
+                .unwrap()
+                .allowed_reporters,
+            Some(Vec::new())
+        );
+        let raw: serde_yml::Value = serde_yml::from_str(&valid).unwrap();
+        assert!(detect_unknown_policy_fields(&raw).is_empty());
+        fs::write(
+            temp.path().join(POLICY_FILE_NAME),
+            valid.replace("strict: true", "strict: false"),
+        )
+        .unwrap();
+        assert!(load_for_beads_dir(temp.path()).is_err());
+
+        let base = independent_gate_workflow();
+        for reporters in [
+            vec!["Alice".to_owned(), " alice ".to_owned()],
+            vec!["unknown".to_owned()],
+            vec![" ".to_owned()],
+        ] {
+            let mut invalid = base.clone();
+            invalid
+                .gate_policies
+                .get_mut("independent_validation")
+                .unwrap()
+                .allowed_reporters = Some(reporters);
+            assert!(invalid.validate_gate_policies().is_err());
+        }
+        let mut duplicate_provider = base.clone();
+        duplicate_provider
+            .gate_policies
+            .get_mut("independent_validation")
+            .unwrap()
+            .provider_reporters = std::collections::BTreeMap::from([
+            ("CI".to_owned(), vec!["alice".to_owned()]),
+            (" ci ".to_owned(), vec!["bob".to_owned()]),
+        ]);
+        assert!(duplicate_provider.validate_gate_policies().is_err());
+        let mut invalid_override = base.clone();
+        invalid_override
+            .gate_policies
+            .get_mut("independent_validation")
+            .unwrap()
+            .override_reporters = vec!["UNKNOWN".to_owned()];
+        assert!(invalid_override.validate_gate_policies().is_err());
+        let mut orphan = base.clone();
+        orphan
+            .gate_policies
+            .insert("not_required".to_owned(), GateReporterPolicy::default());
+        assert!(orphan.validate_gate_policies().is_err());
+        let mut duplicate_gate = base;
+        duplicate_gate.gate_policies.insert(
+            " INDEPENDENT_VALIDATION ".to_owned(),
+            GateReporterPolicy::default(),
+        );
+        assert!(duplicate_gate.validate_gate_policies().is_err());
+    }
+
+    #[test]
+    fn gate_report_authorization_binds_provider_and_denies_explicit_empty_list() {
+        let mut policy = GateReporterPolicy::default();
+        assert!(
+            policy
+                .validate_report("bd-602", "validation", " Alice ", true, "ALICE", &[])
+                .is_ok()
+        );
+        assert!(
+            policy
+                .validate_report("bd-602", "validation", "alice", true, "bob", &[])
+                .is_err()
+        );
+        for unknown in ["", "  ", "unknown", " UnKnOwN "] {
+            assert!(
+                policy
+                    .validate_report("bd-602", "validation", unknown, true, unknown, &[])
+                    .is_err()
+            );
+        }
+        policy
+            .provider_reporters
+            .insert("CI".to_owned(), vec!["Alice".to_owned()]);
+        assert!(
+            policy
+                .validate_report("bd-602", "validation", " ci ", true, " alice ", &[])
+                .is_ok()
+        );
+        assert!(
+            policy
+                .validate_report("bd-602", "validation", "ci", false, "bob", &[])
+                .is_err()
+        );
+        policy
+            .provider_reporters
+            .insert("disabled".to_owned(), Vec::new());
+        assert!(
+            policy
+                .validate_report("bd-602", "validation", "disabled", true, "disabled", &[])
+                .is_err()
+        );
+        policy.allowed_reporters = Some(vec!["bob".to_owned()]);
+        assert!(
+            policy
+                .validate_report("bd-602", "validation", "ci", true, "alice", &[])
+                .is_err()
+        );
+        assert!(
+            policy
+                .validate_report("bd-602", "validation", "bob", true, "bob", &[])
+                .is_ok()
+        );
+        policy.allowed_reporters = Some(Vec::new());
+        for passed in [false, true] {
+            assert!(
+                policy
+                    .validate_report("bd-602", "validation", "bob", passed, "bob", &[])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn gate_self_approval_checks_current_prospective_and_recorded_assignees() {
+        let policy = GateReporterPolicy {
+            forbid_self_approval: true,
+            ..Default::default()
+        };
+        assert!(
+            policy
+                .validate_report("bd-602", "validation", "alice", true, " ALICE ", &["alice"])
+                .is_err()
+        );
+        assert!(
+            policy
+                .validate_report("bd-602", "validation", "alice", false, "ALICE", &["alice"])
+                .is_ok()
+        );
+        let mut approval = independent_gate_record(1, "alice", "Alice", true);
+        let state = |record: &GateResultRecord, assignees: &[&str]| {
+            protected_gate_state(
+                &policy,
+                "independent_validation",
+                std::slice::from_ref(record),
+                assignees,
+            )
+        };
+        assert_eq!(
+            state(&approval, &["worker"]).passing_reporters,
+            vec!["alice"]
+        );
+        assert!(state(&approval, &[" ALICE "]).passing_reporters.is_empty());
+        assert!(
+            state(&approval, &["worker", "ALICE"])
+                .passing_reporters
+                .is_empty()
+        );
+        approval.assignee_at_report = Some(" aLiCe ".to_owned());
+        assert!(state(&approval, &["worker"]).passing_reporters.is_empty());
+        approval.assignee_at_report = None;
+        assert!(state(&approval, &["worker"]).passing_reporters.is_empty());
+        approval.assignee_at_report = Some(String::new());
+        assert_eq!(state(&approval, &[]).passing_reporters, vec!["alice"]);
+    }
+
+    #[test]
+    fn gate_identity_free_results_cannot_satisfy_protected_policy() {
+        let mut workflow = independent_gate_workflow();
+        let results = vec![GateResult {
+            gate: "independent_validation".to_owned(),
+            provider: "alice".to_owned(),
+            passed: true,
+            note: None,
+        }];
+        let violations =
+            evaluate_gates(&workflow, "bd-602", "in_review", "closed", &[], 2, &results);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].gate, "gate_independent_validation");
+        assert_eq!(
+            violations[0].detail.as_ref().unwrap()["reason"],
+            "reporter_history_required"
+        );
+        workflow.gate_policies.clear();
+        assert!(
+            evaluate_gates(&workflow, "bd-602", "in_review", "closed", &[], 2, &results).is_empty()
+        );
+    }
+
+    #[test]
+    fn gate_failure_survives_impersonation_provider_switch_and_forged_note() {
+        let workflow = independent_gate_workflow();
+        let policy = workflow.gate_policy("independent_validation").unwrap();
+        let failure = independent_gate_record(1, "alice", "alice", false);
+        let mut forged_note = independent_gate_record(5, "lead", "lead", true);
+        forged_note.note = Some("override-failure: 1; authorized override".to_owned());
+        let mut unauthorized_override = independent_gate_record(6, "bob", "bob", true);
+        unauthorized_override.override_reason = Some("I approve".to_owned());
+        let mut empty_override = independent_gate_record(7, "lead", "lead", true);
+        empty_override.override_reason = Some("  ".to_owned());
+        let mut history = vec![
+            failure,
+            independent_gate_record(2, "alice", "bob", true),
+            independent_gate_record(3, "bob", "bob", true),
+            independent_gate_record(4, "alice", "alice", true),
+            forged_note,
+            unauthorized_override,
+            empty_override,
+        ];
+        let state = protected_gate_state(policy, "independent_validation", &history, &["worker"]);
+        assert!(state.unresolved_failure);
+        assert!(state.passing_reporters.is_empty());
+        assert_eq!(state.latest_history_id, Some(7));
+        history.reverse();
+        assert_eq!(
+            protected_gate_state(policy, "independent_validation", &history, &["worker"]),
+            state
+        );
+        assert!(
+            !evaluate_scoped_gates(
+                &workflow,
+                "bd-602",
+                "in_review",
+                "closed",
+                &[],
+                2,
+                &history,
+                &["worker"],
+            )
+            .is_empty()
+        );
+        let mut legacy_failure = independent_gate_record(1, "legacy", "unknown", false);
+        legacy_failure.recorded_by = None;
+        let legacy = [
+            legacy_failure,
+            independent_gate_record(2, "alice", "alice", true),
+        ];
+        assert!(
+            protected_gate_state(policy, "independent_validation", &legacy, &["worker"])
+                .unresolved_failure
+        );
+    }
+
+    #[test]
+    fn gate_override_replay_rechecks_authority_and_later_failures() {
+        let workflow = independent_gate_workflow();
+        let policy = workflow.gate_policy("independent_validation").unwrap();
+        let failure = independent_gate_record(1, "alice", "alice", false);
+        let mut approval = independent_gate_record(2, "lead", "LEAD", true);
+        approval.override_reason = Some("Independent review of false negative".to_owned());
+        let mut history = vec![failure, approval.clone()];
+        let state = protected_gate_state(policy, "independent_validation", &history, &["worker"]);
+        assert!(!state.unresolved_failure);
+        assert_eq!(state.passing_reporters, vec!["lead"]);
+        assert!(
+            protected_gate_state(
+                policy,
+                "independent_validation",
+                std::slice::from_ref(&approval),
+                &["worker"],
+            )
+            .passing_reporters
+            .is_empty(),
+            "an override without its failed history is not ordinary approval"
+        );
+        let mut revoked = policy.clone();
+        revoked.override_reporters.clear();
+        assert!(
+            protected_gate_state(&revoked, "independent_validation", &history, &["worker"])
+                .unresolved_failure
+        );
+        revoked = policy.clone();
+        revoked.allowed_reporters = Some(vec!["alice".to_owned(), "bob".to_owned()]);
+        assert!(
+            protected_gate_state(&revoked, "independent_validation", &history, &["worker"])
+                .unresolved_failure
+        );
+        revoked = policy.clone();
+        revoked
+            .provider_reporters
+            .insert("lead".to_owned(), vec!["bob".to_owned()]);
+        assert!(
+            protected_gate_state(&revoked, "independent_validation", &history, &["worker"])
+                .unresolved_failure
+        );
+        assert!(
+            protected_gate_state(policy, "independent_validation", &history, &[" Lead "])
+                .unresolved_failure
+        );
+        history.push(independent_gate_record(3, "bob", "bob", false));
+        history.push(independent_gate_record(4, "lead", "lead", true));
+        assert!(
+            protected_gate_state(policy, "independent_validation", &history, &["worker"])
+                .unresolved_failure
+        );
+        approval.id = 5;
+        approval.override_reason = Some("Reviewed the later failure".to_owned());
+        history.push(approval);
+        assert!(
+            !protected_gate_state(policy, "independent_validation", &history, &["worker"])
+                .unresolved_failure
+        );
+    }
+
+    #[test]
+    fn gate_protected_min_reviewers_counts_actors_on_the_exact_gate() {
+        let mut workflow = independent_gate_workflow();
+        workflow
+            .gates
+            .get_mut("in_review -> closed")
+            .unwrap()
+            .require_all = vec![GateSpec::MinReviewers(2)];
+        let mut policy = workflow
+            .gate_policies
+            .remove("independent_validation")
+            .unwrap();
+        policy.provider_reporters = std::collections::BTreeMap::from([
+            ("reviewer:first".to_owned(), vec!["alice".to_owned()]),
+            ("reviewer:alias".to_owned(), vec!["alice".to_owned()]),
+        ]);
+        workflow
+            .gate_policies
+            .insert("min_reviewers".to_owned(), policy);
+        let review = |id, provider, actor| {
+            let mut record = independent_gate_record(id, provider, actor, true);
+            record.gate = "min_reviewers".to_owned();
+            record
+        };
+        let mut records = vec![
+            review(1, "reviewer:first", "alice"),
+            review(2, "reviewer:alias", "ALICE"),
+            independent_gate_record(3, "bob", "bob", true),
+            review(4, "charlie", "charlie"),
+        ];
+        assert!(
+            !evaluate_scoped_gates(
+                &workflow,
+                "bd-602",
+                "in_review",
+                "closed",
+                &[],
+                2,
+                &records,
+                &["worker"],
+            )
+            .is_empty()
+        );
+        records.push(review(5, "bob", "bob"));
+        assert!(
+            evaluate_scoped_gates(
+                &workflow,
+                "bd-602",
+                "in_review",
+                "closed",
+                &[],
+                2,
+                &records,
+                &["worker"],
+            )
+            .is_empty(),
+            "the default provider binding must work without a reviewer prefix"
+        );
+        let state = protected_gate_state(
+            workflow.gate_policy("min_reviewers").unwrap(),
+            "min_reviewers",
+            &records,
+            &["worker"],
+        );
+        assert_eq!(state.passing_reporters, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn gate_scoped_evaluation_rejects_unattributed_legacy_or_other_scope_evidence() {
+        let workflow = independent_gate_workflow();
+        let approval = independent_gate_record(1, "alice", "alice", true);
+        let evaluate = |record: &GateResultRecord| {
+            evaluate_scoped_gates(
+                &workflow,
+                "bd-602",
+                "in_review",
+                "closed",
+                &[],
+                2,
+                std::slice::from_ref(record),
+                &["worker"],
+            )
+        };
+        assert!(evaluate(&approval).is_empty());
+        for mismatch in [
+            "reporter", "unknown", "snapshot", "issue", "source", "target",
+        ] {
+            let mut invalid = approval.clone();
+            match mismatch {
+                "reporter" => invalid.recorded_by = None,
+                "unknown" => invalid.recorded_by = Some("unknown".to_owned()),
+                "snapshot" => invalid.assignee_at_report = None,
+                "issue" => invalid.issue_id = "bd-other".to_owned(),
+                "source" => invalid.from_status = "open".to_owned(),
+                "target" => invalid.to_status = "archived".to_owned(),
+                _ => unreachable!(),
+            }
+            assert!(
+                !evaluate(&invalid).is_empty(),
+                "{mismatch} must not authorize closure"
+            );
+        }
     }
 }

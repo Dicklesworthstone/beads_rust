@@ -4807,8 +4807,9 @@ impl SqliteStorage {
     ///
     /// # Errors
     ///
-    /// Returns an error if the issue is missing or the database write fails.
-    #[allow(clippy::too_many_arguments)]
+    /// Returns an error if the scope changed, configured reporter restrictions
+    /// or failure/override rules reject the report, or the database write fails.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn record_scoped_gate_result(
         &self,
         issue_id: &str,
@@ -4820,10 +4821,12 @@ impl SqliteStorage {
         passed: bool,
         note: Option<&str>,
         recorded_by: &str,
+        gate_override: Option<&crate::close_policy::GateOverride>,
     ) -> Result<crate::close_policy::GateResultRecord> {
         let to_status = to_status.trim().to_ascii_lowercase();
         let gate = gate.trim();
         let provider = provider.trim();
+        let recorded_by = recorded_by.trim();
         if to_status.is_empty() {
             return Err(BeadsError::validation(
                 "to",
@@ -4842,6 +4845,7 @@ impl SqliteStorage {
                 "gate provider must not be empty",
             ));
         }
+        self.workflow_transition_policy.validate_gate_policies()?;
         let mut recorded = None;
         self.with_connection_write_transaction(|conn| {
             let issue = Self::get_issue_from_conn(conn, issue_id)?.ok_or_else(|| {
@@ -4866,11 +4870,84 @@ impl SqliteStorage {
                 ));
             }
 
+            let assignee_at_report = issue.assignee.as_deref().unwrap_or_default();
+            let assignees = [assignee_at_report];
+            if let Some(policy) = self.workflow_transition_policy.gate_policy(gate) {
+                policy.validate_report(
+                    issue_id,
+                    gate,
+                    provider,
+                    passed,
+                    recorded_by,
+                    &assignees,
+                )?;
+                let history = Self::get_scoped_gate_result_history_in_tx(
+                    conn,
+                    issue_id,
+                    &from_status,
+                    &to_status,
+                    status_revision,
+                )?;
+                let state = crate::close_policy::protected_gate_state(
+                    policy,
+                    gate,
+                    &history,
+                    &assignees,
+                );
+                if let Some(gate_override) = gate_override {
+                    if !passed || gate_override.reason.trim().is_empty() {
+                        return Err(BeadsError::validation(
+                            "override_reason",
+                            "a gate override requires PASS and a non-empty reason",
+                        ));
+                    }
+                    if !policy.override_allowed(recorded_by) {
+                        return Err(gate_report_policy_error(
+                            issue_id,
+                            gate,
+                            "override_not_authorized",
+                            "the declared actor is not authorized to override this gate",
+                        ));
+                    }
+                    if state.latest_history_id != Some(gate_override.expected_history_id) {
+                        return Err(gate_report_policy_error(
+                            issue_id,
+                            gate,
+                            "stale_gate_override",
+                            "the gate history changed after the override was prepared; inspect the current history before retrying",
+                        ));
+                    }
+                    if !state.unresolved_failure {
+                        return Err(gate_report_policy_error(
+                            issue_id,
+                            gate,
+                            "no_failed_gate_to_override",
+                            "the current gate has no unresolved failure to override",
+                        ));
+                    }
+                } else if passed && state.unresolved_failure {
+                    return Err(gate_report_policy_error(
+                        issue_id,
+                        gate,
+                        "unresolved_gate_failure",
+                        "a failed verification remains at this status revision; complete a rework transition or request an authorized override with a reason",
+                    ));
+                }
+            } else if gate_override.is_some() {
+                return Err(gate_report_policy_error(
+                    issue_id,
+                    gate,
+                    "override_not_configured",
+                    "this gate has no reporter policy authorizing overrides",
+                ));
+            }
+
             conn.execute_with_params(
                 "INSERT INTO gate_result_history (
                     issue_id, from_status, to_status, status_revision, gate,
-                    provider, passed, note, recorded_by, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    provider, passed, note, recorded_by, recorded_at,
+                    assignee_at_report, override_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(from_status.as_str()),
@@ -4881,6 +4958,10 @@ impl SqliteStorage {
                     SqliteValue::from(i64::from(passed)),
                     note.map_or(SqliteValue::Null, SqliteValue::from),
                     SqliteValue::from(recorded_by),
+                    SqliteValue::from(assignee_at_report),
+                    gate_override.map_or(SqliteValue::Null, |value| {
+                        SqliteValue::from(value.reason.trim())
+                    }),
                 ],
             )?;
             let row = conn.query_row("SELECT last_insert_rowid()")?;
@@ -4894,7 +4975,8 @@ impl SqliteStorage {
                 })?;
             let rows = conn.query_with_params(
                 "SELECT id, issue_id, from_status, to_status, status_revision,
-                        gate, provider, passed, note, recorded_by, recorded_at
+                        gate, provider, passed, note, recorded_by, recorded_at,
+                        assignee_at_report, override_reason
                  FROM gate_result_history WHERE id = ?",
                 &[SqliteValue::from(id)],
             )?;
@@ -4924,6 +5006,9 @@ impl SqliteStorage {
                     SqliteValue::from(recorded_by),
                 ],
             )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('needs_flush', 'true')",
+            )?;
             Ok(())
         })?;
         recorded.ok_or_else(|| {
@@ -4952,6 +5037,54 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn status_revision(&self, issue_id: &str) -> Result<i64> {
         Self::status_revision_in_tx(&self.conn, issue_id)
+    }
+
+    /// Return every verdict for the exact current transition attempt, including
+    /// reporter identity, assignee snapshot, and explicit override evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_scoped_gate_result_history(
+        &self,
+        issue_id: &str,
+        from_status: &str,
+        to_status: &str,
+    ) -> Result<Vec<crate::close_policy::GateResultRecord>> {
+        Self::get_scoped_gate_result_history_in_tx(
+            &self.conn,
+            issue_id,
+            from_status,
+            to_status,
+            self.status_revision(issue_id)?,
+        )
+    }
+
+    fn get_scoped_gate_result_history_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        from_status: &str,
+        to_status: &str,
+        status_revision: i64,
+    ) -> Result<Vec<crate::close_policy::GateResultRecord>> {
+        if !crate::storage::schema::table_exists(conn, "gate_result_history") {
+            return Ok(Vec::new());
+        }
+        let rows = conn.query_with_params(
+            "SELECT id, issue_id, from_status, to_status, status_revision,
+                    gate, provider, passed, note, recorded_by, recorded_at,
+                    assignee_at_report, override_reason
+             FROM gate_result_history
+             WHERE issue_id = ? AND from_status = ? AND to_status = ?
+               AND status_revision = ? ORDER BY id ASC",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(from_status.trim().to_ascii_lowercase()),
+                SqliteValue::from(to_status.trim().to_ascii_lowercase()),
+                SqliteValue::from(status_revision),
+            ],
+        )?;
+        rows.iter().map(gate_result_record_from_row).collect()
     }
 
     /// Return the latest verdict from each `(gate, provider)` for an exact
@@ -5103,7 +5236,8 @@ impl SqliteStorage {
         }
         let rows = self.conn.query_with_params(
             "SELECT id, issue_id, from_status, to_status, status_revision,
-                    gate, provider, passed, note, recorded_by, recorded_at
+                        gate, provider, passed, note, recorded_by, recorded_at,
+                        assignee_at_report, override_reason
              FROM gate_result_history WHERE issue_id = ? ORDER BY id ASC",
             &[SqliteValue::from(issue_id)],
         )?;
@@ -7867,6 +8001,7 @@ impl SqliteStorage {
         workflow: &crate::close_policy::Workflow,
         updates: &[(String, IssueUpdate)],
     ) -> Result<()> {
+        workflow.validate_gate_policies()?;
         for (id, update) in updates {
             let Some(to_status) = update.status.as_ref() else {
                 if update.transition_comment.is_some()
@@ -7962,16 +8097,37 @@ impl SqliteStorage {
                 }
                 let priority = update.priority.map_or(issue.priority.0, |value| value.0);
                 let status_revision = Self::status_revision_in_tx(conn, id)?;
-                let results =
-                    Self::get_scoped_gate_results_in_tx(conn, id, from, to, status_revision)?;
+                let history = Self::get_scoped_gate_result_history_in_tx(
+                    conn,
+                    id,
+                    from,
+                    to,
+                    status_revision,
+                )?;
+                // A simultaneous reassignment cannot turn an assignee's own
+                // approval into independent verification for this transition.
+                let prospective_assignee = update
+                    .assignee
+                    .as_ref()
+                    .map(|value| value.as_deref())
+                    .unwrap_or(issue.assignee.as_deref());
+                let assignees = [issue.assignee.as_deref(), prospective_assignee]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
                 let required_gates = workflow.required_gates_for(from, to, &labels, priority);
-                let mut gate_violations = crate::close_policy::evaluate_gates(
-                    workflow, id, from, to, &labels, priority, &results,
+                let mut gate_violations = crate::close_policy::evaluate_scoped_gates(
+                    workflow, id, from, to, &labels, priority, &history, &assignees,
                 );
                 for violation in &mut gate_violations {
                     let Some(gate_id) = violation.gate.strip_prefix("gate_") else {
                         continue;
                     };
+                    // This legacy stale-pass diagnostic has no identity
+                    // context. Never use it to describe protected evidence.
+                    if workflow.gate_policy(gate_id).is_some() {
+                        continue;
+                    }
                     let Some(spec) = required_gates
                         .iter()
                         .find(|spec| spec.id().eq_ignore_ascii_case(gate_id))
@@ -23869,6 +24025,18 @@ fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &st
     Ok(comment_id)
 }
 
+fn gate_report_policy_error(issue_id: &str, gate: &str, reason: &str, message: &str) -> BeadsError {
+    BeadsError::PolicyViolation {
+        issue_id: issue_id.to_owned(),
+        summary: message.to_owned(),
+        violations: vec![crate::close_policy::PolicyViolation {
+            gate: format!("gate_{gate}"),
+            message: message.to_owned(),
+            detail: Some(serde_json::json!({ "reason": reason, "gate": gate })),
+        }],
+    }
+}
+
 fn gate_result_record_from_row(row: &Row) -> Result<crate::close_policy::GateResultRecord> {
     let required_text = |index: usize, name: &str| {
         row.get(index)
@@ -23900,6 +24068,8 @@ fn gate_result_record_from_row(row: &Row) -> Result<crate::close_policy::GateRes
         note: row.get(8).and_then(SqliteValue::as_text).map(String::from),
         recorded_by: row.get(9).and_then(SqliteValue::as_text).map(String::from),
         recorded_at: required_text(10, "recorded_at")?,
+        assignee_at_report: row.get(11).and_then(SqliteValue::as_text).map(String::from),
+        override_reason: row.get(12).and_then(SqliteValue::as_text).map(String::from),
     })
 }
 
@@ -26456,6 +26626,7 @@ required_fields:
                 true,
                 Some("cycle one"),
                 "ci-bot",
+                None,
             )
             .unwrap();
         assert_eq!(first.status_revision, 0);
@@ -26523,6 +26694,7 @@ required_fields:
                 true,
                 Some("raced stale report"),
                 "ci-bot",
+                None,
             )
             .unwrap_err();
         assert!(stale_report.to_string().contains("retry"));
@@ -26544,6 +26716,7 @@ required_fields:
                 true,
                 Some("cycle two"),
                 "ci-bot",
+                None,
             )
             .unwrap();
         assert!(second.status_revision > first.status_revision);
@@ -26586,6 +26759,276 @@ required_fields:
             Some("cycle two"),
             "a re-report must overwrite the mirror row with the latest verdict"
         );
+    }
+
+    fn independent_validation_workflow() -> crate::close_policy::Workflow {
+        serde_yml::from_str(
+            "strict: true\ngates:\n  'in_progress -> closed':\n    require_all: [validation]\ngate_policies:\n  validation:\n    allowed_reporters: [worker, verifier, other, lead]\n    forbid_self_approval: true\n    override_reporters: [lead]\n",
+        )
+        .unwrap()
+    }
+
+    fn independent_validation_storage() -> SqliteStorage {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(independent_validation_workflow());
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-independent",
+                    "Independent validation",
+                    Status::InProgress,
+                    2,
+                    Some("worker"),
+                    Utc::now(),
+                    None,
+                ),
+                "creator",
+            )
+            .unwrap();
+        storage
+    }
+
+    #[test]
+    fn gate_report_authorization_refuses_without_audit_or_mirror_mutation() {
+        let storage = independent_validation_storage();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        for (provider, actor) in [
+            ("worker", "worker"),
+            ("verifier", "other"),
+            ("stranger", "stranger"),
+        ] {
+            let error = storage
+                .record_scoped_gate_result(
+                    "bd-independent",
+                    "in_progress",
+                    0,
+                    "closed",
+                    "validation",
+                    provider,
+                    true,
+                    None,
+                    actor,
+                    None,
+                )
+                .unwrap_err();
+            assert!(matches!(error, BeadsError::PolicyViolation { .. }));
+        }
+        assert!(
+            storage
+                .get_gate_result_history("bd-independent")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .get_legacy_gate_results("bd-independent")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("false")
+        );
+        let report = storage
+            .record_scoped_gate_result(
+                "bd-independent",
+                "in_progress",
+                0,
+                "closed",
+                "validation",
+                "verifier",
+                true,
+                None,
+                "verifier",
+                None,
+            )
+            .unwrap();
+        assert_eq!(report.assignee_at_report.as_deref(), Some("worker"));
+        assert!(report.override_reason.is_none());
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn gate_failure_override_is_explicit_audited_and_compare_and_set() {
+        let mut storage = independent_validation_storage();
+        let failed = storage
+            .record_scoped_gate_result(
+                "bd-independent",
+                "in_progress",
+                0,
+                "closed",
+                "validation",
+                "verifier",
+                false,
+                Some("test failed"),
+                "verifier",
+                None,
+            )
+            .unwrap();
+        for actor in ["verifier", "other", "lead"] {
+            assert!(matches!(
+                storage.record_scoped_gate_result(
+                    "bd-independent",
+                    "in_progress",
+                    0,
+                    "closed",
+                    "validation",
+                    actor,
+                    true,
+                    None,
+                    actor,
+                    None,
+                ),
+                Err(BeadsError::PolicyViolation { .. })
+            ));
+        }
+        let newer = storage
+            .record_scoped_gate_result(
+                "bd-independent",
+                "in_progress",
+                0,
+                "closed",
+                "validation",
+                "other",
+                false,
+                Some("second failure"),
+                "other",
+                None,
+            )
+            .unwrap();
+        let stale = crate::close_policy::GateOverride {
+            expected_history_id: failed.id,
+            reason: "reviewed original failure".to_owned(),
+        };
+        let error = storage
+            .record_scoped_gate_result(
+                "bd-independent",
+                "in_progress",
+                0,
+                "closed",
+                "validation",
+                "lead",
+                true,
+                None,
+                "lead",
+                Some(&stale),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("history changed"));
+        let fresh = crate::close_policy::GateOverride {
+            expected_history_id: newer.id,
+            reason: "both failures independently investigated".to_owned(),
+        };
+        assert!(
+            storage
+                .record_scoped_gate_result(
+                    "bd-independent",
+                    "in_progress",
+                    0,
+                    "closed",
+                    "validation",
+                    "other",
+                    true,
+                    None,
+                    "other",
+                    Some(&fresh),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            storage.get_gate_result_history("bd-independent").unwrap(),
+            [failed.clone(), newer.clone()]
+        );
+        let overridden = storage
+            .record_scoped_gate_result(
+                "bd-independent",
+                "in_progress",
+                0,
+                "closed",
+                "validation",
+                "lead",
+                true,
+                Some("override evidence"),
+                "lead",
+                Some(&fresh),
+            )
+            .unwrap();
+        assert_eq!(
+            overridden.override_reason.as_deref(),
+            Some(fresh.reason.as_str())
+        );
+        assert_eq!(overridden.recorded_by.as_deref(), Some("lead"));
+        assert_eq!(
+            storage.get_gate_result_history("bd-independent").unwrap(),
+            [failed, newer, overridden]
+        );
+        let closed = storage
+            .update_issue(
+                "bd-independent",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "worker",
+            )
+            .unwrap();
+        assert_eq!(closed.status, Status::Closed);
+    }
+
+    #[test]
+    fn gate_transition_rechecks_prospective_assignee_and_preserves_refused_update() {
+        let mut storage = independent_validation_storage();
+        storage
+            .record_scoped_gate_result(
+                "bd-independent",
+                "in_progress",
+                0,
+                "closed",
+                "validation",
+                "verifier",
+                true,
+                None,
+                "verifier",
+                None,
+            )
+            .unwrap();
+        let before = storage.get_issue("bd-independent").unwrap().unwrap();
+        let events_before = storage.get_events("bd-independent", 0).unwrap();
+        let error = storage
+            .update_issue(
+                "bd-independent",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    assignee: Some(Some("verifier".to_owned())),
+                    ..IssueUpdate::default()
+                },
+                "worker",
+            )
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::PolicyViolation { .. }));
+        assert_eq!(
+            storage.get_issue("bd-independent").unwrap().unwrap(),
+            before
+        );
+        assert_eq!(
+            storage.get_events("bd-independent", 0).unwrap(),
+            events_before
+        );
+        storage
+            .update_issue(
+                "bd-independent",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    assignee: Some(Some("other".to_owned())),
+                    ..IssueUpdate::default()
+                },
+                "worker",
+            )
+            .unwrap();
     }
 
     #[test]
@@ -32072,6 +32515,7 @@ required_fields:
                 storage
                     .record_scoped_gate_result(
                         &issue.id, "open", 0, "closed", "review", "review", true, None, "reviewer",
+                        None,
                     )
                     .unwrap();
                 if !seeded {

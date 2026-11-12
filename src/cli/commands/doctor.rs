@@ -743,9 +743,14 @@ fn emit_refused_unsafe(
 /// mode repair. Unsupported readable declarations are not corruption. A
 /// failed inspection remains an error, not a compatible-layout verdict or
 /// authorization to rebuild; the separate recovery gates still apply.
+enum DoctorSchemaRepairInspection {
+    VersionUpgrade { from_version: u32 },
+    Current(CurrentSchemaRepairInspection),
+}
+
 fn current_schema_layout_before_repair(
     db_path: &Path,
-) -> Result<Option<CurrentSchemaRepairInspection>> {
+) -> Result<Option<DoctorSchemaRepairInspection>> {
     let metadata = match fs::symlink_metadata(db_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -756,13 +761,45 @@ fn current_schema_layout_before_repair(
     }
     config::with_database_family_snapshot(db_path, |snapshot| {
         let conn = Connection::open(snapshot.to_string_lossy().into_owned())?;
-        let inspection = inspect_current_schema_for_repair(&conn);
+        let inspection = (|| {
+            let version = conn
+                .query_row("PRAGMA user_version")?
+                .get(0)
+                .and_then(SqliteValue::as_integer);
+            if version == Some(19) {
+                // Schema 19 was the previous current version. Refusing its
+                // ordinary opener must not turn readable authoritative
+                // history into a generic JSONL-reconstruction candidate.
+                conn.query("SELECT name FROM sqlite_schema")?;
+                Ok(DoctorSchemaRepairInspection::VersionUpgrade { from_version: 19 })
+            } else {
+                inspect_current_schema_for_repair(&conn).map(DoctorSchemaRepairInspection::Current)
+            }
+        })();
         if let Err(error) = conn.close() {
             // A private-copy close failure cannot erase positive evidence
             // that the source contains an unsupported authoritative layout.
             tracing::debug!(%error, "doctor layout inspection snapshot close failed");
         }
         inspection.map(Some)
+    })
+}
+
+fn schema_version_upgrade_in_report(report: &DoctorReport) -> Option<u32> {
+    report.checks.iter().find_map(|check| {
+        if check.name != "schema.runtime" || check.status != CheckStatus::Error {
+            return None;
+        }
+        let details = check.details.as_ref()?;
+        (details
+            .get("user_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(19)
+            && details
+                .get("layout_classification")
+                .and_then(serde_json::Value::as_str)
+                == Some("schema_version_upgrade"))
+        .then_some(19)
     })
 }
 
@@ -774,11 +811,10 @@ fn reviewed_runtime_upgrade_in_report(
             return None;
         }
         let details = check.details.as_ref()?;
-        if details
+        let version = details
             .get("user_version")
-            .and_then(serde_json::Value::as_u64)
-            != Some(19)
-        {
+            .and_then(serde_json::Value::as_i64);
+        if version != Some(19) && version != Some(i64::from(CURRENT_SCHEMA_VERSION)) {
             return None;
         }
         serde_json::from_value::<ReviewedRuntimeSchemaUpgrade>(
@@ -914,17 +950,25 @@ fn repair_current_schema_under_write_authority(
 
 fn verify_current_schema_maintenance_completed(db_path: &Path) -> Result<()> {
     match current_schema_layout_before_repair(db_path)? {
-        Some(CurrentSchemaRepairInspection::Compatible) => Ok(()),
-        Some(CurrentSchemaRepairInspection::Unsupported { reason }) => {
-            Err(BeadsError::Config(reason))
+        Some(DoctorSchemaRepairInspection::Current(CurrentSchemaRepairInspection::Compatible)) => {
+            Ok(())
         }
-        Some(CurrentSchemaRepairInspection::MaintenanceRequired) => Err(BeadsError::Config(
+        Some(DoctorSchemaRepairInspection::Current(
+            CurrentSchemaRepairInspection::Unsupported { reason },
+        )) => Err(BeadsError::Config(reason)),
+        Some(DoctorSchemaRepairInspection::Current(
+            CurrentSchemaRepairInspection::MaintenanceRequired,
+        )) => Err(BeadsError::Config(
             "the database still requires current-schema maintenance".to_owned(),
         )),
-        Some(CurrentSchemaRepairInspection::ReviewedUpgrade(_)) => Err(BeadsError::Config(
+        Some(DoctorSchemaRepairInspection::Current(
+            CurrentSchemaRepairInspection::ReviewedUpgrade(_),
+        )) => Err(BeadsError::Config(
             "the database now requires a separately reviewed release-layout upgrade".to_owned(),
         )),
-        Some(CurrentSchemaRepairInspection::NotCurrent) | None => Err(BeadsError::Config(
+        Some(DoctorSchemaRepairInspection::VersionUpgrade { .. })
+        | Some(DoctorSchemaRepairInspection::Current(CurrentSchemaRepairInspection::NotCurrent))
+        | None => Err(BeadsError::Config(
             "the database is absent or no longer declares the inspected current schema".to_owned(),
         )),
     }
@@ -964,7 +1008,7 @@ fn refuse_doctor_repair_for_runtime_upgrade(
     dry_run: bool,
     ctx: &OutputContext,
 ) -> ! {
-    let reason = "this schema-19 database requires the reviewed v0.7.6 runtime layout upgrade. \
+    let reason = "this database requires the reviewed runtime layout additions. \
                   Generic doctor repair cannot preserve all database-only records through \
                   JSONL reconstruction. Run `br doctor migrate-schema plan --json` to inspect \
                   the lossless upgrade, then `br doctor migrate-schema heal` or apply the \
@@ -979,6 +1023,35 @@ fn refuse_doctor_repair_for_runtime_upgrade(
         "heal_command": "br doctor migrate-schema heal",
     });
     emit_refused_unsafe("--repair", reason, &evidence, ctx);
+    crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
+}
+
+fn refuse_doctor_repair_for_schema_version_upgrade(
+    db_path: &Path,
+    from_version: u32,
+    dry_run: bool,
+    ctx: &OutputContext,
+) -> ! {
+    let reason = format!(
+        "this schema-{from_version} database requires the reviewed migration to schema \
+         {CURRENT_SCHEMA_VERSION}. Generic doctor repair cannot preserve all database-only \
+         records through JSONL reconstruction. Run `br doctor migrate-schema plan --json` \
+         to inspect the lossless migration, then `br doctor migrate-schema heal` or apply \
+         the reviewed plan token. No repair writes were applied"
+    );
+    let evidence = serde_json::json!({
+        "gate": "schema_version_upgrade",
+        "finding": "schema.runtime",
+        "database_path": db_path.display().to_string(),
+        "dry_run": dry_run,
+        "user_version": from_version,
+        "target_version": CURRENT_SCHEMA_VERSION,
+        "runtime_compatible": false,
+        "layout_classification": "schema_version_upgrade",
+        "recommended_fix": "br doctor migrate-schema plan --json",
+        "heal_command": "br doctor migrate-schema heal",
+    });
+    emit_refused_unsafe("--repair", &reason, &evidence, ctx);
     crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
 }
 
@@ -4042,11 +4115,19 @@ fn build_issue_write_probe_check(
 /// database recovery path and all of its other preconditions unchanged.
 fn refuse_known_current_layout_jsonl_rebuild(db_path: &Path) -> Result<()> {
     let reason = match current_schema_layout_before_repair(db_path) {
-        Ok(Some(CurrentSchemaRepairInspection::Unsupported { reason })) => Some(reason),
-        Ok(Some(CurrentSchemaRepairInspection::ReviewedUpgrade(_))) => {
-            Some("the source requires the explicit reviewed release-layout upgrade".to_owned())
-        }
-        Ok(Some(CurrentSchemaRepairInspection::MaintenanceRequired)) => Some(
+        Ok(Some(DoctorSchemaRepairInspection::VersionUpgrade { from_version })) => Some(format!(
+            "the source requires reviewed schema migration from {from_version} to \
+             {CURRENT_SCHEMA_VERSION}; run `br doctor migrate-schema plan --json`"
+        )),
+        Ok(Some(DoctorSchemaRepairInspection::Current(
+            CurrentSchemaRepairInspection::Unsupported { reason },
+        ))) => Some(reason),
+        Ok(Some(DoctorSchemaRepairInspection::Current(
+            CurrentSchemaRepairInspection::ReviewedUpgrade(_),
+        ))) => Some("the source requires the explicit reviewed release-layout upgrade".to_owned()),
+        Ok(Some(DoctorSchemaRepairInspection::Current(
+            CurrentSchemaRepairInspection::MaintenanceRequired,
+        ))) => Some(
             "the source requires dedicated current-schema index or derived-cache maintenance"
                 .to_owned(),
         ),
@@ -4061,7 +4142,7 @@ fn refuse_known_current_layout_jsonl_rebuild(db_path: &Path) -> Result<()> {
     };
     if let Some(reason) = reason {
         return Err(BeadsError::Config(format!(
-            "Refusing JSONL reconstruction of a readable current-schema source: {reason}. \
+            "Refusing JSONL reconstruction of a readable versioned-schema source: {reason}. \
              Preserve the original database; generic reconstruction cannot preserve its \
              authoritative state"
         )));
@@ -5294,7 +5375,24 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
         .query_row("PRAGMA user_version")?
         .get(0)
         .and_then(SqliteValue::as_integer);
-    if version == Some(i64::from(CURRENT_SCHEMA_VERSION)) {
+    if version == Some(19) {
+        push_check(
+            checks,
+            "schema.runtime",
+            CheckStatus::Error,
+            Some(format!(
+                "Schema 19 requires reviewed migration to schema {CURRENT_SCHEMA_VERSION}"
+            )),
+            Some(serde_json::json!({
+                "user_version": 19,
+                "target_version": CURRENT_SCHEMA_VERSION,
+                "runtime_compatible": false,
+                "layout_classification": "schema_version_upgrade",
+                "recommended_fix": "br doctor migrate-schema plan --json",
+                "heal_command": "br doctor migrate-schema heal",
+            })),
+        );
+    } else if version == Some(i64::from(CURRENT_SCHEMA_VERSION)) {
         match inspect_current_schema_for_repair(conn) {
             Ok(CurrentSchemaRepairInspection::Compatible) => {
                 push_check(checks, "schema.runtime", CheckStatus::Ok, None, None);
@@ -5303,7 +5401,9 @@ fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> R
                 checks,
                 "schema.runtime",
                 CheckStatus::Error,
-                Some("Schema 19 requires the reviewed v0.7.6 runtime layout upgrade".to_owned()),
+                Some(format!(
+                    "Schema {CURRENT_SCHEMA_VERSION} requires the reviewed runtime layout additions"
+                )),
                 Some(serde_json::json!({
                     "user_version": version,
                     "runtime_compatible": false,
@@ -15200,7 +15300,17 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             Ok(current_schema_layout_before_repair(&paths.db_path))
         })?;
         match inspected {
-            Ok(Some(CurrentSchemaRepairInspection::ReviewedUpgrade(upgrade))) => {
+            Ok(Some(DoctorSchemaRepairInspection::VersionUpgrade { from_version })) => {
+                refuse_doctor_repair_for_schema_version_upgrade(
+                    &paths.db_path,
+                    from_version,
+                    args.dry_run,
+                    ctx,
+                );
+            }
+            Ok(Some(DoctorSchemaRepairInspection::Current(
+                CurrentSchemaRepairInspection::ReviewedUpgrade(upgrade),
+            ))) => {
                 refuse_doctor_repair_for_runtime_upgrade(
                     &paths.db_path,
                     upgrade,
@@ -15208,7 +15318,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     ctx,
                 );
             }
-            Ok(Some(CurrentSchemaRepairInspection::Unsupported { reason })) => {
+            Ok(Some(DoctorSchemaRepairInspection::Current(
+                CurrentSchemaRepairInspection::Unsupported { reason },
+            ))) => {
                 refuse_doctor_repair_for_unsupported_current_layout(
                     &paths.db_path,
                     &reason,
@@ -15216,7 +15328,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     ctx,
                 );
             }
-            Ok(Some(CurrentSchemaRepairInspection::MaintenanceRequired)) => {
+            Ok(Some(DoctorSchemaRepairInspection::Current(
+                CurrentSchemaRepairInspection::MaintenanceRequired,
+            ))) => {
                 if !fixer_filter.allows(FM_CURRENT_SCHEMA_MAINTENANCE) {
                     refuse_doctor_repair_for_current_maintenance(
                         &paths.db_path,
@@ -15304,6 +15418,11 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     // Repeat against the report snapshot before generic repair planning.
+    if args.repair
+        && let Some(version) = schema_version_upgrade_in_report(&initial.report)
+    {
+        refuse_doctor_repair_for_schema_version_upgrade(&paths.db_path, version, args.dry_run, ctx);
+    }
     if args.repair
         && let Some(upgrade) = reviewed_runtime_upgrade_in_report(&initial.report)
     {
@@ -16662,7 +16781,8 @@ fn repair_dry_run_candidates(
 ) -> Vec<crate::cli::commands::doctor_subsystems::capabilities_doctor::FixerEntry> {
     use crate::cli::commands::doctor_subsystems::capabilities_doctor::DoctorCapabilities;
 
-    if reviewed_runtime_upgrade_in_report(report).is_some()
+    if schema_version_upgrade_in_report(report).is_some()
+        || reviewed_runtime_upgrade_in_report(report).is_some()
         || unsupported_current_layout_in_report(report).is_some()
         || pending_sync_merge_in_report(report).is_some()
     {
@@ -27583,9 +27703,9 @@ mod tests {
             incompatible.checks.push(CheckResult {
                 name: "schema.runtime".to_string(),
                 status: CheckStatus::Error,
-                message: Some("reviewed schema-19 runtime upgrade required".to_string()),
+                message: Some("reviewed runtime layout additions required".to_string()),
                 details: Some(serde_json::json!({
-                    "user_version": 19,
+                    "user_version": CURRENT_SCHEMA_VERSION,
                     "schema19_runtime_upgrade": upgrade,
                 })),
             });
@@ -27615,6 +27735,55 @@ mod tests {
                 .any(|fixer| fixer.id == "doctor.repair_database_from_jsonl"),
             "a failed inspection is not positive unsupported-layout evidence"
         );
+    }
+
+    #[test]
+    fn released_schema19_requires_migration_before_generic_repair() {
+        let tmp = TempDir::new().unwrap();
+        let (beads_dir, _, mut report) = make_doctor_fixture(tmp.path());
+        let db_path = beads_dir.join("beads.db");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/schema_migration/schema19_v076_release.db.gz");
+        let mut decoder = flate2::read::GzDecoder::new(fs::File::open(fixture).unwrap());
+        let mut original = Vec::new();
+        decoder.read_to_end(&mut original).unwrap();
+        fs::write(&db_path, &original).unwrap();
+
+        assert!(matches!(
+            current_schema_layout_before_repair(&db_path).unwrap(),
+            Some(DoctorSchemaRepairInspection::VersionUpgrade { from_version: 19 })
+        ));
+        let error = refuse_known_current_layout_jsonl_rebuild(&db_path).unwrap_err();
+        assert!(error.to_string().contains("migrate-schema plan"), "{error}");
+
+        config::with_database_family_snapshot(&db_path, |snapshot| {
+            let conn = Connection::open(snapshot.to_string_lossy().into_owned())?;
+            required_schema_checks(&conn, &mut report.checks)?;
+            conn.close()?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(schema_version_upgrade_in_report(&report), Some(19));
+        let runtime = report
+            .checks
+            .iter()
+            .find(|check| check.name == "schema.runtime")
+            .unwrap();
+        assert_eq!(runtime.status, CheckStatus::Error);
+        let details = runtime.details.as_ref().unwrap();
+        assert_eq!(details["target_version"], CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            details["recommended_fix"],
+            "br doctor migrate-schema plan --json"
+        );
+        let args = DoctorArgs {
+            repair: true,
+            dry_run: true,
+            unsafe_auto_fix: true,
+            ..DoctorArgs::default()
+        };
+        assert!(repair_dry_run_candidates(&beads_dir, &report, &args).is_empty());
+        assert_eq!(fs::read(&db_path).unwrap(), original);
     }
 
     #[test]

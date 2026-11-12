@@ -307,6 +307,10 @@ fn header_user_version(db_path: &Path) -> u32 {
     u32::from_be_bytes(bytes[60..64].try_into().expect("db header"))
 }
 
+fn current_schema_version() -> u32 {
+    u32::try_from(beads_rust::storage::schema::CURRENT_SCHEMA_VERSION).unwrap()
+}
+
 fn db_declares_table(db_path: &Path, table: &str) -> bool {
     // The sqlite_schema table stores the verbatim CREATE TABLE DDL (with or
     // without IF NOT EXISTS), so a raw byte scan is a connection-free
@@ -1041,6 +1045,21 @@ fn schema19_json(run: &BrRun) -> Value {
     serde_json::from_str(&run.stdout).expect("complete stdout must be JSON")
 }
 
+fn assert_gate_reporter_migration_defaults(db: &Path) {
+    let tables = engine_rows(db, None);
+    let (columns, records) = &tables["gate_result_history"];
+    for column in ["assignee_at_report", "override_reason"] {
+        let index = columns
+            .iter()
+            .position(|name| name == column)
+            .unwrap_or_else(|| panic!("migration must add {column}"));
+        assert!(
+            records.iter().all(|row| row[index] == "NULL"),
+            "historical evidence must not acquire an invented {column}"
+        );
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn released_schema19_plan_apply_undo_preserves_every_original_value() {
@@ -1076,10 +1095,6 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
     assert!(!stats.status.success(), "{}", stats.stdout);
     assert!(format!("{}{}", stats.stdout, stats.stderr).contains("migrate-schema"));
     assert_eq!(schema19_tracker_files(&beads), source_files);
-    let additions = serde_json::json!({
-        "jsonl_row_receipts_created": true,
-        "closed_by_column_added": true,
-    });
     let doctor = run_br(&workspace, ["doctor", "--json"], "release19_doctor");
     assert!(!doctor.status.success(), "{}", doctor.stdout);
     let inspection: Value = serde_json::from_str(&doctor.stdout).expect("doctor JSON");
@@ -1090,13 +1105,20 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
                 .iter()
                 .find(|check| check["name"] == "schema.runtime")
         })
-        .expect("doctor must diagnose the current-version layout");
+        .expect("doctor must diagnose the released schema version");
     assert_eq!(runtime["status"], "error");
-    assert_eq!(runtime["details"]["schema19_runtime_upgrade"], additions);
-    assert!(
-        runtime["details"]["downgrade"]
-            .as_str()
-            .is_some_and(|note| note.contains("v0.7.6"))
+    assert_eq!(runtime["details"]["user_version"], 19);
+    assert_eq!(
+        runtime["details"]["target_version"],
+        current_schema_version()
+    );
+    assert_eq!(
+        runtime["details"]["layout_classification"],
+        "schema_version_upgrade"
+    );
+    assert_eq!(
+        runtime["details"]["recommended_fix"],
+        "br doctor migrate-schema plan --json"
     );
     assert_eq!(schema19_tracker_files(&beads), source_files);
 
@@ -1108,7 +1130,7 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
     assert_eq!(heal["heal_needed"], true);
     assert_eq!(heal["migration_eligible"], true);
     assert_eq!(heal["from_version"], 19);
-    assert_eq!(heal["to_version"], 19);
+    assert_eq!(heal["to_version"], current_schema_version());
     assert!(
         heal["note"]
             .as_str()
@@ -1123,14 +1145,19 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
     ));
     assert_eq!(plan["eligible"], true);
     assert_eq!(plan["from_version"], 19);
-    assert_eq!(plan["to_version"], 19);
+    assert_eq!(plan["to_version"], current_schema_version());
     assert!(
         plan["note"]
             .as_str()
             .is_some_and(|note| note.contains("v0.7.6") && note.contains("not a safe downgrade"))
     );
-    assert_eq!(plan["forecast"]["schema19_runtime_upgrade"], additions);
-    assert_eq!(heal["schema19_runtime_upgrade"], additions);
+    assert!(plan["forecast"]["schema19_runtime_upgrade"].is_null());
+    assert_eq!(plan["forecast"]["gate_reporter_columns_added"], true);
+    assert_eq!(plan["forecast"]["dependency_type_key_added"], false);
+    assert_eq!(
+        heal["migration_plan"]["forecast"]["gate_reporter_columns_added"],
+        true
+    );
     assert_eq!(heal["plan_token"], plan["plan_token"]);
     assert_eq!(heal["migration_plan"], plan);
     assert_schema19_preservation_profile(&plan);
@@ -1148,9 +1175,11 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
         ],
         "release19_apply",
     ));
-    assert_eq!(applied["effects"]["schema19_runtime_upgrade"], additions);
-    assert_eq!(header_user_version(&db), 19);
+    assert!(applied["effects"]["schema19_runtime_upgrade"].is_null());
+    assert_eq!(applied["effects"]["gate_reporter_columns_added"], true);
+    assert_eq!(header_user_version(&db), current_schema_version());
     assert_eq!(schema19_authority_rows(&db, Some(&before)), before);
+    assert_gate_reporter_migration_defaults(&db);
     assert_eq!(schema19_operator_shape(&db), operator_shape);
     let catalog_after = engine_rows(&db, Some(&catalog_columns));
     for row in &catalog_before["sqlite_master"].1 {
@@ -1253,7 +1282,7 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
         "release19_plan_after_undo",
     ));
     assert_eq!(again["eligible"], true);
-    assert_eq!(again["forecast"]["schema19_runtime_upgrade"], additions);
+    assert_eq!(again["forecast"]["gate_reporter_columns_added"], true);
 }
 
 #[test]
@@ -1269,7 +1298,9 @@ fn released_schema19_explicit_heal_preserves_database_only_authority() {
         "release19_heal",
     ));
     assert_eq!(healed["action"], "migrated");
+    assert_eq!(header_user_version(&db), current_schema_version());
     assert_eq!(schema19_authority_rows(&db, Some(&before)), before);
+    assert_gate_reporter_migration_defaults(&db);
     assert_eq!(
         fs::read(workspace.root.join(".beads/issues.jsonl")).unwrap(),
         jsonl
@@ -1313,13 +1344,10 @@ fn released_schema19_partial_upgrades_only_add_the_missing_structure() {
             ["doctor", "migrate-schema", "plan", "--json"],
             &format!("release19_{name}_plan"),
         ));
-        assert_eq!(
-            plan["forecast"]["schema19_runtime_upgrade"],
-            serde_json::json!({
-                "jsonl_row_receipts_created": receipts_needed,
-                "closed_by_column_added": actor_needed,
-            })
-        );
+        assert_eq!(plan["from_version"], 19);
+        assert_eq!(plan["to_version"], current_schema_version());
+        assert!(plan["forecast"]["schema19_runtime_upgrade"].is_null());
+        assert_eq!(plan["forecast"]["gate_reporter_columns_added"], true);
         assert_schema19_preservation_profile(&plan);
         schema19_json(&run_br(
             &workspace,
@@ -1334,6 +1362,17 @@ fn released_schema19_partial_upgrades_only_add_the_missing_structure() {
             &format!("release19_{name}_apply"),
         ));
         assert_eq!(schema19_authority_rows(&db, Some(&before)), before);
+        assert_gate_reporter_migration_defaults(&db);
+        let after = engine_rows(&db, None);
+        assert_eq!(
+            after["jsonl_row_receipts"].1.len(),
+            usize::from(!receipts_needed)
+        );
+        if actor_needed {
+            let (columns, rows) = &after["close_metadata"];
+            let actor = columns.iter().position(|name| name == "closed_by").unwrap();
+            assert!(rows.iter().all(|row| row[actor] == "NULL"));
+        }
     }
 }
 
@@ -1509,6 +1548,12 @@ fn schema19_release_default_reads_preserve_upgrade_and_guarded_undo() {
         }));
         let plan = workflow_schema19_plan(&workspace);
         let applied = workflow_schema19_apply(&workspace, plan["plan_token"].as_str().unwrap());
+        assert_eq!(plan["from_version"], 19);
+        assert_eq!(plan["to_version"], current_schema_version());
+        assert_eq!(plan["forecast"]["gate_reporter_columns_added"], true);
+        assert_eq!(plan["forecast"]["dependency_type_key_added"], false);
+        assert_eq!(header_user_version(&db), current_schema_version());
+        assert_gate_reporter_migration_defaults(&db);
         let installed = schema19_tracker_files(&beads);
 
         // No sync opt-outs: even an unchanged v1 receipt used to promote a
@@ -1927,7 +1972,7 @@ fn schema19_workflows_heal_without_jsonl_preserves_history_and_repeats() {
     assert_eq!(preview["migration_eligible"], true);
     assert_eq!(preview["automatic_heal_allowed"], false);
     assert_eq!(preview["from_version"], 19);
-    assert_eq!(preview["to_version"], 19);
+    assert_eq!(preview["to_version"], current_schema_version());
     assert_eq!(preview["plan_token"], plan["plan_token"]);
     assert_eq!(preview["migration_plan"], plan);
     assert_schema19_preservation_profile(&plan);
@@ -1942,9 +1987,10 @@ fn schema19_workflows_heal_without_jsonl_preserves_history_and_repeats() {
     ));
     assert_eq!(healed["action"], "migrated");
     assert_eq!(healed["from_version"], 19);
-    assert_eq!(healed["to_version"], 19);
-    assert_eq!(header_user_version(&db), 19);
+    assert_eq!(healed["to_version"], current_schema_version());
+    assert_eq!(header_user_version(&db), current_schema_version());
     assert_eq!(engine_rows(&db, Some(&before)), before);
+    assert_gate_reporter_migration_defaults(&db);
     let backup = Path::new(healed["backup"].as_str().unwrap());
     assert_eq!(fs::read(backup.join("beads.db")).unwrap(), source);
     assert!(
@@ -2425,7 +2471,7 @@ fn schema19_preinstall_retry_case(recorded_failure: bool) {
     assert_eq!(restored["raw_restored"], marker["raw_before"]);
     assert_eq!(restored["logical_restored"], marker["logical_before"]);
     assert!(!run_dir.join("applied.json").exists());
-    assert_eq!(header_user_version(&db), 19);
+    assert_eq!(header_user_version(&db), current_schema_version());
     assert_eq!(engine_rows(&db, Some(&before)), before);
     assert_eq!(fs::read(run_dir.join("commit-ready.json")).unwrap(), intent);
     assert_eq!(fs::read(before_dir.join("beads.db")).unwrap(), original);
@@ -2522,7 +2568,13 @@ fn schema19_workflows_postinstall_resume_repeat_and_guarded_undo() {
 #[test]
 fn schema19_workflows_future_version_heal_refuses_without_mutation() {
     let workspace = workflow_schema19_workspace();
-    edit_schema19_fixture(&workspace, &["PRAGMA user_version = 20"]);
+    edit_schema19_fixture(
+        &workspace,
+        &[&format!(
+            "PRAGMA user_version = {}",
+            current_schema_version() + 1
+        )],
+    );
     let source = workflow_schema19_durable_files(&workspace);
     for args in [
         vec!["doctor", "migrate-schema", "plan", "--json"],
@@ -2544,12 +2596,12 @@ fn schema19_workflows_future_version_heal_refuses_without_mutation() {
 }
 
 /// Qualification against the real old executable; no network fetch occurs in
-/// the test. Both database layouts declare 19, so refusal must concern actual
-/// closure-table incompatibility, not a fabricated future-version header.
+/// the test. A genuine released schema 19 database is migrated to the current
+/// schema before exercising the released binary's future-version refusal.
 #[test]
 #[ignore = "requires BR_V076_BINARY pointing to the checksum-verified official Linux amd64 v0.7.6 release"]
 #[allow(clippy::too_many_lines)]
-fn official_v076_refuses_upgraded_schema19_layout_and_reads_guarded_undo() {
+fn official_v076_refuses_upgraded_schema_and_reads_guarded_undo() {
     use sha2::Digest;
     use std::fmt::Write as _;
 
@@ -2624,7 +2676,7 @@ fn official_v076_refuses_upgraded_schema19_layout_and_reads_guarded_undo() {
     let source = fs::read(&db).unwrap();
     let plan = workflow_schema19_plan(&workspace);
     let applied = workflow_schema19_apply(&workspace, plan["plan_token"].as_str().unwrap());
-    assert_eq!(header_user_version(&db), 19);
+    assert_eq!(header_user_version(&db), current_schema_version());
     let migrated = schema19_tracker_files(&beads);
     let migrated_records = workflow_schema19_authority(&db);
     let old = run_release_stats();
@@ -2634,12 +2686,13 @@ fn official_v076_refuses_upgraded_schema19_layout_and_reads_guarded_undo() {
         String::from_utf8_lossy(&old.stdout)
     );
     let refusal: Value = serde_json::from_slice(&old.stdout).unwrap();
-    assert_eq!(refusal["error"]["code"], "CONFIG_ERROR");
+    assert_eq!(refusal["error"]["code"], "SCHEMA_MISMATCH");
     assert!(
         refusal["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("close_metadata")
+            .to_ascii_lowercase()
+            .contains("schema")
     );
     assert_eq!(schema19_tracker_files(&beads), migrated);
     assert_eq!(workflow_schema19_authority(&db), migrated_records);
