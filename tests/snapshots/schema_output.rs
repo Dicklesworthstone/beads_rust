@@ -19,6 +19,7 @@ const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "AdditiveReconcileReceipt",
     "BlockedIssue",
     "BlockedPage",
+    "Comment",
     "CoordinationClaimRow",
     "CoordinationStatusOutput",
     "CountGroup",

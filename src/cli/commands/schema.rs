@@ -25,7 +25,7 @@ use crate::format::{
     BlockedIssueOutput, BlockedPage, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue,
     Statistics,
 };
-use crate::model::Issue;
+use crate::model::{Comment, Issue};
 use crate::output::{OutputContext, OutputMode};
 use crate::sync::AdditiveReconcileReceipt;
 use crate::{config, output};
@@ -193,6 +193,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
     match target {
         SchemaTarget::All => {
             schemas.insert("InitResult", schema_for_output::<InitResult>());
+            schemas.insert("Comment", schema_for_output::<Comment>());
             schemas.insert("Issue", schema_for_output::<Issue>());
             schemas.insert("IssueWithCounts", schema_for_output::<IssueWithCounts>());
             schemas.insert("IssueDetails", schema_for_output::<IssueDetails>());
@@ -476,17 +477,34 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
 }
 
 fn insert_comment_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
+    for name in [
+        "comments add",
+        "comments edit",
+        "comments redact",
+        "comments delete",
+    ] {
+        commands.insert(
+            name,
+            CommandShape {
+                shape: "object",
+                jq_filter: ".",
+                items_at: None,
+                item_schema: Some("Comment"),
+                error_envelope_on_stderr: false,
+                notes: Some("Current comment with portable revision metadata. Redacted and deleted text is empty; original authorship is retained."),
+            },
+        );
+    }
     commands.insert(
         "comments list",
         CommandShape {
             shape: "array",
             jq_filter: ".[]",
             items_at: Some("."),
-            item_schema: None,
+            item_schema: Some("Comment"),
             error_envelope_on_stderr: false,
             notes: Some(
-                "Empty array if no comments. ErrorEnvelope on stdout if the issue id \
-                 cannot be resolved.",
+                "Empty array if no visible comments. Deleted markers require --include-deleted. ErrorEnvelope on stdout if the issue id cannot be resolved.",
             ),
         },
     );

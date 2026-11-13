@@ -13,6 +13,8 @@ pub mod acceptance;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -378,6 +380,9 @@ pub enum EventType {
     PriorityChanged,
     AssigneeChanged,
     Commented,
+    CommentEdited,
+    CommentRedacted,
+    CommentDeleted,
     Closed,
     Reopened,
     DependencyAdded,
@@ -400,6 +405,9 @@ impl EventType {
             Self::PriorityChanged => "priority_changed",
             Self::AssigneeChanged => "assignee_changed",
             Self::Commented => "commented",
+            Self::CommentEdited => "comment_edited",
+            Self::CommentRedacted => "comment_redacted",
+            Self::CommentDeleted => "comment_deleted",
             Self::Closed => "closed",
             Self::Reopened => "reopened",
             Self::DependencyAdded => "dependency_added",
@@ -431,6 +439,9 @@ impl<'de> Deserialize<'de> for EventType {
             "priority_changed" => Self::PriorityChanged,
             "assignee_changed" => Self::AssigneeChanged,
             "commented" => Self::Commented,
+            "comment_edited" => Self::CommentEdited,
+            "comment_redacted" => Self::CommentRedacted,
+            "comment_deleted" => Self::CommentDeleted,
             "closed" => Self::Closed,
             "reopened" => Self::Reopened,
             "dependency_added" => Self::DependencyAdded,
@@ -851,19 +862,7 @@ impl Issue {
             return false;
         }
 
-        // Compare comments (order independent) by their sync identity.
-        //
-        // `Comment::id` is a per-database AUTOINCREMENT rowid: two clones of
-        // one workspace both hand out `1` to their first comment, so the id
-        // published in JSONL is only meaningful to the database that minted
-        // it and import may reassign it on collision. The identity that
-        // survives sync is `(issue_id, created_at, author, body)`
-        // (GitHub #486).
-        let mut self_comments: Vec<_> = self.comments.iter().map(Comment::sync_key).collect();
-        self_comments.sort_unstable();
-        let mut other_comments: Vec<_> = other.comments.iter().map(Comment::sync_key).collect();
-        other_comments.sort_unstable();
-        self_comments == other_comments
+        comments_sync_equal(&self.comments, &other.comments)
     }
 
     /// Check if this issue is a tombstone that has exceeded its TTL.
@@ -885,6 +884,16 @@ impl Issue {
         as_of: DateTime<Utc>,
     ) -> bool {
         if self.status != Status::Tombstone {
+            return false;
+        }
+
+        // Automatic retention must not discard the evidence that suppresses
+        // an older peer's sensitive comment payload.
+        if self
+            .comments
+            .iter()
+            .any(|comment| comment.state() != CommentState::Active)
+        {
             return false;
         }
 
@@ -978,27 +987,434 @@ pub struct Comment {
     /// Database-local rowid. It is exported to JSONL for reference only:
     /// every clone mints its own sequence, so two clones' comments routinely
     /// share an id and import reassigns the local rowid when that happens.
-    /// Sync compares comments by [`Comment::sync_key`], never by `id`.
+    /// Sync compares portable revision identities, never this rowid.
     pub id: i64,
     pub issue_id: String,
     pub author: String,
     #[serde(rename = "text")]
     pub body: String,
     pub created_at: DateTime<Utc>,
+    /// Portable identity and content-free revision ancestry. Absent in legacy
+    /// records; enrolled deterministically before mutation or reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<CommentRevision>,
+}
+
+/// Removal is monotone: deletion dominates redaction, and either suppresses
+/// every ordinary edit independently of clocks.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentState {
+    #[default]
+    Active,
+    Redacted,
+    Deleted,
+}
+
+/// Current revision metadata. Ancestors are opaque digests, never old text.
+/// They distinguish sequential edits from divergent edits even when one branch
+/// has made more edits or has a clock ahead of another machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CommentRevision {
+    pub identity: String,
+    pub generation: u64,
+    pub head: String,
+    pub ancestors: Vec<String>,
+    pub state: CommentState,
+    pub updated_at: DateTime<Utc>,
+    pub updated_by: String,
+}
+
+fn comment_conflict(message: impl Into<String>) -> crate::error::BeadsError {
+    crate::error::BeadsError::SyncConflict {
+        message: message.into(),
+    }
+}
+
+fn comment_digest(parts: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+        digest.update(part);
+    }
+    crate::util::hex_encode(&digest.finalize())
+}
+
+fn is_comment_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl Comment {
-    /// The identity a comment keeps across clones: everything except the
-    /// database-local rowid (GitHub #486).
+    /// Whether this comment is visible text, redacted, or logically deleted.
     #[must_use]
-    pub fn sync_key(&self) -> (&str, DateTime<Utc>, &str, &str) {
-        (
-            self.issue_id.as_str(),
-            self.created_at,
-            self.author.as_str(),
-            self.body.as_str(),
-        )
+    pub fn state(&self) -> CommentState {
+        self.revision
+            .as_ref()
+            .map_or(CommentState::Active, |r| r.state)
     }
+
+    #[must_use]
+    pub fn revision_head(&self) -> Option<&str> {
+        self.revision.as_ref().map(|r| r.head.as_str())
+    }
+
+    /// Text suitable for display, including a text-free terminal marker.
+    #[must_use]
+    pub fn display_body(&self) -> &str {
+        match self.state() {
+            CommentState::Active => &self.body,
+            CommentState::Redacted => "[redacted]",
+            CommentState::Deleted => "[deleted]",
+        }
+    }
+
+    /// Validate portable metadata without echoing comment contents.
+    ///
+    /// # Errors
+    /// Returns a conflict for malformed ancestry or a nonempty removed body.
+    pub fn validate_revision(&self) -> crate::error::Result<()> {
+        let Some(revision) = &self.revision else {
+            return Ok(());
+        };
+        if !is_comment_digest(&revision.identity)
+            || !is_comment_digest(&revision.head)
+            || revision.ancestors.len() > 4096
+            || revision
+                .ancestors
+                .iter()
+                .any(|ancestor| !is_comment_digest(ancestor) || ancestor == &revision.head)
+            || !revision.ancestors.windows(2).all(|pair| pair[0] < pair[1])
+            || revision.updated_by.trim().is_empty()
+            || revision.updated_by.len() > 200
+            || revision.updated_by.contains('\0')
+        {
+            return Err(comment_conflict("Invalid comment revision metadata"));
+        }
+        if revision.generation == 0 {
+            if revision.head != revision.identity
+                || !revision.ancestors.is_empty()
+                || revision.state != CommentState::Active
+                || revision.updated_at != self.created_at
+                || revision.updated_by != self.author
+            {
+                return Err(comment_conflict("Invalid initial comment revision"));
+            }
+        } else if !revision.ancestors.contains(&revision.identity) {
+            return Err(comment_conflict("Comment revision is missing its origin"));
+        }
+        if revision.state != CommentState::Active && !self.body.is_empty() {
+            return Err(comment_conflict("Removed comment must have an empty body"));
+        }
+        Ok(())
+    }
+
+    /// Replace text or advance to a terminal privacy state. Enroll the whole
+    /// issue's legacy comments first, then persist this revision and its audit
+    /// in one transaction.
+    ///
+    /// # Errors
+    /// Refuses invalid metadata, empty active text, terminal-state downgrades,
+    /// or exhausted ordinary-edit ancestry. The comment stays unchanged.
+    pub fn revise(
+        &mut self,
+        state: CommentState,
+        body: &str,
+        actor: &str,
+        now: DateTime<Utc>,
+    ) -> crate::error::Result<()> {
+        self.validate_revision()?;
+        let previous = self
+            .revision
+            .as_ref()
+            .ok_or_else(|| comment_conflict("Comment must be enrolled before modification"))?;
+        if previous.state != CommentState::Active && state < previous.state {
+            return Err(comment_conflict(
+                "A redacted or deleted comment cannot be restored; add a new comment",
+            ));
+        }
+        if (state == CommentState::Active && body.trim().is_empty())
+            || (state != CommentState::Active && !body.is_empty())
+            || body.contains('\0')
+            || actor.trim().is_empty()
+            || actor.len() > 200
+            || actor.contains('\0')
+        {
+            return Err(crate::error::BeadsError::validation(
+                "comment",
+                "invalid comment text or actor",
+            ));
+        }
+        if previous.state == state && self.body == body {
+            return Ok(());
+        }
+        let mut revision = previous.clone();
+        if state == CommentState::Active {
+            revision.generation = revision
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| comment_conflict("Comment revision generation exhausted"))?;
+            if revision.ancestors.len() >= 4096 {
+                return Err(comment_conflict("Comment revision ancestry limit reached"));
+            }
+            revision.ancestors.push(revision.head.clone());
+            revision.ancestors.sort();
+            revision.ancestors.dedup();
+        } else {
+            // Privacy removal remains possible at the ordinary edit limit.
+            // A terminal state needs only its origin to suppress every branch.
+            revision.generation = revision.generation.saturating_add(1);
+            revision.ancestors = vec![revision.identity.clone()];
+        }
+        revision.state = state;
+        revision.updated_at = now;
+        actor.clone_into(&mut revision.updated_by);
+        let state_name = match state {
+            CommentState::Active => "active",
+            CommentState::Redacted => "redacted",
+            CommentState::Deleted => "deleted",
+        };
+        revision.head = comment_digest(&[
+            b"br-comment-revision-v1",
+            revision.identity.as_bytes(),
+            &revision.generation.to_le_bytes(),
+            previous.head.as_bytes(),
+            state_name.as_bytes(),
+            now.to_rfc3339().as_bytes(),
+            actor.as_bytes(),
+            body.as_bytes(),
+        ]);
+        body.clone_into(&mut self.body);
+        self.revision = Some(revision);
+        Ok(())
+    }
+}
+
+/// Enroll legacy comments without changing IDs, authors, creation times or
+/// text. Original-payload digests match old JSONL after an edit. Occurrence
+/// ordinals preserve intentional identical comments; persist all siblings
+/// when modifying one so their ordinals cannot shift.
+///
+/// # Errors
+/// Rejects malformed existing revision metadata.
+pub fn normalize_comment_revisions(comments: &mut [Comment]) -> crate::error::Result<()> {
+    let enrolled: HashSet<String> = comments
+        .iter()
+        .filter_map(|comment| {
+            comment
+                .revision
+                .as_ref()
+                .map(|revision| revision.identity.clone())
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..comments.len()).collect();
+    order.sort_by_key(|index| (comments[*index].id, *index));
+    let mut occurrences = BTreeMap::<String, u64>::new();
+    for index in order {
+        let comment = &mut comments[index];
+        if comment.revision.is_none() {
+            let original = comment_digest(&[
+                b"br-comment-origin-v1",
+                comment.issue_id.as_bytes(),
+                comment.created_at.to_rfc3339().as_bytes(),
+                comment.author.as_bytes(),
+                comment.body.as_bytes(),
+            ]);
+            let occurrence = occurrences.entry(original.clone()).or_default();
+            let identity = comment_digest(&[original.as_bytes(), &occurrence.to_le_bytes()]);
+            *occurrence += 1;
+            if enrolled.contains(&identity) {
+                // Advancing past an enrolled terminal identity would turn a
+                // stale body into a new live comment. Collapsing the entries
+                // could instead lose an intentional duplicate. Require an
+                // unambiguous complete snapshot before importing this mixture.
+                return Err(comment_conflict(
+                    "Ambiguous mixture of legacy and versioned comments; reconcile complete snapshots separately",
+                ));
+            }
+            comment.revision = Some(CommentRevision {
+                head: identity.clone(),
+                identity,
+                generation: 0,
+                ancestors: Vec::new(),
+                state: CommentState::Active,
+                updated_at: comment.created_at,
+                updated_by: comment.author.clone(),
+            });
+        }
+        comment.validate_revision()?;
+    }
+    Ok(())
+}
+
+/// Compare portable state, ignoring database-local rowids and input order.
+#[must_use]
+pub fn comments_sync_equal(left: &[Comment], right: &[Comment]) -> bool {
+    let normalized = |source: &[Comment]| -> crate::error::Result<Vec<Comment>> {
+        let mut comments = source.to_vec();
+        normalize_comment_revisions(&mut comments)?;
+        for comment in &mut comments {
+            comment.id = 0;
+        }
+        comments.sort_by(|a, b| a.revision.cmp(&b.revision));
+        Ok(comments)
+    };
+    match (normalized(left), normalized(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn join_comment_revision(left: &Comment, right: &Comment) -> crate::error::Result<Comment> {
+    let a = left.revision.as_ref().expect("normalized comment");
+    let b = right.revision.as_ref().expect("normalized comment");
+    if left.author != right.author || left.created_at != right.created_at {
+        return Err(comment_conflict(format!(
+            "Comment {} has conflicting immutable attribution",
+            a.identity
+        )));
+    }
+    let winner = if a.head == b.head {
+        if left.body != right.body
+            || a.state != b.state
+            || a.generation != b.generation
+            || a.updated_at != b.updated_at
+            || a.updated_by != b.updated_by
+        {
+            return Err(comment_conflict(format!(
+                "Comment {} has inconsistent revision data",
+                a.identity
+            )));
+        }
+        left
+    } else if a.state != CommentState::Active || b.state != CommentState::Active {
+        // Privacy dominates longer and future-clock active edits. Same-state
+        // concurrent removals have no text to lose.
+        if (a.state, a.generation, a.updated_at, &a.head)
+            >= (b.state, b.generation, b.updated_at, &b.head)
+        {
+            left
+        } else {
+            right
+        }
+    } else {
+        match (a.ancestors.contains(&b.head), b.ancestors.contains(&a.head)) {
+            (true, false) if a.generation > b.generation => left,
+            (false, true) if b.generation > a.generation => right,
+            _ => {
+                return Err(comment_conflict(format!(
+                    "Concurrent edits to comment {}; reconcile its revisions explicitly before syncing",
+                    a.identity
+                )));
+            }
+        }
+    };
+    let mut merged = winner.clone();
+    let revision = merged.revision.as_mut().expect("normalized comment");
+    if revision.state == CommentState::Active {
+        let mut ancestors: BTreeSet<String> =
+            a.ancestors.iter().chain(&b.ancestors).cloned().collect();
+        ancestors.insert(a.head.clone());
+        ancestors.insert(b.head.clone());
+        ancestors.remove(&revision.head);
+        revision.ancestors = ancestors.into_iter().collect();
+    } else {
+        revision.ancestors = vec![revision.identity.clone()];
+    }
+    merged.validate_revision()?;
+    Ok(merged)
+}
+
+/// Reconcile revisions independently of parent issue timestamps and winner
+/// flags. Ordinary concurrent edits fail closed; terminal privacy states win.
+/// Existing local IDs survive matched revisions, with unrelated collisions
+/// left for the storage allocator.
+///
+/// # Errors
+/// Returns content-free conflicts for divergent active revisions or invalid
+/// identity/attribution. Never copies losing text into an audit or error.
+///
+/// # Panics
+/// Panics if internal normalization leaves a comment without revision metadata.
+pub fn merge_comment_lists(
+    primary: &[Comment],
+    secondary: &[Comment],
+    target_id: &str,
+) -> crate::error::Result<Vec<Comment>> {
+    let mut primary = primary.to_vec();
+    let mut secondary = secondary.to_vec();
+    normalize_comment_revisions(&mut primary)?;
+    normalize_comment_revisions(&mut secondary)?;
+    let primary_ids: BTreeMap<String, i64> = primary
+        .iter()
+        .filter(|comment| comment.id > 0)
+        .map(|comment| {
+            (
+                comment
+                    .revision
+                    .as_ref()
+                    .expect("normalized comment")
+                    .identity
+                    .clone(),
+                comment.id,
+            )
+        })
+        .collect();
+    let reserved_ids: HashSet<i64> = primary_ids.values().copied().collect();
+    let mut groups: BTreeMap<String, Vec<Comment>> = BTreeMap::new();
+    for mut comment in primary.into_iter().chain(secondary) {
+        let identity = comment
+            .revision
+            .as_ref()
+            .expect("normalized comment")
+            .identity
+            .clone();
+        target_id.clone_into(&mut comment.issue_id);
+        groups.entry(identity).or_default().push(comment);
+    }
+    let mut merged = Vec::with_capacity(groups.len());
+    for (identity, mut candidates) in groups {
+        // A peer's older creation time must not let it steal a local numeric
+        // target. Reserve the primary database's IDs before sorting output.
+        let local_id = primary_ids.get(&identity).copied().unwrap_or_else(|| {
+            candidates
+                .iter()
+                .find(|comment| comment.id > 0 && !reserved_ids.contains(&comment.id))
+                .map_or(0, |comment| comment.id)
+        });
+        // Apply terminal evidence first, even if one input has divergent live
+        // copies of the same identity.
+        candidates.sort_by_key(|comment| std::cmp::Reverse(comment.state()));
+        let mut current = candidates[0].clone();
+        for candidate in &candidates[1..] {
+            current = join_comment_revision(&current, candidate)?;
+        }
+        current.id = local_id;
+        merged.push(current);
+    }
+    merged.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.author.cmp(&b.author))
+            .then_with(|| {
+                a.revision
+                    .as_ref()
+                    .map(|r| &r.identity)
+                    .cmp(&b.revision.as_ref().map(|r| &r.identity))
+            })
+    });
+    let mut seen = HashSet::new();
+    for comment in &mut merged {
+        if comment.id > 0 && !seen.insert(comment.id) {
+            comment.id = 0;
+        }
+    }
+    Ok(merged)
 }
 
 /// An event in the issue's history (audit log).
@@ -1776,6 +2192,7 @@ mod tests {
                 author: "alice".to_string(),
                 body: "second".to_string(),
                 created_at: Utc.timestamp_opt(1_700_000_200, 0).unwrap(),
+                revision: None,
             },
             Comment {
                 id: 1,
@@ -1783,6 +2200,7 @@ mod tests {
                 author: "alice".to_string(),
                 body: "first".to_string(),
                 created_at: Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+                revision: None,
             },
         ];
 
@@ -1810,6 +2228,7 @@ mod tests {
             author: "alice".to_string(),
             body: "same payload".to_string(),
             created_at: Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+            revision: None,
         }];
         let mut issue2 = issue1.clone();
         issue2.comments[0].id = 7;
@@ -2105,6 +2524,402 @@ mod tests {
     // COMMENT TESTS
     // ========================================================================
 
+    fn legacy_comment(id: i64, body: &str) -> Comment {
+        Comment {
+            id,
+            issue_id: "bd-comment".to_owned(),
+            author: "alice".to_owned(),
+            body: body.to_owned(),
+            created_at: Utc.with_ymd_and_hms(2026, 11, 1, 0, 0, 0).unwrap(),
+            revision: None,
+        }
+    }
+
+    fn enrolled_comment() -> Comment {
+        let mut comments = vec![legacy_comment(7, "private-original")];
+        normalize_comment_revisions(&mut comments).unwrap();
+        comments.remove(0)
+    }
+
+    #[test]
+    fn comment_revision_sequential_edits_keep_identity_and_causal_history() {
+        let original = enrolled_comment();
+        let mut first = original.clone();
+        first
+            .revise(
+                CommentState::Active,
+                "corrected",
+                "alice",
+                original.created_at,
+            )
+            .unwrap();
+        let mut second = first.clone();
+        second
+            .revise(
+                CommentState::Active,
+                "final",
+                "alice",
+                original.created_at - chrono::Duration::days(1),
+            )
+            .unwrap();
+        let roundtrip: Comment =
+            serde_json::from_str(&serde_json::to_string(&second).unwrap()).unwrap();
+        let merged = merge_comment_lists(
+            std::slice::from_ref(&original),
+            &[roundtrip],
+            &original.issue_id,
+        )
+        .unwrap();
+        assert_eq!(merged[0].body, "final");
+        assert_eq!(merged[0].id, original.id);
+        assert_eq!(merged[0].author, original.author);
+        assert_eq!(merged[0].created_at, original.created_at);
+        assert_eq!(
+            merged[0].revision.as_ref().unwrap().identity,
+            original.revision.as_ref().unwrap().identity
+        );
+        assert!(
+            merged[0]
+                .revision
+                .as_ref()
+                .unwrap()
+                .ancestors
+                .contains(&first.revision.as_ref().unwrap().head)
+        );
+        assert!(
+            !serde_json::to_string(&merged)
+                .unwrap()
+                .contains("private-original")
+        );
+    }
+
+    #[test]
+    fn comment_revision_concurrent_edits_fail_even_with_unequal_generations() {
+        let origin = enrolled_comment();
+        let mut left = origin.clone();
+        let mut right = origin.clone();
+        left.revise(
+            CommentState::Active,
+            "left-secret",
+            "alice",
+            origin.created_at,
+        )
+        .unwrap();
+        right
+            .revise(
+                CommentState::Active,
+                "right-secret",
+                "alice",
+                origin.created_at,
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let error = merge_comment_lists(
+                std::slice::from_ref(&left),
+                std::slice::from_ref(&right),
+                &origin.issue_id,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("Concurrent edits"));
+            assert!(!error.contains("left-secret") && !error.contains("right-secret"));
+            assert!(
+                merge_comment_lists(
+                    std::slice::from_ref(&right),
+                    std::slice::from_ref(&left),
+                    &origin.issue_id
+                )
+                .is_err()
+            );
+            left.revise(
+                CommentState::Active,
+                "left-followup",
+                "alice",
+                origin.created_at,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn comment_revision_redaction_dominates_future_edits_and_repeated_legacy_imports() {
+        let legacy = legacy_comment(999, "private-original");
+        let origin = enrolled_comment();
+        let mut redacted = origin.clone();
+        redacted
+            .revise(CommentState::Redacted, "", "moderator", origin.created_at)
+            .unwrap();
+        let mut future = origin.clone();
+        for body in ["branch-one", "branch-two", "branch-three"] {
+            future
+                .revise(
+                    CommentState::Active,
+                    body,
+                    "alice",
+                    origin.created_at + chrono::Duration::days(365),
+                )
+                .unwrap();
+        }
+        for (left, right) in [(&redacted, &future), (&future, &redacted)] {
+            let mut result = merge_comment_lists(
+                std::slice::from_ref(left),
+                std::slice::from_ref(right),
+                &origin.issue_id,
+            )
+            .unwrap();
+            assert_eq!(result[0].state(), CommentState::Redacted);
+            assert!(result[0].body.is_empty());
+            for _ in 0..3 {
+                let again =
+                    merge_comment_lists(&result, std::slice::from_ref(&legacy), &origin.issue_id)
+                        .unwrap();
+                assert!(comments_sync_equal(&result, &again));
+                result = again;
+            }
+            let serialized = serde_json::to_string(&result).unwrap();
+            assert!(!serialized.contains("private-original") && !serialized.contains("branch-"));
+            assert_eq!(result[0].revision.as_ref().unwrap().updated_by, "moderator");
+        }
+    }
+
+    #[test]
+    fn comment_revision_delete_dominates_redaction_in_every_order() {
+        let origin = enrolled_comment();
+        let mut redacted = origin.clone();
+        let mut deleted = origin.clone();
+        redacted
+            .revise(
+                CommentState::Redacted,
+                "",
+                "alice",
+                origin.created_at + chrono::Duration::days(3),
+            )
+            .unwrap();
+        deleted
+            .revise(CommentState::Deleted, "", "alice", origin.created_at)
+            .unwrap();
+        let left = merge_comment_lists(
+            std::slice::from_ref(&deleted),
+            std::slice::from_ref(&redacted),
+            &origin.issue_id,
+        )
+        .unwrap();
+        let right = merge_comment_lists(
+            &[redacted],
+            std::slice::from_ref(&deleted),
+            &origin.issue_id,
+        )
+        .unwrap();
+        assert!(comments_sync_equal(&left, &right));
+        assert_eq!(left[0].state(), CommentState::Deleted);
+        assert!(
+            deleted
+                .revise(CommentState::Active, "restore", "alice", origin.created_at)
+                .is_err()
+        );
+        assert!(
+            deleted
+                .revise(CommentState::Redacted, "", "alice", origin.created_at)
+                .is_err()
+        );
+        let before = deleted.clone();
+        deleted
+            .revise(CommentState::Deleted, "", "alice", origin.created_at)
+            .unwrap();
+        assert_eq!(before, deleted, "repeated removal is idempotent");
+    }
+
+    #[test]
+    fn comment_revision_preserves_legacy_multiplicity_and_local_id_collisions() {
+        let legacy = vec![legacy_comment(3, "same"), legacy_comment(4, "same")];
+        let mut enrolled = legacy.clone();
+        normalize_comment_revisions(&mut enrolled).unwrap();
+        assert_ne!(
+            enrolled[0].revision.as_ref().unwrap().identity,
+            enrolled[1].revision.as_ref().unwrap().identity
+        );
+        let timestamp = enrolled[1].created_at;
+        enrolled[0]
+            .revise(CommentState::Redacted, "", "alice", timestamp)
+            .unwrap();
+        let merged = merge_comment_lists(&enrolled, &legacy, "bd-comment").unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged.iter().filter(|c| c.body == "same").count(), 1);
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|c| c.state() == CommentState::Redacted)
+                .count(),
+            1
+        );
+        let collision = merge_comment_lists(
+            &[legacy_comment(1, "one")],
+            &[legacy_comment(1, "two")],
+            "bd-comment",
+        )
+        .unwrap();
+        assert_eq!(collision.len(), 2);
+        assert_eq!(collision.iter().filter(|c| c.id == 0).count(), 1);
+    }
+
+    #[test]
+    fn comment_revision_refuses_ambiguous_mixed_enrollment_without_restoring_text() {
+        let original = legacy_comment(7, "private-original");
+        let mut enrolled = vec![original.clone()];
+        normalize_comment_revisions(&mut enrolled).unwrap();
+        let mut legacy_copy = original;
+        legacy_copy.id = 8;
+        let error = normalize_comment_revisions(&mut [enrolled[0].clone(), legacy_copy.clone()])
+            .unwrap_err();
+        assert!(!error.to_string().contains("private-original"));
+        let now = enrolled[0].created_at;
+        enrolled[0]
+            .revise(CommentState::Redacted, "", "alice", now)
+            .unwrap();
+        assert!(
+            normalize_comment_revisions(&mut [enrolled[0].clone(), legacy_copy.clone()]).is_err()
+        );
+        // Separate complete snapshots remain safe and idempotent.
+        let merged = merge_comment_lists(&enrolled, &[legacy_copy], "bd-comment").unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].state(), CommentState::Redacted);
+        assert!(merged[0].body.is_empty());
+    }
+
+    #[test]
+    fn comment_revision_older_peer_cannot_steal_local_numeric_target() {
+        let local = legacy_comment(7, "local");
+        let mut remote = legacy_comment(7, "remote");
+        remote.created_at -= chrono::Duration::seconds(1);
+        let merged = merge_comment_lists(
+            std::slice::from_ref(&local),
+            std::slice::from_ref(&remote),
+            &local.issue_id,
+        )
+        .unwrap();
+        assert_eq!(merged[0].body, "remote");
+        assert_eq!(
+            merged[0].id, 0,
+            "only the imported collision needs allocation"
+        );
+        assert_eq!(merged[1].body, "local");
+        assert_eq!(merged[1].id, 7);
+        let again = merge_comment_lists(&merged, &[remote], &local.issue_id).unwrap();
+        assert_eq!(again, merged);
+    }
+
+    #[test]
+    fn comment_revision_terminals_make_multi_branch_join_associative() {
+        let origin = enrolled_comment();
+        let mut edit = origin.clone();
+        let mut redact = origin.clone();
+        let mut delete = origin.clone();
+        edit.revise(CommentState::Active, "changed", "alice", origin.created_at)
+            .unwrap();
+        redact
+            .revise(CommentState::Redacted, "", "alice", origin.created_at)
+            .unwrap();
+        delete
+            .revise(CommentState::Deleted, "", "alice", origin.created_at)
+            .unwrap();
+        let branches = [edit, redact, delete];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let first = merge_comment_lists(
+                std::slice::from_ref(&branches[order[0]]),
+                std::slice::from_ref(&branches[order[1]]),
+                &origin.issue_id,
+            )
+            .unwrap();
+            let result = merge_comment_lists(
+                &first,
+                std::slice::from_ref(&branches[order[2]]),
+                &origin.issue_id,
+            )
+            .unwrap();
+            assert!(comments_sync_equal(
+                &result,
+                std::slice::from_ref(&branches[2])
+            ));
+        }
+    }
+
+    #[test]
+    fn comment_revision_rejects_malformed_and_attribution_changes_without_text_in_errors() {
+        let origin = enrolled_comment();
+        let mut malformed = origin.clone();
+        malformed.revision.as_mut().unwrap().head = "not-a-revision".to_owned();
+        assert!(normalize_comment_revisions(&mut [malformed]).is_err());
+        let mut forged = origin.clone();
+        forged.author = "mallory".to_owned();
+        assert!(
+            merge_comment_lists(std::slice::from_ref(&origin), &[forged], &origin.issue_id)
+                .is_err()
+        );
+        let mut leaked = origin.clone();
+        leaked
+            .revise(CommentState::Redacted, "", "alice", origin.created_at)
+            .unwrap();
+        leaked.body = "private-leak".to_owned();
+        let error = leaked.validate_revision().unwrap_err().to_string();
+        assert!(!error.contains("private-leak"));
+    }
+
+    #[test]
+    fn comment_revision_semantic_equality_detects_metadata_and_ignores_rowids() {
+        let origin = enrolled_comment();
+        let mut copy = origin.clone();
+        copy.id = 500;
+        assert!(comments_sync_equal(
+            std::slice::from_ref(&origin),
+            std::slice::from_ref(&copy)
+        ));
+        copy.revise(CommentState::Active, "changed", "alice", origin.created_at)
+            .unwrap();
+        assert!(!comments_sync_equal(&[origin], &[copy]));
+    }
+
+    #[test]
+    fn comment_revision_privacy_removal_remains_available_at_edit_limit() {
+        let mut comment = enrolled_comment();
+        let now = comment.created_at;
+        let revision = comment.revision.as_mut().unwrap();
+        revision.generation = u64::MAX;
+        revision.head = "f".repeat(64);
+        revision.ancestors = vec![revision.identity.clone()];
+        assert!(
+            comment
+                .revise(CommentState::Active, "edit", "alice", now)
+                .is_err()
+        );
+        comment
+            .revise(CommentState::Redacted, "", "alice", now)
+            .unwrap();
+        assert_eq!(comment.state(), CommentState::Redacted);
+        assert!(comment.body.is_empty());
+    }
+
+    #[test]
+    fn comment_revision_privacy_markers_prevent_automatic_parent_expiration() {
+        let mut issue = create_test_issue();
+        issue.status = Status::Tombstone;
+        issue.deleted_at = Some(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap());
+        let mut comment = enrolled_comment();
+        let now = comment.created_at;
+        assert!(issue.is_expired_tombstone_at(Some(1), now));
+        comment
+            .revise(CommentState::Redacted, "", "alice", now)
+            .unwrap();
+        issue.comments.push(comment);
+        assert!(!issue.is_expired_tombstone_at(Some(1), now));
+    }
+
     #[test]
     fn test_comment_serialization_roundtrip() {
         let comment = Comment {
@@ -2113,6 +2928,7 @@ mod tests {
             author: "testuser".to_string(),
             body: "This is a comment".to_string(),
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            revision: None,
         };
 
         let json = serde_json::to_string(&comment).unwrap();

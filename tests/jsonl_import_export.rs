@@ -129,6 +129,7 @@ fn export_sorts_comments_canonically_after_loading_relations() {
             author: "zara".to_string(),
             body: "second by canonical order".to_string(),
             created_at: timestamp,
+            revision: None,
         },
         Comment {
             id: 0,
@@ -136,6 +137,7 @@ fn export_sorts_comments_canonically_after_loading_relations() {
             author: "alice".to_string(),
             body: "first by canonical order".to_string(),
             created_at: timestamp,
+            revision: None,
         },
     ];
 
@@ -812,6 +814,7 @@ fn tombstone_import_unions_related_historical_evidence() {
         author: "local-author".to_string(),
         body: "Local audit evidence".to_string(),
         created_at: local.created_at + Duration::minutes(10),
+        revision: None,
     }];
     local.dependencies = vec![Dependency {
         issue_id: local.id.clone(),
@@ -832,6 +835,7 @@ fn tombstone_import_unions_related_historical_evidence() {
         author: "peer-author".to_string(),
         body: "Peer audit evidence".to_string(),
         created_at: local.created_at + Duration::minutes(30),
+        revision: None,
     }];
     incoming.dependencies = vec![Dependency {
         issue_id: local.id.clone(),

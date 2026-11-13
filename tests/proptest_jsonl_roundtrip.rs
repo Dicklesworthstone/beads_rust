@@ -405,6 +405,7 @@ prop_compose! {
                 author: comment_author.clone(),
                 body,
                 created_at: comment_base + Duration::seconds(i64::try_from(index).unwrap()),
+                revision: None,
             })
             .collect();
         let dependency = Dependency {
@@ -742,6 +743,7 @@ fn adversarial_text_payloads_survive_the_jsonl_round_trip() {
                     author: "proptest".to_string(),
                     body: (*payload).to_string(),
                     created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                    revision: None,
                 }],
             )
             .unwrap();

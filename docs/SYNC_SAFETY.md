@@ -160,6 +160,7 @@ creating one.
 | **Stale DB guard** | Exporting when DB is missing issues from JSONL | `--force` |
 | **Unimported content guard** | Replacing unread JSONL payloads, including edits and comments on existing issue IDs, or treating preserved peer changes as imported | Explicit `sync --flush-only --force` |
 | **Imported omission guard** | A full export republishing clean local issues omitted by an accepted import | Explicit reconciliation with `sync --merge`, or deliberate `sync --flush-only --force` |
+| **Comment revision guard** | Replacing a known comment revision with stale content, or omitting an issue carrying a removal marker | **None**; first reconcile comment revisions. Explicit whole-issue hard purge retains its intentional-omission semantics |
 
 ### Branch changes and pending local work
 
@@ -171,7 +172,7 @@ dirty markers remain intact, and a later explicit edit to an omitted issue
 publishes that issue and its relations normally.
 
 Automatic import refuses when it would keep a local version whose synchronized
-payload differs from the incoming row, apart from append-only comments. This
+payload differs from the incoming row, apart from compatible comment revision joins. This
 includes older or equal-timestamp external edits and attempts to restore a live
 row over a local tombstone. A restored file may represent an intentional Git
 revert or an older branch; timestamps and a clean database cannot distinguish
@@ -293,7 +294,7 @@ JSON and TOON modes include the structured `AUTO_FLUSH_FAILED` warning code.
 The local change stays committed, with JSONL export still pending.
 
 Run `br sync --merge` to reconcile both sides. `br sync --import-only` reads the
-current JSONL under the normal rules for local winners and append-only comments;
+current JSONL under the normal rules for local winners and comment revisions;
 clean imported omissions can still prevent a later full flush. Use
 `br sync --flush-only --force` only when deliberately choosing the database's
 full contents over the external file. An empty JSONL before the workspace's
@@ -306,6 +307,12 @@ number of days. Export omits a tombstone only after that interval has elapsed
 since its known deletion time. An absent or zero setting keeps tombstones
 indefinitely; an unknown deletion time never authorizes omission. Retention
 changes the JSONL population without deleting the database record or its history.
+
+An issue carrying a redacted or deleted comment is exempt from automatic
+tombstone expiration. Its text-free comment markers must remain available to
+suppress stale copies on other machines. Explicit whole-issue hard purge can
+remove those markers; it also removes this protection for future imports of
+older copies.
 
 `br sync --flush-only` applies the current policy even when every database row
 is clean. Shortening retention can remove expired tombstones from JSONL;
@@ -360,7 +367,8 @@ reconciliation. Existing explicit `--force` behavior is unchanged.
 | **Conflict marker scan** | Importing unresolved merge conflicts | **None** - must resolve conflicts |
 | **Schema validation** | Importing malformed JSON | **None** - must fix JSONL |
 | **Ambiguous automatic import** | A skipped conflicting row being acknowledged and later silently overwritten, including older or equal-timestamp external edits | Explicit reconciliation with `sync --merge`; review `--force-db` or `--force-jsonl` when a winner is required |
-| **Payload comment identity** | Treating a database-local comment rowid as global identity: two clones both mint comment id `1`, so a merged JSONL routinely carries one id for two issues; import reassigns the local rowid and verifies comments by `(issue, created_at, author, text)` instead of refusing the file | n/a - never refuses; same-issue duplicate payloads are still rejected |
+| **Portable comment identity** | Treating a database-local rowid as global identity, or treating an edited body as a new comment. Legacy identities are derived from the original payload and duplicate occurrence; versioned comments retain that identity across changes | Rowid collisions are reallocated. Malformed revisions and ambiguous mixtures of legacy and versioned identities must be reconciled |
+| **Comment privacy** | Restoring text removed by a redaction or deletion, or silently choosing one of two divergent active edits | **None**; terminal states dominate active text, and active conflicts require explicit reconciliation |
 | **Tombstone protection** | Resurrecting deleted issues | **None** - by design |
 | **Tombstone history preservation** | Dropping known closure, deletion, attribution, or relationship evidence while keeping a deleted record | **None** - conflicting historical facts require reconciliation |
 
@@ -369,7 +377,7 @@ Ordinary import fills missing closure and deletion timestamps, reasons, actor
 and session attribution, original type, and close-policy bypass evidence from
 the same issue on a peer. Older and equal-timestamp records can supply missing
 facts too; a newer sparse record cannot erase them. Labels, relationships, and
-comments are retained additively. Import reports changed protected records as
+comments are joined by their revision identities. Import reports changed protected records as
 `tombstone_enriched` (also included in `updated`), separately from unchanged
 `tombstone_skipped` records. A tombstone deleted while open keeps an unknown
 `closed_at`; neither deletion nor import fabricates a close timestamp.
@@ -392,6 +400,75 @@ database preserves that source's historical evidence; explicit purge retains
 its existing intentional-omission semantics. These guards preserve evidence
 still available in a database or source file; they cannot reconstruct fields that older versions already
 removed from every copy.
+
+### Comment revisions and privacy
+
+Each comment carries a portable identity, a current revision head, content-free
+ancestor digests, a generation, a state, and the modifying actor and time. The
+original author and creation time stay immutable. Database-local numeric IDs may
+be remapped on import; they are not cross-machine identities. Old JSONL without
+revision metadata is still accepted. Its identity is derived deterministically
+from the original issue ID, author, timestamp, body, and duplicate occurrence.
+The first mutation enrolls every sibling comment atomically so identical legacy
+comments keep their distinct identities after one is edited.
+
+An older importer may have changed an issue ID before portable comment identities
+existed. A later alias file can then lack enough provenance to match its comment
+to a known removal marker. Import and collision merging refuse an unmatched
+active legacy or generation-zero comment when it is being rekeyed and shares
+the original author and creation time of a target redaction or deletion. A
+matching portable identity or an already established destination sibling identity
+still reconciles normally. Preserve both snapshots for reviewed identity
+reconciliation; force flags cannot recover missing provenance. Repeating a stale
+alias in the merge base does not establish a distinct comment identity.
+
+| Competing records for one identity | Result |
+|------------------------------------|--------|
+| Same revision, same contents | No-op, including repeated imports |
+| Active ancestor and its descendant | Descendant; clocks and parent issue timestamps do not choose the comment |
+| Divergent active edits | Content-free conflict; no implicit last-writer winner |
+| Active text and redaction | Redaction with empty text |
+| Active text or redaction and deletion | Deletion with empty text |
+| Same terminal state on both sides | Deterministic metadata selection; text stays empty |
+| Inconsistent attribution, malformed ancestry, or ambiguous mixed enrollment | Refusal before mutation |
+
+These rules apply to ordinary imports, three-way merges, same-count relation
+updates, and protected issue tombstones. Whole-issue winner flags cannot override
+them. A terminal marker in the supplied merge base remains evidence even when
+both descendants omitted it. Full and incremental exports refuse to discard
+known revisions from the source; clean rebuild and recovery refuse a source
+that cannot preserve a known local edit or removal. Automatic tombstone TTL
+does not expire issues carrying comment privacy markers. Additive reconciliation
+retains its stricter relation-immutability rule and refuses changes to existing
+comment revisions; use ordinary import or merge for those changes.
+
+The current comment row stores only current text. Edits, redactions, and
+deletions record content-free audit events with actor, time, portable identity,
+revision head, and ownership-override evidence. When a comment is changed,
+legacy `commented` event payload columns on its issue are scrubbed because those
+events did not reliably identify which comment body they copied. Event identity,
+ordering, actor, time, and agent attribution remain intact. Portable-history
+publication and replay sanitize legacy comment payloads too, including the
+retained previous checkpoint; old checkpoint checksums are verified before
+sanitization. Source receipts continue to describe the original imported file,
+not a sanitized fiction about what was read.
+
+An export that removes or replaces old comment text skips making a fresh
+`.br_history` copy of that source generation. Existing Git history, peer clones,
+backups, recovery files, and SQLite/WAL remnants are not erased by changing
+current records. Revision digests are identity evidence, not encryption or
+secure erasure. All machines must understand the revision protocol; an older
+client or a manually stripped marker cannot provide its guarantees. Preserve
+revision metadata and handle any required Git-history cleanup separately.
+
+A terminal comment cannot be restored by editing. To resolve divergent active
+edits during a privacy incident, explicitly redact or delete that identity and
+synchronize its marker, then add a new comment with the reviewed replacement.
+If pending peer edits stop automatic import before the command can run, inspect
+the local comment ID with `--no-auto-import --allow-stale`, then use those same
+flags with `--no-auto-flush` for the deliberate local redaction. Run an explicit
+`sync --merge` afterward to join that marker with the peer's revisions.
+Do not fabricate ancestry or use whole-issue force flags to discard one branch.
 
 Ordinary import preserves exported close-policy bypass evidence. A new issue
 keeps its bypass flag, reason, and fired gates. For a skipped issue, import can
@@ -455,8 +532,8 @@ both an old branch export and a real update made with a slower clock. The
 explicit winner flags resolve that ambiguity using their normal policies;
 `--force` chooses the newer timestamp and prefers local on a tie. A strictly
 newer external-only revision remains eligible for normal merging. Changes on
-both sides retain the existing conflict behavior, and append-only comments
-are still combined before comparing the remaining payload.
+both sides retain the existing conflict behavior, and comment revisions
+are joined before comparing the remaining payload.
 
 Resolution notes never move a retained issue's `updated_at` backwards, even
 when its clock is ahead of the merging machine. The note and its audit event

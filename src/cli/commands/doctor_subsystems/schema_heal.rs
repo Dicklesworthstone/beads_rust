@@ -12,10 +12,10 @@
 //! 1. [`audit_stale_database`] reads the old database schema-agnostically
 //!    (plain `SELECT`s over whatever columns exist) and compares every issue
 //!    row against the JSONL snapshot. An issue is *represented* when the JSONL
-//!    carries it as a tombstone, carries equivalent content, or carries a
+//!    carries equivalent content, or carries a
 //!    copy at least as new while the database never marked the row dirty and
-//!    every local comment occurrence survives in the JSONL. A newer issue
-//!    timestamp alone cannot supersede an append-only comment history.
+//!    every local comment revision survives in the JSONL. A newer issue
+//!    timestamp or issue tombstone cannot supersede comment privacy markers.
 //!    Anything else — absent from the JSONL, an unflushed (dirty) edit that
 //!    differs, missing comments, a row newer than its JSONL copy, or a row
 //!    that cannot be read — is database-only data.
@@ -49,7 +49,10 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::franken_sync::Connection;
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
-use crate::model::{Comment, Dependency, Issue, Status};
+use crate::model::{
+    Comment, CommentRevision, Dependency, Issue, Status, comments_sync_equal, merge_comment_lists,
+    normalize_comment_revisions,
+};
 use crate::storage::schema::{
     CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedRuntimeSchemaUpgrade,
 };
@@ -482,6 +485,12 @@ fn audit_connection(
                     })?;
                     comment_only_restore(preserved, jsonl)?
                 } else {
+                    let mut preserved = preserved;
+                    if let Some(jsonl) = jsonl_issues.get(&preserved.issue.id) {
+                        let comments = comment_restore_union(&preserved, jsonl)?;
+                        preserved.issue.comments.clone_from(&comments);
+                        preserved.comments = Some(comments);
+                    }
                     preserved
                 };
                 audit.restorable.push(preserved);
@@ -496,10 +505,35 @@ fn audit_connection(
 /// would undo a peer's close, title, labels, or dependency edits. Local path
 /// provenance is not a cross-clone scalar and keeps its known local value.
 fn comment_only_restore(mut local: PreservedIssue, jsonl: &Issue) -> Result<PreservedIssue> {
-    if local.issue.id != jsonl.id || jsonl.status == Status::Tombstone {
+    let comments = comment_restore_union(&local, jsonl)?;
+    let mut issue = jsonl.clone();
+    issue.comments = comments;
+    if local.issue.source_repo_path.is_some() {
+        issue
+            .source_repo_path
+            .clone_from(&local.issue.source_repo_path);
+    }
+    local.labels = Some(issue.labels.clone());
+    local.dependencies = Some(issue.dependencies.clone());
+    local.comments = Some(issue.comments.clone());
+    local.issue = issue;
+    Ok(local)
+}
+
+fn comment_restore_union(local: &PreservedIssue, jsonl: &Issue) -> Result<Vec<Comment>> {
+    if local.issue.id != jsonl.id {
         return Err(BeadsError::Config(
-            "comment-only restore requires the same non-tombstone JSONL issue".to_owned(),
+            "comment-only restore requires the same JSONL issue".to_owned(),
         ));
+    }
+    let comments = local.comments.as_ref().ok_or_else(|| {
+        BeadsError::Config(format!(
+            "comment-only restore cannot certify unreadable comments for {}",
+            local.issue.id
+        ))
+    })?;
+    if comments.is_empty() && jsonl.comments.is_empty() {
+        return Ok(Vec::new());
     }
     // As in the audit's scalar comparison, normalize legacy timestamp
     // precision. A reused ID with a different creation time is another issue,
@@ -514,23 +548,7 @@ fn comment_only_restore(mut local: PreservedIssue, jsonl: &Issue) -> Result<Pres
             ),
         });
     }
-    let comments = local.comments.as_ref().ok_or_else(|| {
-        BeadsError::Config(format!(
-            "comment-only restore cannot certify unreadable comments for {}",
-            local.issue.id
-        ))
-    })?;
-    let mut issue = jsonl.clone();
-    issue.comments.clone_from(comments);
-    if local.issue.source_repo_path.is_some() {
-        issue
-            .source_repo_path
-            .clone_from(&local.issue.source_repo_path);
-    }
-    local.labels = Some(issue.labels.clone());
-    local.dependencies = Some(issue.dependencies.clone());
-    local.issue = issue;
-    Ok(local)
+    merge_comment_lists(comments, &jsonl.comments, &jsonl.id)
 }
 
 /// `None` when represented; otherwise the reason and whether the row can be
@@ -539,20 +557,19 @@ fn classify(db: &Issue, jsonl: Option<&Issue>, is_dirty: bool) -> Option<(DbOnly
     let Some(jsonl) = jsonl else {
         return Some((DbOnlyReason::AbsentFromJsonl, true));
     };
-    // A flushed deletion wins over any local state (import tombstone guard).
-    if jsonl.status == Status::Tombstone || issues_equivalent(db, jsonl) {
+    let Ok(comments_preserved) = comments_preserved_by(db, jsonl) else {
+        return Some((DbOnlyReason::Unreadable, false));
+    };
+    // Issue deletion wins scalar precedence only after proving that it carries
+    // every committed comment revision, including terminal privacy markers.
+    if (jsonl.status == Status::Tombstone && comments_preserved) || issues_equivalent(db, jsonl) {
         return None;
     }
     let db_newer = micros(db.updated_at) > micros(jsonl.updated_at);
-    if !db_newer
-        && !multiset_is_subset(
-            db.comments.iter().map(Comment::sync_key),
-            jsonl.comments.iter().map(Comment::sync_key),
-        )
-    {
-        // Scalar last-write-wins cannot prove an append-only history was
-        // carried. Include this issue in the restore plan, but project the
-        // winning JSONL scalars instead of replaying the superseded row.
+    if (!db_newer || jsonl.status == Status::Tombstone) && !comments_preserved {
+        // Scalar precedence cannot prove that comment revisions survived.
+        // Project the winning JSONL scalars, including deletion, while joining
+        // the local comment evidence without restoring redacted text.
         return Some((DbOnlyReason::CommentsAbsentFromJsonl, true));
     }
     if is_dirty {
@@ -628,10 +645,25 @@ fn issues_equivalent(db: &Issue, jsonl: &Issue) -> bool {
             db.dependencies.iter().map(dependency_payload_key),
             jsonl.dependencies.iter().map(dependency_payload_key),
         )
-        && multiset_is_subset(
-            db.comments.iter().map(Comment::sync_key),
-            jsonl.comments.iter().map(Comment::sync_key),
-        )
+        && comments_preserved_by(db, jsonl).unwrap_or(false)
+}
+
+/// A replay represents local comments only if their causal join contributes
+/// no lost revision or privacy state. Database-local rowids are irrelevant.
+fn comments_preserved_by(local: &Issue, imported: &Issue) -> Result<bool> {
+    if local.id != imported.id
+        || local
+            .comments
+            .iter()
+            .chain(&imported.comments)
+            .any(|comment| comment.issue_id != local.id)
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "schema-heal comments have conflicting issue ownership".to_owned(),
+        });
+    }
+    let joined = merge_comment_lists(&imported.comments, &local.comments, &local.id)?;
+    Ok(comments_sync_equal(&joined, &imported.comments))
 }
 
 /// Defaulted relation fields have the same persisted meaning, but populated
@@ -664,8 +696,9 @@ fn dependency_payload_key(
 }
 
 /// A source superset is safe, but one serialized child cannot certify two
-/// distinct stored occurrences. Comment rowids are deliberately not keys:
-/// they are database-local; Comment::sync_key supplies the portable identity.
+/// distinct stored occurrences. Comments use causal revision comparison
+/// separately so terminal states can suppress stale bodies without retaining
+/// those values in a recovery plan.
 fn multiset_is_subset<K: Eq + std::hash::Hash>(
     mut required: impl Iterator<Item = K>,
     present: impl Iterator<Item = K>,
@@ -700,11 +733,21 @@ fn parse_jsonl(mut reader: impl BufRead) -> Result<HashMap<String, Issue>> {
         if trimmed.is_empty() {
             continue;
         }
-        let issue: Issue = serde_json::from_str(trimmed)
+        let mut issue: Issue = serde_json::from_str(trimmed)
             .map_err(|error| BeadsError::Config(format!("line {line_num}: {error}")))?;
         if issue.id.trim().is_empty() {
             return Err(BeadsError::Config(format!(
                 "line {line_num}: empty issue id cannot certify a schema-heal source"
+            )));
+        }
+        normalize_comment_revisions(&mut issue.comments)?;
+        if issue
+            .comments
+            .iter()
+            .any(|comment| comment.issue_id != issue.id)
+        {
+            return Err(BeadsError::Config(format!(
+                "line {line_num}: comment ownership cannot certify a schema-heal source"
             )));
         }
         if issues.insert(issue.id.clone(), issue).is_some() {
@@ -961,16 +1004,25 @@ fn decode_issue(
         .iter()
         .map(|row| decode_related(row, created_at.as_ref()))
         .collect::<Option<_>>()?;
-    let comments: Vec<Comment> = comments
+    let mut comments: Vec<Comment> = comments
         .iter()
         .map(|row| {
             let mut row = row.clone();
             if let Some(Value::String(text)) = row.remove("text").or_else(|| row.remove("body")) {
                 row.insert("text".to_owned(), Value::String(text));
             }
+            if let Some(encoded) = row.remove("revision") {
+                let revision: CommentRevision = match encoded {
+                    Value::Null => return decode_related(&row, created_at.as_ref()),
+                    Value::String(encoded) => serde_json::from_str(&encoded).ok()?,
+                    value => serde_json::from_value(value).ok()?,
+                };
+                row.insert("revision".to_owned(), serde_json::to_value(revision).ok()?);
+            }
             decode_related(&row, created_at.as_ref())
         })
         .collect::<Option<_>>()?;
+    normalize_comment_revisions(&mut comments).ok()?;
     object.insert(
         "labels".to_owned(),
         Value::Array(labels.iter().cloned().map(Value::String).collect()),
@@ -2412,6 +2464,7 @@ mod tests {
             author: "agent".to_owned(),
             body: "same words at a different time".to_owned(),
             created_at: local.created_at,
+            revision: None,
         });
         let mut exported = local.clone();
         exported.comments[0].id = 99;
@@ -2466,6 +2519,7 @@ mod tests {
             author: "local-agent".to_owned(),
             body: body.to_owned(),
             created_at: issue("a-1", "2026-01-01T00:00:00Z").created_at,
+            revision: None,
         }
     }
 
@@ -2494,7 +2548,11 @@ mod tests {
                 );
                 jsonl.comments.clear();
                 jsonl.status = Status::Tombstone;
-                assert_eq!(classify(&local, Some(&jsonl), dirty), None);
+                assert_eq!(
+                    classify(&local, Some(&jsonl), dirty),
+                    Some((DbOnlyReason::CommentsAbsentFromJsonl, true)),
+                    "issue deletion cannot certify omitted comment history"
+                );
             }
         }
         let mut local = issue("a-1", "2026-02-01T00:00:00Z");
@@ -2545,6 +2603,147 @@ mod tests {
     }
 
     #[test]
+    fn schema_heal_comment_revision_proofs_refuse_stale_and_concurrent_payloads() {
+        let mut local = issue("a-1", "2026-01-01T00:00:00Z");
+        local
+            .comments
+            .push(local_comment(1, "original private value"));
+        normalize_comment_revisions(&mut local.comments).unwrap();
+        let mut peer = local.clone();
+        peer.updated_at += chrono::Duration::hours(1);
+        local.comments[0]
+            .revise(
+                crate::model::CommentState::Redacted,
+                "",
+                "local-agent",
+                local.updated_at,
+            )
+            .unwrap();
+        for status in [Status::Open, Status::Tombstone] {
+            peer.status = status;
+            for dirty in [false, true] {
+                assert_eq!(
+                    classify(&local, Some(&peer), dirty),
+                    Some((DbOnlyReason::CommentsAbsentFromJsonl, true)),
+                );
+            }
+            assert!(!comments_preserved_by(&local, &peer).unwrap());
+        }
+        let original = peer.comments[0].clone();
+        local.comments[0] = original.clone();
+        local.comments[0]
+            .revise(
+                crate::model::CommentState::Active,
+                "local private edit",
+                "local-agent",
+                local.updated_at,
+            )
+            .unwrap();
+        peer.comments[0]
+            .revise(
+                crate::model::CommentState::Active,
+                "remote private edit",
+                "local-agent",
+                peer.updated_at,
+            )
+            .unwrap();
+        let verdict = classify(&local, Some(&peer), false);
+        assert_eq!(verdict, Some((DbOnlyReason::Unreadable, false)));
+        let mut blockers = Vec::new();
+        audit_local_replay_coverage(&local, Some(&peer), verdict, &mut blockers);
+        assert!(
+            blockers
+                .iter()
+                .any(|message| message.contains("Concurrent edits"))
+        );
+        assert!(
+            blockers
+                .iter()
+                .all(|message| !message.contains("private edit"))
+        );
+    }
+
+    #[test]
+    fn schema_heal_decodes_sqlite_revision_json_and_keeps_redaction_on_tombstones() {
+        let (conn, mut peer) = older_comment_fixture(1, false);
+        conn.execute("ALTER TABLE comments ADD COLUMN revision TEXT")
+            .unwrap();
+        let mut removed = local_comment(1, "local-only");
+        normalize_comment_revisions(std::slice::from_mut(&mut removed)).unwrap();
+        peer.comments = vec![removed.clone()];
+        peer.status = Status::Tombstone;
+        removed
+            .revise(
+                crate::model::CommentState::Redacted,
+                "",
+                "local-agent",
+                peer.updated_at,
+            )
+            .unwrap();
+        conn.execute_with_params(
+            "UPDATE comments SET text = '', revision = ? WHERE id = 1",
+            &[SqliteValue::from(
+                serde_json::to_string(removed.revision.as_ref().unwrap()).unwrap(),
+            )],
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&peer).unwrap();
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(bytes))).unwrap();
+        assert_eq!(audit.db_only.len(), 1);
+        assert_eq!(
+            audit.db_only[0].reason,
+            DbOnlyReason::CommentsAbsentFromJsonl
+        );
+        assert!(audit.db_only[0].restorable);
+        let plan = &audit.restorable[0];
+        assert_eq!(plan.issue.status, Status::Tombstone);
+        assert_eq!(plan.issue.comments, vec![removed.clone()]);
+        assert_eq!(plan.comments.as_ref().unwrap(), &vec![removed]);
+        assert!(
+            !serde_json::to_string(&plan.issue)
+                .unwrap()
+                .contains("local-only")
+        );
+
+        conn.execute("UPDATE comments SET revision = 'private malformed revision'")
+            .unwrap();
+        let bytes = serde_json::to_vec(&peer).unwrap();
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(bytes))).unwrap();
+        assert_eq!(audit.db_only[0].reason, DbOnlyReason::Unreadable);
+        assert!(!audit.db_only[0].restorable);
+        assert!(audit.restorable.is_empty());
+    }
+
+    #[test]
+    fn schema_heal_newer_local_scalars_still_carry_peer_comment_redaction() {
+        let (conn, mut peer) = older_comment_fixture(2, false);
+        conn.execute("UPDATE issues SET updated_at = '2026-01-02T00:00:00Z'")
+            .unwrap();
+        let mut removed = local_comment(1, "local-only");
+        normalize_comment_revisions(std::slice::from_mut(&mut removed)).unwrap();
+        removed
+            .revise(
+                crate::model::CommentState::Deleted,
+                "",
+                "local-agent",
+                peer.updated_at,
+            )
+            .unwrap();
+        peer.comments = vec![removed.clone()];
+        let bytes = serde_json::to_vec(&peer).unwrap();
+        let audit = audit_connection(&conn, Some(std::io::Cursor::new(bytes))).unwrap();
+        assert_eq!(audit.db_only[0].reason, DbOnlyReason::UnflushedEdit);
+        let plan = &audit.restorable[0];
+        assert_eq!(plan.issue.title, "title a-1");
+        assert_eq!(plan.issue.comments, vec![removed]);
+        assert!(
+            !serde_json::to_string(&plan.issue)
+                .unwrap()
+                .contains("local-only")
+        );
+    }
+
+    #[test]
     fn audit_projects_newer_issue_payload_for_comments_only_restoration() {
         for dirty_mode in 0..3 {
             for equal_revision in [false, true] {
@@ -2588,10 +2787,13 @@ mod tests {
                     restore.issue.source_repo_path.as_deref(),
                     Some("/local/workspace")
                 );
-                assert_eq!(
-                    restore.comments.as_ref().unwrap(),
-                    &[local_comment(1, "local-only")]
-                );
+                let expected_comments = merge_comment_lists(
+                    &[local_comment(1, "local-only")],
+                    &peer.comments,
+                    &peer.id,
+                )
+                .unwrap();
+                assert_eq!(restore.comments.as_ref().unwrap(), &expected_comments);
                 let original = conn
                     .query_row("SELECT title, status, notes FROM issues")
                     .unwrap();
@@ -2630,7 +2832,9 @@ mod tests {
         ));
         let mut deleted = local;
         deleted.status = Status::Tombstone;
-        assert!(comment_only_restore(known, &deleted).is_err());
+        let restored = comment_only_restore(known, &deleted).unwrap();
+        assert_eq!(restored.issue.status, Status::Tombstone);
+        assert_eq!(restored.issue.comments.len(), 1);
     }
 
     #[test]

@@ -273,7 +273,7 @@ impl<'a> IssuePanel<'a> {
             );
             content.append_styled(": ", self.theme.dimmed.clone());
             content.append_styled(
-                sanitize_terminal_text(&comment.body).as_ref(),
+                sanitize_terminal_text(comment.display_body()).as_ref(),
                 self.theme.comment.clone(),
             );
             content.append("\n");

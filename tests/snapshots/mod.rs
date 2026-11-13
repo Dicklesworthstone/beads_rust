@@ -654,6 +654,34 @@ impl serde::Serialize for SnapshotJson<'_> {
     }
 }
 
+fn normalize_comment_revision(value: &Value) -> Value {
+    let mut normalized = normalize_json(value);
+    if let Some(revision) = normalized.as_object_mut() {
+        for key in ["identity", "head"] {
+            if let Some(digest) = revision.get_mut(key) {
+                normalize_comment_digest(digest);
+            }
+        }
+        if let Some(Value::Array(ancestors)) = revision.get_mut("ancestors") {
+            for digest in ancestors {
+                normalize_comment_digest(digest);
+            }
+        }
+    }
+    normalized
+}
+
+fn normalize_comment_digest(value: &mut Value) {
+    if value.as_str().is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        *value = Value::String("COMMENT_REVISION_HASH".to_owned());
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn normalize_json(json: &Value) -> Value {
     match json {
@@ -670,6 +698,16 @@ pub fn normalize_json(json: &Value) -> Value {
                         Value::String("TIMESTAMP".to_string())
                     }
                     "content_hash" => Value::String("HASH".to_string()),
+                    // Only comment revision digests include the fixture's
+                    // variable issue ID and clock. Keep state, generation,
+                    // actor, ancestry shape and all unrelated hashes visible.
+                    "revision"
+                        if map.contains_key("author")
+                            && map.contains_key("text")
+                            && map.contains_key("created_at") =>
+                    {
+                        normalize_comment_revision(value)
+                    }
                     // Normalize source_repo/source_repo_path: br resolves "." to the absolute
                     // path of the workspace; under tempdir-based tests this is
                     // a randomly-named ".tmpXXXXXX" path, so the snapshot must
@@ -1185,5 +1223,44 @@ mod host_tooling_masking_tests {
             normalize_text_with_log("OK sqlite3.integrity_check\n", &TextNormConfig::minimal());
         assert_eq!(normalized, "OK sqlite3.integrity_check\n");
         assert!(!log.contains(&"host_tooling".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod comment_revision_normalization_tests {
+    use super::normalize_json;
+
+    #[test]
+    fn comment_revision_normalization_preserves_state_actor_and_ancestry_shape() {
+        let digest = "a".repeat(64);
+        let input = serde_json::json!({
+            "author": "fixture", "text": "body", "created_at": "2026-11-12T00:00:00Z",
+            "revision": {
+                "identity": digest, "head": "b".repeat(64), "ancestors": [digest, "malformed"],
+                "generation": 3, "state": "active", "updated_at": "2026-11-13T00:00:00Z",
+                "updated_by": "reviewer"
+            },
+            "metadata": {"identity": digest}
+        });
+        let normalized = normalize_json(&input);
+        assert_eq!(normalized["revision"]["identity"], "COMMENT_REVISION_HASH");
+        assert_eq!(normalized["revision"]["head"], "COMMENT_REVISION_HASH");
+        assert_eq!(
+            normalized["revision"]["ancestors"],
+            serde_json::json!(["COMMENT_REVISION_HASH", "malformed"])
+        );
+        assert_eq!(normalized["revision"]["generation"], 3);
+        assert_eq!(normalized["revision"]["state"], "active");
+        assert_eq!(normalized["revision"]["updated_by"], "reviewer");
+        assert_eq!(normalized["revision"]["updated_at"], "TIMESTAMP");
+        assert_eq!(normalized["metadata"]["identity"], digest);
+    }
+
+    #[test]
+    fn comment_revision_normalization_does_not_mask_unrelated_revision_objects() {
+        let input = serde_json::json!({
+            "revision": {"identity": "a".repeat(64), "head": "b".repeat(64)}
+        });
+        assert_eq!(normalize_json(&input), input);
     }
 }

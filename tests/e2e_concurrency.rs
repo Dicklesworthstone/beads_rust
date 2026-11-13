@@ -500,6 +500,7 @@ fn seed_noop_auto_import_workspace(issue_count: usize) -> (TempDir, String) {
                 author: "scale-fixture".to_string(),
                 body: format!("Discussion for issue {index}"),
                 created_at: issue.updated_at,
+                revision: None,
             });
         }
         if index % 8 == 1 {

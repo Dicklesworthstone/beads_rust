@@ -11,11 +11,12 @@ use std::collections::HashSet;
 
 use crate::error::Result;
 use crate::franken_sync::Connection;
-use crate::model::{Comment, Issue};
+use crate::model::Issue;
 
 use super::{
     BOOL_FIELDS, DbOnlyReason, INT_FIELDS, STRING_FIELDS, TIMESTAMP_FIELDS, column_names,
-    dependency_payload_key, multiset_is_subset, quote_identifier, required_legacy_text,
+    comments_preserved_by, dependency_payload_key, multiset_is_subset, quote_identifier,
+    required_legacy_text,
 };
 
 /// A winning JSONL timestamp is sync precedence, not evidence that a schema
@@ -27,6 +28,14 @@ pub(super) fn audit_local_replay_coverage(
     verdict: Option<(DbOnlyReason, bool)>,
     blockers: &mut Vec<String>,
 ) {
+    if let Some(imported) = imported
+        && let Err(error) = comments_preserved_by(local, imported)
+    {
+        blockers.push(format!(
+            "issue {} has comment revisions without a safe replay: {error}",
+            local.id
+        ));
+    }
     if local.bypassed_policy.is_some() || local.bypass_reason.is_some() {
         blockers.push(format!(
             "issue {} has local policy attribution without a verified replay path",
@@ -69,10 +78,7 @@ pub(super) fn audit_local_replay_coverage(
                 local.id
             ));
         }
-        if !multiset_is_subset(
-            local.comments.iter().map(Comment::sync_key),
-            imported.comments.iter().map(Comment::sync_key),
-        ) {
+        if !comments_preserved_by(local, imported).unwrap_or(false) {
             blockers.push(format!(
                 "issue {} has local comments absent from its proposed replay",
                 local.id
@@ -164,7 +170,15 @@ fn replayed_columns(table: &str) -> Option<&'static [&'static str]> {
     match table {
         "issues" => Some(&[]),
         "labels" => Some(&["issue_id", "label"]),
-        "comments" => Some(&["id", "issue_id", "author", "text", "body", "created_at"]),
+        "comments" => Some(&[
+            "id",
+            "issue_id",
+            "author",
+            "text",
+            "body",
+            "created_at",
+            "revision",
+        ]),
         "dependencies" => Some(&[
             "issue_id",
             "depends_on_id",

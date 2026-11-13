@@ -613,6 +613,54 @@ schemas:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
           - type: string
+  Comment:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: Comment
+    description: A comment on an issue.
+    type: object
+    properties:
+      id:
+        description: "Database-local rowid. It is exported to JSONL for reference only:\nevery clone mints its own sequence, so two clones' comments routinely\nshare an id and import reassigns the local rowid when that happens.\nSync compares portable revision identities, never this rowid."
+        type: integer
+        format: int64
+      issue_id.type: string
+      author.type: string
+      text.type: string
+      created_at:
+        type: string
+        format: date-time
+      revision:
+        description: "Portable identity and content-free revision ancestry. Absent in legacy\nrecords; enrolled deterministically before mutation or reconciliation."
+        anyOf[2]:
+          - "$ref": #/$defs/CommentRevision
+          - type: "null"
+    required[5]: id,issue_id,author,text,created_at
+    "$defs":
+      CommentRevision:
+        description: "Current revision metadata. Ancestors are opaque digests, never old text.\nThey distinguish sequential edits from divergent edits even when one branch\nhas made more edits or has a clock ahead of another machine."
+        type: object
+        properties:
+          identity.type: string
+          generation:
+            type: integer
+            format: uint64
+            minimum: 0
+          head.type: string
+          ancestors:
+            type: array
+            items.type: string
+          state:
+            "$ref": #/$defs/CommentState
+          updated_at:
+            type: string
+            format: date-time
+          updated_by.type: string
+        additionalProperties: false
+        required[7]: identity,generation,head,ancestors,state,updated_at,updated_by
+      CommentState:
+        description: "Removal is monotone: deletion dominates redaction, and either suppresses\nevery ordinary edit independently of clocks."
+        type: string
+        enum[3]: active,redacted,deleted
   CoordinationClaimRow:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: CoordinationClaimRow
@@ -1555,7 +1603,7 @@ schemas:
         type: object
         properties:
           id:
-            description: "Database-local rowid. It is exported to JSONL for reference only:\nevery clone mints its own sequence, so two clones' comments routinely\nshare an id and import reassigns the local rowid when that happens.\nSync compares comments by [`Comment::sync_key`], never by `id`."
+            description: "Database-local rowid. It is exported to JSONL for reference only:\nevery clone mints its own sequence, so two clones' comments routinely\nshare an id and import reassigns the local rowid when that happens.\nSync compares portable revision identities, never this rowid."
             type: integer
             format: int64
           issue_id.type: string
@@ -1564,7 +1612,37 @@ schemas:
           created_at:
             type: string
             format: date-time
+          revision:
+            description: "Portable identity and content-free revision ancestry. Absent in legacy\nrecords; enrolled deterministically before mutation or reconciliation."
+            anyOf[2]:
+              - "$ref": #/$defs/CommentRevision
+              - type: "null"
         required[5]: id,issue_id,author,text,created_at
+      CommentRevision:
+        description: "Current revision metadata. Ancestors are opaque digests, never old text.\nThey distinguish sequential edits from divergent edits even when one branch\nhas made more edits or has a clock ahead of another machine."
+        type: object
+        properties:
+          identity.type: string
+          generation:
+            type: integer
+            format: uint64
+            minimum: 0
+          head.type: string
+          ancestors:
+            type: array
+            items.type: string
+          state:
+            "$ref": #/$defs/CommentState
+          updated_at:
+            type: string
+            format: date-time
+          updated_by.type: string
+        additionalProperties: false
+        required[7]: identity,generation,head,ancestors,state,updated_at,updated_by
+      CommentState:
+        description: "Removal is monotone: deletion dominates redaction, and either suppresses\nevery ordinary edit independently of clocks."
+        type: string
+        enum[3]: active,redacted,deleted
   IssueDetails:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: IssueDetails
@@ -1792,7 +1870,7 @@ schemas:
         type: object
         properties:
           id:
-            description: "Database-local rowid. It is exported to JSONL for reference only:\nevery clone mints its own sequence, so two clones' comments routinely\nshare an id and import reassigns the local rowid when that happens.\nSync compares comments by [`Comment::sync_key`], never by `id`."
+            description: "Database-local rowid. It is exported to JSONL for reference only:\nevery clone mints its own sequence, so two clones' comments routinely\nshare an id and import reassigns the local rowid when that happens.\nSync compares portable revision identities, never this rowid."
             type: integer
             format: int64
           issue_id.type: string
@@ -1801,7 +1879,37 @@ schemas:
           created_at:
             type: string
             format: date-time
+          revision:
+            description: "Portable identity and content-free revision ancestry. Absent in legacy\nrecords; enrolled deterministically before mutation or reconciliation."
+            anyOf[2]:
+              - "$ref": #/$defs/CommentRevision
+              - type: "null"
         required[5]: id,issue_id,author,text,created_at
+      CommentRevision:
+        description: "Current revision metadata. Ancestors are opaque digests, never old text.\nThey distinguish sequential edits from divergent edits even when one branch\nhas made more edits or has a clock ahead of another machine."
+        type: object
+        properties:
+          identity.type: string
+          generation:
+            type: integer
+            format: uint64
+            minimum: 0
+          head.type: string
+          ancestors:
+            type: array
+            items.type: string
+          state:
+            "$ref": #/$defs/CommentState
+          updated_at:
+            type: string
+            format: date-time
+          updated_by.type: string
+        additionalProperties: false
+        required[7]: identity,generation,head,ancestors,state,updated_at,updated_by
+      CommentState:
+        description: "Removal is monotone: deletion dominates redaction, and either suppresses\nevery ordinary edit independently of clocks."
+        type: string
+        enum[3]: active,redacted,deleted
       IssueWithDependencyMetadata:
         type: object
         properties:
@@ -2103,7 +2211,7 @@ schemas:
         type: object
         properties:
           id:
-            description: "Database-local rowid. It is exported to JSONL for reference only:\nevery clone mints its own sequence, so two clones' comments routinely\nshare an id and import reassigns the local rowid when that happens.\nSync compares comments by [`Comment::sync_key`], never by `id`."
+            description: "Database-local rowid. It is exported to JSONL for reference only:\nevery clone mints its own sequence, so two clones' comments routinely\nshare an id and import reassigns the local rowid when that happens.\nSync compares portable revision identities, never this rowid."
             type: integer
             format: int64
           issue_id.type: string
@@ -2112,7 +2220,37 @@ schemas:
           created_at:
             type: string
             format: date-time
+          revision:
+            description: "Portable identity and content-free revision ancestry. Absent in legacy\nrecords; enrolled deterministically before mutation or reconciliation."
+            anyOf[2]:
+              - "$ref": #/$defs/CommentRevision
+              - type: "null"
         required[5]: id,issue_id,author,text,created_at
+      CommentRevision:
+        description: "Current revision metadata. Ancestors are opaque digests, never old text.\nThey distinguish sequential edits from divergent edits even when one branch\nhas made more edits or has a clock ahead of another machine."
+        type: object
+        properties:
+          identity.type: string
+          generation:
+            type: integer
+            format: uint64
+            minimum: 0
+          head.type: string
+          ancestors:
+            type: array
+            items.type: string
+          state:
+            "$ref": #/$defs/CommentState
+          updated_at:
+            type: string
+            format: date-time
+          updated_by.type: string
+        additionalProperties: false
+        required[7]: identity,generation,head,ancestors,state,updated_at,updated_by
+      CommentState:
+        description: "Removal is monotone: deletion dominates redaction, and either suppresses\nevery ordinary edit independently of clocks."
+        type: string
+        enum[3]: active,redacted,deleted
   ReadyIssue:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: ReadyIssue
@@ -2873,12 +3011,37 @@ commands:
     jq_filter: .
     error_envelope_on_stderr: false
     notes: "Machine-readable command, feature, safety, exit-code, and env-var inventory."
+  "comments add":
+    shape: object
+    jq_filter: .
+    item_schema: Comment
+    error_envelope_on_stderr: false
+    notes: Current comment with portable revision metadata. Redacted and deleted text is empty; original authorship is retained.
+  "comments delete":
+    shape: object
+    jq_filter: .
+    item_schema: Comment
+    error_envelope_on_stderr: false
+    notes: Current comment with portable revision metadata. Redacted and deleted text is empty; original authorship is retained.
+  "comments edit":
+    shape: object
+    jq_filter: .
+    item_schema: Comment
+    error_envelope_on_stderr: false
+    notes: Current comment with portable revision metadata. Redacted and deleted text is empty; original authorship is retained.
   "comments list":
     shape: array
     jq_filter: ".[]"
     items_at: .
+    item_schema: Comment
     error_envelope_on_stderr: false
-    notes: Empty array if no comments. ErrorEnvelope on stdout if the issue id cannot be resolved.
+    notes: Empty array if no visible comments. Deleted markers require --include-deleted. ErrorEnvelope on stdout if the issue id cannot be resolved.
+  "comments redact":
+    shape: object
+    jq_filter: .
+    item_schema: Comment
+    error_envelope_on_stderr: false
+    notes: Current comment with portable revision metadata. Redacted and deleted text is empty; original authorship is retained.
   "coordination reclaim":
     shape: array|object
     jq_filter: "if type == \"array\" then .[] else .updated[] end"

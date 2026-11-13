@@ -13,12 +13,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    BeadsError, Connection, LegacyTableProjection, Result, hash_len_prefixed, hex_digest,
+    BeadsError, Connection, LegacyTableProjection, Result, hash_len_prefixed, hex_digest, is_false,
     legacy_projection_rowid, legacy_rows_projection, preservation_text, query_user_version,
     quote_identifier, reviewed_schema_objects, with_preservation_snapshot,
 };
 use crate::storage::schema::{
-    CURRENT_SCHEMA_VERSION, legacy_v4 as schema, runtime_schema_compatible,
+    CURRENT_SCHEMA_VERSION, legacy_v4 as schema, reviewed_schema19_runtime_compatible,
+    reviewed_schema20_runtime_compatible, runtime_schema_compatible,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,6 +27,8 @@ pub(super) struct LegacyV4Projection {
     profile: String,
     issues_columns_added: Vec<String>,
     events_columns_added: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    comment_revisions_added: bool,
     created_tables: Vec<String>,
     bookkeeping_preserved: bool,
     tables: Vec<LegacyTableProjection>,
@@ -38,16 +41,27 @@ fn refused(detail: impl std::fmt::Display) -> BeadsError {
     ))
 }
 
-pub(super) fn projection(conn: &Connection, project_source: bool) -> Result<LegacyV4Projection> {
+pub(super) fn projection(
+    conn: &Connection,
+    project_source: bool,
+    target: u32,
+) -> Result<LegacyV4Projection> {
+    let comment_revisions_added = target >= 21;
     let hashes = if project_source {
         schema::attest_source(conn)?;
         schema::content_hashes(conn)?.into_iter().collect()
     } else {
-        if i64::from(query_user_version(conn)?) != i64::from(CURRENT_SCHEMA_VERSION)
-            || !runtime_schema_compatible(conn)
-        {
+        let canonical = match target {
+            19 => reviewed_schema19_runtime_compatible(conn),
+            20 => reviewed_schema20_runtime_compatible(conn),
+            version if i64::from(version) == i64::from(CURRENT_SCHEMA_VERSION) => {
+                runtime_schema_compatible(conn)
+            }
+            _ => false,
+        };
+        if query_user_version(conn)? != target || !canonical {
             return Err(refused(
-                "the candidate does not have the current canonical schema",
+                "the candidate does not have the receipt's canonical target schema",
             ));
         }
         BTreeMap::new()
@@ -55,7 +69,13 @@ pub(super) fn projection(conn: &Connection, project_source: bool) -> Result<Lega
     let mut tables = Vec::new();
     for row in conn.query("SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name")? {
         let name = preservation_text(row.get(0), "table name")?;
-        tables.push(table_projection(conn, &name, project_source, &hashes)?);
+        tables.push(table_projection(
+            conn,
+            &name,
+            project_source,
+            &hashes,
+            comment_revisions_added,
+        )?);
     }
     if project_source {
         for name in schema::NEW_TABLES {
@@ -73,13 +93,17 @@ pub(super) fn projection(conn: &Connection, project_source: bool) -> Result<Lega
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
+        comment_revisions_added,
         created_tables: schema::NEW_TABLES
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
         bookkeeping_preserved: true,
         tables,
-        preserved_schema_sha256: preserved_schema(conn)?,
+        preserved_schema_sha256: preserved_schema(
+            conn,
+            !project_source && comment_revisions_added,
+        )?,
     })
 }
 
@@ -88,6 +112,7 @@ fn table_projection(
     table: &str,
     project_source: bool,
     hashes: &BTreeMap<String, String>,
+    comment_revisions_added: bool,
 ) -> Result<LegacyTableProjection> {
     let rowid = legacy_projection_rowid(conn, table)?;
     let prefix = rowid.map_or_else(String::new, |alias| format!("{alias}, "));
@@ -136,6 +161,7 @@ fn table_projection(
                 "events" => {
                     values.extend([SqliteValue::Null, SqliteValue::Null, SqliteValue::Null]);
                 }
+                "comments" if comment_revisions_added => values.push(SqliteValue::Null),
                 _ => {}
             }
         }
@@ -144,9 +170,9 @@ fn table_projection(
     legacy_rows_projection(table, rowid.is_some(), &rows)
 }
 
-fn preserved_schema(conn: &Connection) -> Result<String> {
+fn preserved_schema(conn: &Connection, project_comment_revision: bool) -> Result<String> {
     let mut hasher = Sha256::new();
-    for object in reviewed_schema_objects(conn, false)? {
+    for object in reviewed_schema_objects(conn, false, false, project_comment_revision)? {
         if schema::NEW_TABLES.contains(&object.table.as_str())
             || (object.table == "events" && object.object_type == "table")
             || (object.object_type == "index"
@@ -173,9 +199,10 @@ pub(super) fn verify(
     db_path: &Path,
     expected: &LegacyV4Projection,
     project_source: bool,
+    target: u32,
 ) -> Result<()> {
     with_preservation_snapshot(db_path, |conn| {
-        let observed = projection(conn, project_source)?;
+        let observed = projection(conn, project_source, target)?;
         if &observed != expected {
             return Err(refused(format!(
                 "complete projected state differs at {}; refusing installation, resumption, or undo",
@@ -213,6 +240,8 @@ mod tests {
             INSERT INTO config (rowid, key, value) VALUES (81, 'editor', 'vim'), (97, 'editor', 'nano');
             INSERT INTO metadata (rowid, key, value) VALUES (105, 'opaque', X'00FF');
             INSERT INTO dirty_issues (rowid, issue_id, marked_at) VALUES (33, 'leg-n57', 'retain-time');
+            INSERT INTO comments (id, issue_id, author, text)
+                VALUES (555, 'leg-n57', 'legacy-author', 'retained comment body');
             CREATE TABLE operator_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, tag TEXT, payload BLOB);
             CREATE UNIQUE INDEX operator_tag ON operator_notes(tag COLLATE NOCASE) WHERE tag IS NOT NULL;
             INSERT INTO operator_notes (id, tag, payload) VALUES (171, 'retain', X'01FF');
@@ -239,9 +268,13 @@ mod tests {
     #[test]
     fn released_schema4_complete_destination_matches_before_and_after_upgrade() {
         let (_temp, conn) = released_source();
-        let expected = projection(&conn, true).unwrap();
+        let expected =
+            projection(&conn, true, u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()).unwrap();
         upgrade(&conn);
-        assert_eq!(projection(&conn, false).unwrap(), expected);
+        assert_eq!(
+            projection(&conn, false, u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()).unwrap(),
+            expected,
+        );
         assert!(
             expected
                 .tables
@@ -276,6 +309,7 @@ mod tests {
             "UPDATE issues SET source_repo_path='invented' WHERE id='leg-n57'",
             "UPDATE issues SET prerequisites='invented' WHERE id='leg-n57'",
             "UPDATE events SET agent_name='invented' WHERE id=1",
+            "UPDATE comments SET revision='invented'",
             "UPDATE operator_notes SET payload='decoded'",
             "UPDATE operator_without_rowid SET payload='decoded'",
             "UPDATE sqlite_sequence SET seq=5 WHERE name='events'",
@@ -283,10 +317,11 @@ mod tests {
             "DROP INDEX operator_tag; CREATE INDEX operator_tag ON operator_notes(tag COLLATE NOCASE) WHERE tag IS NOT NULL",
         ] {
             let (_temp, conn) = released_source();
-            let expected = projection(&conn, true).unwrap();
+            let expected =
+                projection(&conn, true, u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()).unwrap();
             upgrade(&conn);
             execute_batch(&conn, sql).unwrap();
-            let observed = projection(&conn, false);
+            let observed = projection(&conn, false, u32::try_from(CURRENT_SCHEMA_VERSION).unwrap());
             assert!(
                 observed.is_err() || observed.unwrap() != expected,
                 "accepted drift: {sql}"
@@ -309,9 +344,12 @@ mod tests {
             gate_result_history_created: true,
             prerequisites_column_added: true,
             gate_reporter_columns_added: true,
+            comment_revisions_added: true,
             dependency_type_key_added: true,
             legacy_v15_conversion: None,
-            legacy_v4_conversion: Some(projection(&conn, true).unwrap()),
+            legacy_v4_conversion: Some(
+                projection(&conn, true, u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()).unwrap(),
+            ),
             content_hash_refresh_profile: None,
             schema19_runtime_upgrade: None,
             schema19_preservation: None,
@@ -326,7 +364,8 @@ mod tests {
             before, after,
             "the old multiset witness does not include hidden rowids"
         );
-        forecast.legacy_v4_conversion = Some(projection(&conn, true).unwrap());
+        forecast.legacy_v4_conversion =
+            Some(projection(&conn, true, u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()).unwrap());
         let token_after = compute_plan_token("/released-schema4.db", &after, &forecast).unwrap();
         assert_ne!(token_before, token_after);
     }

@@ -468,8 +468,12 @@ impl CommentValidator {
             errors.push(ValidationError::new("issue_id", "cannot be empty"));
         }
 
-        if comment.body.trim().is_empty() {
+        if comment.state() == crate::model::CommentState::Active && comment.body.trim().is_empty() {
             errors.push(ValidationError::new("content", "cannot be empty"));
+        }
+
+        if let Err(error) = comment.validate_revision() {
+            errors.push(ValidationError::new("revision", error.to_string()));
         }
 
         // Comment bodies are unbounded — same reasoning as long-text issue
@@ -1066,6 +1070,7 @@ mod tests {
             author: "tester".to_string(),
             body: " ".to_string(),
             created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            revision: None,
         };
 
         let errors = CommentValidator::validate(&comment).unwrap_err();

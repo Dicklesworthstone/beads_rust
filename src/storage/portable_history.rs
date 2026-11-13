@@ -603,31 +603,70 @@ pub fn validate(snapshot: &PortableHistorySnapshot) -> Result<()> {
     Ok(())
 }
 
-/// Check old companion bytes before adding the two nullable v20 fields for
-/// comparisons/replay. Checkpoint checksum validation therefore still hashes
-/// the original v1 representation; absent evidence stays unknown rather than
-/// being inferred from a mutable issue or from the reporting actor.
+/// Validate original companion evidence before removing legacy comment text
+/// and adding the two nullable v20 gate fields for comparisons/replay.
+/// Checkpoint checksums still cover the original v1 representation; absent
+/// gate evidence stays unknown rather than being inferred from mutable state.
 fn canonical_snapshot(
     snapshot: &PortableHistorySnapshot,
 ) -> Result<Cow<'_, PortableHistorySnapshot>> {
     validate(snapshot)?;
-    let Some(index) = snapshot
+    let legacy_gate_index = snapshot
         .tables
         .iter()
-        .position(|table| table.table == "gate_result_history" && table.columns.len() == 11)
-    else {
+        .position(|table| table.table == "gate_result_history" && table.columns.len() == 11);
+    if legacy_gate_index.is_none() && !has_comment_event_payloads(snapshot) {
         return Ok(Cow::Borrowed(snapshot));
-    };
-    let mut canonical = snapshot.clone();
-    let table = &mut canonical.tables[index];
-    table.columns.extend([
-        "assignee_at_report".to_owned(),
-        "override_reason".to_owned(),
-    ]);
-    for row in &mut table.rows {
-        row.extend([Value::Null, Value::Null]);
     }
+    let mut canonical = snapshot.clone();
+    if let Some(index) = legacy_gate_index {
+        let table = &mut canonical.tables[index];
+        table.columns.extend([
+            "assignee_at_report".to_owned(),
+            "override_reason".to_owned(),
+        ]);
+        for row in &mut table.rows {
+            row.extend([Value::Null, Value::Null]);
+        }
+    }
+    sanitize_comment_events(&mut canonical);
     Ok(Cow::Owned(canonical))
+}
+
+fn has_comment_event_payloads(snapshot: &PortableHistorySnapshot) -> bool {
+    snapshot.tables.iter().any(|table| {
+        table.table == "events"
+            && table.rows.iter().any(|row| {
+                row.get(2)
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("commented"))
+                    && row
+                        .get(4..7)
+                        .is_some_and(|values| values.iter().any(|value| !value.is_null()))
+            })
+    })
+}
+
+/// Keep comment event attribution and sequence evidence without copying comment
+/// text into audit exports. Legacy events have no stable comment reference, so
+/// their free-text payloads cannot be safely linked to one redacted comment.
+/// New revision events contain only identity/action metadata and stay intact.
+pub fn sanitize_comment_events(snapshot: &mut PortableHistorySnapshot) {
+    for table in &mut snapshot.tables {
+        if table.table != "events" {
+            continue;
+        }
+        for row in &mut table.rows {
+            if row
+                .get(2)
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("commented"))
+                && let Some(payloads) = row.get_mut(4..7)
+            {
+                payloads.fill(Value::Null);
+            }
+        }
+    }
 }
 
 /// Order each table by its key and, for append-only tables, by sequence.
@@ -646,6 +685,7 @@ fn sort_rows(snapshot: &mut PortableHistorySnapshot) {
 }
 
 fn normalize(snapshot: &mut PortableHistorySnapshot) -> Result<()> {
+    sanitize_comment_events(snapshot);
     sort_rows(snapshot);
     let mut event_ids = HashMap::<(String, i64), i64>::new();
     for (spec, table) in SPECS.iter().zip(&mut snapshot.tables) {
@@ -1345,6 +1385,109 @@ mod tests {
     use super::*;
     use crate::model::{Issue, Status};
     use crate::storage::{EventAttribution, IssueUpdate};
+
+    fn legacy_comment_history_fixture() -> (SqliteStorage, Issue) {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let time = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let issue = Issue {
+            id: "bd-private-history".to_owned(),
+            title: "Private comment history".to_owned(),
+            created_at: time,
+            updated_at: time,
+            ..Issue::default()
+        };
+        storage.upsert_issue_for_import(&issue).unwrap();
+        storage.execute_raw(
+            "INSERT INTO events \
+                (id, issue_id, event_type, actor, old_value, new_value, comment, created_at, agent_name, harness, model) \
+             VALUES \
+                (11, 'bd-private-history', 'commented', 'alice', 'private-old', 'private-new', 'private-body', '2026-11-12T12:00:00Z', 'agent-a', 'harness-a', 'model-a'), \
+                (12, 'bd-private-history', 'CoMmEnTeD', 'bob', 'private-old-2', 'private-new-2', 'private-body-2', '2026-11-12T12:00:00Z', NULL, NULL, NULL), \
+                (13, 'bd-private-history', 'comment_redacted', 'operator', NULL, NULL, '{\"identity\":\"portable-identity\",\"generation\":1,\"forced\":true}', '2026-11-12T12:00:00Z', NULL, NULL, NULL), \
+                (14, 'bd-private-history', 'updated', 'reviewer', 'open', 'open', 'retain unrelated audit evidence', '2026-11-12T12:00:00Z', NULL, NULL, NULL)",
+        ).unwrap();
+        (storage, issue)
+    }
+
+    #[test]
+    fn portable_comment_snapshots_sanitize_all_legacy_payloads_and_retain_attribution() {
+        let (storage, _) = legacy_comment_history_fixture();
+        let snapshot = storage.all_portable_history().unwrap();
+        let rows = &snapshot.tables[0].rows;
+        assert_eq!(rows.len(), 4);
+        for row in &rows[..2] {
+            assert_eq!(row[4..7], [Value::Null, Value::Null, Value::Null]);
+        }
+        assert_eq!(rows[0][0], 1);
+        assert_eq!(rows[0][3], "alice");
+        assert_eq!(rows[0][7], "2026-11-12T12:00:00Z");
+        assert_eq!(rows[0][8], "agent-a");
+        assert_eq!(rows[0][9], "harness-a");
+        assert_eq!(rows[0][10], "model-a");
+        assert_eq!(rows[1][3], "bob");
+        assert_eq!(rows[2][2], "comment_redacted");
+        assert_eq!(rows[2][3], "operator");
+        assert_eq!(
+            serde_json::from_str::<Value>(rows[2][6].as_str().unwrap()).unwrap()["forced"],
+            true
+        );
+        assert_eq!(rows[3][6], "retain unrelated audit evidence");
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("private-old"));
+        assert!(!encoded.contains("private-new"));
+        assert!(!encoded.contains("private-body"));
+    }
+
+    #[test]
+    fn portable_comment_replay_sanitizes_old_checkpoints_idempotently() {
+        let (source, issue) = legacy_comment_history_fixture();
+        let mut incoming = source.all_portable_history().unwrap();
+        for row in &mut incoming.tables[0].rows[..2] {
+            row[4] = Value::from("private-old-checkpoint");
+            row[5] = Value::from("private-new-checkpoint");
+            row[6] = Value::from("private-body-checkpoint");
+        }
+        let expected = source.all_portable_history().unwrap();
+        let mut destination = SqliteStorage::open_memory().unwrap();
+        destination.upsert_issue_for_import(&issue).unwrap();
+        for _ in 0..2 {
+            let replay = destination.restore_portable_history(&incoming).unwrap();
+            assert_eq!(replay.replayed, vec![issue.id.clone()]);
+            assert!(replay.diverged.is_empty());
+            assert_eq!(destination.all_portable_history().unwrap(), expected);
+            let raw = destination.execute_raw_query(
+                "SELECT old_value, new_value, comment FROM events WHERE LOWER(event_type) = 'commented' ORDER BY id",
+            ).unwrap();
+            assert_eq!(raw.len(), 2);
+            assert!(
+                raw.iter()
+                    .all(|row| row.iter().all(|value| *value == SqliteValue::Null))
+            );
+        }
+        assert!(
+            incoming.tables[0].rows[0][6]
+                .as_str()
+                .unwrap()
+                .contains("private-body")
+        );
+        let encoded =
+            serde_json::to_string(&destination.get_events(&issue.id, 100).unwrap()).unwrap();
+        assert!(!encoded.contains("private-body"));
+        assert!(encoded.contains("portable-identity"));
+    }
+
+    #[test]
+    fn portable_comment_sanitation_does_not_bypass_checkpoint_validation() {
+        let (source, issue) = legacy_comment_history_fixture();
+        let mut malformed = source.all_portable_history().unwrap();
+        malformed.tables[0].rows[0][6] = serde_json::json!({"private": "invalid type"});
+        let mut destination = SqliteStorage::open_memory().unwrap();
+        destination.upsert_issue_for_import(&issue).unwrap();
+        assert!(destination.restore_portable_history(&malformed).is_err());
+        assert!(destination.get_events(&issue.id, 100).unwrap().is_empty());
+    }
 
     fn gate_source() -> (SqliteStorage, crate::close_policy::Workflow) {
         let mut storage = SqliteStorage::open_memory().unwrap();

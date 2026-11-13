@@ -4662,6 +4662,7 @@ fn e2e_sync_flush_export_parallelism_preserves_jsonl_bytes() {
                     "Deterministic comment payload {index:04} for serde_json export parity."
                 ),
                 created_at: now,
+                revision: None,
             });
             serde_json::to_string(&issue).expect("serialize parallel export fixture issue")
         })

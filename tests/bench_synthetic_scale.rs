@@ -877,6 +877,7 @@ fn generate_comments(
                 config.seed
             ),
             created_at: created_at + chrono::Duration::seconds(usize_to_i64(offset + 1)),
+            revision: None,
         })
         .collect()
 }

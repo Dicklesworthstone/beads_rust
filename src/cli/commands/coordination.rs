@@ -962,6 +962,7 @@ mod tests {
                 author: "a".to_string(),
                 body: "old".to_string(),
                 created_at: now() - Duration::hours(2),
+                revision: None,
             },
             Comment {
                 id: 2,
@@ -969,6 +970,7 @@ mod tests {
                 author: "b".to_string(),
                 body: "new".to_string(),
                 created_at: now(),
+                revision: None,
             },
         ];
 

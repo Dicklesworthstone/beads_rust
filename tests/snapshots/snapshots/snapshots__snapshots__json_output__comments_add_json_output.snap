@@ -7,5 +7,14 @@ expression: normalize_json(&add_json)
   "issue_id": "ISSUE_ID",
   "author": "ACTOR",
   "text": "First comment",
-  "created_at": "TIMESTAMP"
+  "created_at": "TIMESTAMP",
+  "revision": {
+    "identity": "COMMENT_REVISION_HASH",
+    "generation": 0,
+    "head": "COMMENT_REVISION_HASH",
+    "ancestors": [],
+    "state": "active",
+    "updated_at": "TIMESTAMP",
+    "updated_by": "snapshot-author"
+  }
 }

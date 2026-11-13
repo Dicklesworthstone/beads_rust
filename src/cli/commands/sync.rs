@@ -3919,6 +3919,7 @@ fn execute_import(
     // before any destructive table reset.
     if args.force || args.rebuild {
         ensure_no_conflict_markers_snapshot(source)?;
+        crate::sync::ensure_rebuild_preserves_comment_revisions(storage, source)?;
     }
     let jsonl_issue_ids = if args.force || args.rebuild {
         Some(get_issue_ids_from_jsonl_snapshot(source)?)
@@ -5801,7 +5802,11 @@ fn execute_merge(
         for (id, kind) in &report.conflicts {
             use std::fmt::Write;
             let _ = writeln!(msg, "  - {id}: {kind:?}");
-            if *kind == crate::sync::ConflictType::TombstoneHistory {
+            if matches!(
+                kind,
+                crate::sync::ConflictType::TombstoneHistory
+                    | crate::sync::ConflictType::CommentRevision
+            ) {
                 for (_, detail) in report.notes.iter().filter(|(note_id, _)| note_id == id) {
                     let _ = writeln!(msg, "    {detail}");
                 }
@@ -5820,6 +5825,12 @@ fn execute_merge(
             .any(|(_, kind)| *kind == crate::sync::ConflictType::TombstoneHistory)
         {
             msg.push_str("\nNo merge changes were applied. Preserve the database, incoming JSONL, and base snapshot, then reconcile the contradictory historical fields explicitly; force flags cannot discard this evidence.");
+        } else if report
+            .conflicts
+            .iter()
+            .any(|(_, kind)| *kind == crate::sync::ConflictType::CommentRevision)
+        {
+            msg.push_str("\nNo merge changes were applied. Concurrent comment edits need an explicit reconciliation of their revisions. Preserve both sources; force flags cannot choose comment text or undo a redaction.");
         } else {
             msg.push_str("\nUse --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
         }
@@ -5978,6 +5989,11 @@ fn render_merge_conflicts_rich(
         .any(|(_, kind)| *kind == crate::sync::ConflictType::TombstoneHistory)
     {
         text.append("Preserve the database, incoming JSONL, and base snapshot, then reconcile the contradictory tombstone history explicitly; force flags cannot discard this evidence.");
+    } else if conflicts
+        .iter()
+        .any(|(_, kind)| *kind == crate::sync::ConflictType::CommentRevision)
+    {
+        text.append("Preserve both sources and explicitly reconcile the concurrent comment revisions; force flags cannot choose comment text or undo a redaction.");
     } else {
         text.append("Use --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
     }

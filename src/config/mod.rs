@@ -1674,6 +1674,7 @@ fn preserved_unflushed_state(
     beads_dir: &Path,
     db_path: &Path,
 ) -> Result<UnflushedStateSnapshot> {
+    crate::sync::ensure_rebuild_preserves_comment_revisions(storage, source)?;
     let mut snapshot = snapshot_unflushed_state(storage);
     if !snapshot.warnings.is_empty() {
         return Err(automatic_recovery_preservation_refusal(
@@ -7916,6 +7917,7 @@ mod tests {
                     author: "tester".to_string(),
                     body: "relation survives rebuild".to_string(),
                     created_at: now,
+                    revision: None,
                 }],
             )
             .expect("sync comment");

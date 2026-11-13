@@ -83,7 +83,10 @@ pub(crate) use path::{
 };
 
 use crate::error::{BeadsError, Result};
-use crate::model::{Comment, Dependency, DependencyType, Issue};
+use crate::model::{
+    Comment, CommentState, Dependency, DependencyType, Issue, comments_sync_equal,
+    merge_comment_lists, normalize_comment_revisions,
+};
 use crate::storage::sqlite::{ExportCloseBypassAudit, ImportCloseBypassAudit, ImportIssueLookup};
 use crate::storage::{EventAttribution, SqliteStorage};
 use crate::sync::history::HistoryConfig;
@@ -5819,6 +5822,7 @@ fn canonicalize_additive_issue(issue: &mut Issue) {
             .then_with(|| left.id.cmp(&right.id))
             .then_with(|| left.author.cmp(&right.author))
             .then_with(|| left.body.cmp(&right.body))
+            .then_with(|| left.revision.cmp(&right.revision))
     });
 }
 
@@ -5837,32 +5841,30 @@ fn canonicalize_additive_issue_for_storage(issue: &mut Issue) {
 }
 
 fn additive_issues_semantically_equal(left: &Issue, right: &Issue) -> bool {
+    if !comments_sync_equal(&left.comments, &right.comments) {
+        return false;
+    }
     let mut left = left.clone();
     let mut right = right.clone();
     // GitHub #528: the machine-local source_repo_path is not exported, so a DB
     // row that carries it is not drift against its path-free JSONL row.
     left.source_repo_path = None;
     right.source_repo_path = None;
-    for comment in &mut left.comments {
-        comment.id = 0;
-    }
-    for comment in &mut right.comments {
-        comment.id = 0;
-    }
+    left.comments.clear();
+    right.comments.clear();
     canonicalize_additive_issue(&mut left);
     canonicalize_additive_issue(&mut right);
     left == right
 }
 
 fn additive_relations_semantically_equal(left: &Issue, right: &Issue) -> bool {
+    if !comments_sync_equal(&left.comments, &right.comments) {
+        return false;
+    }
     let mut left = left.clone();
     let mut right = right.clone();
-    for comment in &mut left.comments {
-        comment.id = 0;
-    }
-    for comment in &mut right.comments {
-        comment.id = 0;
-    }
+    left.comments.clear();
+    right.comments.clear();
     canonicalize_additive_issue(&mut left);
     canonicalize_additive_issue(&mut right);
     left.labels == right.labels
@@ -6001,6 +6003,7 @@ fn record_additive_conflict_scalar_diff(
 
 fn additive_relation_element_multiset(issue: &Issue) -> Result<BTreeMap<String, usize>> {
     let mut issue = issue.clone();
+    normalize_comment_revisions(&mut issue.comments)?;
     for comment in &mut issue.comments {
         comment.id = 0;
     }
@@ -6051,6 +6054,8 @@ fn additive_conflict_relation_diff_witness(
 ) -> Result<AdditiveConflictRelationDiffWitness> {
     let mut before = existing.clone();
     let mut after = incoming.clone();
+    normalize_comment_revisions(&mut before.comments)?;
+    normalize_comment_revisions(&mut after.comments)?;
     for comment in &mut before.comments {
         comment.id = 0;
     }
@@ -6407,7 +6412,7 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
         "metadata",
         "thread_id",
     ];
-    const COMMENT_FIELDS: &[&str] = &["id", "issue_id", "author", "text", "created_at"];
+    const COMMENT_FIELDS: &[&str] = &["id", "issue_id", "author", "text", "created_at", "revision"];
 
     let value = serde_json::from_str::<DuplicateKeyRejectingJson>(trimmed)
         .map_err(|error| BeadsError::Config(format!("Invalid JSON at line {line_num}: {error}")))?
@@ -6873,8 +6878,8 @@ fn additive_database_witness(
     )?;
     let comment_rows = additive_raw_rows(
         storage,
-        "SELECT id, issue_id, author, text, created_at \
-         FROM comments ORDER BY id, issue_id, author, text, created_at",
+        "SELECT id, issue_id, author, text, created_at, revision \
+         FROM comments ORDER BY id, issue_id, author, text, created_at, revision",
     )?;
     let event_rows = additive_raw_rows(
         storage,
@@ -8325,6 +8330,7 @@ fn plan_additive_reconcile_in_snapshot(
                 author: comment.author.clone(),
                 body: comment.body.clone(),
                 created_at: comment.created_at,
+                revision: comment.revision.clone(),
             };
             if let Err(validation_errors) = CommentValidator::validate(&comment_for_validation) {
                 record_additive_conflict_detail_with_subcodes(
@@ -8344,6 +8350,12 @@ fn plan_additive_reconcile_in_snapshot(
         if issue_has_conflict {
             continue;
         }
+
+        // Validate first so malformed legacy payloads retain the structured
+        // conflict receipt. Enroll before allocating database-local rowids.
+        let mut enrolled_issue = issue.clone();
+        normalize_comment_revisions(&mut enrolled_issue.comments)?;
+        let issue = &enrolled_issue;
 
         // GitHub #528: source_repo_path is machine-local. The import UPDATE
         // keeps the row's own value (an incoming one, carried only by legacy
@@ -8846,8 +8858,8 @@ fn plan_additive_reconcile_in_snapshot(
     )?;
     let mut expected_comment_rows = additive_raw_rows(
         storage,
-        "SELECT id, issue_id, author, text, created_at \
-         FROM comments ORDER BY id, issue_id, author, text, created_at",
+        "SELECT id, issue_id, author, text, created_at, revision \
+         FROM comments ORDER BY id, issue_id, author, text, created_at, revision",
     )?;
     for mutation in mutations.iter().filter(|mutation| mutation.creates_issue()) {
         let issue = mutation.issue();
@@ -8894,6 +8906,14 @@ fn plan_additive_reconcile_in_snapshot(
                 additive_sqlite_value_witness(SqliteValue::from(
                     comment.created_at.to_rfc3339().as_str(),
                 )),
+                additive_sqlite_value_witness(
+                    comment
+                        .revision
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                ),
             ]);
         }
     }
@@ -10135,7 +10155,10 @@ fn validate_jsonl_issue_records_from_reader(
         summary.record_count += 1;
         match serde_json::from_str::<Issue>(trimmed) {
             Ok(mut issue) => {
-                normalize_issue(&mut issue);
+                if let Err(error) = normalize_issue(&mut issue) {
+                    summary.push_failure(line_num + 1, error.to_string());
+                    continue;
+                }
                 if !seen_ids.insert(issue.id.clone()) {
                     summary
                         .push_failure(line_num + 1, format!("Duplicate issue id '{}'", issue.id));
@@ -10213,7 +10236,9 @@ fn classify_jsonl_salvage_record(
         Ok(issue) => issue,
         Err(error) => return Some(Err(error.to_string())),
     };
-    normalize_issue(&mut issue);
+    if let Err(error) = normalize_issue(&mut issue) {
+        return Some(Err(error.to_string()));
+    }
     if let Err(errors) = IssueValidator::validate(&issue) {
         return Some(Err(errors
             .iter()
@@ -11416,7 +11441,7 @@ fn hydrate_export_issue_batch(
         labels_map.as_ref(),
         comments_map.as_ref(),
         ctx,
-    );
+    )?;
 
     storage.attach_close_bypass_audit_for_export(&mut issues)?;
 
@@ -11470,7 +11495,7 @@ fn hydrate_export_issues_full_scan(
         labels_map.as_ref(),
         comments_map.as_ref(),
         ctx,
-    );
+    )?;
 
     Ok(issues)
 }
@@ -11482,7 +11507,7 @@ fn populate_export_issue_relations(
     labels_map: Option<&HashMap<String, Vec<String>>>,
     comments_map: Option<&HashMap<String, Vec<Comment>>>,
     ctx: &ExportContext,
-) {
+) -> Result<()> {
     for issue in issues {
         if let Some(map) = deps_map {
             if let Some(deps) = map.get(&issue.id) {
@@ -11514,8 +11539,9 @@ fn populate_export_issue_relations(
             issue.comments = comments;
         }
 
-        normalize_issue_for_export(issue);
+        normalize_issue_for_export(issue)?;
     }
+    Ok(())
 }
 
 fn write_export_issue_jsonl<W: Write>(
@@ -11922,7 +11948,24 @@ fn export_to_jsonl_with_policy_expected_authority(
         JsonlSourceSnapshot::state_witness,
     );
 
-    if let (Some(beads_dir), Some(previous_source)) = (config.beads_dir.as_ref(), previous_source) {
+    // Comment suppression is independent of whole-issue force policies. Check
+    // it before making a fresh history copy or staging replacement output.
+    let export_ids = export_issue_ids(storage)?;
+    let purged_ids = storage.get_purged_ids_pending_export()?;
+    let suppress_history_backup = if let Some(source) = previous_source {
+        let mut comments = storage.get_comments_for_export()?;
+        for id in &export_ids {
+            comments.entry(id.clone()).or_default();
+        }
+        verify_exported_comment_revisions(&comments, source, true, &purged_ids)?
+    } else {
+        false
+    };
+
+    if !suppress_history_backup
+        && let (Some(beads_dir), Some(previous_source)) =
+            (config.beads_dir.as_ref(), previous_source)
+    {
         // Perform backup before overwriting (if enabled and we have a beads_dir).
         // We backup any JSONL file that has been validated as safe for sync,
         // even if it's outside the .beads/ directory (e.g., in repo root).
@@ -11941,9 +11984,6 @@ fn export_to_jsonl_with_policy_expected_authority(
             previous_source,
         )?;
     }
-
-    // Get sorted export IDs up front for safety checks and bounded batch hydration.
-    let export_ids = export_issue_ids(storage)?;
 
     if let Some(previous_source) = previous_source {
         let (mut protected_ids, expired) =
@@ -11968,8 +12008,6 @@ fn export_to_jsonl_with_policy_expected_authority(
         // IDs the operator intentionally hard-deleted (purged) are expected
         // to disappear from the JSONL on the next export; they are not data
         // loss (#405).
-        let purged_ids = storage.get_purged_ids_pending_export()?;
-
         // Check 1: prevent exporting empty database over non-empty JSONL
         if export_ids.is_empty()
             && jsonl_count > 0
@@ -13365,7 +13403,8 @@ fn exact_full_export_hash_mapping(
     Ok(expected)
 }
 
-fn normalize_issue_for_export(issue: &mut Issue) {
+fn normalize_issue_for_export(issue: &mut Issue) -> Result<()> {
+    normalize_comment_revisions(&mut issue.comments)?;
     // GitHub #528: source_repo_path is this machine's absolute workspace path.
     // It stays in the database for local tooling, but the committed JSONL is
     // shared across machines, so it never carries the field.
@@ -13399,6 +13438,7 @@ fn normalize_issue_for_export(issue: &mut Issue) {
                 .then_with(|| left.id.cmp(&right.id))
         });
     }
+    Ok(())
 }
 
 fn filter_dirty_metadata_for_export(
@@ -13709,8 +13749,90 @@ fn scan_existing_jsonl_replacements(
     })
 }
 
-/// Stage a temp output beside `output_path`, snapshotting the previous
-/// generation into `.br_history` first.
+fn exported_comments_from_lines<'a>(
+    lines: impl Iterator<Item = &'a String>,
+) -> Result<HashMap<String, Vec<Comment>>> {
+    let mut comments = HashMap::new();
+    for line in lines {
+        let mut issue: Issue = serde_json::from_str(line)?;
+        normalize_comment_revisions(&mut issue.comments)?;
+        comments.insert(issue.id, issue.comments);
+    }
+    Ok(comments)
+}
+
+/// Validate comment ancestry against the immutable generation being replaced.
+/// Return whether making a new raw backup would copy superseded comment text.
+/// Existing historical files remain the operator's separate retention concern.
+fn verify_exported_comment_revisions(
+    replacement_comments: &HashMap<String, Vec<Comment>>,
+    source: &JsonlSourceSnapshot,
+    complete: bool,
+    purged_ids: &HashSet<String>,
+) -> Result<bool> {
+    let mut suppress_history_backup = false;
+    for_each_jsonl_import_issue(source, |_line_num, previous, _| {
+        let Some(current) = replacement_comments.get(&previous.id) else {
+            // Unchanged incremental records keep their exact source bytes.
+            // Whole-issue hard purge is an explicit removal of the containing
+            // suppression record; ordinary force/retention cannot do that.
+            if complete
+                && !purged_ids.contains(&previous.id)
+                && previous
+                    .comments
+                    .iter()
+                    .any(|comment| comment.state() != CommentState::Active)
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Refusing to export without comment suppression evidence for '{}'; import or reconcile it before exporting",
+                        previous.id
+                    ),
+                });
+            }
+            return Ok(());
+        };
+        let revised = previous
+            .comments
+            .iter()
+            .filter(|comment| {
+                comment
+                    .revision
+                    .as_ref()
+                    .is_some_and(|revision| revision.generation > 0)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let joined = merge_comment_lists(current, &revised, &previous.id)?;
+        if !comments_sync_equal(current, &joined) {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing to export stale comment revisions for '{}'; import or reconcile them before exporting; force does not waive this check",
+                    previous.id
+                ),
+            });
+        }
+        for old in &previous.comments {
+            if joined.iter().any(|new| {
+                new.revision
+                    .as_ref()
+                    .zip(old.revision.as_ref())
+                    .is_some_and(|(new_revision, old_revision)| {
+                        new_revision.identity == old_revision.identity
+                            && new_revision.generation > 0
+                            && new.body != old.body
+                    })
+            }) {
+                suppress_history_backup = true;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(suppress_history_backup)
+}
+
+/// Stage a temp output beside `output_path`, retaining a history snapshot
+/// unless that would make a new copy of superseded comment text.
 ///
 /// `previous_source` is the already-captured snapshot of the file being
 /// replaced; the history backup copies from it instead of re-reading (and
@@ -13719,16 +13841,19 @@ fn prepare_jsonl_temp_output(
     output_path: &Path,
     config: &ExportConfig,
     previous_source: &JsonlSourceSnapshot,
+    suppress_history_backup: bool,
 ) -> Result<JsonlTempOutput> {
     if let Some(ref beads_dir) = config.beads_dir {
         validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)?;
-        let output_abs = absolute_or_current_dir_join(output_path);
-        history::backup_before_export_snapshot(
-            beads_dir,
-            &config.history,
-            &output_abs,
-            previous_source,
-        )?;
+        if !suppress_history_backup {
+            let output_abs = absolute_or_current_dir_join(output_path);
+            history::backup_before_export_snapshot(
+                beads_dir,
+                &config.history,
+                &output_abs,
+                previous_source,
+            )?;
+        }
     }
 
     let parent_dir = output_path.parent().ok_or_else(|| {
@@ -13972,8 +14097,12 @@ fn write_existing_jsonl_replacements_atomically(
     config: &ExportConfig,
     source: &JsonlSourceSnapshot,
 ) -> Result<(String, usize)> {
+    let replacement_comments = exported_comments_from_lines(replacement_lines.values())?;
+    let suppress_history_backup =
+        verify_exported_comment_revisions(&replacement_comments, source, false, &HashSet::new())?;
     let mut reader = source.reader();
-    let mut temp_output = prepare_jsonl_temp_output(output_path, config, source)?;
+    let mut temp_output =
+        prepare_jsonl_temp_output(output_path, config, source, suppress_history_backup)?;
     let mut hasher = Sha256::new();
     let mut seen_ids = HashSet::new();
     let mut replaced_ids = HashSet::with_capacity(replacement_lines.len());
@@ -14072,8 +14201,13 @@ fn write_jsonl_lines_atomically(
     output_path: &Path,
     config: &ExportConfig,
     source: &JsonlSourceSnapshot,
+    purged_ids: &HashSet<String>,
 ) -> Result<String> {
-    let mut temp_output = prepare_jsonl_temp_output(output_path, config, source)?;
+    let replacement_comments = exported_comments_from_lines(lines_by_id.values())?;
+    let suppress_history_backup =
+        verify_exported_comment_revisions(&replacement_comments, source, true, purged_ids)?;
+    let mut temp_output =
+        prepare_jsonl_temp_output(output_path, config, source, suppress_history_backup)?;
     let mut hasher = Sha256::new();
 
     for line in lines_by_id.values() {
@@ -14133,7 +14267,7 @@ fn collect_incremental_auto_flush_changes(
         let maybe_issue = issues_by_id.remove(issue_id);
         match maybe_issue {
             Some(mut issue) if is_issue_exportable_at(&issue, retention_days, export_as_of) => {
-                normalize_issue_for_export(&mut issue);
+                normalize_issue_for_export(&mut issue)?;
                 let json = serde_json::to_string(&issue).map_err(|err| {
                     BeadsError::Config(format!(
                         "Failed to serialize issue '{}' during auto-flush: {err}",
@@ -14395,7 +14529,7 @@ fn collect_incremental_retention_changes(
                     ),
                 });
             }
-            normalize_issue_for_export(&mut issue);
+            normalize_issue_for_export(&mut issue)?;
             let json = serde_json::to_string(&issue).map_err(|error| {
                 BeadsError::Config(format!(
                     "Failed to serialize retained tombstone '{}': {error}",
@@ -14680,8 +14814,13 @@ fn try_incremental_auto_flush(
         return Ok(Some(AutoFlushResult::default()));
     }
 
-    let content_hash =
-        write_jsonl_lines_atomically(&lines_by_id, jsonl_path, export_config, &source)?;
+    let content_hash = write_jsonl_lines_atomically(
+        &lines_by_id,
+        jsonl_path,
+        export_config,
+        &source,
+        &storage.get_purged_ids_pending_export()?,
+    )?;
     jsonl_authority.verify_jsonl_authority()?;
     finalize_incremental_auto_flush(storage, &changes, Some(&content_hash), Some(jsonl_path))?;
 
@@ -15239,7 +15378,7 @@ pub(crate) fn merge_tombstone_history(preferred: &Issue, other: &Issue) -> Resul
     merged.labels.sort();
     merged.labels.dedup();
     join_tombstone_dependencies(&mut merged, &evidence)?;
-    merged.comments = union_comment_lists(&preferred.comments, &other.comments, &preferred.id);
+    merged.comments = merge_comment_lists(&preferred.comments, &other.comments, &preferred.id)?;
     if preferred.status == Status::Tombstone
         && other.status != Status::Tombstone
         && merged.sync_equals(preferred)
@@ -15500,7 +15639,7 @@ fn determine_action(
 /// - Recomputes `content_hash`
 /// - Sets ephemeral=true if ID contains "-wisp-"
 /// - Applies defaults and repairs `closed_at` invariant
-fn normalize_issue(issue: &mut Issue) -> usize {
+fn normalize_issue(issue: &mut Issue) -> Result<usize> {
     use crate::util::content_hash;
 
     // Deduplicate labels
@@ -15567,6 +15706,9 @@ fn normalize_issue(issue: &mut Issue) -> usize {
         issue.comments = unique;
     }
     let exact_duplicate_comments_deduplicated = comments_before - issue.comments.len();
+    // Enroll legacy identities while their original issue IDs and local row
+    // ordering are still available. Alias resolution must not change identity.
+    normalize_comment_revisions(&mut issue.comments)?;
 
     // Normalize legacy Go-beads (bd) terminal status aliases that survived
     // JSONL import as `Status::Custom(_)`. Leaving them unmapped is
@@ -15622,7 +15764,7 @@ fn normalize_issue(issue: &mut Issue) -> usize {
     // Recompute after all import repairs so the stored row hash matches the
     // canonical issue state used by collision detection and export hashes.
     issue.content_hash = Some(content_hash(issue));
-    exact_duplicate_comments_deduplicated
+    Ok(exact_duplicate_comments_deduplicated)
 }
 
 #[derive(Debug)]
@@ -15757,13 +15899,14 @@ struct ImportCollisionPlan {
     displaced_issue_ids: Vec<String>,
     comment_owner_ids_to_replace: Vec<String>,
     comments_by_target: HashMap<String, Vec<Comment>>,
+    rekeyed_comments_by_target: BTreeMap<String, Vec<Comment>>,
 }
 
 fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<(Issue, usize)> {
     let mut issue: Issue = serde_json::from_str(trimmed)
         .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {line_num}: {e}")))?;
 
-    let exact_duplicate_comments_deduplicated = normalize_issue(&mut issue);
+    let exact_duplicate_comments_deduplicated = normalize_issue(&mut issue)?;
 
     if let Err(errors) = IssueValidator::validate(&issue) {
         let details = errors
@@ -16083,10 +16226,12 @@ fn scan_import_collision_renames(
     let mut displaced_issue_ids = BTreeSet::new();
     let mut comment_owner_ids_to_replace = BTreeSet::new();
     let mut comments_by_target: HashMap<String, Vec<Comment>> = HashMap::new();
+    let mut rekeyed_comments_by_target: BTreeMap<String, Vec<Comment>> = BTreeMap::new();
     let progress =
         create_progress_bar(record_count as u64, "Scanning issues", config.show_progress);
 
     for_each_jsonl_import_issue(source, |_line_num, mut issue, _| {
+        let original_id = issue.id.clone();
         apply_prefix_renames(&mut issue, prefix_renames);
 
         if issue.ephemeral {
@@ -16149,8 +16294,17 @@ fn scan_import_collision_renames(
                 }
                 comment.issue_id.clone_from(&target_id);
             }
+            if original_id != target_id {
+                rekeyed_comments_by_target
+                    .entry(target_id.clone())
+                    .or_default()
+                    .extend(issue.comments.iter().cloned());
+            }
             let comments = comments_by_target.entry(target_id.clone()).or_default();
-            *comments = union_comment_lists(comments, &issue.comments, &target_id);
+            // Delay the causal join until all source aliases and the local
+            // snapshot are available. A later alias or local redaction must
+            // suppress earlier divergent active branches regardless of order.
+            comments.extend(issue.comments);
         }
         if matches!(
             action,
@@ -16169,6 +16323,7 @@ fn scan_import_collision_renames(
         displaced_issue_ids: displaced_issue_ids.into_iter().collect(),
         comment_owner_ids_to_replace: comment_owner_ids_to_replace.into_iter().collect(),
         comments_by_target,
+        rekeyed_comments_by_target,
     })
 }
 
@@ -16323,8 +16478,11 @@ fn skipped_import_matches_stored_issue(
     // sparse legacy record omits; certify the skip against that form.
     canonicalize_persisted_issue_defaults(&mut expected);
 
-    normalize_issue_for_export(&mut stored);
-    normalize_issue_for_export(&mut expected);
+    if normalize_issue_for_export(&mut stored).is_err()
+        || normalize_issue_for_export(&mut expected).is_err()
+    {
+        return false;
+    }
     stored.sync_equals(&expected)
 }
 
@@ -16461,8 +16619,11 @@ fn warn_skipped_import_keeps_local_fields(stored: &Issue, target_id: &str, incom
         expected.id = target_id.to_string();
     }
     canonicalize_persisted_issue_defaults(&mut expected);
-    normalize_issue_for_export(&mut stored);
-    normalize_issue_for_export(&mut expected);
+    if normalize_issue_for_export(&mut stored).is_err()
+        || normalize_issue_for_export(&mut expected).is_err()
+    {
+        return;
+    }
     let differing_fields = sync_mismatch_field_names(&stored, &expected)
         .into_iter()
         .filter(|field| !matches!(field.as_str(), "content_hash" | "comments" | "unknown"))
@@ -16693,6 +16854,21 @@ fn write_import_export_hash_batch(
     Ok(())
 }
 
+fn release_foreign_reserved_comment_ids(
+    comments: &mut [Comment],
+    target_id: &str,
+    reserved_owners: &HashMap<i64, &str>,
+) {
+    for comment in comments {
+        if reserved_owners
+            .get(&comment.id)
+            .is_some_and(|owner| *owner != target_id)
+        {
+            comment.id = 0;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stream_import_actions_in_tx(
     storage: &SqliteStorage,
@@ -16721,19 +16897,28 @@ fn stream_import_actions_in_tx(
     let stream_started = Instant::now();
 
     progress.set_position(0);
-    // Comment IDs are globally unique. Release every comment row owned by an
-    // issue this transaction will replace before replaying any individual
-    // issue, so authoritative IDs can move between those issues without the
-    // result depending on JSONL line order. The enclosing transaction restores
-    // all rows if a later action or semantic verification fails.
-    // Comments are append-only facts (beads_rust-hcoe6). Snapshot the existing
-    // comments before clearing their rows; every Update unions this snapshot
-    // and all source aliases so no later action can discard an earlier fact.
+    // Comment rowids are globally unique. Snapshot every replacement owner's
+    // comments before clearing its rows, and reserve those local rowids until
+    // each owner is replayed. Every Update causally joins the snapshot and all
+    // source aliases, so line order cannot discard revisions or suppression
+    // evidence. The enclosing transaction restores all rows if any later
+    // action or semantic verification fails.
     let existing_comments_by_issue = if comment_owner_ids_to_replace.is_empty() {
         HashMap::new()
     } else {
         storage.get_comments_for_issues(comment_owner_ids_to_replace)?
     };
+    // A different incoming issue must not claim a temporarily freed local
+    // rowid before its original owner is replayed. AUTOINCREMENT allocates
+    // foreign/new comments beyond the retained sequence instead.
+    let reserved_comment_owners = existing_comments_by_issue
+        .iter()
+        .flat_map(|(owner, comments)| {
+            comments
+                .iter()
+                .map(move |comment| (comment.id, owner.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
     storage.delete_comments_for_import_issue_ids_in_tx(comment_owner_ids_to_replace)?;
     // The collision scan records every insert/update in this list. An empty
     // list proves the immutable source will only skip rows using the same
@@ -16871,7 +17056,11 @@ fn stream_import_actions_in_tx(
                 if let Some(existing) = existing.first_mut() {
                     if let Some(comments) = existing_comments_by_issue.get(&target_id) {
                         existing.comments =
-                            union_comment_lists(&existing.comments, comments, &target_id);
+                            merge_comment_lists(&existing.comments, comments, &target_id)?;
+                    }
+                    if let Some(incoming) = incoming_comments_by_target.get(&target_id) {
+                        existing.comments =
+                            merge_comment_lists(&existing.comments, incoming, &target_id)?;
                     }
                     let source_issue = issue.clone();
                     issue.id.clone_from(&target_id);
@@ -16889,16 +17078,19 @@ fn stream_import_actions_in_tx(
                 None
             };
             let source_before_comment_union = if matches!(action, CollisionAction::Update { .. }) {
-                let mut comments = issue.comments.clone();
-                if let Some(existing) = existing_comments_by_issue.get(&target_id) {
-                    comments = union_comment_lists(&comments, existing, &target_id);
-                }
-                if let Some(incoming) = incoming_comments_by_target.get(&target_id) {
-                    comments = union_comment_lists(&comments, incoming, &target_id);
-                }
-                if comments.len() > issue.comments.len() {
-                    let source_issue = issue.clone();
-                    issue.comments = comments;
+                let existing = existing_comments_by_issue
+                    .get(&target_id)
+                    .map_or(&[][..], Vec::as_slice);
+                let incoming = incoming_comments_by_target
+                    .get(&target_id)
+                    .map_or(issue.comments.as_slice(), Vec::as_slice);
+                let comments = merge_comment_lists(existing, incoming, &target_id)?;
+                let source_issue =
+                    (!comments_sync_equal(&comments, &issue.comments)).then(|| issue.clone());
+                // Keep this database's rowids even when the portable state is
+                // equal; another clone's local numbering is not an edit.
+                issue.comments = comments;
+                if let Some(source_issue) = source_issue {
                     computed_hash = crate::util::content_hash(&issue);
                     Some(source_before_tombstone_union.unwrap_or(source_issue))
                 } else {
@@ -16917,8 +17109,16 @@ fn stream_import_actions_in_tx(
                     .any(|id| id == &target_id);
                 if !scheduled_for_replace && !issue.comments.is_empty() {
                     let db_comments = storage.get_comments(&target_id)?;
-                    let union = union_comment_lists(&db_comments, &issue.comments, &target_id);
-                    if union.len() > db_comments.len() {
+                    let incoming = incoming_comments_by_target
+                        .get(&target_id)
+                        .map_or(issue.comments.as_slice(), Vec::as_slice);
+                    let mut union = merge_comment_lists(&db_comments, incoming, &target_id)?;
+                    release_foreign_reserved_comment_ids(
+                        &mut union,
+                        &target_id,
+                        &reserved_comment_owners,
+                    );
+                    if !comments_sync_equal(&union, &db_comments) {
                         uncertified_local_wins += certify_skipped_imports(
                             storage,
                             &mut skip_lookup,
@@ -16942,11 +17142,26 @@ fn stream_import_actions_in_tx(
                         // a shared id, which would certify the stale export
                         // (GH#547). Certify the rest of this import from live rows.
                         skip_lookup = None;
-                        tx_result.comments_imported += union.len() - db_comments.len();
+                        tx_result.comments_imported += union
+                            .iter()
+                            .filter(|comment| {
+                                !db_comments.iter().any(|existing| {
+                                    comments_sync_equal(
+                                        std::slice::from_ref(*comment),
+                                        std::slice::from_ref(existing),
+                                    )
+                                })
+                            })
+                            .count();
                     }
                 }
             }
 
+            release_foreign_reserved_comment_ids(
+                &mut issue.comments,
+                &target_id,
+                &reserved_comment_owners,
+            );
             process_import_action(
                 storage,
                 &action,
@@ -17529,6 +17744,21 @@ fn import_from_jsonl_snapshot_impl(
         if mode == ImportMode::Automatic {
             refuse_automatic_import_with_displaced_issue_ids(&collision_plan)?;
             refuse_automatic_import_with_existing_orphans(storage)?;
+        }
+        // An older importer may already have rewritten a legacy comment's
+        // owning issue without preserving its origin. Check aliases against
+        // the locked current state before clearing any relation rows.
+        for (target_id, incoming) in &collision_plan.rekeyed_comments_by_target {
+            let existing = storage.get_comments(target_id)?;
+            let known = existing
+                .iter()
+                .chain(
+                    collision_plan.comments_by_target[target_id]
+                        .iter()
+                        .filter(|comment| comment.state() != CommentState::Active),
+                )
+                .collect::<Vec<_>>();
+            refuse_ambiguous_rekeyed_comments(&known, incoming, target_id)?;
         }
         // One query proves that no owned relation rows (labels, dependencies,
         // comments) exist anywhere yet. When it holds, every inserted issue
@@ -18511,6 +18741,9 @@ pub enum ConflictType {
     /// Tombstone histories contain contradictory facts. Choosing a winning
     /// row must not silently erase closure or deletion evidence.
     TombstoneHistory,
+    /// Concurrent active revisions or invalid comment evidence cannot be
+    /// resolved by selecting an issue timestamp or a force strategy.
+    CommentRevision,
 }
 
 /// Result of merging a single issue across base, left (local), and right (external).
@@ -18964,6 +19197,32 @@ pub fn three_way_merge(
     let empty_tombstones: HashSet<String, RandomState> = HashSet::new();
     let tombstones = tombstones.unwrap_or(&empty_tombstones);
 
+    // A legacy comment's identity includes its original owning issue. Enroll
+    // each complete sibling group before collision relocation changes IDs.
+    let mut enrolled = MergeContext {
+        base: context.base.clone(),
+        left: context.left.clone(),
+        right: context.right.clone(),
+        base_policy: context.base_policy,
+    };
+    let mut invalid = BTreeSet::new();
+    for side in [&mut enrolled.base, &mut enrolled.left, &mut enrolled.right] {
+        for (id, issue) in side {
+            if normalize_comment_revisions(&mut issue.comments).is_err() {
+                invalid.insert(id.clone());
+            }
+        }
+    }
+    for id in invalid {
+        report
+            .conflicts
+            .push((id.clone(), ConflictType::CommentRevision));
+        enrolled.base.remove(&id);
+        enrolled.left.remove(&id);
+        enrolled.right.remove(&id);
+    }
+    let context = &enrolled;
+
     // Two issues published under one id are two issues, not two versions of
     // one issue (GitHub #512). Re-key the loser before merging so neither side
     // can silently replace the other.
@@ -18975,7 +19234,16 @@ pub fn three_way_merge(
             .iter()
             .map(|id| plan.local_renames.get(id).unwrap_or(id).clone())
             .collect();
-        rekeyed = plan.rekey(context);
+        rekeyed = match plan.rekey(context) {
+            Ok(rekeyed) => rekeyed,
+            Err((id, error)) => {
+                report
+                    .conflicts
+                    .push((id.clone(), ConflictType::CommentRevision));
+                report.notes.push((id, error.to_string()));
+                return report;
+            }
+        };
         report.id_collisions = plan.collisions;
         report.conflicts.extend(plan.unresolved);
         (&rekeyed, &remapped_tombstones)
@@ -19002,15 +19270,43 @@ pub fn three_way_merge(
         let original_base = context.base.get(&id);
         let left = context.left.get(&id);
         let right = context.right.get(&id);
+        let terminal_sources = [original_base, left, right]
+            .into_iter()
+            .flatten()
+            .flat_map(|issue| &issue.comments)
+            .filter(|comment| comment.state() != CommentState::Active)
+            .cloned()
+            .collect::<Vec<_>>();
+        let protected_comments = match merge_comment_lists(&[], &terminal_sources, &id) {
+            Ok(comments) => comments,
+            Err(error) => {
+                report
+                    .conflicts
+                    .push((id.clone(), ConflictType::CommentRevision));
+                report.notes.push((id.clone(), error.to_string()));
+                continue;
+            }
+        };
         let tombstone_base =
             original_base.filter(|issue| issue.status == crate::model::Status::Tombstone);
         let history_sources = [tombstone_base, left, right];
 
-        // Comments are append-only, so a comment present on either side is
-        // kept: a side that lacks it never saw it rather than deleted it.
-        let with_union = left
-            .zip(right)
-            .and_then(|(left, right)| union_comments_if_diverged(original_base, left, right));
+        // Comment identity and ancestry are independent of the issue clock.
+        // Privacy markers dominate active branches; concurrent active edits
+        // require explicit reconciliation even under an issue force strategy.
+        let with_union = match left.zip(right) {
+            Some((left, right)) => match union_comments_if_diverged(original_base, left, right) {
+                Ok(joined) => joined,
+                Err(error) => {
+                    report
+                        .conflicts
+                        .push((id.clone(), ConflictType::CommentRevision));
+                    report.notes.push((id.clone(), error.to_string()));
+                    continue;
+                }
+            },
+            None => None,
+        };
         // A record whose comments were combined is a new revision of both
         // inputs. Make it strictly newer than either so a clone that later
         // imports the merged JSONL (last-write-wins) takes it instead of
@@ -19059,23 +19355,29 @@ pub fn three_way_merge(
                 (base.as_ref(), Some(local), Some(external))
             });
 
-        let revised = |mut issue: Issue| -> Result<Issue> {
-            if issue.status == crate::model::Status::Tombstone {
-                // The ordinary scalar winner cannot discard historical facts
-                // from a tombstone base or either side, including a closed row
-                // whose attempted resurrection is refused below. An unchanged
-                // sole copy needs no rewrite, including its content hash.
-                for source in history_sources.into_iter().flatten() {
-                    if &issue != source {
-                        issue = merge_tombstone_history(&issue, source)?;
+        let revised =
+            |mut issue: Issue| -> std::result::Result<Issue, (ConflictType, Box<BeadsError>)> {
+                issue.comments =
+                    merge_comment_lists(&issue.comments, &protected_comments, &issue.id)
+                        .map_err(|error| (ConflictType::CommentRevision, Box::new(error)))?;
+                if issue.status == crate::model::Status::Tombstone {
+                    // The ordinary scalar winner cannot discard historical facts
+                    // from a tombstone base or either side, including a closed row
+                    // whose attempted resurrection is refused below. An unchanged
+                    // sole copy needs no rewrite, including its content hash.
+                    for source in history_sources.into_iter().flatten() {
+                        if &issue != source {
+                            issue = merge_tombstone_history(&issue, source).map_err(|error| {
+                                (ConflictType::TombstoneHistory, Box::new(error))
+                            })?;
+                        }
                     }
                 }
-            }
-            if let Some(revision_at) = union_revision_at {
-                issue.updated_at = issue.updated_at.max(revision_at);
-            }
-            Ok(issue)
-        };
+                if let Some(revision_at) = union_revision_at {
+                    issue.updated_at = issue.updated_at.max(revision_at);
+                }
+                Ok(issue)
+            };
 
         // Check tombstone protection: if issue is tombstoned and trying to resurrect.
         // A collided id holds a different issue than the tombstone that
@@ -19092,10 +19394,8 @@ pub fn three_way_merge(
                 if let Some(issue) = left {
                     match revised(issue.clone()) {
                         Ok(issue) => report.kept.push(issue),
-                        Err(error) => {
-                            report
-                                .conflicts
-                                .push((id.clone(), ConflictType::TombstoneHistory));
+                        Err((conflict_type, error)) => {
+                            report.conflicts.push((id.clone(), conflict_type));
                             report.notes.push((id.clone(), error.to_string()));
                             continue;
                         }
@@ -19106,6 +19406,12 @@ pub fn three_way_merge(
             }
 
             if left.is_none() && external_non_tombstone {
+                if !protected_comments.is_empty() {
+                    report
+                        .conflicts
+                        .push((id.clone(), ConflictType::CommentRevision));
+                    continue;
+                }
                 // Trying to resurrect from external - skip.
                 report.tombstone_protected.push(id.clone());
                 continue;
@@ -19119,13 +19425,17 @@ pub fn three_way_merge(
             }
         };
         match result {
-            MergeResult::NoAction => {}
-            MergeResult::Keep(issue) => match revised(issue) {
-                Ok(issue) => report.kept.push(issue),
-                Err(error) => {
+            MergeResult::NoAction => {
+                if !protected_comments.is_empty() {
                     report
                         .conflicts
-                        .push((id.clone(), ConflictType::TombstoneHistory));
+                        .push((id.clone(), ConflictType::CommentRevision));
+                }
+            }
+            MergeResult::Keep(issue) => match revised(issue) {
+                Ok(issue) => report.kept.push(issue),
+                Err((conflict_type, error)) => {
+                    report.conflicts.push((id.clone(), conflict_type));
                     report.notes.push((id.clone(), error.to_string()));
                 }
             },
@@ -19140,15 +19450,28 @@ pub fn three_way_merge(
                         }
                         report.kept.push(issue);
                     }
-                    Err(error) => {
-                        report
-                            .conflicts
-                            .push((id.clone(), ConflictType::TombstoneHistory));
+                    Err((conflict_type, error)) => {
+                        report.conflicts.push((id.clone(), conflict_type));
                         report.notes.push((id.clone(), error.to_string()));
                     }
                 }
             }
             MergeResult::Delete => {
+                // Applying an issue deletion retains its existing local
+                // comments. Refuse if suppression evidence from any input is
+                // absent locally: deleting a stale or missing row would lose
+                // that evidence and let a later legacy import restore text.
+                if !protected_comments.is_empty()
+                    && context.left.get(&id).is_none_or(|local| {
+                        !merge_comment_lists(&local.comments, &protected_comments, &id)
+                            .is_ok_and(|joined| comments_sync_equal(&joined, &local.comments))
+                    })
+                {
+                    report
+                        .conflicts
+                        .push((id.clone(), ConflictType::CommentRevision));
+                    continue;
+                }
                 report.deleted.push(id.clone());
             }
             MergeResult::Conflict(conflict_type) => {
@@ -19160,51 +19483,19 @@ pub fn three_way_merge(
     report
 }
 
-/// Keep every comment either side has (multiset union by
-/// [`Comment::sync_key`]) when the two sides' comment sets diverge.
-///
-/// Returns `None` when both sides already carry the same comments, so the
-/// common path does not clone anything. Otherwise returns base, left, and
-/// right with the union applied to all three, which makes comment-only
-/// differences invisible to the merge decision.
+/// Causally join comments before ordinary issue-field conflict selection.
+/// Base privacy evidence participates even when both peers carry stale text.
 fn union_comments_if_diverged(
     base: Option<&Issue>,
     left: &Issue,
     right: &Issue,
-) -> Option<(Option<Issue>, Issue, Issue)> {
-    let mut remaining: HashMap<_, usize> = HashMap::new();
-    for comment in &left.comments {
-        *remaining.entry(comment.sync_key()).or_default() += 1;
-    }
-    let mut extra = Vec::new();
-    for comment in &right.comments {
-        match remaining.get_mut(&comment.sync_key()) {
-            Some(count) if *count > 0 => *count -= 1,
-            _ => extra.push(comment.clone()),
-        }
-    }
-    let left_has_extra = remaining.values().any(|count| *count > 0);
-    if extra.is_empty() && !left_has_extra {
-        return None;
-    }
-
-    let mut union = left.comments.clone();
-    union.extend(extra);
-    // Deterministic across clones regardless of which side is "local".
-    union.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.author.cmp(&b.author))
-            .then_with(|| a.body.cmp(&b.body))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    // Comment ids are database-local rowids; two clones reuse them. Keep the
-    // first holder of each id and let the database mint fresh ids for the rest.
-    let mut seen_ids = HashSet::new();
-    for comment in &mut union {
-        if comment.id > 0 && !seen_ids.insert(comment.id) {
-            comment.id = 0;
-        }
+) -> Result<Option<(Option<Issue>, Issue, Issue)>> {
+    // Apply terminal evidence first so it can suppress otherwise-conflicting
+    // active branches without retaining either superseded body.
+    let protected = merge_comment_lists(&left.comments, &protected_base_comments(base), &left.id)?;
+    let union = merge_comment_lists(&protected, &right.comments, &left.id)?;
+    if comments_sync_equal(&union, &left.comments) && comments_sync_equal(&union, &right.comments) {
+        return Ok(None);
     }
 
     let with_union = |issue: &Issue| {
@@ -19212,56 +19503,59 @@ fn union_comments_if_diverged(
         issue.comments.clone_from(&union);
         issue
     };
-    Some((base.map(with_union), with_union(left), with_union(right)))
+    Ok(Some((
+        base.map(with_union),
+        with_union(left),
+        with_union(right),
+    )))
 }
 
-/// Keep every comment either side has (multiset union by
-/// [`Comment::sync_key`]) when combining two comment sets (beads_rust-hcoe6).
-pub(crate) fn union_comment_lists(
-    primary: &[Comment],
-    secondary: &[Comment],
-    target_id: &str,
-) -> Vec<Comment> {
-    let mut remaining: HashMap<(&str, DateTime<Utc>, &str, &str), usize> = HashMap::new();
-    for comment in primary {
-        *remaining.entry(comment.sync_key()).or_default() += 1;
-    }
-    let mut extra = Vec::new();
-    for comment in secondary {
-        match remaining.get_mut(&comment.sync_key()) {
-            Some(count) if *count > 0 => *count -= 1,
-            _ => {
-                let mut c = comment.clone();
-                if c.issue_id != target_id {
-                    c.issue_id = target_id.to_string();
-                }
-                extra.push(c);
-            }
-        }
-    }
-    if extra.is_empty() {
-        return primary.to_vec();
-    }
+fn protected_base_comments(base: Option<&Issue>) -> Vec<Comment> {
+    base.into_iter()
+        .flat_map(|issue| &issue.comments)
+        .filter(|comment| comment.state() != CommentState::Active)
+        .cloned()
+        .collect()
+}
 
-    let mut union = primary.to_vec();
-    union.extend(extra);
-    // Deterministic across clones regardless of which side is "primary".
-    union.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.author.cmp(&b.author))
-            .then_with(|| a.body.cmp(&b.body))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    // Comment ids are database-local rowids; two clones reuse them. Keep the
-    // first holder of each id and let the database mint fresh ids for the rest.
-    let mut seen_ids = HashSet::new();
-    for comment in &mut union {
-        if comment.id > 0 && !seen_ids.insert(comment.id) {
-            comment.id = 0;
+/// A pre-revision importer could change a legacy comment's owner without
+/// retaining its original identity. A different genesis digest after rekey
+/// cannot prove that text sharing a removed comment's author and timestamp
+/// is a distinct comment. Known sibling identities remain unambiguous.
+fn refuse_ambiguous_rekeyed_comments(
+    known: &[&Comment],
+    incoming: &[Comment],
+    target_id: &str,
+) -> Result<()> {
+    let known_identities = known
+        .iter()
+        .filter_map(|comment| {
+            comment
+                .revision
+                .as_ref()
+                .map(|revision| revision.identity.as_str())
+        })
+        .collect::<HashSet<_>>();
+    for comment in incoming {
+        let unmatched_genesis = comment.state() == CommentState::Active
+            && comment.revision.as_ref().is_none_or(|revision| {
+                revision.generation == 0 && !known_identities.contains(revision.identity.as_str())
+            });
+        if unmatched_genesis
+            && known.iter().any(|removed| {
+                removed.state() != CommentState::Active
+                    && removed.author == comment.author
+                    && removed.created_at == comment.created_at
+            })
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Cannot rekey an unidentified legacy comment onto issue '{target_id}': its author and creation time match a removed comment but its identity differs. Preserve both copies and reconcile the legacy comment identity before syncing; force cannot recover missing provenance"
+                ),
+            });
         }
     }
-    union
+    Ok(())
 }
 
 /// How a three-way merge re-keys issues whose id collided (GitHub #512).
@@ -19282,7 +19576,55 @@ struct IdCollisionPlan {
 }
 
 impl IdCollisionPlan {
-    fn rekey(&self, context: &MergeContext) -> MergeContext {
+    fn rekey(
+        &self,
+        context: &MergeContext,
+    ) -> std::result::Result<MergeContext, (String, Box<BeadsError>)> {
+        let sides = [
+            (&context.base, &self.base_renames),
+            (&context.left, &self.local_renames),
+            (&context.right, &self.external_renames),
+        ];
+        // Keep dropped base entries available as privacy evidence here. A
+        // scalar ancestor may be omitted later, but cannot certify a newly
+        // enrolled alias as a different comment after provenance was lost.
+        let evidence_by_target = sides.map(|(issues, renames)| {
+            let mut evidence: HashMap<&str, Vec<&Issue>> = HashMap::new();
+            for issue in issues.values() {
+                let target = renames.get(&issue.id).unwrap_or(&issue.id);
+                evidence.entry(target).or_default().push(issue);
+            }
+            evidence
+        });
+        for (side_index, (issues, renames)) in sides.into_iter().enumerate() {
+            let mut renamed_ids = renames.keys().collect::<Vec<_>>();
+            renamed_ids.sort_unstable();
+            for original_id in renamed_ids {
+                let Some(incoming) = issues.get(original_id) else {
+                    continue;
+                };
+                let target_id = &renames[original_id];
+                let known = evidence_by_target
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != side_index)
+                    .filter_map(|(_, evidence)| evidence.get(target_id.as_str()))
+                    .flatten()
+                    .filter(|issue| issue.created_at == incoming.created_at)
+                    .flat_map(|issue| {
+                        issue.comments.iter().filter(move |comment| {
+                            // Repeating an old alias in the base does not
+                            // prove it distinct from the destination marker.
+                            // Established destination identities or explicit
+                            // suppression can supply that proof.
+                            issue.id == *target_id || comment.state() != CommentState::Active
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                refuse_ambiguous_rekeyed_comments(&known, &incoming.comments, target_id)
+                    .map_err(|error| (original_id.clone(), Box::new(error)))?;
+            }
+        }
         let rekey_side = |side: &HashMap<String, Issue>, renames: &HashMap<String, String>| {
             side.values()
                 .map(|issue| {
@@ -19302,12 +19644,48 @@ impl IdCollisionPlan {
                 (issue.id.clone(), issue)
             })
             .collect();
-        MergeContext {
+        let mut rekeyed = MergeContext {
             base,
             left: rekey_side(&context.left, &self.local_renames),
             right: rekey_side(&context.right, &self.external_renames),
             base_policy: context.base_policy,
+        };
+        // Dropping a scalar ancestor prevents a false issue deletion when the
+        // other clone never carried that issue. Its privacy evidence still
+        // belongs to the surviving owner, even when that owner was relocated.
+        let mut dropped_ids = self.base_drops.iter().collect::<Vec<_>>();
+        dropped_ids.sort_unstable();
+        for id in dropped_ids {
+            let Some(base) = context.base.get(id) else {
+                continue;
+            };
+            let protected = protected_base_comments(Some(base));
+            if protected.is_empty() {
+                continue;
+            }
+            let target_id = self.base_renames.get(id).unwrap_or(id);
+            let mut preserved = false;
+            for side in [&mut rekeyed.left, &mut rekeyed.right] {
+                if let Some(owner) = side.get_mut(target_id)
+                    && owner.created_at == base.created_at
+                {
+                    owner.comments = merge_comment_lists(&owner.comments, &protected, target_id)
+                        .map_err(|error| (id.clone(), Box::new(error)))?;
+                    preserved = true;
+                }
+            }
+            if !preserved {
+                return Err((
+                    id.clone(),
+                    Box::new(BeadsError::SyncConflict {
+                        message: format!(
+                            "Cannot relocate comment suppression evidence for issue '{id}'; preserve the base and resolve its issue identity before merging"
+                        ),
+                    }),
+                ));
+            }
         }
+        Ok(rekeyed)
     }
 }
 
@@ -20184,6 +20562,68 @@ fn dirty_ids_for_preservation(storage: &SqliteStorage, warnings: &mut Vec<String
         "dirty-issue markers",
         warnings,
     )
+}
+
+/// Refuse rebuilding from a source that cannot preserve committed comment
+/// revisions, including clean rows which ordinary dirty-state recovery omits.
+/// This protects suppression evidence without replaying unrelated local issue
+/// fields over an operator-selected rebuild source.
+pub(crate) fn ensure_rebuild_preserves_comment_revisions(
+    storage: &SqliteStorage,
+    source: &JsonlSourceSnapshot,
+) -> Result<()> {
+    let mut protected = storage
+        .get_all_comments()?
+        .into_iter()
+        .filter_map(|(id, comments)| {
+            let revised = comments
+                .into_iter()
+                .filter(|comment| {
+                    comment
+                        .revision
+                        .as_ref()
+                        .is_some_and(|revision| revision.generation > 0)
+                })
+                .collect::<Vec<_>>();
+            (!revised.is_empty()).then_some((id, revised))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if protected.is_empty() {
+        return Ok(());
+    }
+    let mut seen_ids = HashSet::new();
+    for_each_jsonl_import_issue(source, |_line_num, issue, _| {
+        if !seen_ids.insert(issue.id.clone()) {
+            return Err(BeadsError::SyncConflict {
+                message: format!("Rebuild refused: duplicate source issue '{}'", issue.id),
+            });
+        }
+        // Import discards ephemeral records. Their apparent presence cannot
+        // certify that a rebuild would retain local suppression evidence.
+        if issue.ephemeral {
+            return Ok(());
+        }
+        if let Some(local) = protected.remove(&issue.id) {
+            let joined = merge_comment_lists(&issue.comments, &local, &issue.id)?;
+            if !comments_sync_equal(&joined, &issue.comments) {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Rebuild refused: source issue '{}' does not preserve local comment revisions; reconcile comments before rebuilding",
+                        issue.id
+                    ),
+                });
+            }
+        }
+        Ok(())
+    })?;
+    if let Some((id, _)) = protected.first_key_value() {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Rebuild refused: source omits local comment revisions for '{id}'; reconcile comments before rebuilding"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Snapshot all unflushed state with a complete account of known capture
@@ -23611,6 +24051,7 @@ mod tests {
             author: "fixture".to_string(),
             body: "Preserve this comment exactly.".to_string(),
             created_at: fixed_time(190),
+            revision: None,
         }];
         write_additive_issues(&jsonl_path, &[target.clone(), source.clone()]);
 
@@ -23663,7 +24104,10 @@ mod tests {
         let expected = canonical_additive_test_issue(source);
         assert_eq!(stored["bd-source"].labels, expected.labels);
         assert_eq!(stored["bd-source"].dependencies, expected.dependencies);
-        assert_eq!(stored["bd-source"].comments, expected.comments);
+        assert!(comments_sync_equal(
+            &stored["bd-source"].comments,
+            &expected.comments
+        ));
         assert_eq!(receipt.events_before, 0);
         assert_eq!(receipt.events_after, 0);
     }
@@ -24033,6 +24477,7 @@ mod tests {
             author: "fixture".to_string(),
             body: "Wrong owner".to_string(),
             created_at: fixed_time(190),
+            revision: None,
         }];
         write_additive_issues(&jsonl_path, &[invalid]);
 
@@ -24089,6 +24534,7 @@ mod tests {
             author: String::new(),
             body: "\0PRIVATE-COMMENT\n\u{1b}[31m".to_string(),
             created_at: fixed_time(190),
+            revision: None,
         };
         let canonical_payload = serde_json::to_string(&comment).unwrap();
         invalid.comments = vec![comment];
@@ -24384,6 +24830,7 @@ mod tests {
             author: "fixture".to_string(),
             body: "First owner".to_string(),
             created_at: fixed_time(95),
+            revision: None,
         }];
         second_comment_owner.comments = vec![
             Comment {
@@ -24392,6 +24839,7 @@ mod tests {
                 author: "fixture".to_string(),
                 body: "Duplicate owner".to_string(),
                 created_at: fixed_time(95),
+                revision: None,
             },
             Comment {
                 id: 0,
@@ -24399,6 +24847,7 @@ mod tests {
                 author: "fixture".to_string(),
                 body: "Allocate this nonpositive surrogate ID.".to_string(),
                 created_at: fixed_time(96),
+                revision: None,
             },
         ];
         write_additive_issues(&jsonl_path, &[first_comment_owner, second_comment_owner]);
@@ -26123,6 +26572,7 @@ mod tests {
                 author: "br-sync".to_string(),
                 body: "merge note written after report".to_string(),
                 created_at: Utc::now(),
+                revision: None,
             }],
             ..Issue::default()
         };
@@ -27008,6 +27458,7 @@ mod tests {
             author: "peer".to_string(),
             body: "Peer discussion must survive".to_string(),
             created_at: peer.updated_at,
+            revision: None,
         });
         assert_eq!(peer.compute_content_hash(), narrow_hash);
         write_jsonl_issues(&jsonl_path, &source.iter().collect::<Vec<_>>());
@@ -27668,7 +28119,7 @@ mod tests {
         let mut issue = make_test_issue("bd-wisp-123", "Wisp issue");
         assert!(!issue.ephemeral);
 
-        normalize_issue(&mut issue);
+        normalize_issue(&mut issue).unwrap();
 
         // Issue ID containing "-wisp-" should be marked ephemeral
         assert!(issue.ephemeral);
@@ -27683,16 +28134,17 @@ mod tests {
             author: "reporter".to_string(),
             body: "recovery evidence".to_string(),
             created_at: issue.created_at,
+            revision: None,
         };
         let mut conflicting = comment.clone();
         conflicting.body = "different evidence".to_string();
         issue.comments = vec![comment.clone(), comment, conflicting.clone()];
 
-        let deduplicated = normalize_issue(&mut issue);
+        let deduplicated = normalize_issue(&mut issue).unwrap();
 
         assert_eq!(deduplicated, 1);
         assert_eq!(issue.comments.len(), 2);
-        assert_eq!(issue.comments[1], conflicting);
+        assert!(comments_sync_equal(&issue.comments[1..], &[conflicting]));
     }
 
     #[test]
@@ -27707,6 +28159,7 @@ mod tests {
             author: "reporter".to_string(),
             body: "recovery evidence".to_string(),
             created_at: issue.created_at,
+            revision: None,
         };
         issue.comments = vec![comment.clone(), comment];
         fs::write(
@@ -27752,6 +28205,7 @@ mod tests {
                 author: "alice".to_string(),
                 body: "shared identity".to_string(),
                 created_at: first.created_at,
+                revision: None,
             });
             second.comments.push(crate::model::Comment {
                 id: 3_560,
@@ -27759,6 +28213,7 @@ mod tests {
                 author: "alice".to_string(),
                 body: second_body.to_string(),
                 created_at: first.created_at,
+                revision: None,
             });
             let issues = if reverse_lines {
                 [&second, &first]
@@ -28039,6 +28494,7 @@ mod tests {
             author: "alice".to_string(),
             body: "comment from clone A".to_string(),
             created_at: peer.created_at,
+            revision: None,
         });
         fs::write(
             &jsonl_path,
@@ -28087,11 +28543,11 @@ mod tests {
             .unwrap();
 
         // Two divergent JSONL lineages independently used stale_b_comment.id.
-        // The merged JSONL kept that id for A and renumbered B, while the
-        // ignored local database still assigns the old id to B. A appears
-        // first in JSONL, so per-issue replacement used to AUTO-reallocate A
-        // before B released the authoritative id and then fail the semantic
-        // verifier because neither persisted id matched JSONL.
+        // The merged JSONL kept that id for A and renumbered B, while this
+        // database still assigns the old id to B. A appears first in JSONL.
+        // Preserve B's local identity and allocate A a free local rowid; the
+        // portable payload, rather than a foreign database's numbering, is
+        // the synchronization invariant.
         let mut incoming_a = existing_a.clone();
         incoming_a.updated_at += chrono::Duration::minutes(1);
         incoming_a.comments = vec![crate::model::Comment {
@@ -28100,6 +28556,7 @@ mod tests {
             author: "alice".to_string(),
             body: "comment from A".to_string(),
             created_at: incoming_a.updated_at,
+            revision: None,
         }];
 
         let mut incoming_b = existing_b.clone();
@@ -28110,6 +28567,7 @@ mod tests {
             author: stale_b_comment.author.clone(),
             body: stale_b_comment.body.clone(),
             created_at: stale_b_comment.created_at,
+            revision: stale_b_comment.revision.clone(),
         }];
 
         fs::write(
@@ -28128,13 +28586,15 @@ mod tests {
             &ImportConfig::default(),
             Some("bd-"),
         )
-        .expect("cross-issue comment ownership must converge to JSONL");
+        .expect("cross-issue comment payloads must converge to JSONL");
         assert_eq!(result.updated_count, 2);
 
         let comments_a = storage.get_comments(&incoming_a.id).unwrap();
         let comments_b = storage.get_comments(&incoming_b.id).unwrap();
-        assert_eq!(comments_a, incoming_a.comments);
-        assert_eq!(comments_b, incoming_b.comments);
+        assert!(comments_sync_equal(&comments_a, &incoming_a.comments));
+        assert!(comments_sync_equal(&comments_b, &incoming_b.comments));
+        assert_eq!(comments_b[0].id, stale_b_comment.id);
+        assert_ne!(comments_a[0].id, stale_b_comment.id);
 
         let second = import_from_jsonl(
             &mut storage,
@@ -29415,6 +29875,7 @@ mod tests {
                 author: "tester".to_string(),
                 body: "Keep the local discussion".to_string(),
                 created_at: absent.created_at,
+                revision: None,
             });
             absent.dependencies.push(Dependency {
                 issue_id: absent.id.clone(),
@@ -29703,7 +30164,7 @@ mod tests {
                 .get_issue_for_export(&tombstone.id)
                 .unwrap()
                 .unwrap();
-            normalize_issue_for_export(&mut expected);
+            normalize_issue_for_export(&mut expected).unwrap();
             let events = storage.get_events(&tombstone.id, 100).unwrap();
 
             retitle(&mut storage, &live.id, "Apply retention contraction");
@@ -31730,9 +32191,9 @@ mod tests {
     fn verify_applied_import_semantics_checks_the_last_record_applied_to_an_issue() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let mut superseded = make_test_issue("bd-dup", "Intermediate update");
-        normalize_issue(&mut superseded);
+        normalize_issue(&mut superseded).unwrap();
         let mut final_record = make_test_issue("bd-dup", "Final update");
-        normalize_issue(&mut final_record);
+        normalize_issue(&mut final_record).unwrap();
         storage.create_issue(&final_record, "tester").unwrap();
 
         // Two JSONL records collapsed onto one issue (an external-ref
@@ -31758,7 +32219,7 @@ mod tests {
         issue.status = Status::Closed;
         issue.closed_at = None;
 
-        normalize_issue(&mut issue);
+        normalize_issue(&mut issue).unwrap();
 
         // closed_at should be set to updated_at for closed issues
         assert!(issue.closed_at.is_some());
@@ -31771,7 +32232,7 @@ mod tests {
         issue.status = Status::Open;
         issue.closed_at = Some(Utc::now());
 
-        normalize_issue(&mut issue);
+        normalize_issue(&mut issue).unwrap();
 
         // closed_at should be cleared for open issues
         assert!(issue.closed_at.is_none());
@@ -31788,7 +32249,7 @@ mod tests {
             issue.closed_by_model = Some(String::new());
             issue.deleted_by = Some("deleter".to_string());
 
-            normalize_issue(&mut issue);
+            normalize_issue(&mut issue).unwrap();
 
             assert_eq!(
                 issue.closed_by.as_deref(),
@@ -31809,7 +32270,7 @@ mod tests {
         let mut issue = make_test_issue("bd-001", "Test");
         issue.content_hash = None;
 
-        normalize_issue(&mut issue);
+        normalize_issue(&mut issue).unwrap();
 
         assert!(issue.content_hash.is_some());
         assert!(!issue.content_hash.as_ref().unwrap().is_empty());
@@ -31820,7 +32281,7 @@ mod tests {
         let mut issue = make_test_issue("bd-001", "Test");
         issue.external_ref = Some("  ext-123  ".to_string());
 
-        normalize_issue(&mut issue);
+        normalize_issue(&mut issue).unwrap();
 
         let expected_hash = crate::util::content_hash(&issue);
         assert_eq!(issue.external_ref.as_deref(), Some("ext-123"));
@@ -31836,7 +32297,7 @@ mod tests {
         issue.status = Status::Custom("done".to_string());
         issue.closed_at = None;
 
-        normalize_issue(&mut issue);
+        normalize_issue(&mut issue).unwrap();
 
         assert_eq!(issue.status, Status::Closed);
         assert!(issue.closed_at.is_some());
@@ -31847,7 +32308,7 @@ mod tests {
         for raw in ["Done", "COMPLETE", "completed", "Finished", "Resolved"] {
             let mut issue = make_test_issue("bd-001", "Legacy alias");
             issue.status = Status::Custom(raw.to_string());
-            normalize_issue(&mut issue);
+            normalize_issue(&mut issue).unwrap();
             assert_eq!(
                 issue.status,
                 Status::Closed,
@@ -31860,7 +32321,7 @@ mod tests {
     fn test_normalize_issue_preserves_unknown_custom_status() {
         let mut issue = make_test_issue("bd-001", "Custom status");
         issue.status = Status::Custom("qa-review".to_string());
-        normalize_issue(&mut issue);
+        normalize_issue(&mut issue).unwrap();
         assert_eq!(issue.status, Status::Custom("qa-review".to_string()));
     }
 
@@ -31877,7 +32338,7 @@ mod tests {
             thread_id: None,
         });
 
-        normalize_issue(&mut issue);
+        normalize_issue(&mut issue).unwrap();
 
         assert_eq!(
             issue.dependencies[0].dep_type,
@@ -31927,10 +32388,10 @@ mod tests {
             ),
         ] {
             issue.dependencies = incoming;
-            assert_eq!(normalize_issue(&mut issue), 0);
+            assert_eq!(normalize_issue(&mut issue).unwrap(), 0);
             assert_eq!(issue.dependencies, expected);
             let normalized = issue.clone();
-            assert_eq!(normalize_issue(&mut issue), 0);
+            assert_eq!(normalize_issue(&mut issue).unwrap(), 0);
             assert_eq!(issue, normalized);
         }
     }
@@ -31948,7 +32409,7 @@ mod tests {
             thread_id: None,
         });
 
-        normalize_issue(&mut issue);
+        normalize_issue(&mut issue).unwrap();
 
         assert_eq!(
             issue.dependencies[0].dep_type,
@@ -32042,6 +32503,7 @@ mod tests {
             author: "bob".to_string(),
             body: "Comment from JSONL".to_string(),
             created_at: Utc::now() - chrono::Duration::minutes(30),
+            revision: None,
         });
         let json = serde_json::to_string(&incoming).unwrap();
         let source_bytes = format!("{json}\n");
@@ -32119,6 +32581,7 @@ mod tests {
             author: "alice".to_string(),
             body: "Comment from DB".to_string(),
             created_at: db_comment.created_at,
+            revision: db_comment.revision.clone(),
         });
         incoming.comments.push(Comment {
             id: 11,
@@ -32126,6 +32589,7 @@ mod tests {
             author: "bob".to_string(),
             body: "New comment added via no-db".to_string(),
             created_at: Utc::now() - chrono::Duration::minutes(40),
+            revision: None,
         });
         let json = serde_json::to_string(&incoming).unwrap();
         fs::write(&path, format!("{json}\n")).unwrap();
@@ -32156,6 +32620,7 @@ mod tests {
             author: "alice".to_string(),
             body: "first".to_string(),
             created_at: t1,
+            revision: None,
         };
         let c2 = Comment {
             id: 2,
@@ -32163,6 +32628,7 @@ mod tests {
             author: "bob".to_string(),
             body: "second".to_string(),
             created_at: t2,
+            revision: None,
         };
         let c3 = Comment {
             id: 3,
@@ -32170,12 +32636,13 @@ mod tests {
             author: "carol".to_string(),
             body: "third".to_string(),
             created_at: t3,
+            revision: None,
         };
 
         let primary = vec![c1.clone(), c3.clone()];
         let secondary = vec![c1, c2];
 
-        let union = union_comment_lists(&primary, &secondary, "bd-1");
+        let union = merge_comment_lists(&primary, &secondary, "bd-1").unwrap();
         assert_eq!(union.len(), 3);
         assert_eq!(union[0].body, "first");
         assert_eq!(union[1].body, "second");
@@ -32355,6 +32822,7 @@ mod tests {
                     author: "local".to_string(),
                     body: "before the update".to_string(),
                     created_at: fixed_time(100),
+                    revision: None,
                 });
             }
             write_additive_issues(&path, std::slice::from_ref(&original));
@@ -32373,6 +32841,7 @@ mod tests {
                     author: "remote".to_string(),
                     body: "after the update".to_string(),
                     created_at: fixed_time(200),
+                    revision: None,
                 });
             }
             // The alias collides by the original content hash. Classification
@@ -32433,6 +32902,7 @@ mod tests {
                 author: "local".to_string(),
                 body: "database fact".to_string(),
                 created_at: fixed_time(100),
+                revision: None,
             });
             write_additive_issues(&path, std::slice::from_ref(&original));
             import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
@@ -32451,6 +32921,7 @@ mod tests {
                 author: "remote".to_string(),
                 body: "update fact".to_string(),
                 created_at: fixed_time(200),
+                revision: None,
             }];
             let mut alias = original;
             alias.id = "bd-alias".to_string();
@@ -32462,6 +32933,7 @@ mod tests {
                 author: "remote".to_string(),
                 body: "alias fact".to_string(),
                 created_at: fixed_time(300),
+                revision: None,
             }];
             let expected = if alias_updates && !alias_first {
                 &alias
@@ -32520,6 +32992,7 @@ mod tests {
             author: "local".to_string(),
             body: "already certified fact".to_string(),
             created_at: fixed_time(100),
+            revision: None,
         });
         write_additive_issues(&path, std::slice::from_ref(&original));
         import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
@@ -32539,6 +33012,7 @@ mod tests {
             author: "remote".to_string(),
             body: "later alias fact".to_string(),
             created_at: fixed_time(200),
+            revision: None,
         }];
         write_additive_issues(&path, &[original.clone(), alias]);
         let imported =
@@ -32590,6 +33064,7 @@ mod tests {
             author: "both".to_string(),
             body: "synced fact".to_string(),
             created_at: fixed_time(100),
+            revision: None,
         });
         write_additive_issues(&path, std::slice::from_ref(&original));
         import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
@@ -32614,6 +33089,7 @@ mod tests {
             author: "clone-a".to_string(),
             body: "remote fact".to_string(),
             created_at: fixed_time(200),
+            revision: None,
         });
         write_additive_issues(&path, std::slice::from_ref(&theirs));
         let imported =
@@ -32653,6 +33129,7 @@ mod tests {
                 author: "local".to_string(),
                 body: "must survive refusal".to_string(),
                 created_at: fixed_time(100),
+                revision: None,
             });
             write_additive_issues(&path, std::slice::from_ref(&original));
             import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
@@ -32677,6 +33154,7 @@ mod tests {
                 author: "remote".to_string(),
                 body: "first payload".to_string(),
                 created_at: fixed_time(150),
+                revision: None,
             }];
             if !wrong_owner {
                 let mut conflicting = invalid.comments[0].clone();
@@ -34587,6 +35065,7 @@ transitions:
                 author: "tester".to_string(),
                 body: "same".to_string(),
                 created_at: timestamp,
+                revision: None,
             },
             Comment {
                 id: 2,
@@ -34594,10 +35073,11 @@ transitions:
                 author: "tester".to_string(),
                 body: "same".to_string(),
                 created_at: timestamp,
+                revision: None,
             },
         ];
 
-        normalize_issue_for_export(&mut issue);
+        normalize_issue_for_export(&mut issue).unwrap();
 
         let ids = issue
             .comments
@@ -34901,6 +35381,7 @@ transitions:
                     author: "peer".to_string(),
                     body: "Unimported peer discussion".to_string(),
                     created_at: peer.updated_at,
+                    revision: None,
                 });
                 write_jsonl_issues(&jsonl_path, &issues.iter().collect::<Vec<_>>());
             }
@@ -36677,6 +37158,8 @@ transitions:
         let mut modified = with_comment(base_modified.clone(), 1, "Unexported work", 200);
         modified.description = Some("Local work after exporting".to_string());
         modified.updated_at = fixed_time_merge(200);
+        // Storage getters now return local comments with enrolled revisions.
+        normalize_comment_revisions(&mut modified.comments).unwrap();
         let external = created_issue("bd-external", "An unrelated external addition", 150);
         let context = MergeContext::new(
             issue_map(&[&exported, &base_modified]),
@@ -37374,7 +37857,7 @@ transitions:
         assert_eq!(issue.closed_by, external.closed_by);
         assert_eq!(issue.deleted_at, local.deleted_at);
         assert_eq!(issue.deleted_by, local.deleted_by);
-        assert_eq!(issue.comments, external.comments);
+        assert!(comments_sync_equal(&issue.comments, &external.comments));
         assert!(issue.updated_at >= external.updated_at);
     }
 
@@ -37772,6 +38255,7 @@ transitions:
             author: "agent".to_string(),
             body: body.to_string(),
             created_at: fixed_time_merge(at),
+            revision: None,
         });
         issue
     }
@@ -37797,6 +38281,692 @@ transitions:
             .iter()
             .find(|issue| issue.id == id)
             .unwrap_or_else(|| panic!("{id} not kept: {:?}", kept_titles(report)))
+    }
+
+    fn comment_revision_fixture(id: &str) -> Issue {
+        let mut issue = with_comment(
+            created_issue(id, "Portable comment revisions", 10),
+            7,
+            "sensitive-original-fixture",
+            20,
+        );
+        issue.updated_at = fixed_time_merge(20);
+        normalize_comment_revisions(&mut issue.comments).unwrap();
+        issue
+    }
+
+    #[test]
+    fn comment_revision_terminal_dominates_future_clock_edits_in_both_merge_directions() {
+        let base = comment_revision_fixture("bd-comment-terminal");
+        let mut edited = base.clone();
+        edited.comments[0].id = 42;
+        for (text, time) in [
+            ("branch one", 100),
+            ("branch two", 200),
+            ("branch three", 300),
+        ] {
+            edited.comments[0]
+                .revise(CommentState::Active, text, "agent", fixed_time_merge(time))
+                .unwrap();
+        }
+        edited.updated_at = fixed_time_merge(900);
+        for state in [CommentState::Redacted, CommentState::Deleted] {
+            let mut removed = base.clone();
+            removed.comments[0]
+                .revise(state, "", "privacy-operator", fixed_time_merge(30))
+                .unwrap();
+            removed.updated_at = fixed_time_merge(30);
+            for (local, external) in [(&removed, &edited), (&edited, &removed)] {
+                for strategy in [
+                    ConflictResolution::Manual,
+                    ConflictResolution::PreferLocal,
+                    ConflictResolution::PreferExternal,
+                    ConflictResolution::PreferNewer,
+                ] {
+                    for local_export in [false, true] {
+                        let context = MergeContext::new(
+                            issue_map(&[&base]),
+                            issue_map(&[local]),
+                            issue_map(&[external]),
+                        );
+                        let context = if local_export {
+                            context.with_local_export_base()
+                        } else {
+                            context
+                        };
+                        let report = three_way_merge(&context, strategy, None);
+                        assert!(report.conflicts.is_empty(), "{report:?}");
+                        let joined = kept(&report, &base.id);
+                        assert_eq!(joined.comments.len(), 1);
+                        let comment = &joined.comments[0];
+                        assert_eq!(comment.state(), state);
+                        assert!(comment.body.is_empty());
+                        assert_eq!(comment.id, local.comments[0].id);
+                        assert_eq!(comment.author, base.comments[0].author);
+                        assert_eq!(comment.created_at, base.comments[0].created_at);
+                        assert_eq!(comment.revision, removed.comments[0].revision);
+                        let encoded = serde_json::to_string(joined).unwrap();
+                        assert!(!encoded.contains("sensitive-original-fixture"));
+                        assert!(!encoded.contains("branch three"));
+                        let decoded: Issue = serde_json::from_str(&encoded).unwrap();
+                        let repeated = three_way_merge(
+                            &MergeContext::new(
+                                issue_map(&[joined]),
+                                issue_map(&[joined]),
+                                issue_map(&[&decoded]),
+                            ),
+                            strategy,
+                            None,
+                        );
+                        assert!(repeated.conflicts.is_empty());
+                        assert_eq!(kept(&repeated, &base.id), joined);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn comment_revision_concurrent_active_edits_refuse_every_merge_force_policy() {
+        let base = comment_revision_fixture("bd-comment-conflict");
+        let mut left = base.clone();
+        left.comments[0]
+            .revise(
+                CommentState::Active,
+                "private-left-fixture",
+                "left-actor",
+                fixed_time_merge(40),
+            )
+            .unwrap();
+        left.updated_at = fixed_time_merge(400);
+        let mut right = base.clone();
+        for time in [30, 35] {
+            right.comments[0]
+                .revise(
+                    CommentState::Active,
+                    &format!("private-right-fixture-{time}"),
+                    "right-actor",
+                    fixed_time_merge(time),
+                )
+                .unwrap();
+        }
+        right.updated_at = fixed_time_merge(900);
+        for (local, external) in [(&left, &right), (&right, &left)] {
+            for strategy in [
+                ConflictResolution::Manual,
+                ConflictResolution::PreferLocal,
+                ConflictResolution::PreferExternal,
+                ConflictResolution::PreferNewer,
+            ] {
+                let report = three_way_merge(
+                    &MergeContext::new(
+                        issue_map(&[&base]),
+                        issue_map(&[local]),
+                        issue_map(&[external]),
+                    ),
+                    strategy,
+                    None,
+                );
+                assert_eq!(
+                    report.conflicts,
+                    [(base.id.clone(), ConflictType::CommentRevision)]
+                );
+                assert!(report.kept.is_empty());
+                assert!(report.deleted.is_empty());
+                for (_, note) in &report.notes {
+                    assert!(!note.contains("private-left-fixture"));
+                    assert!(!note.contains("private-right-fixture"));
+                    assert!(!note.contains("sensitive-original-fixture"));
+                }
+            }
+        }
+        assert_eq!(left.comments[0].body, "private-left-fixture");
+        assert_eq!(right.comments[0].body, "private-right-fixture-35");
+    }
+
+    #[test]
+    fn comment_revision_base_suppression_survives_stale_peers_and_cannot_be_dropped() {
+        let original = comment_revision_fixture("bd-comment-base");
+        let mut base = original.clone();
+        base.comments[0]
+            .revise(CommentState::Redacted, "", "agent", fixed_time_merge(30))
+            .unwrap();
+        let mut legacy = original.clone();
+        legacy.comments[0].revision = None;
+        let report = three_way_merge(
+            &MergeContext::new(
+                issue_map(&[&base]),
+                issue_map(&[&legacy]),
+                issue_map(&[&legacy]),
+            ),
+            ConflictResolution::Manual,
+            None,
+        );
+        assert!(report.conflicts.is_empty(), "{report:?}");
+        assert_eq!(
+            kept(&report, &base.id).comments[0].state(),
+            CommentState::Redacted
+        );
+        assert!(kept(&report, &base.id).comments[0].body.is_empty());
+
+        let absent = HashMap::new();
+        for local in [issue_map(&[&legacy]), absent.clone()] {
+            let report = three_way_merge(
+                &MergeContext::new(issue_map(&[&base]), local, absent.clone()),
+                ConflictResolution::PreferExternal,
+                None,
+            );
+            assert_eq!(
+                report.conflicts,
+                [(base.id.clone(), ConflictType::CommentRevision)]
+            );
+            assert!(report.kept.is_empty());
+            assert!(report.deleted.is_empty());
+        }
+        let retained_local = three_way_merge(
+            &MergeContext::new(issue_map(&[&base]), issue_map(&[&base]), HashMap::new()),
+            ConflictResolution::PreferExternal,
+            None,
+        );
+        assert!(retained_local.conflicts.is_empty());
+        assert_eq!(retained_local.deleted, [base.id]);
+    }
+
+    #[test]
+    fn comment_revision_legacy_identity_is_enrolled_before_issue_collision_relocation() {
+        let earlier = created_issue("bd-parent.1", "First independent child", 10);
+        let later = with_comment(
+            created_issue("bd-parent.1", "Second independent child", 20),
+            1,
+            "relocated discussion",
+            30,
+        );
+        let mut expected = later.comments.clone();
+        normalize_comment_revisions(&mut expected).unwrap();
+        for (left, right) in [(&earlier, &later), (&later, &earlier)] {
+            let report = three_way_merge(
+                &MergeContext::new(HashMap::new(), issue_map(&[left]), issue_map(&[right])),
+                ConflictResolution::Manual,
+                None,
+            );
+            assert!(report.conflicts.is_empty(), "{report:?}");
+            assert_eq!(report.id_collisions.len(), 1);
+            let relocated = kept(&report, &report.id_collisions[0].relocated_id);
+            assert_ne!(relocated.id, later.id);
+            assert_eq!(relocated.comments[0].issue_id, relocated.id);
+            assert_eq!(relocated.comments[0].revision, expected[0].revision);
+        }
+    }
+
+    #[test]
+    fn comment_revision_remote_terminal_evidence_blocks_whole_issue_omission() {
+        let base = comment_revision_fixture("bd-comment-remote-terminal");
+        for state in [CommentState::Redacted, CommentState::Deleted] {
+            let mut remote = base.clone();
+            remote.comments[0]
+                .revise(state, "", "agent", fixed_time_merge(30))
+                .unwrap();
+            remote.updated_at = fixed_time_merge(300);
+            for local_export in [false, true] {
+                for protected_issue in [false, true] {
+                    for strategy in [
+                        ConflictResolution::Manual,
+                        ConflictResolution::PreferLocal,
+                        ConflictResolution::PreferExternal,
+                        ConflictResolution::PreferNewer,
+                    ] {
+                        let context = MergeContext::new(
+                            issue_map(&[&base]),
+                            HashMap::new(),
+                            issue_map(&[&remote]),
+                        );
+                        let context = if local_export {
+                            context.with_local_export_base()
+                        } else {
+                            context
+                        };
+                        let tombstones = HashSet::from([base.id.clone()]);
+                        let report = three_way_merge(
+                            &context,
+                            strategy,
+                            protected_issue.then_some(&tombstones),
+                        );
+                        assert!(report.deleted.is_empty(), "{report:?}");
+                        assert!(report.tombstone_protected.is_empty(), "{report:?}");
+                        if report.conflicts.is_empty() {
+                            let kept = kept(&report, &base.id);
+                            assert_eq!(kept.comments[0].state(), state);
+                            assert!(kept.comments[0].body.is_empty());
+                        } else {
+                            assert!(report.kept.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn comment_revision_collision_keeps_terminal_evidence_from_a_dropped_base() {
+        for older_collision in [false, true] {
+            let original = comment_revision_fixture("bd-private.1");
+            let mut base = original.clone();
+            base.comments[0]
+                .revise(CommentState::Redacted, "", "agent", fixed_time_merge(30))
+                .unwrap();
+            let unrelated = created_issue(
+                &original.id,
+                "Independent colliding issue",
+                if older_collision { 5 } else { 50 },
+            );
+            for (left, right) in [(&original, &unrelated), (&unrelated, &original)] {
+                let report = three_way_merge(
+                    &MergeContext::new(
+                        issue_map(&[&base]),
+                        issue_map(&[left]),
+                        issue_map(&[right]),
+                    ),
+                    ConflictResolution::Manual,
+                    None,
+                );
+                assert!(report.conflicts.is_empty(), "{report:?}");
+                assert_eq!(report.kept.len(), 2);
+                let owner = report
+                    .kept
+                    .iter()
+                    .find(|issue| issue.created_at == original.created_at)
+                    .unwrap();
+                assert_eq!(owner.comments.len(), 1);
+                assert_eq!(owner.comments[0].state(), CommentState::Redacted);
+                assert!(owner.comments[0].body.is_empty());
+                assert_eq!(owner.comments[0].revision, base.comments[0].revision);
+                let other = report
+                    .kept
+                    .iter()
+                    .find(|issue| issue.created_at == unrelated.created_at)
+                    .unwrap();
+                assert!(other.comments.is_empty());
+            }
+        }
+
+        let mut unmatched = comment_revision_fixture("bd-private.1");
+        unmatched.comments[0]
+            .revise(CommentState::Deleted, "", "agent", fixed_time_merge(30))
+            .unwrap();
+        let left = created_issue(&unmatched.id, "Different issue A", 40);
+        let right = created_issue(&unmatched.id, "Different issue B", 50);
+        let report = three_way_merge(
+            &MergeContext::new(
+                issue_map(&[&unmatched]),
+                issue_map(&[&left]),
+                issue_map(&[&right]),
+            ),
+            ConflictResolution::PreferExternal,
+            None,
+        );
+        assert_eq!(
+            report.conflicts,
+            [(unmatched.id, ConflictType::CommentRevision)]
+        );
+        assert!(report.kept.is_empty());
+    }
+
+    #[test]
+    fn comment_revision_malformed_metadata_refuses_all_merge_strategies() {
+        let base = comment_revision_fixture("bd-comment-invalid");
+        let mut invalid = base.clone();
+        invalid.comments[0].revision.as_mut().unwrap().head = "invalid".to_string();
+        for strategy in [
+            ConflictResolution::Manual,
+            ConflictResolution::PreferLocal,
+            ConflictResolution::PreferExternal,
+            ConflictResolution::PreferNewer,
+        ] {
+            let report = three_way_merge(
+                &MergeContext::new(
+                    issue_map(&[&base]),
+                    issue_map(&[&base]),
+                    issue_map(&[&invalid]),
+                ),
+                strategy,
+                None,
+            );
+            assert_eq!(
+                report.conflicts,
+                [(base.id.clone(), ConflictType::CommentRevision)]
+            );
+            assert!(report.kept.is_empty());
+            assert!(report.deleted.is_empty());
+        }
+    }
+
+    #[test]
+    fn comment_revision_preupgrade_relocated_alias_requires_proven_identity() {
+        let legacy = with_comment(
+            created_issue("bd-p.1", "Relocated legacy issue", 20),
+            7,
+            "old-private-fixture",
+            30,
+        );
+        let mut target = legacy.clone();
+        target.id = "bd-p.2".to_string();
+        target.comments[0].issue_id.clone_from(&target.id);
+        let mut sibling = target.comments[0].clone();
+        sibling.id = 8;
+        sibling.body = "distinct identified sibling".to_string();
+        target.comments.push(sibling);
+        normalize_comment_revisions(&mut target.comments).unwrap();
+        let enrolled_target = target.clone();
+        let unrelated = created_issue("bd-p.1", "Earlier unrelated issue", 10);
+        for state in [CommentState::Redacted, CommentState::Deleted] {
+            let mut removed = target.clone();
+            removed.comments[0]
+                .revise(state, "", "agent", fixed_time_merge(40))
+                .unwrap();
+            for reversed in [false, true] {
+                let (left, right) = if reversed {
+                    (issue_map(&[&legacy]), issue_map(&[&unrelated, &removed]))
+                } else {
+                    (issue_map(&[&unrelated, &removed]), issue_map(&[&legacy]))
+                };
+                for strategy in [
+                    ConflictResolution::Manual,
+                    ConflictResolution::PreferLocal,
+                    ConflictResolution::PreferExternal,
+                    ConflictResolution::PreferNewer,
+                ] {
+                    for base in [HashMap::new(), issue_map(&[&legacy])] {
+                        let report = three_way_merge(
+                            &MergeContext::new(base, left.clone(), right.clone()),
+                            strategy,
+                            None,
+                        );
+                        assert!(
+                            report
+                                .conflicts
+                                .iter()
+                                .any(|(_, kind)| *kind == ConflictType::CommentRevision),
+                            "{report:?}"
+                        );
+                        assert!(report.kept.is_empty());
+                        assert!(report.deleted.is_empty());
+                        assert!(!format!("{:?}", report.notes).contains("old-private-fixture"));
+                    }
+                }
+            }
+            // Portable metadata proves which removed comment and which
+            // distinct sibling the alias carries, even with equal authors and
+            // creation timestamps. No original payload or identity is guessed.
+            let mut identified_alias = enrolled_target.clone();
+            identified_alias.id.clone_from(&legacy.id);
+            for comment in &mut identified_alias.comments {
+                comment.issue_id.clone_from(&legacy.id);
+            }
+            let report = three_way_merge(
+                &MergeContext::new(
+                    HashMap::new(),
+                    issue_map(&[&unrelated, &removed]),
+                    issue_map(&[&identified_alias]),
+                ),
+                ConflictResolution::Manual,
+                None,
+            );
+            assert!(report.conflicts.is_empty(), "{report:?}");
+            let saved = kept(&report, &target.id);
+            assert_eq!(saved.comments.len(), 2);
+            assert!(comments_sync_equal(&saved.comments, &removed.comments));
+        }
+    }
+
+    #[test]
+    fn comment_revision_rebuild_guard_protects_clean_revisions_and_omitted_records() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("issues.jsonl");
+        for state in [
+            CommentState::Active,
+            CommentState::Redacted,
+            CommentState::Deleted,
+        ] {
+            let original = comment_revision_fixture("bd-comment-rebuild");
+            let mut revised = original.clone();
+            revised.comments[0]
+                .revise(
+                    state,
+                    if state == CommentState::Active {
+                        "corrected text"
+                    } else {
+                        ""
+                    },
+                    "agent",
+                    fixed_time_merge(40),
+                )
+                .unwrap();
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            storage.create_issue(&revised, "agent").unwrap();
+            storage
+                .sync_comments_for_import(&revised.id, &revised.comments)
+                .unwrap();
+            storage.clear_all_dirty_issues().unwrap();
+            let before = storage.get_comments(&revised.id).unwrap();
+            let mut ephemeral = revised.clone();
+            ephemeral.ephemeral = true;
+            for records in [vec![original], Vec::new(), vec![ephemeral]] {
+                write_additive_issues(&path, &records);
+                let source = capture_jsonl_source_snapshot(&path).unwrap();
+                let error =
+                    ensure_rebuild_preserves_comment_revisions(&storage, &source).unwrap_err();
+                assert!(!error.to_string().contains("sensitive-original-fixture"));
+                assert_eq!(storage.get_comments(&revised.id).unwrap(), before);
+                assert!(storage.get_dirty_issue_metadata().unwrap().is_empty());
+            }
+            write_additive_issues(&path, &[revised]);
+            let source = capture_jsonl_source_snapshot(&path).unwrap();
+            ensure_rebuild_preserves_comment_revisions(&storage, &source).unwrap();
+        }
+    }
+
+    #[test]
+    fn comment_revision_export_refuses_stale_or_omitted_suppression_even_with_force() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("issues.jsonl");
+        let original = comment_revision_fixture("bd-comment-export");
+        let mut removed = original.clone();
+        removed.comments[0]
+            .revise(CommentState::Redacted, "", "agent", fixed_time_merge(30))
+            .unwrap();
+        for force in [false, true] {
+            for missing in [false, true] {
+                let mut storage = SqliteStorage::open_memory().unwrap();
+                if !missing {
+                    storage.create_issue(&original, "agent").unwrap();
+                    storage
+                        .sync_comments_for_import(&original.id, &original.comments)
+                        .unwrap();
+                }
+                write_additive_issues(&path, &[removed.clone()]);
+                let bytes = fs::read(&path).unwrap();
+                let error = export_to_jsonl(
+                    &storage,
+                    &path,
+                    &ExportConfig {
+                        force,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+                assert!(!error.to_string().contains("sensitive-original-fixture"));
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn comment_revision_incremental_export_avoids_fresh_sensitive_history_copies() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let path = beads_dir.join("issues.jsonl");
+        let original = comment_revision_fixture("bd-comment-backup");
+        let mut removed = original.clone();
+        removed.comments[0]
+            .revise(CommentState::Deleted, "", "agent", fixed_time_merge(30))
+            .unwrap();
+        let config = ExportConfig {
+            beads_dir: Some(beads_dir.clone()),
+            history: HistoryConfig {
+                min_interval_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for existing_line in [false, true] {
+            write_additive_issues(&path, &[original.clone()]);
+            let source = capture_jsonl_source_snapshot(&path).unwrap();
+            let line = serde_json::to_string(&removed).unwrap();
+            if existing_line {
+                write_existing_jsonl_replacements_atomically(
+                    &HashMap::from([(removed.id.clone(), line)]),
+                    &path,
+                    &config,
+                    &source,
+                )
+                .unwrap();
+            } else {
+                write_jsonl_lines_atomically(
+                    &BTreeMap::from([(removed.id.clone(), line)]),
+                    &path,
+                    &config,
+                    &source,
+                    &HashSet::new(),
+                )
+                .unwrap();
+            }
+            assert!(
+                !fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("sensitive-original-fixture")
+            );
+            assert!(
+                history::list_backups(&beads_dir.join(".br_history"), None)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let source = capture_jsonl_source_snapshot(&path).unwrap();
+        removed.title = "Nonprivate scalar update".to_string();
+        write_existing_jsonl_replacements_atomically(
+            &HashMap::from([(removed.id.clone(), serde_json::to_string(&removed).unwrap())]),
+            &path,
+            &config,
+            &source,
+        )
+        .unwrap();
+        let backups = history::list_backups(&beads_dir.join(".br_history"), None).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert!(
+            !fs::read_to_string(&backups[0].path)
+                .unwrap()
+                .contains("sensitive-original-fixture")
+        );
+    }
+
+    #[test]
+    fn comment_revision_full_export_does_not_back_up_superseded_text() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let path = beads_dir.join("issues.jsonl");
+        let original = comment_revision_fixture("bd-comment-full-backup");
+        write_additive_issues(&path, &[original.clone()]);
+        let mut removed = original;
+        removed.comments[0]
+            .revise(CommentState::Redacted, "", "agent", fixed_time_merge(30))
+            .unwrap();
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.upsert_issue_for_import(&removed).unwrap();
+        storage
+            .sync_comments_for_import(&removed.id, &removed.comments)
+            .unwrap();
+        export_to_jsonl(
+            &storage,
+            &path,
+            &ExportConfig {
+                beads_dir: Some(beads_dir.clone()),
+                history: HistoryConfig {
+                    min_interval_secs: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("sensitive-original-fixture")
+        );
+        assert!(
+            history::list_backups(&beads_dir.join(".br_history"), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn comment_revision_additive_reconcile_preserves_markers_and_witnesses_metadata() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, path, mut config) = additive_test_paths(&temp);
+        for state in [CommentState::Redacted, CommentState::Deleted] {
+            let original = comment_revision_fixture("bd-comment-reconcile");
+            let mut removed = original.clone();
+            removed.comments[0]
+                .revise(state, "", "agent", fixed_time_merge(30))
+                .unwrap();
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            storage
+                .upsert_issue_and_relations_for_import(&removed)
+                .unwrap();
+            let before = storage.get_comments(&removed.id).unwrap();
+            let events_before = storage.get_all_events(0).unwrap();
+
+            config.source_authoritative_ids.insert(removed.id.clone());
+            write_additive_issues(&path, &[original]);
+            let plan = plan_additive_reconcile(&storage, &path, &config).unwrap();
+            assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Conflicted);
+            assert_eq!(
+                plan.receipt().conflict_reasons.get("shared_relation_drift"),
+                Some(&1)
+            );
+            assert!(
+                !serde_json::to_string(plan.receipt())
+                    .unwrap()
+                    .contains("sensitive-original-fixture")
+            );
+            assert!(apply_reviewed_additive_plan(&mut storage, &path, &config, &plan).is_err());
+            assert_eq!(storage.get_comments(&removed.id).unwrap(), before);
+            assert_eq!(storage.get_all_events(0).unwrap(), events_before);
+
+            config.source_authoritative_ids.clear();
+            write_additive_issues(&path, &[removed.clone()]);
+            let mut fresh = SqliteStorage::open_memory().unwrap();
+            let plan = plan_additive_reconcile(&fresh, &path, &config).unwrap();
+            assert_eq!(plan.receipt().conflicted, 0);
+            assert_eq!(plan.receipt().relation_rows_planned.comments, 1);
+            let applied = apply_reviewed_additive_plan(&mut fresh, &path, &config, &plan).unwrap();
+            assert_eq!(
+                applied.target_after.as_ref(),
+                Some(&plan.receipt().expected_target_after)
+            );
+            assert!(comments_sync_equal(
+                &fresh.get_comments(&removed.id).unwrap(),
+                &removed.comments
+            ));
+            let repeated = plan_additive_reconcile(&fresh, &path, &config).unwrap();
+            assert_eq!(
+                repeated.receipt().status,
+                AdditiveReconcileStatus::NoChanges
+            );
+        }
     }
 
     fn comment_bodies(issue: &Issue) -> Vec<&str> {
@@ -38082,7 +39252,11 @@ transitions:
                     );
                     let merged = kept(&report, "bd-rev");
                     assert_eq!(merged.updated_at, newer.updated_at, "{case}");
-                    assert_eq!(merged.comments, local.comments, "{case}");
+                    assert!(
+                        comments_sync_equal(&merged.comments, &local.comments),
+                        "{case}"
+                    );
+                    assert_eq!(merged.comments[0].id, local.comments[0].id, "{case}");
                 }
             }
         }
@@ -38496,6 +39670,7 @@ transitions:
             author: "tester".to_string(),
             body: "hello".to_string(),
             created_at: Utc::now(),
+            revision: None,
         });
 
         let renames: HashMap<String, String> = [

@@ -876,6 +876,11 @@ pub fn classify_command(command: &Commands) -> CommandCompatibility {
                 CommentCommands::List(_) => {
                     CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
                 }
+                CommentCommands::Edit(_)
+                | CommentCommands::Redact(_)
+                | CommentCommands::Delete(_) => {
+                    CommandCompatibility::DirectOnly(DirectOnlyReason::UnsafeCommand)
+                }
             },
         ),
         Commands::Update(args) => classify_update(args),
@@ -1648,6 +1653,7 @@ mod tests {
             })),
             id: None,
             wrap: false,
+            include_deleted: false,
         });
 
         assert_eq!(
@@ -1668,6 +1674,7 @@ mod tests {
             })),
             id: None,
             wrap: false,
+            include_deleted: false,
         });
 
         assert_eq!(
@@ -1682,9 +1689,11 @@ mod tests {
             command: Some(CommentCommands::List(CommentListArgs {
                 id: "br-1".to_string(),
                 wrap: false,
+                include_deleted: false,
             })),
             id: None,
             wrap: false,
+            include_deleted: false,
         });
 
         assert_eq!(

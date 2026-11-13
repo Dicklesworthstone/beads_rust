@@ -48,7 +48,8 @@ use crate::storage::schema::{
     attest_reviewed_migration_source_core_tables, is_reviewed_dependency_retired_index,
     is_reviewed_migration_managed_index, refuse_schema_repair_during_pending_merge,
     reviewed_runtime_schema_upgrade, reviewed_schema19_runtime_compatible,
-    run_reviewed_schema_migration_steps_in_transaction, runtime_schema_compatible,
+    reviewed_schema20_runtime_compatible, run_reviewed_schema_migration_steps_in_transaction,
+    runtime_schema_compatible,
 };
 use crate::sync::{DatabaseFamilyWriteLock, DatabaseTargetAuthorityState};
 
@@ -148,6 +149,7 @@ struct ReviewedStatePreservation {
     added_empty_sequences: Vec<String>,
     close_metadata_column_added: bool,
     gate_reporter_columns_added: bool,
+    comment_revisions_added: bool,
 }
 
 /// The expected destination, computed from the admitted source before any
@@ -161,6 +163,8 @@ struct LegacyV15Projection {
     closed_by_column_added: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     gate_reporter_columns_added: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    comment_revisions_added: bool,
     tables: Vec<LegacyTableProjection>,
     preserved_schema_sha256: String,
     retired_indexes: Vec<String>,
@@ -195,6 +199,8 @@ pub(super) struct MigrationForecast {
     gate_result_history_created: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     gate_reporter_columns_added: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    comment_revisions_added: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     prerequisites_column_added: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -329,6 +335,8 @@ struct ReviewedSchemaMigrationEffectsReceipt {
     #[serde(default, skip_serializing_if = "is_false")]
     gate_reporter_columns_added: bool,
     #[serde(default, skip_serializing_if = "is_false")]
+    comment_revisions_added: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     prerequisites_column_added: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     dependency_type_key_added: bool,
@@ -348,6 +356,7 @@ impl From<ReviewedSchemaMigrationEffects> for ReviewedSchemaMigrationEffectsRece
             content_hash_rows_rebuilt: value.content_hash_rows_rebuilt,
             gate_result_history_created: value.gate_result_history_created,
             gate_reporter_columns_added: value.gate_reporter_columns_added,
+            comment_revisions_added: value.comment_revisions_added,
             prerequisites_column_added: value.prerequisites_column_added,
             dependency_type_key_added: value.dependency_type_key_added,
             legacy_v15_tables_converted: false,
@@ -3357,6 +3366,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 content_hash_rows_rebuilt: 0,
                 gate_result_history_created: false,
                 gate_reporter_columns_added: false,
+                comment_revisions_added: false,
                 prerequisites_column_added: false,
                 dependency_type_key_added: false,
                 legacy_v15_conversion: None,
@@ -3437,7 +3447,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     }
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
-            "reviewed schema migration is available only from source schemas 4, 13, 14, 15, 16, 17, 18, and 19 \
+            "reviewed schema migration is available only from source schemas 4, 13, 14, 15, 16, 17, 18, 19, and 20 \
              to {target}; observed unsupported source version {from}. The original database \
              remains authoritative: JSONL reconstruction cannot establish lossless preservation. \
              Use `br doctor migrate-schema heal --dry-run` to audit this tracker, then use a \
@@ -3461,12 +3471,16 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
         // and capacity history. Refuse an unsupported schema19 before issuing
         // any migration token, as the former same-version upgrade did.
         let _ = reviewed_runtime_schema_upgrade(&conn)?;
+    } else if from == 20 && !reviewed_schema20_runtime_compatible(&conn) {
+        return Err(BeadsError::Config(
+            "schema20 source does not have the reviewed runtime layout; preserve the original database and inspect its schema before migrating".to_owned(),
+        ));
     }
     let legacy_v15_conversion = legacy_v15
-        .then(|| legacy_v15_projection(&conn, true, true, true))
+        .then(|| legacy_v15_projection(&conn, true, true, true, true))
         .transpose()?;
     let legacy_v4_conversion = (from == 4)
-        .then(|| legacy_v4::projection(&conn, true))
+        .then(|| legacy_v4::projection(&conn, true, target))
         .transpose()?;
     let content_hash_refresh_profile = hash_refresh::plan_profile(&conn, from)?;
     let issue_count = query_count(&conn, "SELECT COUNT(*) FROM issues")?;
@@ -3487,7 +3501,8 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
             0
         },
         gate_result_history_created,
-        gate_reporter_columns_added: true,
+        gate_reporter_columns_added: from < 20,
+        comment_revisions_added: true,
         prerequisites_column_added: from < 18,
         dependency_type_key_added: from < 19 && !legacy_v15,
         legacy_v15_conversion,
@@ -3498,7 +3513,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
         application_id: Some(application_id),
         post_migration_maintenance: true,
     };
-    if from == 19 {
+    if matches!(from, 19 | 20) {
         let preservation =
             capture_reviewed_state_preservation(db_path, &forecast)?.ok_or_else(|| {
                 BeadsError::internal("schema19 plan omitted its preservation witness")
@@ -3753,6 +3768,7 @@ fn apply_with_plan_token(
         || effects.content_hash_rows_rebuilt != forecast.content_hash_rows_rebuilt
         || effects.gate_result_history_created != forecast.gate_result_history_created
         || effects.gate_reporter_columns_added != forecast.gate_reporter_columns_added
+        || effects.comment_revisions_added != forecast.comment_revisions_added
         || effects.prerequisites_column_added != forecast.prerequisites_column_added
         || effects.dependency_type_key_added != forecast.dependency_type_key_added
         || effects.legacy_v15_tables_converted != forecast.legacy_v15_conversion.is_some()
@@ -3953,6 +3969,7 @@ fn validate_commit_ready_marker(
         || marker.effects.content_hash_rows_rebuilt != marker.forecast.content_hash_rows_rebuilt
         || marker.effects.gate_result_history_created != marker.forecast.gate_result_history_created
         || marker.effects.gate_reporter_columns_added != marker.forecast.gate_reporter_columns_added
+        || marker.effects.comment_revisions_added != marker.forecast.comment_revisions_added
         || marker.effects.prerequisites_column_added != marker.forecast.prerequisites_column_added
         || marker.effects.dependency_type_key_added != marker.forecast.dependency_type_key_added
         || marker.effects.legacy_v15_tables_converted
@@ -4655,6 +4672,7 @@ fn run_post_migration_maintenance(
             content_hash_rows_rebuilt: 0,
             gate_result_history_created: false,
             gate_reporter_columns_added: false,
+            comment_revisions_added: false,
             prerequisites_column_added: false,
             dependency_type_key_added: false,
             legacy_v15_tables_converted: false,
@@ -4675,6 +4693,7 @@ fn run_post_migration_maintenance(
                     content_hash_rows_rebuilt: 0,
                     gate_result_history_created: false,
                     gate_reporter_columns_added: false,
+                    comment_revisions_added: false,
                     prerequisites_column_added: false,
                     dependency_type_key_added: false,
                     legacy_v15_tables_converted: false,
@@ -4704,6 +4723,10 @@ fn run_post_migration_maintenance(
         close_connection(conn)?;
         let mut effects = result?;
         effects.legacy_v15_tables_converted = forecast.legacy_v15_conversion.is_some();
+        effects.comment_revisions_added |= forecast
+            .legacy_v15_conversion
+            .as_ref()
+            .is_some_and(|projection| projection.comment_revisions_added);
         effects
     };
 
@@ -6675,6 +6698,8 @@ fn reviewed_target_shape_is_canonical(db_path: &Path, target: u32) -> Result<boo
             runtime_schema_compatible(&conn)
         } else if target == 19 {
             reviewed_schema19_runtime_compatible(&conn)
+        } else if target == 20 {
+            reviewed_schema20_runtime_compatible(&conn)
         } else {
             false
         };
@@ -6808,10 +6833,11 @@ fn capture_reviewed_state_preservation_with_text_encoding(
         Ok(Some(ReviewedStatePreservation {
             application_id: query_application_id(conn)?,
             tables,
-            schema: reviewed_schema_objects(conn, false, false)?,
+            schema: reviewed_schema_objects(conn, false, false, false)?,
             added_empty_sequences,
             close_metadata_column_added,
             gate_reporter_columns_added: forecast.gate_reporter_columns_added,
+            comment_revisions_added: forecast.comment_revisions_added,
         }))
     })
 }
@@ -6880,6 +6906,7 @@ fn reviewed_schema_objects(
     conn: &Connection,
     project_close_metadata_addition: bool,
     project_gate_reporter_addition: bool,
+    project_comment_revision_addition: bool,
 ) -> Result<Vec<ReviewedSchemaObjectPreservation>> {
     let mut objects = Vec::new();
     for row in conn.query(
@@ -6908,10 +6935,15 @@ fn reviewed_schema_objects(
         let projects_gate_reporters = project_gate_reporter_addition
             && object_type == "table"
             && table == "gate_result_history";
+        let projects_comment_revisions = project_comment_revision_addition
+            && object_type == "table"
+            && table == "comments";
         let fingerprint = if projects_close_metadata {
             legacy_close_metadata_schema_fingerprint(&sql, false)?
         } else if projects_gate_reporters {
             legacy_gate_history_schema_fingerprint(&sql, false)?
+        } else if projects_comment_revisions {
+            legacy_comment_revision_schema_fingerprint(&sql, false)?
         } else {
             ddl_token_fingerprint(&sql, true)
         };
@@ -6919,6 +6951,8 @@ fn reviewed_schema_objects(
             legacy_close_metadata_schema_fingerprint(&sql, true)?
         } else if projects_gate_reporters {
             legacy_gate_history_schema_fingerprint(&sql, true)?
+        } else if projects_comment_revisions {
+            legacy_comment_revision_schema_fingerprint(&sql, true)?
         } else {
             quoted_ddl_fingerprint(&sql)
         };
@@ -6987,10 +7021,22 @@ fn verify_reviewed_state_preservation(
                 "reviewed migration preservation refused: historical gate assignees and overrides must remain unknown".to_owned(),
             ));
         }
+        if candidate
+            && expected.comment_revisions_added
+            && query_count(
+                conn,
+                "SELECT COUNT(*) FROM comments WHERE revision IS NOT NULL",
+            )? != 0
+        {
+            return Err(BeadsError::Config(
+                "reviewed migration preservation refused: legacy comment revisions must remain unknown".to_owned(),
+            ));
+        }
         let observed = reviewed_schema_objects(
             conn,
             candidate && expected.close_metadata_column_added,
             candidate && expected.gate_reporter_columns_added,
+            candidate && expected.comment_revisions_added,
         )?;
         for object in &expected.schema {
             if !observed.contains(object) {
@@ -7119,9 +7165,11 @@ fn validate_schema19_preservation_profile(forecast: &MigrationForecast) -> Resul
         // old unexecuted plan cannot match a freshly recomputed apply token.
         return Ok(());
     };
-    let historical = forecast.to_version == 19
+    let historical = forecast.from_version == 19
+        && forecast.to_version == 19
         && forecast.schema19_runtime_upgrade.is_some()
         && !forecast.gate_reporter_columns_added
+        && !forecast.comment_revisions_added
         && matches!(
             profile.profile.as_str(),
             LEGACY_SCHEMA19_PRESERVATION_PROFILE
@@ -7131,9 +7179,16 @@ fn validate_schema19_preservation_profile(forecast: &MigrationForecast) -> Resul
     let reporter_upgrade = forecast.to_version == 20
         && forecast.schema19_runtime_upgrade.is_none()
         && forecast.gate_reporter_columns_added
+        && !forecast.comment_revisions_added
+        && forecast.from_version == 19
         && profile.profile == SCHEMA19_PRESERVATION_PROFILE;
-    if forecast.from_version != 19
-        || !(historical || reporter_upgrade)
+    let comment_upgrade = forecast.to_version == 21
+        && matches!(forecast.from_version, 19 | 20)
+        && forecast.schema19_runtime_upgrade.is_none()
+        && forecast.comment_revisions_added
+        && forecast.gate_reporter_columns_added == (forecast.from_version == 19)
+        && profile.profile == SCHEMA19_PRESERVATION_PROFILE;
+    if !(historical || reporter_upgrade || comment_upgrade)
         || !recovery_pruning_hash_is_valid(&profile.source_sha256)
     {
         return Err(BeadsError::Config(
@@ -7222,6 +7277,7 @@ fn legacy_table_projection(
     project_source: bool,
     closed_by_column_added: bool,
     gate_reporter_columns_added: bool,
+    comment_revisions_added: bool,
 ) -> Result<LegacyTableProjection> {
     let rowid = legacy_projection_rowid(conn, table)?;
     let prefix = rowid.map_or_else(String::new, |alias| format!("{alias}, "));
@@ -7230,6 +7286,7 @@ fn legacy_table_projection(
         (true, "issues") => "*, ''",
         (true, "close_metadata") if closed_by_column_added => "*, NULL",
         (true, "gate_result_history") if gate_reporter_columns_added => "*, NULL, NULL",
+        (true, "comments") if comment_revisions_added => "*, NULL",
         (true, "dirty_issues") => "issue_id, marked_at",
         (true, "child_counters") => "parent_id, last_child",
         _ => "*",
@@ -7377,8 +7434,26 @@ fn legacy_close_metadata_schema_fingerprint(sql: &str, preserve_quoting: bool) -
 /// Project only the two reviewed nullable audit additions. Historical rows
 /// must separately retain NULL in both columns; no attribution is invented.
 fn legacy_gate_history_schema_fingerprint(sql: &str, preserve_quoting: bool) -> Result<String> {
+    nullable_columns_schema_fingerprint(
+        sql,
+        preserve_quoting,
+        &["assignee_at_report", "override_reason"],
+        "legacy gate history",
+    )
+}
+
+fn legacy_comment_revision_schema_fingerprint(sql: &str, preserve_quoting: bool) -> Result<String> {
+    nullable_columns_schema_fingerprint(sql, preserve_quoting, &["revision"], "comment revision")
+}
+
+fn nullable_columns_schema_fingerprint(
+    sql: &str,
+    preserve_quoting: bool,
+    columns: &[&str],
+    context: &str,
+) -> Result<String> {
     let mut tokens = ddl_tokens(sql, true, preserve_quoting);
-    for column in ["assignee_at_report", "override_reason"] {
+    for &column in columns {
         let names = [
             column.to_owned(),
             quoted_identifier_token('"', column),
@@ -7400,7 +7475,7 @@ fn legacy_gate_history_schema_fingerprint(sql: &str, preserve_quoting: bool) -> 
                     || (previous.is_some_and(|token| token == "(") && delimiter == Some(")"))
                 {
                     return Err(BeadsError::internal(format!(
-                        "legacy gate history projection requires exactly one nullable {column} TEXT addition without defaults or constraints"
+                        "{context} projection requires exactly one nullable {column} TEXT addition without defaults or constraints"
                     )));
                 }
                 addition = Some(if previous.is_some_and(|token| token == ",") {
@@ -7416,9 +7491,7 @@ fn legacy_gate_history_schema_fingerprint(sql: &str, preserve_quoting: bool) -> 
             }
         }
         let addition = addition.ok_or_else(|| {
-            BeadsError::internal(format!(
-                "legacy gate history projection is missing {column} TEXT"
-            ))
+            BeadsError::internal(format!("{context} projection is missing {column} TEXT"))
         })?;
         drop(tokens.drain(addition));
     }
@@ -7489,6 +7562,7 @@ fn legacy_v15_projection(
     project_source: bool,
     closed_by_column_added: bool,
     gate_reporter_columns_added: bool,
+    comment_revisions_added: bool,
 ) -> Result<LegacyV15Projection> {
     if !project_source {
         for row in conn.query("SELECT name FROM main.sqlite_schema WHERE type='index'")? {
@@ -7513,6 +7587,7 @@ fn legacy_v15_projection(
             project_source,
             closed_by_column_added,
             gate_reporter_columns_added,
+            comment_revisions_added,
         )?);
     }
     if project_source {
@@ -7525,6 +7600,7 @@ fn legacy_v15_projection(
         profile: LEGACY_V15_PROFILE.to_owned(),
         closed_by_column_added,
         gate_reporter_columns_added,
+        comment_revisions_added,
         tables,
         preserved_schema_sha256: legacy_preserved_schema_witness(
             conn,
@@ -7553,6 +7629,7 @@ fn verify_legacy_v15_projection(
         project_source,
         expected.closed_by_column_added,
         expected.gate_reporter_columns_added,
+        expected.comment_revisions_added,
     );
     let closed = close_connection(conn);
     let observed = observed?;
@@ -7587,6 +7664,7 @@ fn verify_reviewed_profile(
             || forecast.content_hash_rows_rebuilt != 0
             || forecast.gate_result_history_created
             || forecast.gate_reporter_columns_added
+            || forecast.comment_revisions_added
             || forecast.prerequisites_column_added
             || forecast.dependency_type_key_added
             || !forecast.post_migration_maintenance
@@ -7658,7 +7736,7 @@ fn verify_reviewed_profile(
         ));
     }
     if let Some(expected) = &forecast.legacy_v4_conversion {
-        legacy_v4::verify(db_path, expected, project_source)?;
+        legacy_v4::verify(db_path, expected, project_source, forecast.to_version)?;
     }
     verify_legacy_v15_projection(
         db_path,
@@ -8972,6 +9050,7 @@ mod tests {
                         gate_result_history_created: false,
                         prerequisites_column_added: false,
                         gate_reporter_columns_added: false,
+                        comment_revisions_added: false,
                         dependency_type_key_added: false,
                         legacy_v15_tables_converted: false,
                         schema19_runtime_upgrade: None,
@@ -11001,6 +11080,44 @@ mod tests {
     }
 
     #[test]
+    fn comment_revision_schema_projection_accepts_only_one_nullable_text_column() {
+        let source =
+            "CREATE TABLE comments (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL)";
+        for candidate in [
+            "CREATE TABLE comments (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, revision TEXT)",
+            "CREATE TABLE comments (id INTEGER PRIMARY KEY AUTOINCREMENT, \"revision\" TEXT, text TEXT NOT NULL)",
+        ] {
+            assert_eq!(
+                legacy_comment_revision_schema_fingerprint(candidate, false).unwrap(),
+                ddl_token_fingerprint(source, true),
+            );
+            assert_eq!(
+                legacy_comment_revision_schema_fingerprint(candidate, true).unwrap(),
+                quoted_ddl_fingerprint(source),
+            );
+        }
+        for declaration in [
+            "revision TEXT NOT NULL",
+            "revision TEXT DEFAULT NULL",
+            "revision TEXT DEFAULT 'invented'",
+            "revision INTEGER",
+            "revision TEXT CHECK (revision <> '')",
+            "revision TEXT, revision TEXT",
+        ] {
+            let candidate =
+                format!("CREATE TABLE comments (id INTEGER PRIMARY KEY, {declaration})");
+            for preserve_quoting in [false, true] {
+                assert!(
+                    legacy_comment_revision_schema_fingerprint(&candidate, preserve_quoting)
+                        .is_err(),
+                    "accepted unreviewed addition: {declaration}",
+                );
+            }
+        }
+        assert!(legacy_comment_revision_schema_fingerprint(source, true).is_err());
+    }
+
+    #[test]
     fn legacy_schema_fingerprint_keeps_operator_grouping_and_compound_identifiers() {
         for (before, changed) in [
             (
@@ -11421,6 +11538,7 @@ mod tests {
             gate_result_history_created: true,
             prerequisites_column_added: false,
             gate_reporter_columns_added: false,
+            comment_revisions_added: false,
             dependency_type_key_added: false,
             legacy_v15_conversion: None,
             legacy_v4_conversion: None,
@@ -11569,6 +11687,7 @@ mod tests {
             added_empty_sequences: Vec::new(),
             close_metadata_column_added: false,
             gate_reporter_columns_added: false,
+            comment_revisions_added: false,
         };
         let historical = [
             (
@@ -11601,6 +11720,31 @@ mod tests {
             current,
             "new plans bind the quotation distinction in their source proof"
         );
+    }
+
+    #[test]
+    fn comment_revision_forecast_preserves_schema20_receipts_and_requires_explicit_addition() {
+        let historical = r#"{"from_version":19,"to_version":20,"content_hash_rows_rebuilt":0,"gate_result_history_created":false,"gate_reporter_columns_added":true,"schema19_preservation":{"profile":"schema19-layout-preservation-v3","source_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"post_migration_maintenance":true}"#;
+        let old: MigrationForecast = serde_json::from_str(historical).unwrap();
+        assert_eq!(serde_json::to_string(&old).unwrap(), historical);
+        validate_schema19_preservation_profile(&old).unwrap();
+        for from in [19, 20] {
+            let mut current = old.clone();
+            current.from_version = from;
+            current.to_version = 21;
+            current.gate_reporter_columns_added = from == 19;
+            assert!(validate_schema19_preservation_profile(&current).is_err());
+            current.comment_revisions_added = true;
+            validate_schema19_preservation_profile(&current).unwrap();
+            let encoded = serde_json::to_string(&current).unwrap();
+            let restored: MigrationForecast = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(restored, current);
+            current.gate_reporter_columns_added = !current.gate_reporter_columns_added;
+            assert!(validate_schema19_preservation_profile(&current).is_err());
+        }
+        let mut invented_old = old;
+        invented_old.comment_revisions_added = true;
+        assert!(validate_schema19_preservation_profile(&invented_old).is_err());
     }
 
     #[test]
@@ -11784,20 +11928,26 @@ mod tests {
         database_name: &str,
         version: u32,
     ) -> (TempDir, MigrationContext) {
-        assert!(matches!(version, 13 | 14 | 17 | 18));
+        assert!(matches!(version, 13 | 14 | 17 | 18 | 20));
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
         fs::create_dir(&beads_dir).expect("create beads dir");
         let db_path = beads_dir.join(database_name);
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open db");
-        let mut source_schema = crate::storage::schema::SCHEMA_SQL.replace(
-            "PRIMARY KEY (issue_id, depends_on_id, type)",
-            "PRIMARY KEY (issue_id, depends_on_id)",
-        );
-        source_schema = source_schema.replace(
-            "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
-            "",
-        );
+        let mut source_schema = crate::storage::schema::SCHEMA_SQL.to_owned();
+        if version < 19 {
+            source_schema = source_schema.replace(
+                "PRIMARY KEY (issue_id, depends_on_id, type)",
+                "PRIMARY KEY (issue_id, depends_on_id)",
+            );
+        }
+        if version < 20 {
+            source_schema = source_schema.replace(
+                "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                "",
+            );
+        }
+        source_schema = source_schema.replace("        revision TEXT,\n", "");
         if version < 18 {
             source_schema =
                 source_schema.replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "");
@@ -11862,6 +12012,83 @@ mod tests {
 
     fn reviewed_v14_migration_context() -> (TempDir, MigrationContext) {
         reviewed_v14_migration_context_with_database_name("beads.db")
+    }
+
+    #[test]
+    fn schema20_comment_revision_upgrade_preserves_identity_and_supports_guarded_undo() {
+        let (_temp, migration) = reviewed_source_migration_context("beads.db", 20);
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(
+            "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES \
+             (1203, 'bd-schema-rehearsal', 'original-author', 'original body', '2026-07-27T12:00:00Z')",
+        )
+        .unwrap();
+        conn.execute("UPDATE sqlite_sequence SET seq=9000 WHERE name='comments'")
+            .unwrap();
+        close_connection(conn).unwrap();
+        let original = logical_witness(&migration.db_path).unwrap();
+        let plan = build_plan(&migration.db_path).unwrap();
+        let forecast = plan.forecast.as_ref().unwrap();
+        assert_eq!((forecast.from_version, forecast.to_version), (20, 21));
+        assert!(forecast.comment_revisions_added);
+        assert!(!forecast.gate_reporter_columns_added);
+        assert!(forecast.schema19_preservation.is_some());
+        execute_apply(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token: plan.plan_token.unwrap(),
+                json: false,
+            },
+            &migration,
+        )
+        .unwrap();
+        let conn = open_read_only(&migration.db_path).unwrap();
+        let comment = conn
+            .query_row(
+                "SELECT rowid, id, author, text, created_at, revision FROM comments WHERE id=1203",
+            )
+            .unwrap();
+        assert_eq!(comment.get(0).and_then(SqliteValue::as_integer), Some(1203));
+        assert_eq!(comment.get(1).and_then(SqliteValue::as_integer), Some(1203));
+        assert_eq!(
+            comment.get(2).and_then(SqliteValue::as_text),
+            Some("original-author")
+        );
+        assert_eq!(
+            comment.get(3).and_then(SqliteValue::as_text),
+            Some("original body")
+        );
+        assert_eq!(
+            comment.get(4).and_then(SqliteValue::as_text),
+            Some("2026-07-27T12:00:00Z")
+        );
+        assert_eq!(comment.get(5), Some(&SqliteValue::Null));
+        assert_eq!(
+            query_count(
+                &conn,
+                "SELECT seq FROM sqlite_sequence WHERE name='comments'"
+            )
+            .unwrap(),
+            9000,
+        );
+        close_connection(conn).unwrap();
+        let run = fs::read_dir(migration_runs_root(&migration.beads_dir))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let applied: AppliedMigrationReceipt = read_json(&run.join("applied.json")).unwrap();
+        assert!(applied.effects.comment_revisions_added);
+        execute_undo(
+            &DoctorMigrateSchemaUndoArgs {
+                run_id: applied.run_id,
+                dry_run: false,
+                json: false,
+            },
+            &migration,
+        )
+        .unwrap();
+        assert_eq!(logical_witness(&migration.db_path).unwrap(), original);
     }
 
     #[test]
@@ -11940,6 +12167,7 @@ mod tests {
             gate_result_history_created: true,
             prerequisites_column_added: true,
             gate_reporter_columns_added: false,
+            comment_revisions_added: false,
             dependency_type_key_added: true,
             legacy_v15_conversion: None,
             legacy_v4_conversion: None,
@@ -12062,7 +12290,7 @@ mod tests {
         conn.execute("UPDATE sqlite_sequence SET rowid = rowid + 100")
             .unwrap();
         assert_eq!(
-            legacy_table_projection(&conn, "sqlite_sequence", false, false, false).unwrap(),
+            legacy_table_projection(&conn, "sqlite_sequence", false, false, false, false).unwrap(),
             historical,
             "historical receipts must retain their rowid-free sequence serialization"
         );
@@ -12391,6 +12619,7 @@ mod tests {
         let mut historical = current.clone();
         historical.to_version = 19;
         historical.gate_reporter_columns_added = false;
+        historical.comment_revisions_added = false;
         historical.schema19_runtime_upgrade =
             with_preservation_snapshot(&db, reviewed_runtime_schema_upgrade).unwrap();
         let legacy_proof = capture_reviewed_state_preservation_with_text_encoding(
@@ -12520,6 +12749,7 @@ mod tests {
             let mut historical = current.clone();
             historical.to_version = 19;
             historical.gate_reporter_columns_added = false;
+            historical.comment_revisions_added = false;
             historical.schema19_runtime_upgrade =
                 with_preservation_snapshot(&db, reviewed_runtime_schema_upgrade).unwrap();
             let proof =
@@ -13005,6 +13235,7 @@ mod tests {
             &conn,
             &crate::storage::schema::SCHEMA_SQL
                 .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
+                .replace("        revision TEXT,\n", "")
                 .replace(
                     "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
                     "",
@@ -13108,7 +13339,7 @@ mod tests {
         let rows = [
             "SELECT rowid, id, title, content_hash FROM issues ORDER BY rowid",
             "SELECT rowid, * FROM dependencies ORDER BY rowid",
-            "SELECT rowid, * FROM comments ORDER BY rowid",
+            "SELECT rowid, id, issue_id, author, text, created_at FROM comments ORDER BY rowid",
             "SELECT rowid, * FROM events ORDER BY rowid",
             "SELECT rowid, issue_id, closed_by_agent_name, closed_by_harness, closed_by_model, \
              bypassed_policy, bypass_reason, policy_gates_fired, recorded_at \
@@ -13132,7 +13363,7 @@ mod tests {
     fn legacy_close_attribution_projection_is_receipt_bound_and_backward_compatible() {
         let (_temp, migration) = legacy_v15_migration_context();
         let conn = open_read_only(&migration.db_path).unwrap();
-        let historical = legacy_v15_projection(&conn, true, false, false).unwrap();
+        let historical = legacy_v15_projection(&conn, true, false, false, false).unwrap();
         close_connection(conn).unwrap();
         let historical_json = serde_json::to_value(&historical).unwrap();
         assert!(historical_json.get("closed_by_column_added").is_none());
@@ -13171,6 +13402,15 @@ mod tests {
             .query_row("SELECT closed_by, closed_by_agent_name FROM close_metadata WHERE issue_id = 'bd-legacy'")
             .unwrap();
         assert_eq!(closure.get(0), Some(&SqliteValue::Null));
+        assert_eq!(
+            query_count(
+                &conn,
+                "SELECT COUNT(*) FROM comments WHERE revision IS NOT NULL"
+            )
+            .unwrap(),
+            0,
+            "migration must not invent revisions for legacy comments",
+        );
         assert_eq!(
             closure.get(1).and_then(SqliteValue::as_text),
             Some("historical-agent")
@@ -14065,7 +14305,7 @@ mod tests {
                 "SELECT rowid, id, title FROM issues ORDER BY rowid",
                 "SELECT rowid, * FROM dependencies ORDER BY rowid",
                 "SELECT rowid, * FROM labels ORDER BY rowid",
-                "SELECT rowid, * FROM comments ORDER BY rowid",
+                "SELECT rowid, id, issue_id, author, text, created_at FROM comments ORDER BY rowid",
                 "SELECT rowid, * FROM events ORDER BY rowid",
                 "SELECT rowid, * FROM config ORDER BY rowid",
                 "SELECT rowid, * FROM metadata ORDER BY rowid",
@@ -14651,6 +14891,7 @@ mod tests {
                 gate_result_history_created: forecast.gate_result_history_created,
                 prerequisites_column_added: forecast.prerequisites_column_added,
                 gate_reporter_columns_added: forecast.gate_reporter_columns_added,
+                comment_revisions_added: forecast.comment_revisions_added,
                 dependency_type_key_added: forecast.dependency_type_key_added,
                 legacy_v15_tables_converted: forecast.legacy_v15_conversion.is_some(),
                 schema19_runtime_upgrade: forecast.schema19_runtime_upgrade,
@@ -15508,8 +15749,8 @@ mod tests {
             with_migration_read_snapshot(db, |snapshot, _| {
                 with_preservation_snapshot(snapshot, |connection| {
                     Ok((
-                        legacy_table_projection(connection, "events", false, false, false)?,
-                        legacy_table_projection(connection, "config", false, false, false)?,
+                        legacy_table_projection(connection, "events", false, false, false, false)?,
+                        legacy_table_projection(connection, "config", false, false, false, false)?,
                     ))
                 })
             })

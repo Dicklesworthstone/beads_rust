@@ -1487,6 +1487,14 @@ br epic <COMMAND>
 
 Manage comments on issues.
 
+Persistent revision metadata uses database schema 21. For an existing schema-20
+database, review `br doctor migrate-schema plan --json`, then apply the returned
+token with `br doctor migrate-schema apply --plan-token <TOKEN> --json` before
+ordinary commands can open it. Finish any pending synchronization with the
+matching previous binary before migration; existing recovery receipts are not
+rewritten to claim compatibility. The reviewed migration adds a nullable column and preserves
+existing comment IDs, text, authors, timestamps, and sequence reservations.
+
 ```bash
 br comments <COMMAND>
 ```
@@ -1496,6 +1504,9 @@ br comments <COMMAND>
 |---------|-------------|
 | `add <ID> [TEXT]...` | Add a comment |
 | `list <ID>` | List comments |
+| `edit <ID> <COMMENT_ID> [TEXT]...` | Replace an active comment's text, preserving its identity and original author |
+| `redact <ID> <COMMENT_ID>` | Remove the text permanently from the current record, retaining a visible marker |
+| `delete <ID> <COMMENT_ID>` | Logically delete the comment, retaining a text-free synchronization marker |
 
 **Options:**
 | Option | Description |
@@ -1505,6 +1516,62 @@ br comments <COMMAND>
 | `add --author <NAME>` | Override the default author |
 | `add --message <TEXT>` | Comment text as an alternative flag |
 | `list --wrap` | Wrap long comment lines |
+| `--include-deleted`, `list --include-deleted` | Include logically deleted comments in the list |
+| `edit -f, --file <PATH>` | Read replacement text from a file; use `-` for standard input |
+| `edit -m, --message <TEXT>` | Replacement text as an alternative to positional text |
+| `edit/redact/delete --if-revision <HEAD>` | Refuse if the stored comment's revision head differs from the supplied value |
+| `edit/redact/delete --force` | Explicitly override the original-author check; does not bypass revision or privacy guards |
+
+List output includes the numeric comment ID. It is local to the current database;
+use the ID shown on the machine where the mutation runs. `--json` also exposes
+`revision.identity`, the portable identity, and `revision.head`, the value for
+an optimistic concurrency check. Legacy comments acquire revision metadata
+deterministically when reconciled or first modified.
+
+```bash
+br comments list br-abc123 --json
+br --actor alice comments edit br-abc123 7 --message "Corrected operational summary"
+br --actor alice comments edit br-abc123 7 --file corrected-comment.txt --if-revision <HEAD>
+br --actor alice comments redact br-abc123 7
+br --actor maintainer comments delete br-abc123 7 --force
+br comments list br-abc123 --include-deleted --json
+```
+
+The resolved actor must match the comment's original author unless `--force`
+is supplied. A mutation preserves that original author and creation time and
+records the modifying actor, time, revision, and any ownership override in the
+audit. Actors are self-reported through the existing actor configuration and
+`--actor`; this is an ownership guard, not authenticated access control.
+
+Redaction leaves `[redacted]` in human-readable output. Deletion hides the
+comment from ordinary comment lists; `--include-deleted` shows `[deleted]`.
+Both keep an empty `text` value and revision metadata in JSONL so another
+machine cannot restore an older body by importing it. A redacted or deleted
+comment cannot become active again; add a new comment if replacement text is
+needed. Deletion can follow redaction. Repeating the same operation is a no-op.
+Privacy removal also works on comments whose parent issue is tombstoned.
+
+Synchronization follows comment ancestry independently of issue timestamps.
+Sequential edits converge; divergent active edits refuse synchronization with
+a content-free conflict. Redaction wins over every active revision, and deletion
+wins over redaction, including with `--force-db` or `--force-jsonl`. Preserve
+both source snapshots when resolving concurrent edits. Do not strip or fabricate
+revision metadata to choose a winner. An explicit redaction or deletion of the
+known comment resolves a privacy incident across those branches; a new comment
+can hold the reviewed replacement. All participating machines must use a version
+that understands comment revisions.
+
+Imports also refuse ambiguous legacy aliases that could restore removed text
+after an older client changed an issue ID without preserving comment identity.
+Keep both source snapshots for reviewed reconciliation; `--force` cannot supply
+the missing provenance.
+
+Audit events retain IDs, actors, times, and revision references without copying
+old or new bodies. Current portable history checkpoints also remove legacy
+`commented` event payloads, including a retained previous checkpoint. **Changing
+current records does not erase existing Git commits, clones, backups, recovery
+files, or SQLite/WAL remnants.** Existing Git history must be handled separately
+if it already contains sensitive text. See [comment revision safety](SYNC_SAFETY.md#comment-revisions-and-privacy).
 
 ---
 

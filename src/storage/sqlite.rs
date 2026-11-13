@@ -9,7 +9,8 @@ use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
 use crate::franken_sync::{Connection, Row};
 use crate::model::{
-    Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
+    Comment, CommentState, Dependency, DependencyType, Event, EventType, Issue, IssueType,
+    Priority, Status, merge_comment_lists, normalize_comment_revisions,
 };
 use crate::storage::events::get_events;
 use crate::storage::portable_history::{
@@ -2909,12 +2910,10 @@ impl SqliteStorage {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
 
-        // Ordinary opens keep the shipped auto-migration contract: a database
-        // behind CURRENT_SCHEMA_VERSION is migrated in place (legacy fleets
-        // depend on this — pre-v13 databases have no reviewed migration
-        // pair). The reviewed `br doctor migrate-schema` lifecycle remains
-        // the explicit, receipt-bound alternative for operator-driven
-        // migrations of supported version pairs.
+        // Older fleets retain the shipped auto-migration contract (pre-v13
+        // databases have no reviewed migration pair). Schema 19 and 20 require
+        // the explicit, receipt-bound `br doctor migrate-schema` lifecycle;
+        // schema application below refuses to consume those transitions.
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
         let header_schema_version = checked_database_header_user_version(path)?;
         let effective_schema_version = connection_user_version(&conn).or(header_schema_version);
@@ -7925,14 +7924,20 @@ impl SqliteStorage {
             }
 
             // Insert Comments
-            for comment in &issue.comments {
+            let mut comments = issue.comments.clone();
+            for comment in &mut comments {
+                comment.issue_id.clone_from(&issue.id);
+            }
+            normalize_comment_revisions(&mut comments)?;
+            for comment in &comments {
                 conn.execute_with_params(
-                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO comments (issue_id, author, text, created_at, revision) VALUES (?, ?, ?, ?, ?)",
                     &[
                         SqliteValue::from(issue.id.as_str()),
                         SqliteValue::from(comment.author.as_str()),
                         SqliteValue::from(comment.body.as_str()),
                         SqliteValue::from(comment.created_at.to_rfc3339()),
+                        comment_revision_value(comment)?,
                     ],
                 )?;
                 ctx.record_event(
@@ -15903,15 +15908,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_comments(&self, issue_id: &str) -> Result<Vec<Comment>> {
-        let rows = self.conn.query_with_params(
-            "SELECT id, issue_id, author, text, created_at
-             FROM comments
-             WHERE issue_id = ?
-             ORDER BY created_at ASC, id ASC",
-            &[SqliteValue::from(issue_id)],
-        )?;
-
-        rows.iter().map(comment_from_row).collect()
+        fetch_issue_comments(&self.conn, issue_id)
     }
 
     /// Get comments for multiple issues in batch.
@@ -15934,7 +15931,7 @@ impl SqliteStorage {
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
-                "SELECT id, issue_id, author, text, created_at
+                "SELECT id, issue_id, author, text, created_at, revision
                  FROM comments
                  WHERE issue_id IN ({})
                  ORDER BY issue_id ASC, created_at ASC, id ASC",
@@ -15956,6 +15953,9 @@ impl SqliteStorage {
             }
         }
 
+        for comments in map.values_mut() {
+            normalize_comment_revisions(comments)?;
+        }
         Ok(map)
     }
 
@@ -15985,9 +15985,9 @@ impl SqliteStorage {
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
-                "SELECT id, issue_id, author, text, created_at
+                "SELECT id, issue_id, author, text, created_at, revision
                  FROM (
-                     SELECT id, issue_id, author, text, created_at,
+                     SELECT id, issue_id, author, text, created_at, revision,
                             ROW_NUMBER() OVER (
                                 PARTITION BY issue_id
                                 ORDER BY created_at DESC, id DESC
@@ -16062,6 +16062,165 @@ impl SqliteStorage {
             ctx.mark_dirty(issue_id);
 
             fetch_comment(conn, comment_id)
+        })
+    }
+
+    /// Edit text while preserving the comment's identity and original attribution.
+    ///
+    /// # Errors
+    /// Refuses a missing comment, wrong actor, stale expected revision, or an
+    /// attempt to restore a redacted or deleted comment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_comment(
+        &mut self,
+        issue_id: &str,
+        comment_id: i64,
+        actor: &str,
+        text: &str,
+        expected_head: Option<&str>,
+        force: bool,
+    ) -> Result<Comment> {
+        validate_new_comment(issue_id, actor, text)?;
+        self.change_comment(
+            issue_id,
+            comment_id,
+            actor,
+            CommentState::Active,
+            text,
+            expected_head,
+            force,
+        )
+    }
+
+    /// Erase comment text, keeping a permanent synchronization redaction marker.
+    ///
+    /// # Errors
+    /// Refuses invalid ownership or attribution and stale expected revisions.
+    pub fn redact_comment(
+        &mut self,
+        issue_id: &str,
+        comment_id: i64,
+        actor: &str,
+        expected_head: Option<&str>,
+        force: bool,
+    ) -> Result<Comment> {
+        self.change_comment(
+            issue_id,
+            comment_id,
+            actor,
+            CommentState::Redacted,
+            "",
+            expected_head,
+            force,
+        )
+    }
+
+    /// Delete comment text while retaining a permanent synchronization tombstone.
+    ///
+    /// # Errors
+    /// Refuses invalid ownership or attribution and stale expected revisions.
+    pub fn delete_comment(
+        &mut self,
+        issue_id: &str,
+        comment_id: i64,
+        actor: &str,
+        expected_head: Option<&str>,
+        force: bool,
+    ) -> Result<Comment> {
+        self.change_comment(
+            issue_id,
+            comment_id,
+            actor,
+            CommentState::Deleted,
+            "",
+            expected_head,
+            force,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn change_comment(
+        &mut self,
+        issue_id: &str,
+        comment_id: i64,
+        actor: &str,
+        state: CommentState,
+        text: &str,
+        expected_head: Option<&str>,
+        force: bool,
+    ) -> Result<Comment> {
+        if actor.trim().is_empty() || actor.len() > 200 || actor.contains('\0') {
+            return Err(BeadsError::validation(
+                "actor",
+                "a valid nonempty actor is required",
+            ));
+        }
+        self.mutate("change_comment", actor, |conn, ctx| {
+            if state == CommentState::Active {
+                Self::ensure_issue_mutable_in_tx(conn, issue_id, "edit comment on")?;
+            } else if Self::issue_status_in_tx(conn, issue_id)?.is_none() {
+                return Err(BeadsError::IssueNotFound {
+                    id: issue_id.to_owned(),
+                });
+            }
+            let mut comments = fetch_issue_comments(conn, issue_id)?;
+            let index = comments
+                .iter()
+                .position(|comment| comment.id == comment_id)
+                .ok_or_else(|| {
+                    BeadsError::validation(
+                        "comment_id",
+                        format!("comment {comment_id} does not belong to issue {issue_id}"),
+                    )
+                })?;
+            authorize_comment_change(&comments[index], actor, expected_head, force)?;
+            if comments[index].state() == state && comments[index].body == text {
+                return Ok(comments[index].clone());
+            }
+            let now = Utc::now();
+            comments[index].revise(state, text, actor, now)?;
+            // Persist all enrolled siblings together so modifying one identical
+            // legacy comment cannot change another comment's occurrence identity.
+            for comment in &comments {
+                persist_comment_revision(conn, comment)?;
+            }
+            let comment = &comments[index];
+            conn.execute_with_params(
+                "UPDATE comments SET text = ? WHERE id = ? AND issue_id = ?",
+                &[
+                    SqliteValue::from(comment.body.as_str()),
+                    SqliteValue::from(comment_id),
+                    SqliteValue::from(issue_id),
+                ],
+            )?;
+            scrub_legacy_comment_events(conn, issue_id)?;
+            let parent = conn.query_row_with_params(
+                "SELECT updated_at FROM issues WHERE id = ?",
+                &[SqliteValue::from(issue_id)],
+            )?;
+            let updated_at = parse_datetime_value(parent.get(0))?.max(now).to_rfc3339();
+            conn.execute_with_params(
+                "UPDATE issues SET updated_at = ? WHERE id = ?",
+                &[
+                    SqliteValue::from(updated_at.as_str()),
+                    SqliteValue::from(issue_id),
+                ],
+            )?;
+            let event_type = match state {
+                CommentState::Active => EventType::CommentEdited,
+                CommentState::Redacted => EventType::CommentRedacted,
+                CommentState::Deleted => EventType::CommentDeleted,
+            };
+            ctx.record_event(
+                event_type,
+                issue_id,
+                Some(comment_change_evidence(
+                    comment,
+                    force && comment.author != actor,
+                )?),
+            );
+            ctx.mark_dirty(issue_id);
+            Ok(comment.clone())
         })
     }
 
@@ -17226,7 +17385,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_all_comments(&self) -> Result<HashMap<String, Vec<Comment>>> {
         let rows = self.conn.query(
-            "SELECT id, issue_id, author, text, created_at
+            "SELECT id, issue_id, author, text, created_at, revision
              FROM comments
              ORDER BY issue_id ASC, created_at ASC, id ASC",
         )?;
@@ -17237,6 +17396,9 @@ impl SqliteStorage {
             map.entry(comment.issue_id.clone())
                 .or_default()
                 .push(comment);
+        }
+        for comments in map.values_mut() {
+            normalize_comment_revisions(comments)?;
         }
         Ok(map)
     }
@@ -17249,7 +17411,7 @@ impl SqliteStorage {
     pub fn get_comments_for_export(&self) -> Result<HashMap<String, Vec<Comment>>> {
         let rows = self.conn.query(
             "SELECT comments.id, comments.issue_id, comments.author, comments.text,
-                    comments.created_at
+                    comments.created_at, comments.revision
              FROM comments
              INNER JOIN issues ON issues.id = comments.issue_id
              WHERE (issues.ephemeral = 0 OR issues.ephemeral IS NULL)
@@ -17263,6 +17425,9 @@ impl SqliteStorage {
             map.entry(comment.issue_id.clone())
                 .or_default()
                 .push(comment);
+        }
+        for comments in map.values_mut() {
+            normalize_comment_revisions(comments)?;
         }
         Ok(map)
     }
@@ -17848,8 +18013,8 @@ impl SqliteStorage {
 
     /// Find tombstones intentionally omitted by an export at one frozen cutoff.
     ///
-    /// Read only retention metadata, without hydrating issues or their
-    /// relations. Status and timestamps use the same decoders as full export,
+    /// Read retention and comment-revision metadata without hydrating full
+    /// issues. Status and timestamps use the same decoders as full export,
     /// including legacy status casing and numeric deletion timestamps. An
     /// unknown deletion time never authorizes omission.
     pub(crate) fn get_expired_tombstone_ids_at(
@@ -17866,8 +18031,8 @@ impl SqliteStorage {
     }
 
     /// Partition export-eligible tombstones under the current retention policy.
-    /// Only IDs and retention metadata are read; callers hydrate missing
-    /// retained records in batches when an export must restore them.
+    /// Privacy markers never expire automatically: their parent must remain
+    /// exportable to suppress the comment in a stale peer's later import.
     pub(crate) fn get_tombstone_retention_ids_at(
         &self,
         retention_days: Option<u64>,
@@ -17877,6 +18042,11 @@ impl SqliteStorage {
             "SELECT id, status, deleted_at FROM issues \
              WHERE (ephemeral = 0 OR ephemeral IS NULL) AND id NOT LIKE '%-wisp-%'",
         )?;
+        let privacy_issues = if retention_days.is_some_and(|days| days != 0) {
+            self.comment_privacy_issue_ids()?
+        } else {
+            HashSet::new()
+        };
         let mut retained = HashSet::new();
         let mut expired = HashSet::new();
         for row in rows {
@@ -17886,12 +18056,13 @@ impl SqliteStorage {
             let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
                 continue;
             };
-            let is_expired = if retention_days.is_some_and(|days| days != 0) {
-                let deleted_at = parse_opt_datetime_value(row.get(2))?;
-                crate::model::tombstone_expired_at(deleted_at, retention_days, as_of)
-            } else {
-                false
-            };
+            let is_expired =
+                if !privacy_issues.contains(id) && retention_days.is_some_and(|days| days != 0) {
+                    let deleted_at = parse_opt_datetime_value(row.get(2))?;
+                    crate::model::tombstone_expired_at(deleted_at, retention_days, as_of)
+                } else {
+                    false
+                };
             if is_expired {
                 expired.insert(id.to_string());
             } else {
@@ -17899,6 +18070,22 @@ impl SqliteStorage {
             }
         }
         Ok((retained, expired))
+    }
+
+    fn comment_privacy_issue_ids(&self) -> Result<HashSet<String>> {
+        let mut protected = HashSet::new();
+        for row in self.conn.query(
+            "SELECT id, issue_id, author, text, created_at, revision
+             FROM comments WHERE revision IS NOT NULL",
+        )? {
+            // Invalid metadata never authorizes automatic omission. Use the
+            // same semantic validation as full reads, including terminal bodies.
+            let comment = comment_from_row(&row)?;
+            if comment.state() != CommentState::Active {
+                protected.insert(comment.issue_id);
+            }
+        }
+        Ok(protected)
     }
 
     /// Delete dependency rows owned by the given issues whose target issue is
@@ -21821,7 +22008,7 @@ impl SqliteStorage {
         }
         for row in self.import_comparison_rows(
             "comments",
-            "id, issue_id, author, text, created_at",
+            "id, issue_id, author, text, created_at, revision",
             &ImportIssueLookup::relation_rowids(&lookup.comments, &issues),
         )? {
             let comment = comment_from_row(&row)?;
@@ -21841,6 +22028,7 @@ impl SqliteStorage {
                     .cmp(&right.created_at)
                     .then_with(|| left.id.cmp(&right.id))
             });
+            normalize_comment_revisions(&mut issue.comments)?;
         }
         Ok(issues)
     }
@@ -23237,7 +23425,7 @@ impl SqliteStorage {
         Ok(())
     }
 
-    /// Sync comments for an issue (remove existing, add new).
+    /// Causally join imported comments, retaining local revisions and removals.
     ///
     /// # Errors
     ///
@@ -23258,14 +23446,16 @@ impl SqliteStorage {
         comments: &[crate::model::Comment],
     ) -> Result<()> {
         validate_import_comments_for_issue(issue_id, comments)?;
-
-        // Remove existing comments
+        let existing = fetch_issue_comments(&self.conn, issue_id)?;
+        let merged = merge_comment_lists(&existing, comments, issue_id)?;
+        // Join before replacement: an omitted or stale incoming comment
+        // cannot erase local privacy protection or a causally newer edit.
         self.conn.execute_with_params(
             "DELETE FROM comments WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
 
-        self.insert_comment_rows_for_import(issue_id, comments)
+        self.insert_comment_rows_for_import(issue_id, &merged)
     }
 
     /// Delete comments owned by issues that an outer import transaction will
@@ -23648,6 +23838,10 @@ impl SqliteStorage {
                         SqliteValue::from(created_at.as_str()),
                     ],
                 )?;
+                // Enroll the complete group under the existing merge authority.
+                for comment in fetch_issue_comments(&storage.conn, issue_id)? {
+                    persist_comment_revision(&storage.conn, &comment)?;
+                }
                 storage.conn.execute_with_params(
                     "UPDATE issues SET updated_at = ? WHERE id = ?",
                     &[
@@ -24062,7 +24256,17 @@ impl SqliteStorage {
             return Ok(());
         }
 
-        for comment in comments {
+        let mut comments = comments.to_vec();
+        normalize_comment_revisions(&mut comments)?;
+        if comments.iter().any(|comment| {
+            comment
+                .revision
+                .as_ref()
+                .is_some_and(|revision| revision.generation != 0)
+        }) {
+            scrub_legacy_comment_events(&self.conn, issue_id)?;
+        }
+        for comment in &comments {
             self.insert_comment_for_import(issue_id, comment)?;
         }
 
@@ -24084,7 +24288,7 @@ impl SqliteStorage {
                     // id was AUTO-reallocated to the same value during this
                     // import — reinsert without an explicit id so AUTOINCREMENT
                     // assigns a fresh one. Comment identity for sync is the
-                    // payload (`Comment::sync_key`), never the rowid, so the
+                    // portable revision identity, never the rowid, so the
                     // semantic verifier accepts the reassigned id (GitHub
                     // #486). True same-issue JSONL duplicates are rejected
                     // earlier by `validate_import_comments_for_issue`, so this
@@ -24106,12 +24310,13 @@ impl SqliteStorage {
         created_at: &str,
     ) -> Result<()> {
         self.conn.execute_with_params(
-            "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO comments (issue_id, author, text, created_at, revision) VALUES (?, ?, ?, ?, ?)",
             &[
                 SqliteValue::from(issue_id),
                 SqliteValue::from(comment.author.as_str()),
                 SqliteValue::from(comment.body.as_str()),
                 SqliteValue::from(created_at),
+                comment_revision_value(comment)?,
             ],
         )?;
         Ok(())
@@ -24124,13 +24329,14 @@ impl SqliteStorage {
         created_at: &str,
     ) -> Result<()> {
         self.conn.execute_with_params(
-            "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO comments (id, issue_id, author, text, created_at, revision) VALUES (?, ?, ?, ?, ?, ?)",
             &[
                 SqliteValue::from(comment.id),
                 SqliteValue::from(issue_id),
                 SqliteValue::from(comment.author.as_str()),
                 SqliteValue::from(comment.body.as_str()),
                 SqliteValue::from(created_at),
+                comment_revision_value(comment)?,
             ],
         )?;
         Ok(())
@@ -24204,6 +24410,7 @@ fn validate_new_comment(issue_id: &str, author: &str, text: &str) -> Result<()> 
         author: author.to_string(),
         body: text.to_string(),
         created_at: Utc::now(),
+        revision: None,
     };
 
     CommentValidator::validate(&comment).map_err(BeadsError::from_validation_errors)
@@ -24211,14 +24418,18 @@ fn validate_new_comment(issue_id: &str, author: &str, text: &str) -> Result<()> 
 
 fn validate_issue_comments_for_create(issue: &Issue) -> Result<()> {
     for comment in &issue.comments {
-        validate_new_comment(&issue.id, &comment.author, &comment.body)?;
+        let mut comment_for_validation = comment.clone();
+        comment_for_validation.id = 1;
+        comment_for_validation.issue_id.clone_from(&issue.id);
+        CommentValidator::validate(&comment_for_validation)
+            .map_err(BeadsError::from_validation_errors)?;
     }
 
     Ok(())
 }
 
 fn validate_import_comments_for_issue(issue_id: &str, comments: &[Comment]) -> Result<()> {
-    let mut seen_comment_ids = HashSet::new();
+    let mut seen_legacy_comment_ids = HashSet::new();
     for comment in comments {
         if comment.issue_id != issue_id {
             return Err(BeadsError::validation(
@@ -24229,17 +24440,15 @@ fn validate_import_comments_for_issue(issue_id: &str, comments: &[Comment]) -> R
                 ),
             ));
         }
-        let comment_for_validation = Comment {
-            id: 1,
-            issue_id: issue_id.to_string(),
-            author: comment.author.clone(),
-            body: comment.body.clone(),
-            created_at: comment.created_at,
-        };
+        let mut comment_for_validation = comment.clone();
+        comment_for_validation.id = 1;
         CommentValidator::validate(&comment_for_validation)
             .map_err(BeadsError::from_validation_errors)?;
 
-        if comment.id > 0 && !seen_comment_ids.insert(comment.id) {
+        if comment.id > 0
+            && comment.revision.is_none()
+            && !seen_legacy_comment_ids.insert(comment.id)
+        {
             return Err(BeadsError::validation(
                 "comment.id",
                 format!("duplicate import comment id {}", comment.id),
@@ -24251,13 +24460,15 @@ fn validate_import_comments_for_issue(issue_id: &str, comments: &[Comment]) -> R
 }
 
 fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &str) -> Result<i64> {
+    let created_at = Utc::now().to_rfc3339();
     conn.execute_with_params(
         "INSERT INTO comments (issue_id, author, text, created_at)
-         VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+         VALUES (?, ?, ?, ?)",
         &[
             SqliteValue::from(issue_id),
             SqliteValue::from(author),
             SqliteValue::from(text),
+            SqliteValue::from(created_at.as_str()),
         ],
     )?;
     let row = conn.query_row("SELECT last_insert_rowid()")?;
@@ -24272,7 +24483,92 @@ fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &st
             "comments insert returned invalid last_insert_rowid: {comment_id}"
         )));
     }
+    let mut comment = fetch_comment(conn, comment_id)?;
+    normalize_comment_revisions(std::slice::from_mut(&mut comment))?;
+    persist_comment_revision(conn, &comment)?;
     Ok(comment_id)
+}
+
+fn comment_revision_value(comment: &Comment) -> Result<SqliteValue> {
+    comment
+        .revision
+        .as_ref()
+        .map_or(Ok(SqliteValue::Null), |revision| {
+            Ok(SqliteValue::from(serde_json::to_string(revision)?))
+        })
+}
+
+fn authorize_comment_change(
+    comment: &Comment,
+    actor: &str,
+    expected_head: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    if comment.author != actor && !force {
+        return Err(BeadsError::validation(
+            "actor",
+            "only the original author may change this comment; use --force for an explicit attributed override",
+        ));
+    }
+    if expected_head.is_some_and(|expected| comment.revision_head() != Some(expected)) {
+        return Err(BeadsError::SyncConflict {
+            message: "comment changed since the expected revision; inspect it before retrying"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn comment_change_evidence(comment: &Comment, forced: bool) -> Result<String> {
+    let revision = comment
+        .revision
+        .as_ref()
+        .ok_or_else(|| BeadsError::internal("comment mutation omitted revision metadata"))?;
+    Ok(serde_json::json!({
+        "comment_id": comment.id,
+        "identity": revision.identity,
+        "generation": revision.generation,
+        "head": revision.head,
+        "forced": forced,
+    })
+    .to_string())
+}
+
+fn persist_comment_revision(conn: &Connection, comment: &Comment) -> Result<()> {
+    conn.execute_with_params(
+        "UPDATE comments SET revision = ? WHERE id = ? AND issue_id = ?",
+        &[
+            comment_revision_value(comment)?,
+            SqliteValue::from(comment.id),
+            SqliteValue::from(comment.issue_id.as_str()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn scrub_legacy_comment_events(conn: &Connection, issue_id: &str) -> Result<()> {
+    // Legacy events have no stable comment reference. Preserve attribution,
+    // sequence and time, but remove unlinked copies of comment bodies.
+    conn.execute_with_params(
+        "UPDATE events SET old_value = NULL, new_value = NULL, comment = NULL
+         WHERE issue_id = ? AND LOWER(event_type) = 'commented'",
+        &[SqliteValue::from(issue_id)],
+    )?;
+    Ok(())
+}
+
+fn fetch_issue_comments(conn: &Connection, issue_id: &str) -> Result<Vec<Comment>> {
+    let rows = conn.query_with_params(
+        "SELECT id, issue_id, author, text, created_at, revision
+         FROM comments WHERE issue_id = ? ORDER BY created_at ASC, id ASC",
+        &[SqliteValue::from(issue_id)],
+    )?;
+    let mut comments = rows
+        .iter()
+        .map(comment_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    normalize_comment_revisions(&mut comments)?;
+    Ok(comments)
 }
 
 fn gate_report_policy_error(issue_id: &str, gate: &str, reason: &str, message: &str) -> BeadsError {
@@ -24357,7 +24653,7 @@ fn gate_result_record_from_row(row: &Row) -> Result<crate::close_policy::GateRes
 
 fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
     let row = match conn.query_row_with_params(
-        "SELECT id, issue_id, author, text, created_at FROM comments WHERE id = ?",
+        "SELECT id, issue_id, author, text, created_at, revision FROM comments WHERE id = ?",
         &[SqliteValue::from(comment_id)],
     ) {
         Ok(row) => row,
@@ -24434,13 +24730,38 @@ fn comment_from_row(row: &Row) -> Result<Comment> {
         other => other,
     })?;
 
-    Ok(Comment {
+    let revision = match row.get(5) {
+        Some(SqliteValue::Null) => None,
+        Some(value) => {
+            let encoded = value.as_text().ok_or_else(|| {
+                BeadsError::validation(
+                    "comment.revision",
+                    format!("comment {id} has non-text revision metadata"),
+                )
+            })?;
+            Some(serde_json::from_str(encoded).map_err(|_| {
+                BeadsError::validation(
+                    "comment.revision",
+                    format!("comment {id} has malformed revision metadata"),
+                )
+            })?)
+        }
+        None => {
+            return Err(BeadsError::internal(
+                "comment query omitted revision metadata",
+            ));
+        }
+    };
+    let comment = Comment {
         id,
         issue_id,
         author,
         body,
         created_at,
-    })
+        revision,
+    };
+    comment.validate_revision()?;
+    Ok(comment)
 }
 
 fn dedupe_preserving_order(values: &[String]) -> Vec<String> {
@@ -35928,6 +36249,497 @@ required_fields:
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn comment_edit_preserves_identity_and_rejects_stale_or_wrong_actor_writes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 12, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-comment-edit",
+            "Edit target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "alice").unwrap();
+        let original = storage
+            .add_comment(&issue.id, "alice", "secret-before-edit")
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+        let events_before = storage.get_events(&issue.id, 100).unwrap();
+        let issue_before = storage.get_issue(&issue.id).unwrap();
+        assert!(
+            storage
+                .edit_comment(
+                    &issue.id,
+                    original.id,
+                    "bob",
+                    "replacement",
+                    original.revision_head(),
+                    false
+                )
+                .is_err()
+        );
+        assert!(
+            storage
+                .edit_comment(
+                    &issue.id,
+                    original.id + 1,
+                    "alice",
+                    "replacement",
+                    None,
+                    false
+                )
+                .is_err()
+        );
+        assert_eq!(
+            storage.get_comments(&issue.id).unwrap(),
+            vec![original.clone()]
+        );
+        assert_eq!(storage.get_events(&issue.id, 100).unwrap(), events_before);
+        assert_eq!(storage.get_issue(&issue.id).unwrap(), issue_before);
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+
+        let edited = storage
+            .edit_comment(
+                &issue.id,
+                original.id,
+                "alice",
+                "corrected",
+                original.revision_head(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            (edited.id, &edited.author, edited.created_at),
+            (original.id, &original.author, original.created_at)
+        );
+        assert_eq!(
+            edited.revision.as_ref().unwrap().identity,
+            original.revision.as_ref().unwrap().identity
+        );
+        assert_eq!(edited.revision.as_ref().unwrap().generation, 1);
+        assert_eq!(edited.body, "corrected");
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec![issue.id.clone()]
+        );
+        let events_after = storage.get_events(&issue.id, 100).unwrap();
+        let event = events_after
+            .iter()
+            .find(|event| event.event_type == EventType::CommentEdited)
+            .unwrap();
+        assert_eq!(event.actor, "alice");
+        let evidence: serde_json::Value =
+            serde_json::from_str(event.comment.as_ref().unwrap()).unwrap();
+        assert_eq!(evidence["comment_id"], original.id);
+        let serialized = serde_json::to_string(&events_after).unwrap();
+        assert!(!serialized.contains("secret-before-edit"));
+        assert!(!serialized.contains("corrected"));
+
+        storage.clear_all_dirty_issues().unwrap();
+        assert!(
+            storage
+                .edit_comment(
+                    &issue.id,
+                    original.id,
+                    "alice",
+                    "stale replacement",
+                    original.revision_head(),
+                    false
+                )
+                .is_err()
+        );
+        assert_eq!(
+            storage.get_comments(&issue.id).unwrap(),
+            vec![edited.clone()]
+        );
+        assert_eq!(storage.get_events(&issue.id, 100).unwrap(), events_after);
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+        let overridden = storage
+            .edit_comment(
+                &issue.id,
+                original.id,
+                "operator",
+                "operator correction",
+                edited.revision_head(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(overridden.author, "alice");
+        assert_eq!(overridden.revision.as_ref().unwrap().updated_by, "operator");
+        let event = storage
+            .get_events(&issue.id, 100)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == EventType::CommentEdited && event.actor == "operator")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(event.comment.as_ref().unwrap()).unwrap()["forced"],
+            true
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn comment_privacy_states_survive_stale_imports_and_repeated_operations() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 12, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-comment-private",
+            "Privacy target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "alice").unwrap();
+        let original = storage
+            .add_comment(&issue.id, "alice", "secret-to-remove")
+            .unwrap();
+        storage.conn.execute(
+            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment)
+             VALUES ('bd-comment-private', 'CoMmEnTeD', 'legacy-agent', 'secret-to-remove', 'secret-to-remove', 'secret-to-remove')",
+        ).unwrap();
+        let mut legacy = original.clone();
+        legacy.revision = None;
+        let redacted = storage
+            .redact_comment(
+                &issue.id,
+                original.id,
+                "alice",
+                original.revision_head(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(redacted.state(), CommentState::Redacted);
+        assert!(redacted.body.is_empty());
+        assert!(
+            storage
+                .edit_comment(
+                    &issue.id,
+                    original.id,
+                    "alice",
+                    "cannot restore",
+                    None,
+                    true
+                )
+                .is_err()
+        );
+        let events = storage.get_events(&issue.id, 100).unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+        assert_eq!(
+            storage
+                .redact_comment(
+                    &issue.id,
+                    original.id,
+                    "alice",
+                    redacted.revision_head(),
+                    false
+                )
+                .unwrap(),
+            redacted
+        );
+        assert_eq!(storage.get_events(&issue.id, 100).unwrap(), events);
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+        for _ in 0..2 {
+            storage
+                .sync_comments_for_import(&issue.id, std::slice::from_ref(&legacy))
+                .unwrap();
+            assert_eq!(
+                storage.get_comments(&issue.id).unwrap(),
+                vec![redacted.clone()]
+            );
+        }
+        let deleted = storage
+            .delete_comment(
+                &issue.id,
+                original.id,
+                "operator",
+                redacted.revision_head(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(deleted.state(), CommentState::Deleted);
+        assert_eq!(deleted.id, original.id);
+        assert_eq!(deleted.author, "alice");
+        assert!(deleted.body.is_empty());
+        for _ in 0..2 {
+            storage
+                .sync_comments_for_import(&issue.id, std::slice::from_ref(&legacy))
+                .unwrap();
+            storage.sync_comments_for_import(&issue.id, &[]).unwrap();
+            assert_eq!(
+                storage.get_comments(&issue.id).unwrap(),
+                vec![deleted.clone()]
+            );
+        }
+        let events = storage.get_events(&issue.id, 100).unwrap();
+        assert_eq!(
+            storage
+                .delete_comment(
+                    &issue.id,
+                    original.id,
+                    "alice",
+                    deleted.revision_head(),
+                    false
+                )
+                .unwrap(),
+            deleted
+        );
+        assert_eq!(storage.get_events(&issue.id, 100).unwrap(), events);
+        assert!(
+            !serde_json::to_string(&storage.get_comments_for_export().unwrap())
+                .unwrap()
+                .contains("secret-to-remove")
+        );
+        assert!(
+            !serde_json::to_string(&storage.all_portable_history().unwrap())
+                .unwrap()
+                .contains("secret-to-remove")
+        );
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("secret-to-remove")
+        );
+    }
+
+    #[test]
+    fn comment_import_conflicts_roll_back_before_replacing_rows_or_audit() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 12, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-comment-conflict",
+            "Concurrent comments",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "alice").unwrap();
+        let original = storage
+            .add_comment(&issue.id, "alice", "original comment")
+            .unwrap();
+        let mut remote = original.clone();
+        remote
+            .revise(
+                CommentState::Active,
+                "remote private edit",
+                "alice",
+                original.created_at + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        let local = storage
+            .edit_comment(
+                &issue.id,
+                original.id,
+                "alice",
+                "local private edit",
+                original.revision_head(),
+                false,
+            )
+            .unwrap();
+        let events = storage.get_events(&issue.id, 100).unwrap();
+        let error = storage
+            .sync_comments_for_import(&issue.id, std::slice::from_ref(&remote))
+            .unwrap_err();
+        assert!(matches!(&error, BeadsError::SyncConflict { .. }));
+        assert!(!error.to_string().contains("private edit"));
+        assert_eq!(storage.get_comments(&issue.id).unwrap(), vec![local]);
+        assert_eq!(storage.get_events(&issue.id, 100).unwrap(), events);
+
+        remote
+            .revise(
+                CommentState::Redacted,
+                "",
+                "alice",
+                original.created_at + chrono::Duration::seconds(2),
+            )
+            .unwrap();
+        for _ in 0..2 {
+            storage
+                .sync_comments_for_import(&issue.id, std::slice::from_ref(&remote))
+                .unwrap();
+            let comments = storage.get_comments(&issue.id).unwrap();
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].id, original.id);
+            assert_eq!(comments[0].revision, remote.revision);
+            assert!(comments[0].body.is_empty());
+        }
+        assert_eq!(storage.get_events(&issue.id, 100).unwrap(), events);
+    }
+
+    #[test]
+    fn comment_mutation_enrolls_identical_legacy_siblings_without_identity_drift() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 12, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-comment-twins",
+            "Legacy comments",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "alice").unwrap();
+        storage.conn.execute("INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (41, 'bd-comment-twins', 'alice', 'duplicate legacy text', '2026-11-12T12:00:00Z'), (42, 'bd-comment-twins', 'alice', 'duplicate legacy text', '2026-11-12T12:00:00Z')").unwrap();
+        let before = storage.get_comments(&issue.id).unwrap();
+        assert_ne!(
+            before[0].revision.as_ref().unwrap().identity,
+            before[1].revision.as_ref().unwrap().identity
+        );
+        let mut legacy = before.clone();
+        for comment in &mut legacy {
+            comment.revision = None;
+        }
+        storage
+            .edit_comment(
+                &issue.id,
+                41,
+                "alice",
+                "first corrected",
+                before[0].revision_head(),
+                false,
+            )
+            .unwrap();
+        let changed = storage.get_comments(&issue.id).unwrap();
+        assert_eq!(changed[1], before[1]);
+        assert_eq!(
+            storage
+                .conn
+                .query_row("SELECT COUNT(*) FROM comments WHERE revision IS NOT NULL")
+                .unwrap()
+                .get(0)
+                .and_then(SqliteValue::as_integer),
+            Some(2)
+        );
+        for _ in 0..2 {
+            storage
+                .sync_comments_for_import(&issue.id, &legacy)
+                .unwrap();
+            assert_eq!(storage.get_comments(&issue.id).unwrap(), changed);
+        }
+    }
+
+    #[test]
+    fn comment_redaction_on_tombstone_preserves_history_and_blocks_automatic_expiration() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 12, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-comment-tomb",
+            "Deleted parent",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "alice").unwrap();
+        let comment = storage
+            .add_comment(&issue.id, "alice", "deleted-parent-secret")
+            .unwrap();
+        storage
+            .delete_issue(&issue.id, "operator", "obsolete parent", None)
+            .unwrap();
+        let before = storage.get_issue(&issue.id).unwrap().unwrap();
+        assert!(
+            storage
+                .edit_comment(&issue.id, comment.id, "alice", "ordinary edit", None, false)
+                .is_err()
+        );
+        storage
+            .redact_comment(&issue.id, comment.id, "alice", None, false)
+            .unwrap();
+        let after = storage.get_issue(&issue.id).unwrap().unwrap();
+        assert_eq!(after.status, Status::Tombstone);
+        assert_eq!(after.deleted_at, before.deleted_at);
+        assert_eq!(after.deleted_by, before.deleted_by);
+        assert_eq!(after.delete_reason, before.delete_reason);
+        assert_eq!(after.closed_at, before.closed_at);
+        assert_eq!(after.closed_by, before.closed_by);
+        let as_of = before.deleted_at.unwrap() + chrono::Duration::days(365);
+        assert!(
+            storage
+                .get_expired_tombstone_ids_at(Some(30), as_of)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .get_tombstone_retention_ids_at(Some(30), as_of)
+                .unwrap()
+                .0
+                .contains(&issue.id)
+        );
+        assert!(
+            !serde_json::to_string(&storage.get_comments(&issue.id).unwrap())
+                .unwrap()
+                .contains("deleted-parent-secret")
+        );
+    }
+
+    #[test]
+    fn comment_row_decoding_rejects_malformed_revision_without_exposing_its_contents() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 12, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-comment-invalid",
+            "Invalid metadata",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "alice").unwrap();
+        let comment = storage
+            .add_comment(&issue.id, "alice", "safe body")
+            .unwrap();
+        let mut invalid_head = comment.revision.clone().unwrap();
+        invalid_head.head = "private-invalid-head".to_owned();
+        let mut removed = comment.clone();
+        removed
+            .revise(CommentState::Redacted, "", "alice", now)
+            .unwrap();
+        for metadata in [
+            "private-malformed-payload".to_owned(),
+            "{\"state\":\"deleted\"}".to_owned(),
+            serde_json::to_string(&invalid_head).unwrap(),
+            serde_json::to_string(removed.revision.as_ref().unwrap()).unwrap(),
+        ] {
+            storage
+                .conn
+                .execute_with_params(
+                    "UPDATE comments SET revision = ? WHERE id = ?",
+                    &[
+                        SqliteValue::from(metadata.as_str()),
+                        SqliteValue::from(comment.id),
+                    ],
+                )
+                .unwrap();
+            let error = storage.get_comments(&issue.id).unwrap_err().to_string();
+            assert!(!error.contains(&metadata));
+            assert!(
+                storage
+                    .get_latest_comments_for_issues(std::slice::from_ref(&issue.id), 1)
+                    .is_err()
+            );
+            assert!(storage.get_expired_tombstone_ids_at(Some(30), now).is_err());
+            assert!(
+                storage
+                    .get_expired_tombstone_ids_at(None, now)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn test_add_comment_rejects_invalid_comment_fields_without_inserting() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
@@ -35994,6 +36806,7 @@ required_fields:
             author: "alice".to_string(),
             body: "   ".to_string(),
             created_at: t1,
+            revision: None,
         });
 
         let err = storage.create_issue(&issue, "tester").unwrap_err();
@@ -36089,6 +36902,7 @@ required_fields:
             author: "alice".to_string(),
             body: "Imported comment".to_string(),
             created_at: t1 + chrono::Duration::minutes(5),
+            revision: None,
         };
         storage
             .sync_comments_for_import("bd-c-import-a", &[imported_comment])
@@ -36129,6 +36943,7 @@ required_fields:
             author: "alice".to_string(),
             body: "first imported comment".to_string(),
             created_at: t1,
+            revision: None,
         };
         let second = crate::model::Comment {
             id: 42,
@@ -36136,6 +36951,7 @@ required_fields:
             author: "alice".to_string(),
             body: "duplicate imported comment".to_string(),
             created_at: t1 + chrono::Duration::minutes(1),
+            revision: None,
         };
 
         let error = storage
@@ -36156,6 +36972,7 @@ required_fields:
             author: "alice".to_string(),
             body: "valid text, wrong owner".to_string(),
             created_at: t1,
+            revision: None,
         };
         let error = storage
             .sync_comments_for_import(&issue.id, &[wrong_issue_comment])
@@ -36219,6 +37036,7 @@ required_fields:
             author: "alice".to_string(),
             body: "first imported (collides with B)".to_string(),
             created_at: t1 + chrono::Duration::minutes(1),
+            revision: None,
         };
         let second = crate::model::Comment {
             id: e + 1,
@@ -36226,6 +37044,7 @@ required_fields:
             author: "alice".to_string(),
             body: "second imported (self-collision)".to_string(),
             created_at: t1 + chrono::Duration::minutes(2),
+            revision: None,
         };
 
         storage
@@ -36307,6 +37126,7 @@ required_fields:
             author: "alice".to_string(),
             body: "   ".to_string(),
             created_at: t1,
+            revision: None,
         };
 
         let error = storage
@@ -36353,6 +37173,7 @@ required_fields:
             author: "alice".to_string(),
             body: "Imported comment".to_string(),
             created_at: t1 + chrono::Duration::minutes(5),
+            revision: None,
         }];
 
         storage
@@ -45390,6 +46211,7 @@ required_fields:
         let path = temp.path().join("pending-close-schema.db");
         let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
         let legacy_schema = crate::storage::schema::SCHEMA_SQL
+            .replace("        revision TEXT,\n", "")
             .replace("        closed_by TEXT,\n", "")
             .replace(
                 "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
@@ -45493,10 +46315,12 @@ required_fields:
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("pending-receipt-schema.db");
         let conn = Connection::open(path.to_string_lossy().into_owned()).unwrap();
-        let legacy_schema = crate::storage::schema::SCHEMA_SQL.replace(
-            "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
-            "",
-        );
+        let legacy_schema = crate::storage::schema::SCHEMA_SQL
+            .replace("        revision TEXT,\n", "")
+            .replace(
+                "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
+                "",
+            );
         execute_batch(&conn, &legacy_schema).unwrap();
         conn.execute("PRAGMA user_version = 19").unwrap();
         conn.execute_with_params(
@@ -46847,6 +47671,7 @@ required_fields:
             author: "fixture".to_string(),
             body: "Imported merge comment".to_string(),
             created_at: now,
+            revision: None,
         }];
         let mut child = make_issue(
             "bd-merge-parent.1",
@@ -48020,6 +48845,7 @@ required_fields:
             author: "substituted".to_string(),
             body: "Substituted owned comment".to_string(),
             created_at: now,
+            revision: None,
         });
         let mut timestamp = planned.clone();
         timestamp.updated_at += chrono::Duration::nanoseconds(1);

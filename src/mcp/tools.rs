@@ -838,6 +838,7 @@ fn validate_mcp_comment(issue_id: &str, author: &str, body: &str) -> McpResult<(
         author: author.to_string(),
         body: body.to_string(),
         created_at: chrono::Utc::now(),
+        revision: None,
     };
 
     CommentValidator::validate(&comment)

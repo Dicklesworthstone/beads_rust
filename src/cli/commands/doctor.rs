@@ -4693,6 +4693,7 @@ fn preserved_state_for_doctor_rebuild(
             });
         }
     };
+    crate::sync::ensure_rebuild_preserves_comment_revisions(&storage, source)?;
     let crate::sync::UnflushedStateSnapshot {
         tombstones: mut tombstone_snapshot,
         dirty: dirty_snapshot,

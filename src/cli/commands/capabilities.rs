@@ -538,7 +538,8 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
             "Without `--force`, an existing database is refused. `--force` preserves issues, sets the prefix, and rewrites metadata.json.",
             "Existing config.yaml, .gitignore, and issues.jsonl entries are preserved.",
         ],
-        "comments" | "comments add" | "comments list" => comments_safety_notes(name),
+        "comments" | "comments add" | "comments list" | "comments edit" | "comments redact"
+        | "comments delete" => comments_safety_notes(name),
         "dep" | "dep add" | "dep import" | "dep remove" | "dep list" | "dep tree"
         | "dep cycles" => dep_safety_notes(name),
         "query" | "query save" | "query run" | "query list" | "query delete" => {
@@ -624,7 +625,7 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
 fn comments_safety_notes(name: &str) -> &'static [&'static str] {
     match name {
         "comments" => &[
-            "Bare `br comments <id>` lists comments; `comments add` is the mutating subcommand.",
+            "Bare `br comments <id>` lists comments; add, edit, redact, and delete mutate comments.",
             "Use `--message` or `--file` for scripted comments instead of relying on shell word joining.",
         ],
         "comments add" => &[
@@ -635,6 +636,14 @@ fn comments_safety_notes(name: &str) -> &'static [&'static str] {
         "comments list" => &[
             "Comments list is read-only; use `--wrap` only for human text output.",
             "Use `--json` when automation needs stable comment objects.",
+            "Deleted comments are hidden unless --include-deleted is supplied; their text-free markers remain in JSONL.",
+        ],
+        "comments edit" | "comments redact" | "comments delete" => &[
+            "Use the current machine's numeric comment ID; portable revision.identity survives imports and rowid remapping.",
+            "The resolved actor must match the original author, or --force must explicitly override ownership. Actor names are self-reported.",
+            "Use --if-revision with revision.head to refuse stale mutations; --force does not bypass that guard.",
+            "Redaction and deletion are irreversible current-record states that suppress stale active revisions during synchronization.",
+            "Current-record changes do not erase existing Git history, clones, backups, or SQLite/WAL remnants.",
         ],
         _ => &[],
     }
@@ -709,6 +718,27 @@ fn query_safety_notes(name: &str) -> &'static [&'static str] {
 #[allow(clippy::too_many_lines)]
 fn command_contract(name: &str) -> CommandContract {
     match name {
+        "comments edit" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &[
+                "br comments edit br-abc 7 --message \"Reviewed summary\" --json",
+                "br comments edit br-abc 7 --file corrected.txt --if-revision <HEAD> --json",
+            ],
+        },
+        "comments redact" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br comments redact br-abc 7 --json"],
+        },
+        "comments delete" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &["br comments delete br-abc 7 --json"],
+        },
         "comments add" => CommandContract {
             operation: "write",
             workspace: "required",

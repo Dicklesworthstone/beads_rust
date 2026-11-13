@@ -17,7 +17,7 @@
 use crate::error::{BeadsError, Result};
 use crate::storage::{
     PortableHistoryIssue, PortableHistoryReplay, PortableHistorySnapshot, SqliteStorage,
-    validate_portable_history,
+    sanitize_comment_events, validate_portable_history,
 };
 use crate::util::hex_encode;
 use serde::{Deserialize, Serialize};
@@ -79,8 +79,9 @@ fn anchor_digest(issues: &BTreeMap<String, PortableHistoryIssue>) -> Result<Stri
 }
 
 impl Checkpoint {
-    fn new(history: PortableHistorySnapshot, warnings: Vec<String>) -> Result<Self> {
+    fn new(mut history: PortableHistorySnapshot, warnings: Vec<String>) -> Result<Self> {
         validate_portable_history(&history)?;
+        sanitize_comment_events(&mut history);
         let anchor_sha256 = anchor_digest(&history.issues)?;
         let mut checkpoint = Self {
             version: 1,
@@ -133,9 +134,15 @@ fn read_lines(path: &Path) -> Result<Vec<Checkpoint>> {
         if line.trim().is_empty() {
             continue;
         }
-        let cp: Checkpoint = serde_json::from_str(line)
+        let mut cp: Checkpoint = serde_json::from_str(line)
             .map_err(|e| damaged(format!("malformed checkpoint at line {}: {e}", index + 1)))?;
         cp.validate()?;
+        // Verify the original checksum before sanitizing. Lineage comparison,
+        // replay, and both retained generations must use metadata-only legacy
+        // comment events, or a companion could restore removed text.
+        sanitize_comment_events(&mut cp.history);
+        cp.history_sha256 =
+            digest_history(cp.version, &cp.anchor_sha256, &cp.history, &cp.warnings)?;
         if !seen.insert(cp.anchor_sha256.clone()) {
             return Err(damaged("duplicate issue generation in history companion"));
         }

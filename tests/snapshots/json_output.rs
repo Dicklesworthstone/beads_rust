@@ -535,7 +535,15 @@ fn snapshot_comments_json() {
 
     let add = run_br(
         &workspace,
-        ["comments", "add", &id, "First comment", "--json"],
+        [
+            "comments",
+            "add",
+            &id,
+            "First comment",
+            "--actor",
+            "snapshot-author",
+            "--json",
+        ],
         "comments_add_json",
     );
     assert!(

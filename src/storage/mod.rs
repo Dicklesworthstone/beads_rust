@@ -22,7 +22,7 @@ mod search;
 pub mod sqlite;
 
 pub(crate) use portable_history::{
-    PortableHistoryIssue, PortableHistoryReplay, PortableHistorySnapshot,
+    PortableHistoryIssue, PortableHistoryReplay, PortableHistorySnapshot, sanitize_comment_events,
     validate as validate_portable_history,
 };
 #[cfg(test)]

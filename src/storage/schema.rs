@@ -14,7 +14,7 @@ pub(crate) mod legacy_v4;
 #[cfg(test)]
 pub(crate) use tests::LEGACY_V15_TEST_CORE_SQL;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 20;
+pub const CURRENT_SCHEMA_VERSION: i32 = 21;
 const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 
 // Persisted witnesses are valid only for this exact compatibility predicate.
@@ -24,7 +24,7 @@ const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 // schema rebuild, overwhelming the compile-time savings of the runtime fast
 // path itself.
 const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str =
-    "v20-independent-gate-reporters-exact-ddl-cookie-fenced";
+    "v21-portable-comment-revisions-exact-ddl-cookie-fenced";
 // Keep this additive receipt table outside SCHEMA_SQL. A pending merge binds
 // the exact schema catalog and must finish against its original layout before
 // an older database can install the indexed receipts (#559).
@@ -247,6 +247,8 @@ pub struct ReviewedSchemaMigrationEffects {
     pub dependency_type_key_added: bool,
     /// Whether v20 added nullable assignee snapshots and explicit override reasons.
     pub gate_reporter_columns_added: bool,
+    /// Whether v21 added nullable portable comment revision metadata.
+    pub comment_revisions_added: bool,
 }
 
 /// The only reviewed runtime-layout changes within schema 19.
@@ -426,6 +428,7 @@ pub const SCHEMA_SQL: &str = r"
         author TEXT NOT NULL,
         text TEXT NOT NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        revision TEXT,
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id);
@@ -979,10 +982,11 @@ fn connection_user_version(conn: &Connection) -> Result<u32> {
 /// stay upgradeable here: 13/14 (pre-gate-history releases), 15 (the #388
 /// gate-history schema shipped in the v0.2.19-era line) and 16 (the #384
 /// capacity-exemptions schema created by the released v0.2.19 binary), and
-/// 17 (capacity occupancy) and 18 (prerequisite checklists, before typed
-/// dependency identity), and 19 (before independent gate-reporter evidence).
+/// 17 (capacity occupancy), 18 (prerequisite checklists, before typed
+/// dependency identity), 19 (before independent gate-reporter evidence), and
+/// 20 (before portable comment revisions).
 /// See GitHub #398.
-pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 8] = [4, 13, 14, 15, 16, 17, 18, 19];
+pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 9] = [4, 13, 14, 15, 16, 17, 18, 19, 20];
 
 fn current_schema_version_u32() -> Result<u32> {
     u32::try_from(CURRENT_SCHEMA_VERSION).map_err(|_| {
@@ -1041,7 +1045,7 @@ fn validate_reviewed_schema_migration(
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
             "schema migrate refused — reviewed migrations are supported only from source \
-             schemas 4, 13, 14, 15, 16, 17, 18, and 19 to {supported_target} (got {from}->{target_version})"
+             schemas 4, 13, 14, 15, 16, 17, 18, 19, and 20 to {supported_target} (got {from}->{target_version})"
         )));
     }
     if marked_at.is_empty() {
@@ -1061,6 +1065,10 @@ fn validate_reviewed_schema_migration(
         // admission that schema19 previously required for its additive upgrade.
         // Both canonical19 and its precisely reviewed missing additions qualify.
         let _ = reviewed_runtime_schema_upgrade(conn)?;
+    } else if from == 20 && !reviewed_schema20_runtime_compatible(conn) {
+        return Err(BeadsError::Config(
+            "schema migrate refused: source schema 20 does not have its exact reviewed runtime layout".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1072,7 +1080,7 @@ fn validate_reviewed_schema_migration(
 /// `BEGIN IMMEDIATE` transaction before calling it. All validation occurs
 /// before the first migration write.
 ///
-/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (4 and 13 through 19) are
+/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (4 and 13 through 20) are
 /// accepted, each running exactly the version-gated step chain up to
 /// `CURRENT_SCHEMA_VERSION` (#398). Hash refreshes update only the derived
 /// issue hashes; every existing dirty marker and export receipt stays exact.
@@ -1104,7 +1112,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
     if from < 15 {
         tracing::info!("Migrating database to schema version 15 (transition-scoped gate history)");
         apply_gate_result_history_migration_in_transaction(conn)?;
-    } else {
+    } else if from < 20 {
         // A genuine v15/v16 database already carries the #388 gate-history
         // schema; attest it instead of re-running the migration so drift is
         // refused rather than silently papered over.
@@ -1112,6 +1120,8 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
             conn,
             &GATE_RESULT_HISTORY_COLUMNS[..LEGACY_GATE_RESULT_HISTORY_COLUMN_COUNT],
         )?;
+    } else {
+        attest_gate_result_history_schema(conn)?;
     }
 
     if from < 16 {
@@ -1141,6 +1151,8 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
     let dependency_type_key_added = apply_dependency_type_key_migration_in_transaction(conn, from)?;
     tracing::info!("Migrating database to schema version 20 (independent gate reporter evidence)");
     let gate_reporter_columns_added = apply_gate_reporter_columns_migration_in_transaction(conn)?;
+    tracing::info!("Migrating database to schema version 21 (portable comment revisions)");
+    let comment_revisions_added = apply_comment_revisions_migration_in_transaction(conn)?;
     apply_jsonl_row_receipts_schema(conn)?;
     ensure_auxiliary_runtime_columns(conn, "close_metadata", CLOSE_METADATA_COLUMNS)?;
 
@@ -1162,6 +1174,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
         prerequisites_column_added,
         dependency_type_key_added,
         gate_reporter_columns_added,
+        comment_revisions_added,
     })
 }
 
@@ -1561,6 +1574,7 @@ const COMMENT_COLUMNS: &[(&str, &str)] = &[
     ("author", "TEXT NOT NULL DEFAULT ''"),
     ("text", "TEXT NOT NULL DEFAULT ''"),
     ("created_at", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+    ("revision", "TEXT"),
 ];
 
 const EVENT_COLUMNS: &[(&str, &str)] = &[
@@ -1640,6 +1654,7 @@ const COMMENTS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("author", "TEXT", true, None, 0),
     schema_column("text", "TEXT", true, None, 0),
     schema_column("created_at", "DATETIME", true, Some("CURRENT_TIMESTAMP"), 0),
+    schema_column("revision", "TEXT", false, None, 0),
 ];
 
 const EVENTS_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
@@ -3290,6 +3305,11 @@ fn attest_reviewed_source_core_tables(conn: &Connection, legacy_v15: bool) -> Re
     } else {
         EVENTS_RUNTIME_COLUMNS
     };
+    let source_comment_columns = if from < 21 {
+        &COMMENTS_RUNTIME_COLUMNS[..COMMENTS_RUNTIME_COLUMNS.len() - 1]
+    } else {
+        COMMENTS_RUNTIME_COLUMNS
+    };
     let mut source_dependency_columns = DEPENDENCIES_RUNTIME_COLUMNS.to_vec();
     if from < 19 {
         source_dependency_columns[2].primary_key_position = 0;
@@ -3302,11 +3322,7 @@ fn attest_reviewed_source_core_tables(conn: &Connection, legacy_v15: bool) -> Re
             DEPENDENCIES_RUNTIME_INDEXES,
         ),
         ("labels", LABELS_RUNTIME_COLUMNS, LABELS_RUNTIME_INDEXES),
-        (
-            "comments",
-            COMMENTS_RUNTIME_COLUMNS,
-            COMMENTS_RUNTIME_INDEXES,
-        ),
+        ("comments", source_comment_columns, COMMENTS_RUNTIME_INDEXES),
         ("events", source_event_columns, EVENTS_RUNTIME_INDEXES),
         ("config", CONFIG_RUNTIME_COLUMNS, CONFIG_RUNTIME_INDEXES),
         (
@@ -3413,7 +3429,15 @@ fn legacy_v15_core_columns(
                 columns[index].default_value = None;
             }
         }
-        "comments" => columns[4].default_value = None,
+        "comments" => {
+            columns[4].default_value = None;
+            if columns
+                .last()
+                .is_some_and(|column| column.name == "revision")
+            {
+                columns.pop();
+            }
+        }
         "events" => {
             columns[3].default_value = None;
             columns[7].not_null = false;
@@ -3788,7 +3812,12 @@ pub(crate) fn apply_reviewed_legacy_v15_core_conversion_in_transaction(
             "CREATE TABLE main.{stage} (source_rowid INTEGER, {names})"
         ))?;
         conn.execute(&format!(
-            "INSERT INTO main.{stage} SELECT rowid, {names} FROM main.{table}"
+            "INSERT INTO main.{stage} SELECT rowid, {} FROM main.{table}",
+            if table == "comments" {
+                "id, issue_id, author, text, created_at, NULL".to_owned()
+            } else {
+                names.clone()
+            }
         ))?;
         conn.execute(&format!("DROP TABLE main.{table}"))?;
         let prefix = format!("CREATE TABLE IF NOT EXISTS {table} (");
@@ -4712,12 +4741,13 @@ pub(crate) fn reviewed_runtime_schema_upgrade(
     }))
 }
 
-/// Ordinary startup and general maintenance must not consume the reviewed
-/// schema-19 transition before the operator has a preservation receipt.
+/// Ordinary startup and general maintenance must not consume reviewed
+/// schema-19/20 transitions before the operator has a preservation receipt.
 fn refuse_implicit_runtime_schema_upgrade(conn: &Connection, operation: &str) -> Result<()> {
-    if connection_user_version(conn)? == 19 && table_exists(conn, "issues") {
+    let version = connection_user_version(conn)?;
+    if matches!(version, 19 | 20) && table_exists(conn, "issues") {
         return Err(BeadsError::Config(format!(
-            "{operation} refused: schema 19 requires the explicit reviewed schema-20 \
+            "{operation} refused: schema {version} requires the explicit reviewed schema-{CURRENT_SCHEMA_VERSION} \
              migration; run `br doctor migrate-schema plan --json` and review its \
              preservation and downgrade guarantees before applying it"
         )));
@@ -4785,9 +4815,14 @@ fn runtime_schema_compatible_with_release_additions(
 }
 
 /// Historical schema-19 receipts must remain verifiable for guarded undo.
-/// This predicate never admits an old database to the schema-20 runtime.
+/// This predicate never admits an old database to the current runtime.
 pub(crate) fn reviewed_schema19_runtime_compatible(conn: &Connection) -> bool {
     runtime_schema_compatible_for_version(conn, false, 19)
+}
+
+/// Retain exact schema-20 admission for migration planning and historical undo.
+pub(crate) fn reviewed_schema20_runtime_compatible(conn: &Connection) -> bool {
+    runtime_schema_compatible_for_version(conn, false, 20)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4832,7 +4867,11 @@ fn runtime_schema_compatible_for_version(
     let comments_ok = core_runtime_table_canonical(
         conn,
         "comments",
-        COMMENTS_RUNTIME_COLUMNS,
+        if version < 21 {
+            &COMMENTS_RUNTIME_COLUMNS[..COMMENTS_RUNTIME_COLUMNS.len() - 1]
+        } else {
+            COMMENTS_RUNTIME_COLUMNS
+        },
         &["issue_id"],
         COMMENTS_RUNTIME_INDEXES,
         false,
@@ -5465,6 +5504,11 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         apply_gate_reporter_columns_migration_in_transaction(conn)?;
     }
 
+    if user_version < 21 {
+        tracing::info!("Migrating database to schema version 21 (portable comment revisions)");
+        apply_comment_revisions_migration_in_transaction(conn)?;
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -5877,6 +5921,53 @@ fn apply_gate_reporter_columns_migration_in_transaction(conn: &Connection) -> Re
     conn.execute("ALTER TABLE gate_result_history ADD COLUMN assignee_at_report TEXT")?;
     conn.execute("ALTER TABLE gate_result_history ADD COLUMN override_reason TEXT")?;
     attest_gate_result_history_schema(conn)?;
+    Ok(true)
+}
+
+/// Add revision metadata without rewriting historical comment values. Legacy
+/// identities are enrolled deterministically on reads, then persisted with all
+/// sibling identities when any comment is first modified.
+fn apply_comment_revisions_migration_in_transaction(conn: &Connection) -> Result<bool> {
+    let already_present = column_exists(conn, "comments", "revision");
+    let columns = if already_present {
+        COMMENTS_RUNTIME_COLUMNS
+    } else {
+        &COMMENTS_RUNTIME_COLUMNS[..COMMENTS_RUNTIME_COLUMNS.len() - 1]
+    };
+    if !core_runtime_table_canonical(
+        conn,
+        "comments",
+        columns,
+        &["issue_id"],
+        COMMENTS_RUNTIME_INDEXES,
+        false,
+        Some("id"),
+        false,
+    ) {
+        return Err(BeadsError::Config(
+            "schema migrate v21 refused: comments has an unreviewed declaration or indexes"
+                .to_owned(),
+        ));
+    }
+    if already_present {
+        return Ok(false);
+    }
+    conn.execute("ALTER TABLE comments ADD COLUMN revision TEXT")?;
+    if !core_runtime_table_canonical(
+        conn,
+        "comments",
+        COMMENTS_RUNTIME_COLUMNS,
+        &["issue_id"],
+        COMMENTS_RUNTIME_INDEXES,
+        false,
+        Some("id"),
+        false,
+    ) {
+        return Err(BeadsError::Config(
+            "schema migrate v21 post-check failed: comments revision metadata is not canonical"
+                .to_owned(),
+        ));
+    }
     Ok(true)
 }
 
@@ -6823,6 +6914,7 @@ mod tests {
                 prerequisites_column_added: false,
                 dependency_type_key_added: false,
                 gate_reporter_columns_added: true,
+                comment_revisions_added: false,
             }
         );
         let hash = conn
@@ -6921,6 +7013,7 @@ mod tests {
                 prerequisites_column_added: false,
                 dependency_type_key_added: false,
                 gate_reporter_columns_added: true,
+                comment_revisions_added: false,
             }
         );
         let issue = conn
@@ -7546,6 +7639,7 @@ mod tests {
                 Connection::open(temp.path().join("source.db").to_string_lossy().into_owned())
                     .unwrap();
             let schema = SCHEMA_SQL
+                .replace("        revision TEXT,\n", "")
                 .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
                 .replace("        closed_by TEXT,\n", "")
                 .replace(
@@ -7728,7 +7822,7 @@ mod tests {
         );
         let queries = [
             "SELECT rowid, * FROM dependencies ORDER BY rowid",
-            "SELECT rowid, * FROM comments ORDER BY rowid",
+            "SELECT rowid, id, issue_id, author, text, created_at FROM comments ORDER BY rowid",
             "SELECT rowid, * FROM events ORDER BY rowid",
             "SELECT rowid, issue_id, marked_at FROM dirty_issues ORDER BY rowid",
             "SELECT rowid, parent_id, last_child FROM child_counters ORDER BY rowid",
@@ -7750,6 +7844,11 @@ mod tests {
                 "{query}"
             );
         }
+        assert!(
+            conn.query("SELECT id FROM comments WHERE revision IS NOT NULL")
+                .unwrap()
+                .is_empty()
+        );
         let sequences = conn
             .query("SELECT name, seq FROM sqlite_sequence ORDER BY name")
             .unwrap();
@@ -7889,6 +7988,7 @@ mod tests {
         let conn =
             Connection::open(temp.path().join("source.db").to_string_lossy().into_owned()).unwrap();
         let source_schema = SCHEMA_SQL
+            .replace("        revision TEXT,\n", "")
             .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
             .replace(
                 "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
@@ -8028,6 +8128,7 @@ mod tests {
         let db_path = temp.path().join("beads.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         let source_schema = SCHEMA_SQL
+            .replace("        revision TEXT,\n", "")
             .replace(
                 "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
                 "",
@@ -8110,6 +8211,125 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn v21_comment_revision_migration_preserves_values_rowids_and_sequence() {
+        let (_temp, conn) = runtime_upgrade_fixture_at_version(true, true, 20);
+        execute_batch(
+            &conn,
+            "INSERT INTO issues (id, title) VALUES ('bd-comment-migrate', 'Legacy comments');
+             INSERT INTO comments (id, issue_id, author, text, created_at) VALUES
+                (17, 'bd-comment-migrate', 'alice', 'original private comment', '2026-11-12T12:00:00Z'),
+                (23, 'bd-comment-migrate', 'bob', 'second comment', '2026-11-12 12:01:00');
+             UPDATE sqlite_sequence SET seq = 71 WHERE name = 'comments';
+             INSERT INTO events (id, issue_id, event_type, actor, comment) VALUES
+                (19, 'bd-comment-migrate', 'commented', 'alice', 'original private comment');
+             INSERT INTO dirty_issues (issue_id) VALUES ('bd-comment-migrate');
+             INSERT INTO metadata (key, value) VALUES ('needs_flush', 'true');",
+        ).unwrap();
+        assert!(reviewed_schema20_runtime_compatible(&conn));
+        assert!(!runtime_schema_compatible(&conn));
+        let original = legacy_v15_test_state(&conn);
+        let comments_query =
+            "SELECT rowid, id, issue_id, author, text, created_at FROM comments ORDER BY id";
+        let original_comments = format!("{:?}", conn.query(comments_query).unwrap());
+        let original_events = format!(
+            "{:?}",
+            conn.query("SELECT rowid, * FROM events ORDER BY id")
+                .unwrap()
+        );
+        let original_dirty = format!(
+            "{:?}",
+            conn.query("SELECT rowid, * FROM dirty_issues ORDER BY rowid")
+                .unwrap()
+        );
+        for repair in [
+            apply_schema as fn(&Connection) -> Result<()>,
+            apply_runtime_compatible_schema,
+        ] {
+            assert!(repair(&conn).is_err());
+            assert_eq!(legacy_v15_test_state(&conn), original);
+        }
+
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        let effects = run_reviewed_schema_migration_steps_in_transaction(
+            &conn,
+            20,
+            current_schema_version_u32().unwrap(),
+            "2026-11-12T12:00:00Z",
+        )
+        .unwrap();
+        assert!(effects.comment_revisions_added);
+        assert!(!effects.gate_reporter_columns_added);
+        assert!(!effects.dependency_type_key_added);
+        assert!(!effects.prerequisites_column_added);
+        assert_eq!(effects.content_hash_rows_rebuilt, 0);
+        assert!(runtime_schema_compatible(&conn));
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(legacy_v15_test_state(&conn), original);
+
+        run_migrations_atomic(&conn, 20, current_schema_version_u32().unwrap()).unwrap();
+        assert!(runtime_schema_compatible(&conn));
+        assert_eq!(connection_user_version(&conn).unwrap(), 21);
+        assert_eq!(
+            format!("{:?}", conn.query(comments_query).unwrap()),
+            original_comments
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                conn.query("SELECT rowid, * FROM events ORDER BY id")
+                    .unwrap()
+            ),
+            original_events
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                conn.query("SELECT rowid, * FROM dirty_issues ORDER BY rowid")
+                    .unwrap()
+            ),
+            original_dirty
+        );
+        for row in conn
+            .query("SELECT revision FROM comments ORDER BY id")
+            .unwrap()
+        {
+            assert_eq!(row.get(0), Some(&SqliteValue::Null));
+        }
+        assert_eq!(
+            conn.query_row("SELECT seq FROM sqlite_sequence WHERE name = 'comments'")
+                .unwrap()
+                .get(0),
+            Some(&SqliteValue::Integer(71))
+        );
+        assert_eq!(
+            conn.query_row("SELECT value FROM metadata WHERE key = 'needs_flush'")
+                .unwrap()
+                .get(0)
+                .and_then(SqliteValue::as_text),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn v21_comment_revision_migration_refuses_unreviewed_source20_without_writes() {
+        for drift in [
+            "ALTER TABLE comments ADD COLUMN revision TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE comments ADD COLUMN operator_note TEXT",
+            "DROP INDEX idx_comments_created_at",
+        ] {
+            let (_temp, conn) = runtime_upgrade_fixture_at_version(true, true, 20);
+            conn.execute(drift).unwrap();
+            assert!(!reviewed_schema20_runtime_compatible(&conn));
+            let before = legacy_v15_test_state(&conn);
+            assert!(
+                run_migrations_atomic(&conn, 20, current_schema_version_u32().unwrap()).is_err()
+            );
+            assert_eq!(legacy_v15_test_state(&conn), before, "{drift}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn v20_gate_evidence_migration_preserves_v19_audit_and_rolls_back() {
         for release_additions in [false, true] {
             let temp = TempDir::new().unwrap();
@@ -8124,6 +8344,7 @@ mod tests {
                 "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
                 "",
             );
+            source = source.replace("        revision TEXT,\n", "");
             if !release_additions {
                 source = source.replace("        closed_by TEXT,\n", "");
             }
@@ -8170,6 +8391,7 @@ mod tests {
             )
             .unwrap();
             assert!(effects.gate_reporter_columns_added);
+            assert!(effects.comment_revisions_added);
             assert!(!effects.gate_result_history_created);
             assert!(!effects.dependency_type_key_added);
             assert!(runtime_schema_compatible(&conn));
@@ -8317,6 +8539,7 @@ mod tests {
         let db_path = temp.path().join("beads.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         let source_schema = SCHEMA_SQL
+            .replace("        revision TEXT,\n", "")
             .replace("        prerequisites TEXT NOT NULL DEFAULT '',\n", "")
             .replace(
                 "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
@@ -10203,6 +10426,9 @@ mod tests {
                 "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
                 "",
             );
+        }
+        if version < 21 {
+            schema = schema.replace("        revision TEXT,\n", "");
         }
         execute_batch(&conn, &schema).unwrap();
         if receipts_present {

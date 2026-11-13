@@ -1508,6 +1508,7 @@ mod tests {
             author: "TopazFox".to_string(),
             body: "files: src/coordination.rs".to_string(),
             created_at: now(),
+            revision: None,
         }];
         let evidence = reservation_evidence_from_snapshots(
             "beads_rust-sc6u",

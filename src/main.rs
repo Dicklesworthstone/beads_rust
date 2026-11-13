@@ -1647,7 +1647,12 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         ),
         Commands::Comments(args) => matches!(
             args.command.as_ref(),
-            Some(beads_rust::cli::CommentCommands::Add(_))
+            Some(
+                beads_rust::cli::CommentCommands::Add(_)
+                    | beads_rust::cli::CommentCommands::Edit(_)
+                    | beads_rust::cli::CommentCommands::Redact(_)
+                    | beads_rust::cli::CommentCommands::Delete(_)
+            )
         ),
         Commands::Epic { command } => matches!(
             command,
@@ -4489,6 +4494,21 @@ mod tests {
         assert!(is_mutating_command(&comments_add));
         assert!(!is_mutating_command(&orphans));
         assert!(is_mutating_command(&orphans_fix));
+    }
+
+    #[test]
+    fn comment_modifications_use_writer_authority_and_mutating_startup() {
+        for args in [
+            vec!["br", "comments", "edit", "bd-123", "7", "replacement"],
+            vec!["br", "comments", "redact", "bd-123", "7"],
+            vec!["br", "comments", "delete", "bd-123", "7", "--force"],
+        ] {
+            let cli = Cli::parse_from(args);
+            assert!(is_mutating_command(&cli.command));
+            assert!(needs_write_lock(&cli.command));
+            assert!(!requires_read_only_storage(&cli.command));
+            assert!(!build_cli_overrides(&cli).read_only_fast_open);
+        }
     }
 
     #[test]

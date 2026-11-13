@@ -5,11 +5,11 @@ use super::{
     auto_import_storage_ctx_if_stale, cli_for_routed_workspace, report_auto_flush_failure,
     resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
-use crate::cli::{CommentAddArgs, CommentCommands, CommentsArgs};
+use crate::cli::{CommentAddArgs, CommentCommands, CommentModifyArgs, CommentsArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
-use crate::model::Comment;
+use crate::model::{Comment, CommentState};
 use crate::output::{OutputContext, OutputMode, rich_text_panel, wrap_rich_lines};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig};
@@ -35,15 +35,55 @@ pub fn execute(
 
     match &args.command {
         Some(CommentCommands::Add(add_args)) => execute_add(add_args, cli, ctx, &beads_dir),
-        Some(CommentCommands::List(list_args)) => {
-            execute_list(&list_args.id, json, cli, ctx, &beads_dir, list_args.wrap)
+        Some(CommentCommands::Edit(edit_args)) => {
+            let text = read_comment_input(
+                &edit_args.text,
+                edit_args.file.as_deref(),
+                edit_args.message.as_deref(),
+            )?;
+            execute_modify(
+                &edit_args.target,
+                CommentState::Active,
+                &text,
+                cli,
+                ctx,
+                &beads_dir,
+            )
         }
+        Some(CommentCommands::Redact(modify_args)) => execute_modify(
+            modify_args,
+            CommentState::Redacted,
+            "",
+            cli,
+            ctx,
+            &beads_dir,
+        ),
+        Some(CommentCommands::Delete(modify_args)) => {
+            execute_modify(modify_args, CommentState::Deleted, "", cli, ctx, &beads_dir)
+        }
+        Some(CommentCommands::List(list_args)) => execute_list(
+            &list_args.id,
+            json,
+            cli,
+            ctx,
+            &beads_dir,
+            list_args.wrap,
+            list_args.include_deleted,
+        ),
         None => {
             let id = args
                 .id
                 .as_deref()
                 .ok_or_else(|| BeadsError::validation("id", "missing issue id"))?;
-            execute_list(id, json, cli, ctx, &beads_dir, args.wrap)
+            execute_list(
+                id,
+                json,
+                cli,
+                ctx,
+                &beads_dir,
+                args.wrap,
+                args.include_deleted,
+            )
         }
     }
 }
@@ -64,7 +104,12 @@ pub fn execute_with_storage_ctx(
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<bool> {
     match &args.command {
-        Some(CommentCommands::Add(_)) => Ok(false),
+        Some(
+            CommentCommands::Add(_)
+            | CommentCommands::Edit(_)
+            | CommentCommands::Redact(_)
+            | CommentCommands::Delete(_),
+        ) => Ok(false),
         Some(CommentCommands::List(list_args)) => execute_list_with_storage_ctx(
             &list_args.id,
             json,
@@ -72,6 +117,7 @@ pub fn execute_with_storage_ctx(
             ctx,
             local_beads_dir,
             list_args.wrap,
+            list_args.include_deleted,
             storage_ctx,
         ),
         None => {
@@ -86,6 +132,7 @@ pub fn execute_with_storage_ctx(
                 ctx,
                 local_beads_dir,
                 args.wrap,
+                args.include_deleted,
                 storage_ctx,
             )
         }
@@ -142,6 +189,88 @@ fn execute_add(
     Ok(())
 }
 
+fn execute_modify(
+    args: &CommentModifyArgs,
+    state: CommentState,
+    text: &str,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+) -> Result<()> {
+    if state == CommentState::Active && text.trim().is_empty() {
+        return Err(BeadsError::validation(
+            "text",
+            "comment text cannot be empty",
+        ));
+    }
+    let (mut storage_ctx, route_cli, auto_flush_external, _routed_write_lock) =
+        open_routed_storage_for_input(beads_dir, cli, &args.id)?;
+    let layer = storage_ctx.load_config(&route_cli)?;
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(
+        config::id_config_from_layer(&layer).prefix,
+    ));
+    let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, &args.id)?;
+    let actor = resolve_author(None, config::actor_from_layer(&layer).as_deref());
+    let action = match state {
+        CommentState::Active => "edited",
+        CommentState::Redacted => "redacted",
+        CommentState::Deleted => "deleted",
+    };
+    let comment = retry_mutation_with_jsonl_recovery(
+        &mut storage_ctx,
+        true,
+        "comment modification",
+        Some(&issue_id),
+        |storage| match state {
+            CommentState::Active => storage.edit_comment(
+                &issue_id,
+                args.comment_id,
+                &actor,
+                text,
+                args.if_revision.as_deref(),
+                args.force,
+            ),
+            CommentState::Redacted => storage.redact_comment(
+                &issue_id,
+                args.comment_id,
+                &actor,
+                args.if_revision.as_deref(),
+                args.force,
+            ),
+            CommentState::Deleted => storage.delete_comment(
+                &issue_id,
+                args.comment_id,
+                &actor,
+                args.if_revision.as_deref(),
+                args.force,
+            ),
+        },
+    )?;
+    storage_ctx.flush_no_db_if_dirty()?;
+    if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
+        );
+    }
+    crate::util::set_last_touched_id(beads_dir, &issue_id);
+    if ctx.is_json() {
+        ctx.json_pretty(&comment);
+    } else if ctx.is_toon() {
+        ctx.toon(&comment);
+    } else if !matches!(ctx.mode(), OutputMode::Quiet) {
+        println!(
+            "Comment {} {} on {}",
+            comment.id,
+            action,
+            sanitize_terminal_inline(&issue_id)
+        );
+    }
+    Ok(())
+}
+
 fn execute_list(
     issue_input: &str,
     json: bool,
@@ -149,6 +278,7 @@ fn execute_list(
     ctx: &OutputContext,
     beads_dir: &Path,
     wrap: bool,
+    include_deleted: bool,
 ) -> Result<()> {
     let (storage_ctx, route_cli, _, _routed_write_lock) =
         open_routed_storage_for_input(beads_dir, cli, issue_input)?;
@@ -163,9 +293,11 @@ fn execute_list(
         json,
         ctx,
         wrap,
+        include_deleted,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_list_with_storage_ctx(
     issue_input: &str,
     json: bool,
@@ -173,6 +305,7 @@ fn execute_list_with_storage_ctx(
     ctx: &OutputContext,
     local_beads_dir: &Path,
     wrap: bool,
+    include_deleted: bool,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<bool> {
     let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
@@ -191,6 +324,7 @@ fn execute_list_with_storage_ctx(
         json,
         ctx,
         wrap,
+        include_deleted,
     )?;
     Ok(true)
 }
@@ -243,9 +377,14 @@ fn list_comments_by_id(
     _json: bool,
     ctx: &OutputContext,
     wrap: bool,
+    include_deleted: bool,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, id)?;
-    let comments = storage.get_comments(&issue_id)?;
+    let comments: Vec<Comment> = storage
+        .get_comments(&issue_id)?
+        .into_iter()
+        .filter(|comment| include_deleted || comment.state() != CommentState::Deleted)
+        .collect();
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
@@ -275,13 +414,14 @@ fn list_comments_by_id(
     for comment in comments {
         let timestamp = comment.created_at.format("%Y-%m-%d %H:%M UTC");
         println!(
-            "[{}] at {}",
+            "#{} [{}] at {}",
+            comment.id,
             sanitize_terminal_inline(&comment.author),
             timestamp
         );
         println!(
             "{}",
-            sanitize_terminal_text(comment.body.trim_end_matches('\n'))
+            sanitize_terminal_text(comment.display_body().trim_end_matches('\n'))
         );
         println!();
     }
@@ -321,7 +461,8 @@ fn render_comments_list_rich(
             content.append("\n\n");
         }
 
-        // Author and timestamp
+        content.append_styled(&format!("#{} ", comment.id), theme.dimmed.clone());
+        // Original author and creation timestamp remain immutable.
         content.append_styled(
             &format!("@{}", sanitize_terminal_inline(&comment.author)),
             theme.username.clone(),
@@ -334,7 +475,8 @@ fn render_comments_list_rich(
         content.append("\n");
 
         // Comment body
-        content.append(sanitize_terminal_text(comment.body.trim_end_matches('\n')).as_ref());
+        content
+            .append(sanitize_terminal_text(comment.display_body().trim_end_matches('\n')).as_ref());
         content.append("\n\n");
     }
 
@@ -429,7 +571,15 @@ fn read_limited_string<R: Read>(reader: &mut R, byte_limit: usize, field: &str) 
 }
 
 fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
-    if let Some(path) = &args.file {
+    read_comment_input(&args.text, args.file.as_deref(), args.message.as_deref())
+}
+
+fn read_comment_input(
+    text: &[String],
+    file: Option<&Path>,
+    message: Option<&str>,
+) -> Result<String> {
+    if let Some(path) = file {
         if path.as_os_str() == "-" {
             let mut stdin = std::io::stdin();
             return read_limited_string(&mut stdin, MAX_STDIN_COMMENT_BYTES, "text");
@@ -437,11 +587,11 @@ fn read_comment_text(args: &CommentAddArgs) -> Result<String> {
         let mut file = fs::File::open(path)?;
         return read_limited_string(&mut file, MAX_STDIN_COMMENT_BYTES, "file");
     }
-    if let Some(message) = &args.message {
-        return Ok(message.clone());
+    if let Some(message) = message {
+        return Ok(message.to_owned());
     }
-    if !args.text.is_empty() {
-        return Ok(args.text.join(" "));
+    if !text.is_empty() {
+        return Ok(text.join(" "));
     }
     Err(BeadsError::validation("text", "comment text required"))
 }

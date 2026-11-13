@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrRun, BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -21,6 +21,688 @@ fn parse_created_id(stdout: &str) -> String {
         .and_then(|rest| rest.split(':').next())
         .unwrap_or("");
     id_part.trim().to_string()
+}
+
+fn successful_json(run: &BrRun) -> Value {
+    assert!(
+        run.status.success(),
+        "command failed: stdout={} stderr={}",
+        run.stdout,
+        run.stderr
+    );
+    serde_json::from_str(&extract_json_payload(&run.stdout)).expect("parse JSON result")
+}
+
+fn privacy_fixture(text: &str) -> (BrWorkspace, String, Value) {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "privacy"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create = run_br(&workspace, ["create", "Comment privacy"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+    assert!(!issue_id.is_empty(), "missing created issue id");
+    let comment = successful_json(&run_br(
+        &workspace,
+        [
+            "comments", "add", &issue_id, text, "--actor", "alice", "--json",
+        ],
+        "add_private_comment",
+    ));
+    (workspace, issue_id, comment)
+}
+
+fn listed_comments(workspace: &BrWorkspace, issue_id: &str, label: &str) -> Vec<Value> {
+    successful_json(&run_br(
+        workspace,
+        ["comments", "list", issue_id, "--include-deleted", "--json"],
+        label,
+    ))
+    .as_array()
+    .expect("comment list")
+    .clone()
+}
+
+fn assert_comment_identity(before: &Value, after: &Value) {
+    for key in ["id", "author", "created_at"] {
+        assert_eq!(before[key], after[key], "immutable comment field {key}");
+    }
+    assert_eq!(
+        before["revision"]["identity"],
+        after["revision"]["identity"]
+    );
+}
+
+#[derive(Clone)]
+struct CommentLedger {
+    issues: String,
+    history: String,
+}
+
+impl CommentLedger {
+    fn read(workspace: &BrWorkspace) -> Self {
+        let beads = workspace.root.join(".beads");
+        Self {
+            issues: std::fs::read_to_string(beads.join("issues.jsonl")).expect("issue ledger"),
+            history: std::fs::read_to_string(beads.join("issues.history.jsonl"))
+                .expect("portable audit history"),
+        }
+    }
+
+    fn write(&self, workspace: &BrWorkspace) {
+        let beads = workspace.root.join(".beads");
+        std::fs::write(beads.join("issues.jsonl"), &self.issues).expect("pull issue ledger");
+        std::fs::write(beads.join("issues.history.jsonl"), &self.history)
+            .expect("pull portable audit history");
+    }
+
+    fn assert_private(&self, removed: &[&str]) {
+        for &sentinel in removed {
+            assert!(
+                !self.issues.contains(sentinel),
+                "removed text in current JSONL"
+            );
+            assert!(
+                !self.history.contains(sentinel),
+                "removed text in a retained portable history generation"
+            );
+        }
+        // Multiple mutations retain two distinct generations. Check every row,
+        // including the older checkpoint that a future import may replay.
+        assert_eq!(self.history.lines().count(), 2);
+        for line in self.history.lines() {
+            let checkpoint: Value = serde_json::from_str(line).expect("history checkpoint");
+            assert!(checkpoint["history"]["tables"].is_array());
+        }
+    }
+}
+
+fn clone_comment_workspace(source: &BrWorkspace) -> BrWorkspace {
+    let target = BrWorkspace::new();
+    let source_beads = source.root.join(".beads");
+    let target_beads = target.root.join(".beads");
+    std::fs::create_dir_all(&target_beads).expect("clone tracked directory");
+    for name in [
+        "issues.jsonl",
+        "issues.history.jsonl",
+        "config.yaml",
+        "metadata.json",
+        ".gitignore",
+    ] {
+        let path = source_beads.join(name);
+        if path.exists() {
+            std::fs::copy(path, target_beads.join(name)).expect("clone tracked file");
+        }
+    }
+    let rebuild = run_br(&target, ["sync", "--import-only"], "clone_rebuild");
+    assert!(
+        rebuild.status.success(),
+        "rebuild failed: {}",
+        rebuild.stderr
+    );
+    target
+}
+
+fn import_and_flush(workspace: &BrWorkspace, ledger: &CommentLedger, label: &str) {
+    ledger.write(workspace);
+    let import = run_br(workspace, ["sync", "--import-only"], label);
+    assert!(import.status.success(), "{label}: {}", import.stderr);
+    let flush = run_br(
+        workspace,
+        ["sync", "--flush-only"],
+        &format!("{label}_flush"),
+    );
+    assert!(flush.status.success(), "{label}: {}", flush.stderr);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_comment_edit_preserves_identity_and_checks_author_and_revision() {
+    let _log =
+        common::test_log("e2e_comment_edit_preserves_identity_and_checks_author_and_revision");
+    let (workspace, issue_id, original) = privacy_fixture("EDIT_ORIGINAL_PRIVATE_SENTINEL");
+    let comment_id = original["id"].as_i64().unwrap().to_string();
+    let original_head = original["revision"]["head"].as_str().unwrap();
+    let denied = run_br(
+        &workspace,
+        [
+            "comments",
+            "edit",
+            &issue_id,
+            &comment_id,
+            "unauthorized",
+            "--actor",
+            "bob",
+        ],
+        "deny_other_author",
+    );
+    assert!(!denied.status.success());
+    let empty = run_br(
+        &workspace,
+        [
+            "comments",
+            "edit",
+            &issue_id,
+            &comment_id,
+            "-m",
+            "  ",
+            "--actor",
+            "alice",
+        ],
+        "deny_empty_edit",
+    );
+    assert!(!empty.status.success());
+    assert_eq!(
+        listed_comments(&workspace, &issue_id, "unchanged_before_edit"),
+        [original.clone()]
+    );
+
+    let edited = successful_json(&run_br(
+        &workspace,
+        [
+            "comments",
+            "edit",
+            &issue_id,
+            &comment_id,
+            "reviewed replacement",
+            "--actor",
+            "alice",
+            "--if-revision",
+            original_head,
+            "--json",
+        ],
+        "edit_own_comment",
+    ));
+    assert_comment_identity(&original, &edited);
+    assert_eq!(edited["text"], "reviewed replacement");
+    assert_eq!(edited["revision"]["generation"], 1);
+    assert_eq!(edited["revision"]["updated_by"], "alice");
+
+    let forced = successful_json(&run_br(
+        &workspace,
+        [
+            "comments",
+            "edit",
+            &issue_id,
+            &comment_id,
+            "moderator replacement",
+            "--actor",
+            "bob",
+            "--force",
+            "--if-revision",
+            edited["revision"]["head"].as_str().unwrap(),
+            "--json",
+        ],
+        "force_other_author",
+    ));
+    assert_comment_identity(&original, &forced);
+    assert_eq!(forced["author"], "alice");
+    assert_eq!(forced["revision"]["updated_by"], "bob");
+    let stale = run_br(
+        &workspace,
+        [
+            "comments",
+            "edit",
+            &issue_id,
+            &comment_id,
+            "stale write",
+            "--actor",
+            "alice",
+            "--if-revision",
+            original_head,
+        ],
+        "deny_stale_head",
+    );
+    assert!(!stale.status.success());
+    assert_eq!(
+        listed_comments(&workspace, &issue_id, "unchanged_after_stale"),
+        [forced.clone()]
+    );
+
+    let audit = successful_json(&run_br(
+        &workspace,
+        ["audit", "log", &issue_id, "--json"],
+        "audit_edits",
+    ));
+    let event = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["event_type"] == "comment_edited" && event["actor"] == "bob")
+        .expect("forced edit audit event");
+    let evidence: Value = serde_json::from_str(event["comment"].as_str().unwrap()).unwrap();
+    assert_eq!(evidence["forced"], true);
+    assert_eq!(evidence["identity"], forced["revision"]["identity"]);
+    assert_eq!(evidence["head"], forced["revision"]["head"]);
+    CommentLedger::read(&workspace).assert_private(&["EDIT_ORIGINAL_PRIVATE_SENTINEL"]);
+}
+
+#[test]
+fn e2e_comment_mutations_are_scoped_to_the_requested_issue() {
+    let _log = common::test_log("e2e_comment_mutations_are_scoped_to_the_requested_issue");
+    let (workspace, issue_id, original) = privacy_fixture("scope evidence");
+    let create = run_br(&workspace, ["create", "Other issue"], "create_other");
+    assert!(create.status.success());
+    let other_id = parse_created_id(&create.stdout);
+    let comment_id = original["id"].as_i64().unwrap().to_string();
+    for operation in ["redact", "delete"] {
+        let denied = run_br(
+            &workspace,
+            [
+                "comments",
+                operation,
+                &other_id,
+                &comment_id,
+                "--actor",
+                "alice",
+                "--force",
+            ],
+            &format!("deny_wrong_issue_{operation}"),
+        );
+        assert!(
+            !denied.status.success(),
+            "wrong issue must not authorize {operation}"
+        );
+    }
+    let denied = run_br(
+        &workspace,
+        [
+            "comments",
+            "edit",
+            &other_id,
+            &comment_id,
+            "wrong issue",
+            "--actor",
+            "alice",
+            "--force",
+        ],
+        "deny_wrong_issue_edit",
+    );
+    assert!(!denied.status.success());
+    assert_eq!(
+        listed_comments(&workspace, &issue_id, "original_unmodified"),
+        [original]
+    );
+    assert!(listed_comments(&workspace, &other_id, "other_stays_empty").is_empty());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_comment_redaction_and_deletion_keep_tombstones_and_metadata_only_audit() {
+    let _log = common::test_log(
+        "e2e_comment_redaction_and_deletion_keep_tombstones_and_metadata_only_audit",
+    );
+    let (workspace, issue_id, original) = privacy_fixture("REDACT_ORIGINAL_PRIVATE_SENTINEL");
+    let comment_id = original["id"].as_i64().unwrap().to_string();
+    let edited = successful_json(&run_br(
+        &workspace,
+        [
+            "comments",
+            "edit",
+            &issue_id,
+            &comment_id,
+            "REDACT_EDITED_PRIVATE_SENTINEL",
+            "--actor",
+            "alice",
+            "--json",
+        ],
+        "edit_before_redaction",
+    ));
+    for operation in ["redact", "delete"] {
+        let denied = run_br(
+            &workspace,
+            [
+                "comments",
+                operation,
+                &issue_id,
+                &comment_id,
+                "--actor",
+                "bob",
+            ],
+            &format!("deny_other_author_{operation}"),
+        );
+        assert!(!denied.status.success());
+    }
+    let redacted = successful_json(&run_br(
+        &workspace,
+        [
+            "comments",
+            "redact",
+            &issue_id,
+            &comment_id,
+            "--actor",
+            "alice",
+            "--if-revision",
+            edited["revision"]["head"].as_str().unwrap(),
+            "--json",
+        ],
+        "redact_comment",
+    ));
+    assert_comment_identity(&original, &redacted);
+    assert_eq!(redacted["text"], "");
+    assert_eq!(redacted["revision"]["state"], "redacted");
+    let repeat = successful_json(&run_br(
+        &workspace,
+        [
+            "comments",
+            "redact",
+            &issue_id,
+            &comment_id,
+            "--actor",
+            "alice",
+            "--json",
+        ],
+        "redact_again",
+    ));
+    assert_eq!(redacted, repeat);
+    let restore = run_br(
+        &workspace,
+        [
+            "comments",
+            "edit",
+            &issue_id,
+            &comment_id,
+            "revive removed text",
+            "--actor",
+            "alice",
+            "--force",
+        ],
+        "deny_restore",
+    );
+    assert!(!restore.status.success());
+    let plain = run_br(&workspace, ["comments", "list", &issue_id], "show_redacted");
+    assert!(plain.status.success());
+    assert!(plain.stdout.contains(&format!("#{comment_id}")));
+    assert!(plain.stdout.contains("[redacted]"));
+
+    let deleted = successful_json(&run_br(
+        &workspace,
+        [
+            "comments",
+            "delete",
+            &issue_id,
+            &comment_id,
+            "--actor",
+            "alice",
+            "--json",
+        ],
+        "delete_comment",
+    ));
+    assert_comment_identity(&original, &deleted);
+    assert_eq!(deleted["revision"]["state"], "deleted");
+    assert_eq!(deleted["text"], "");
+    let repeat = successful_json(&run_br(
+        &workspace,
+        [
+            "comments",
+            "delete",
+            &issue_id,
+            &comment_id,
+            "--actor",
+            "alice",
+            "--json",
+        ],
+        "delete_again",
+    ));
+    assert_eq!(deleted, repeat);
+    let visible = successful_json(&run_br(
+        &workspace,
+        ["comments", "list", &issue_id, "--json"],
+        "hide_deleted",
+    ));
+    assert_eq!(visible, serde_json::json!([]));
+    assert_eq!(
+        listed_comments(&workspace, &issue_id, "show_tombstone"),
+        [deleted.clone()]
+    );
+    let ledger = CommentLedger::read(&workspace);
+    ledger.assert_private(&[
+        "REDACT_ORIGINAL_PRIVATE_SENTINEL",
+        "REDACT_EDITED_PRIVATE_SENTINEL",
+    ]);
+    let exported: Value = serde_json::from_str(ledger.issues.lines().next().unwrap()).unwrap();
+    assert_eq!(exported["comments"][0]["revision"], deleted["revision"]);
+    let audit = successful_json(&run_br(
+        &workspace,
+        ["audit", "log", &issue_id, "--json"],
+        "audit_removals",
+    ));
+    for operation in ["comment_edited", "comment_redacted", "comment_deleted"] {
+        assert!(
+            audit["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["event_type"] == operation && event["actor"] == "alice")
+        );
+    }
+    assert!(!audit.to_string().contains("PRIVATE_SENTINEL"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_comment_redaction_survives_divergent_machine_and_repeated_old_imports() {
+    let _log = common::test_log(
+        "e2e_comment_redaction_survives_divergent_machine_and_repeated_old_imports",
+    );
+    let (machine_a, issue_id, original) = privacy_fixture("SYNC_ORIGINAL_PRIVATE_SENTINEL");
+    let original_ledger = CommentLedger::read(&machine_a);
+    let mut legacy_issue: Value = serde_json::from_str(original_ledger.issues.trim()).unwrap();
+    for comment in legacy_issue["comments"].as_array_mut().unwrap() {
+        comment.as_object_mut().unwrap().remove("revision");
+    }
+    let legacy_ledger = CommentLedger {
+        issues: format!("{legacy_issue}\n"),
+        history: original_ledger.history.clone(),
+    };
+    let machine_b = clone_comment_workspace(&machine_a);
+    let comment_id = original["id"].as_i64().unwrap().to_string();
+    let peer_edit = successful_json(&run_br(
+        &machine_b,
+        [
+            "comments",
+            "edit",
+            &issue_id,
+            &comment_id,
+            "SYNC_PEER_PRIVATE_SENTINEL",
+            "--actor",
+            "alice",
+            "--json",
+        ],
+        "peer_edit",
+    ));
+    assert_eq!(peer_edit["revision"]["state"], "active");
+    let mut peer_ledger = CommentLedger::read(&machine_b);
+    // A skewed parent clock must not let timestamp-based issue selection
+    // restore a removed comment. Keep the actual comment revision intact.
+    let mut future_issue: Value = serde_json::from_str(peer_ledger.issues.trim()).unwrap();
+    future_issue["updated_at"] = Value::String("2099-01-01T00:00:00Z".to_owned());
+    peer_ledger.issues = format!("{future_issue}\n");
+    let redacted = successful_json(&run_br(
+        &machine_a,
+        [
+            "comments",
+            "redact",
+            &issue_id,
+            &comment_id,
+            "--actor",
+            "alice",
+            "--json",
+        ],
+        "local_redaction",
+    ));
+    import_and_flush(&machine_a, &peer_ledger, "import_future_peer_edit");
+    assert_eq!(
+        listed_comments(&machine_a, &issue_id, "redaction_wins_future_clock"),
+        [redacted.clone()]
+    );
+    CommentLedger::read(&machine_a).assert_private(&[
+        "SYNC_ORIGINAL_PRIVATE_SENTINEL",
+        "SYNC_PEER_PRIVATE_SENTINEL",
+    ]);
+
+    for (attempt, older) in [&original_ledger, &legacy_ledger, &original_ledger]
+        .into_iter()
+        .enumerate()
+    {
+        import_and_flush(&machine_a, older, &format!("import_old_{attempt}"));
+        assert_eq!(
+            listed_comments(&machine_a, &issue_id, &format!("no_restore_{attempt}")),
+            [redacted.clone()]
+        );
+        CommentLedger::read(&machine_a).assert_private(&[
+            "SYNC_ORIGINAL_PRIVATE_SENTINEL",
+            "SYNC_PEER_PRIVATE_SENTINEL",
+        ]);
+    }
+    import_and_flush(
+        &machine_b,
+        &CommentLedger::read(&machine_a),
+        "peer_import_redaction",
+    );
+    let peer_comments = listed_comments(&machine_b, &issue_id, "peer_redacted");
+    assert_eq!(peer_comments.len(), 1);
+    assert_eq!(peer_comments[0]["revision"], redacted["revision"]);
+    assert_eq!(peer_comments[0]["text"], "");
+    CommentLedger::read(&machine_b).assert_private(&[
+        "SYNC_ORIGINAL_PRIVATE_SENTINEL",
+        "SYNC_PEER_PRIVATE_SENTINEL",
+    ]);
+
+    let deleted = successful_json(&run_br(
+        &machine_a,
+        [
+            "comments",
+            "delete",
+            &issue_id,
+            &comment_id,
+            "--actor",
+            "alice",
+            "--json",
+        ],
+        "delete_after_redaction",
+    ));
+    import_and_flush(
+        &machine_b,
+        &CommentLedger::read(&machine_a),
+        "peer_import_deletion",
+    );
+    import_and_flush(&machine_b, &legacy_ledger, "peer_reimports_original");
+    assert_eq!(
+        listed_comments(&machine_b, &issue_id, "peer_deleted")[0]["revision"],
+        deleted["revision"]
+    );
+    CommentLedger::read(&machine_b).assert_private(&[
+        "SYNC_ORIGINAL_PRIVATE_SENTINEL",
+        "SYNC_PEER_PRIVATE_SENTINEL",
+    ]);
+    // A machine with no database must rebuild the same terminal identity from
+    // the JSONL tombstone; no local prior revision is needed to enforce it.
+    let machine_c = clone_comment_workspace(&machine_b);
+    let rebuilt = listed_comments(&machine_c, &issue_id, "fresh_machine_tombstone");
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0]["revision"], deleted["revision"]);
+    assert_eq!(rebuilt[0]["text"], "");
+    let visible = successful_json(&run_br(
+        &machine_c,
+        ["comments", "list", &issue_id, "--json"],
+        "fresh_machine_default_list",
+    ));
+    assert_eq!(visible, serde_json::json!([]));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_comment_concurrent_edits_fail_closed_on_both_machines() {
+    let _log = common::test_log("e2e_comment_concurrent_edits_fail_closed_on_both_machines");
+    let (machine_a, issue_id, original) = privacy_fixture("CONCURRENT_ORIGINAL_PRIVATE_SENTINEL");
+    let machine_b = clone_comment_workspace(&machine_a);
+    let comment_id = original["id"].as_i64().unwrap().to_string();
+    let edit_a = successful_json(&run_br(
+        &machine_a,
+        [
+            "comments",
+            "edit",
+            &issue_id,
+            &comment_id,
+            "CONCURRENT_A_PRIVATE_SENTINEL",
+            "--actor",
+            "alice",
+            "--json",
+        ],
+        "concurrent_edit_a",
+    ));
+    let edit_b = successful_json(&run_br(
+        &machine_b,
+        [
+            "comments",
+            "edit",
+            &issue_id,
+            &comment_id,
+            "CONCURRENT_B_PRIVATE_SENTINEL",
+            "--actor",
+            "alice",
+            "--json",
+        ],
+        "concurrent_edit_b",
+    ));
+    let ledger_a = CommentLedger::read(&machine_a);
+    let ledger_b = CommentLedger::read(&machine_b);
+    for (machine, incoming, local, label) in [
+        (&machine_a, &ledger_b, &edit_a, "a"),
+        (&machine_b, &ledger_a, &edit_b, "b"),
+    ] {
+        incoming.write(machine);
+        for attempt in 0..2 {
+            let conflict = run_br(
+                machine,
+                ["sync", "--import-only"],
+                &format!("{label}_conflict_{attempt}"),
+            );
+            assert!(
+                !conflict.status.success(),
+                "divergent ordinary edits must not silently win"
+            );
+            assert!(!conflict.stdout.contains("PRIVATE_SENTINEL"));
+            assert!(!conflict.stderr.contains("PRIVATE_SENTINEL"));
+            let preserved = successful_json(&run_br(
+                machine,
+                [
+                    "--no-auto-import",
+                    "--allow-stale",
+                    "comments",
+                    "list",
+                    &issue_id,
+                    "--json",
+                ],
+                &format!("{label}_local_after_conflict_{attempt}"),
+            ));
+            assert_eq!(preserved, serde_json::json!([local]));
+        }
+        let rebuild = run_br(
+            machine,
+            ["sync", "--import-only", "--force"],
+            &format!("{label}_forced_rebuild_conflict"),
+        );
+        assert!(
+            !rebuild.status.success(),
+            "force must not discard a concurrent comment revision"
+        );
+        assert!(!rebuild.stdout.contains("PRIVATE_SENTINEL"));
+        assert!(!rebuild.stderr.contains("PRIVATE_SENTINEL"));
+        let preserved = successful_json(&run_br(
+            machine,
+            [
+                "--no-auto-import",
+                "--allow-stale",
+                "comments",
+                "list",
+                &issue_id,
+                "--json",
+            ],
+            &format!("{label}_local_after_forced_conflict"),
+        ));
+        assert_eq!(preserved, serde_json::json!([local]));
+    }
 }
 
 /// Test 1: Add single comment, verify in list
@@ -713,7 +1395,7 @@ fn e2e_comments_colliding_ids_from_two_clones_import_on_both_sides() {
             std::fs::copy(&src, beads_b.join(name)).expect("copy tracked beads file");
         }
     }
-    let warm_b = run_br(&clone_b, ["list"], "list_b_rebuild");
+    let warm_b = run_br(&clone_b, ["sync", "--import-only"], "sync_b_rebuild");
     assert!(
         warm_b.status.success(),
         "clone B rebuild failed: {}",

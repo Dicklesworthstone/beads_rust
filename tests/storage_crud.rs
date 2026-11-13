@@ -257,6 +257,7 @@ fn comments_with_same_timestamp_are_ordered_by_id() {
                     author: "reviewer".to_string(),
                     body: "second by id".to_string(),
                     created_at,
+                    revision: None,
                 },
                 Comment {
                     id: 10,
@@ -264,6 +265,7 @@ fn comments_with_same_timestamp_are_ordered_by_id() {
                     author: "reviewer".to_string(),
                     body: "first by id".to_string(),
                     created_at,
+                    revision: None,
                 },
             ],
         )

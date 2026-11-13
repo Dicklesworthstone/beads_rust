@@ -2469,12 +2469,66 @@ pub struct CommentsArgs {
     /// Wrap long lines instead of truncating in text output
     #[arg(long)]
     pub wrap: bool,
+
+    /// Include text-free deletion markers when listing comments
+    #[arg(long)]
+    pub include_deleted: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum CommentCommands {
+    /// Add a comment
     Add(CommentAddArgs),
+    /// List comments and their local IDs
     List(CommentListArgs),
+    /// Edit active text, preserving identity and original authorship
+    Edit(CommentEditArgs),
+    /// Permanently remove text, retaining a visible redaction marker
+    Redact(CommentModifyArgs),
+    /// Logically delete a comment, retaining a text-free sync tombstone
+    Delete(CommentModifyArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CommentModifyArgs {
+    /// Issue ID
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+
+    /// Local comment ID from `br comments list <issue> --json`
+    #[arg(value_parser = clap::value_parser!(i64).range(1..))]
+    pub comment_id: i64,
+
+    /// Require this revision head; refuse a stale modification
+    #[arg(long)]
+    pub if_revision: Option<String>,
+
+    /// Explicitly modify another author's comment (recorded in the audit)
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CommentEditArgs {
+    #[command(flatten)]
+    pub target: CommentModifyArgs,
+
+    /// Replacement text
+    #[arg(conflicts_with_all = ["file", "message"])]
+    pub text: Vec<String>,
+
+    /// Read replacement text from a file, or use - for stdin
+    #[arg(short = 'f', long = "file", conflicts_with = "message")]
+    pub file: Option<PathBuf>,
+
+    /// Replacement text (alternative flag)
+    #[arg(
+        long = "message",
+        short = 'm',
+        visible_alias = "content",
+        allow_hyphen_values = true
+    )]
+    pub message: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -2513,6 +2567,10 @@ pub struct CommentListArgs {
     /// Wrap long lines instead of truncating in text output
     #[arg(long)]
     pub wrap: bool,
+
+    /// Include text-free deletion markers
+    #[arg(long)]
+    pub include_deleted: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -4009,6 +4067,62 @@ mod tests {
     use tempfile::TempDir;
 
     const CLI_REFERENCE: &str = include_str!("../../docs/CLI_REFERENCE.md");
+
+    #[test]
+    fn comment_modification_arguments_reject_invalid_targets_and_competing_text() {
+        for args in [
+            vec!["br", "comments", "redact", "bd-123", "0"],
+            vec!["br", "comments", "delete", "bd-123", "-1"],
+            vec![
+                "br",
+                "comments",
+                "edit",
+                "bd-123",
+                "7",
+                "text",
+                "--message",
+                "other",
+            ],
+            vec![
+                "br",
+                "comments",
+                "edit",
+                "bd-123",
+                "7",
+                "--file",
+                "-",
+                "--message",
+                "other",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let cli = Cli::parse_from([
+            "br",
+            "--actor",
+            "alice",
+            "comments",
+            "edit",
+            "bd-123",
+            "7",
+            "--file",
+            "-",
+            "--if-revision",
+            "head",
+            "--force",
+            "--json",
+        ]);
+        let Commands::Comments(args) = cli.command else {
+            panic!("comments command")
+        };
+        let Some(super::CommentCommands::Edit(edit)) = args.command else {
+            panic!("edit command")
+        };
+        assert_eq!(edit.target.comment_id, 7);
+        assert_eq!(edit.target.if_revision.as_deref(), Some("head"));
+        assert!(edit.target.force);
+        assert_eq!(edit.file.as_deref(), Some(std::path::Path::new("-")));
+    }
 
     #[test]
     fn gate_override_flags_require_a_positive_history_id_and_reason() {

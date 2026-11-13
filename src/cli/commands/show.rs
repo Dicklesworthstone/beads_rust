@@ -1487,7 +1487,10 @@ fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> 
                 "  [{}] {}: {}",
                 comment.created_at.format("%Y-%m-%d %H:%M UTC"),
                 sanitize_terminal_inline(&comment.author),
-                wrap_body(sanitize_terminal_text(&comment.body).as_ref(), wrap_width)
+                wrap_body(
+                    sanitize_terminal_text(comment.display_body()).as_ref(),
+                    wrap_width
+                )
             );
         }
     }
@@ -1758,6 +1761,7 @@ mod tests {
                 author: "alice".to_string(),
                 body: "Looks good".to_string(),
                 created_at: Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 0).unwrap(),
+                revision: None,
             }],
             events: Vec::new(),
             parent: None,
@@ -1856,6 +1860,7 @@ mod tests {
             author: "alice".to_string(),
             body: "Investigating".to_string(),
             created_at: Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 0).unwrap(),
+            revision: None,
         }];
         child.dependencies = vec![Dependency {
             issue_id: "bd-child".to_string(),

@@ -623,6 +623,17 @@ See the [migration reference](docs/CLI_REFERENCE.md#doctor) for eligibility and 
 |---------|-------------|---------|
 | `comments add` | Add comment | `br comments add br-abc123 "Found root cause"` |
 | `comments list` | List comments | `br comments list br-abc123` |
+| `comments edit` | Replace an active comment's text | `br comments edit br-abc123 7 "Corrected summary"` |
+| `comments redact` | Remove text, keeping a visible marker | `br comments redact br-abc123 7` |
+| `comments delete` | Logically delete, keeping a sync marker | `br comments delete br-abc123 7` |
+
+Comment mutations preserve the original author and record the modifying actor.
+They require the original author or an explicit `--force` ownership override;
+`--if-revision <HEAD>` guards against a stale edit. Redacted and deleted bodies
+remain empty when older comments are imported. Deletion is logical because its
+marker must survive synchronization. Current-record changes do **not** erase
+existing Git history or backups. See the [comment command reference](docs/CLI_REFERENCE.md#comments)
+for revision checks, actor semantics, and privacy limitations.
 
 ### Planning & Reporting
 
@@ -1244,7 +1255,10 @@ ancestor holds but the JSONL lacks was deleted on that side, and a change made
 only in the JSONL is taken without an `AmbiguousBase` stop. A path outside
 `.beads/` needs `--allow-external-jsonl`; a path inside `.git/` is refused.
 
-Comments are append-only, so the merge keeps every comment either side added.
+Comment additions are combined by portable identity. Sequential edits follow
+their revision ancestry; concurrent active edits produce a conflict. Redaction
+and deletion markers suppress older text regardless of clocks or issue winner
+flags. See [comment revision safety](docs/SYNC_SAFETY.md#comment-revisions-and-privacy).
 Two clones can also mint the same id for different issues (child ids such as
 `<parent>.1` come from each database's own counter). The merge treats a
 different `created_at` as a different issue: the earlier one keeps the id, the
