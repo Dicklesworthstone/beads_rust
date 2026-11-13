@@ -102,7 +102,7 @@
           meta = with pkgs.lib; {
             description = "Agent-first issue tracker (SQLite + JSONL)";
             homepage = "https://github.com/Dicklesworthstone/beads_rust";
-            license = licenses.unfree;
+            license = licenses.unfreeRedistributable;
             mainProgram = "br";
             platforms = platforms.unix;
           };
