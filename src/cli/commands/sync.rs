@@ -37,8 +37,9 @@ use crate::sync::{
     refresh_base_snapshot_from_flushed_jsonl_snapshot_under_authority,
     require_safe_sync_overwrite_path, require_valid_sync_path, restore_tombstones_after_rebuild,
     salvage_invalid_jsonl_records_under_authority, scan_jsonl_snapshot_for_tombstone_filter,
-    snapshot_tombstones, three_way_merge, tombstones_missing_from_jsonl_tombstones,
-    validate_no_git_path, validate_sync_path_with_external,
+    snapshot_dirty_live_issues, snapshot_tombstones, three_way_merge,
+    tombstones_missing_from_jsonl_tombstones, validate_no_git_path,
+    validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
 use rich_rust::prelude::*;
@@ -224,6 +225,10 @@ pub struct ImportResultOutput {
     pub updated: usize,
     pub skipped: usize,
     pub tombstone_skipped: usize,
+    /// Protected tombstones that gained compatible historical facts.
+    /// Included in `updated`; never represents a resurrection.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub tombstone_enriched: usize,
     pub orphans_removed: usize,
     pub blocked_cache_rebuilt: bool,
     /// Byte-identical repeated comment objects removed during import. A
@@ -3591,6 +3596,7 @@ fn emit_auto_rebuild_import_result(
         updated: 0,
         skipped: 0,
         tombstone_skipped: 0,
+        tombstone_enriched: 0,
         orphans_removed: 0,
         blocked_cache_rebuilt: true,
         exact_duplicate_comments_deduplicated: 0,
@@ -3688,6 +3694,7 @@ fn execute_import(
                 updated: 0,
                 skipped: 0,
                 tombstone_skipped: 0,
+                tombstone_enriched: 0,
                 orphans_removed: 0,
                 blocked_cache_rebuilt: false,
                 exact_duplicate_comments_deduplicated: 0,
@@ -3858,6 +3865,7 @@ fn execute_import(
                         updated: 0,
                         skipped: 0,
                         tombstone_skipped: 0,
+                        tombstone_enriched: 0,
                         orphans_removed: 0,
                         blocked_cache_rebuilt: false,
                         exact_duplicate_comments_deduplicated: 0,
@@ -3923,13 +3931,14 @@ fn execute_import(
         None
     };
 
-    let preserved_tombstones = if args.force || args.rebuild {
-        tombstones_missing_from_jsonl_tombstones(
-            snapshot_tombstones(storage),
-            jsonl_filter
-                .as_ref()
-                .expect("force/rebuild imports should precompute JSONL tombstone filter"),
-        )
+    let preserved_tombstones = if let Some(filter) = &jsonl_filter {
+        let mut candidates = snapshot_tombstones(storage);
+        candidates.extend(
+            snapshot_dirty_live_issues(storage)
+                .into_iter()
+                .filter(|entry| filter.tombstone_ids.contains(&entry.issue.id)),
+        );
+        tombstones_missing_from_jsonl_tombstones(candidates, source)?
     } else {
         Vec::new()
     };
@@ -3990,6 +3999,7 @@ fn execute_import(
         created_or_updated = import_result.imported_count,
         skipped = import_result.skipped_count,
         tombstone_skipped = import_result.tombstone_skipped,
+        tombstone_enriched = import_result.tombstone_enriched,
         "Import complete"
     );
 
@@ -4151,6 +4161,7 @@ fn execute_import(
         updated: import_result.updated_count,
         skipped: import_result.skipped_count,
         tombstone_skipped: import_result.tombstone_skipped,
+        tombstone_enriched: import_result.tombstone_enriched,
         orphans_removed: import_result.orphans_removed,
         blocked_cache_rebuilt: true,
         exact_duplicate_comments_deduplicated: import_result.exact_duplicate_comments_deduplicated,
@@ -4207,6 +4218,12 @@ fn execute_import(
         }
         if result.tombstone_skipped > 0 {
             println!("  Tombstone protected: {} issues", result.tombstone_skipped);
+        }
+        if result.tombstone_enriched > 0 {
+            println!(
+                "  Tombstone history enriched: {} issues (still deleted)",
+                result.tombstone_enriched
+            );
         }
         if result.orphans_removed > 0 {
             println!(
@@ -4349,6 +4366,13 @@ fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
     if result.tombstone_skipped > 0 {
         text.append_styled("Tombstone protected ", theme.dimmed.clone());
         text.append(&result.tombstone_skipped.to_string());
+        text.append("\n");
+    }
+
+    if result.tombstone_enriched > 0 {
+        text.append_styled("Tombstone history enriched ", theme.dimmed.clone());
+        text.append(&result.tombstone_enriched.to_string());
+        text.append_styled(" (still deleted)", theme.muted.clone());
         text.append("\n");
     }
 
@@ -5768,7 +5792,8 @@ fn execute_merge(
     );
 
     if report.has_conflicts() {
-        // Require an explicit merge winner instead of guessing when both sides changed.
+        // Ordinary row conflicts need an explicit winner; contradictory
+        // historical facts remain protected under every winner strategy.
         if ctx.is_rich() {
             render_merge_conflicts_rich(&report.conflicts, ctx);
         }
@@ -5776,6 +5801,11 @@ fn execute_merge(
         for (id, kind) in &report.conflicts {
             use std::fmt::Write;
             let _ = writeln!(msg, "  - {id}: {kind:?}");
+            if *kind == crate::sync::ConflictType::TombstoneHistory {
+                for (_, detail) in report.notes.iter().filter(|(note_id, _)| note_id == id) {
+                    let _ = writeln!(msg, "    {detail}");
+                }
+            }
         }
         if report
             .conflicts
@@ -5784,7 +5814,15 @@ fn execute_merge(
         {
             msg.push_str("\nbeads.base.jsonl is the last local export, not a proven common ancestor. A differing JSONL row with an older or equal timestamp may be an older export or a clock-skewed edit; neither version was discarded.\n");
         }
-        msg.push_str("\nUse --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
+        if report
+            .conflicts
+            .iter()
+            .any(|(_, kind)| *kind == crate::sync::ConflictType::TombstoneHistory)
+        {
+            msg.push_str("\nNo merge changes were applied. Preserve the database, incoming JSONL, and base snapshot, then reconcile the contradictory historical fields explicitly; force flags cannot discard this evidence.");
+        } else {
+            msg.push_str("\nUse --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
+        }
         return Err(BeadsError::Config(msg));
     }
 
@@ -5935,7 +5973,14 @@ fn render_merge_conflicts_rich(
 
     text.append("\n");
     text.append_styled("Hint: ", theme.dimmed.clone());
-    text.append("Use --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
+    if conflicts
+        .iter()
+        .any(|(_, kind)| *kind == crate::sync::ConflictType::TombstoneHistory)
+    {
+        text.append("Preserve the database, incoming JSONL, and base snapshot, then reconcile the contradictory tombstone history explicitly; force flags cannot discard this evidence.");
+    } else {
+        text.append("Use --force-db to keep local DB changes, --force-jsonl to keep JSONL changes, or --force to keep the newer timestamp.");
+    }
 
     let panel = rich_text_panel(&text, ctx.width())
         .title(Text::new("Merge Conflicts"))
@@ -7454,25 +7499,38 @@ mod tests {
 
     #[test]
     fn test_tombstones_missing_from_jsonl_tombstones_only_skips_already_flushed_deletions() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut shared = make_test_issue("bd-in-jsonl", "in jsonl");
+        shared.status = Status::Tombstone;
+        shared.created_at = at;
+        shared.updated_at = at;
+        shared.deleted_at = Some(at);
+        shared.labels = vec!["jsonl".to_string()];
         let in_jsonl = PreservedIssue {
-            issue: make_test_issue("bd-in-jsonl", "in jsonl"),
-            labels: Some(vec!["jsonl".to_string()]),
+            issue: shared.clone(),
+            labels: Some(shared.labels.clone()),
             dependencies: Some(Vec::new()),
             comments: Some(Vec::new()),
         };
+        let mut missing_issue = shared.clone();
+        missing_issue.id = "bd-missing".to_string();
+        missing_issue.title = "missing".to_string();
         let missing = PreservedIssue {
-            issue: make_test_issue("bd-missing", "missing"),
+            issue: missing_issue,
             labels: Some(vec!["local".to_string()]),
             dependencies: Some(Vec::new()),
             comments: Some(Vec::new()),
         };
 
-        let filter = crate::sync::JsonlTombstoneFilter {
-            tombstone_ids: HashSet::from(["bd-in-jsonl".to_string()]),
-            non_tombstone_updated_at: std::collections::HashMap::new(),
-        };
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("issues.jsonl");
+        fs::write(&path, serde_json::to_string(&shared).unwrap()).unwrap();
+        let source = capture_jsonl_source_snapshot(&path).unwrap();
         let filtered =
-            tombstones_missing_from_jsonl_tombstones(vec![in_jsonl, missing.clone()], &filter);
+            tombstones_missing_from_jsonl_tombstones(vec![in_jsonl, missing.clone()], &source)
+                .unwrap();
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].issue.id, "bd-missing");
@@ -7490,10 +7548,18 @@ mod tests {
         use crate::model::Status;
         use chrono::{Duration, Utc};
 
-        let jsonl_updated_at = Utc::now();
+        let jsonl_updated_at = chrono::DateTime::parse_from_rfc3339("2026-11-12T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let mut old_local_tombstone = make_test_issue("bd-contested-older", "older local delete");
         old_local_tombstone.status = Status::Tombstone;
+        old_local_tombstone.created_at = jsonl_updated_at - Duration::days(1);
+        old_local_tombstone.updated_at = jsonl_updated_at - Duration::hours(1);
         old_local_tombstone.deleted_at = Some(jsonl_updated_at - Duration::hours(1));
+        let mut old_incoming = old_local_tombstone.clone();
+        old_incoming.status = Status::Open;
+        old_incoming.deleted_at = None;
+        old_incoming.updated_at = jsonl_updated_at;
         let old_local_preserved = PreservedIssue {
             issue: old_local_tombstone,
             labels: None,
@@ -7503,7 +7569,13 @@ mod tests {
 
         let mut new_local_tombstone = make_test_issue("bd-contested-newer", "newer local delete");
         new_local_tombstone.status = Status::Tombstone;
+        new_local_tombstone.created_at = jsonl_updated_at - Duration::days(1);
+        new_local_tombstone.updated_at = jsonl_updated_at + Duration::hours(1);
         new_local_tombstone.deleted_at = Some(jsonl_updated_at + Duration::hours(1));
+        let mut new_incoming = new_local_tombstone.clone();
+        new_incoming.status = Status::Open;
+        new_incoming.deleted_at = None;
+        new_incoming.updated_at = jsonl_updated_at;
         let new_local_preserved = PreservedIssue {
             issue: new_local_tombstone,
             labels: None,
@@ -7511,19 +7583,24 @@ mod tests {
             comments: None,
         };
 
-        let mut non_tombstone_map = std::collections::HashMap::new();
-        non_tombstone_map.insert("bd-contested-older".to_string(), jsonl_updated_at);
-        non_tombstone_map.insert("bd-contested-newer".to_string(), jsonl_updated_at);
-
-        let filter = crate::sync::JsonlTombstoneFilter {
-            tombstone_ids: HashSet::new(),
-            non_tombstone_updated_at: non_tombstone_map,
-        };
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("issues.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&old_incoming).unwrap(),
+                serde_json::to_string(&new_incoming).unwrap()
+            ),
+        )
+        .unwrap();
+        let source = capture_jsonl_source_snapshot(&path).unwrap();
 
         let filtered = tombstones_missing_from_jsonl_tombstones(
             vec![old_local_preserved, new_local_preserved],
-            &filter,
-        );
+            &source,
+        )
+        .unwrap();
 
         assert_eq!(filtered.len(), 2);
         let filtered_ids: HashSet<_> = filtered

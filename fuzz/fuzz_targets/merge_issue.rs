@@ -458,6 +458,11 @@ fn assert_no_silent_conflict_resolution(
                         .to_string(),
                 );
             }
+            ConflictType::TombstoneHistory => {
+                return Err(
+                    "scalar merge unexpectedly reported a protected-history conflict".to_string(),
+                );
+            }
             ConflictType::BothModified | ConflictType::ConvergentCreation => {
                 let expected = newer_issue(case.local.as_ref(), case.external.as_ref());
                 assert_kept_matches(result, expected, "prefer-newer conflict winner")?;

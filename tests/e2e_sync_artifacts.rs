@@ -1718,6 +1718,232 @@ fn e2e_sync_import_compacts_when_the_freelist_passes_the_threshold() {
     );
 }
 
+fn tombstone_history_rebuild_fixture(
+    conflicting_closure: bool,
+) -> (
+    BrWorkspace,
+    beads_rust::model::Issue,
+    beads_rust::model::Issue,
+) {
+    use beads_rust::model::{Issue, Status};
+    use beads_rust::storage::SqliteStorage;
+    use chrono::{DateTime, Utc};
+
+    let at = |value: &str| {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    };
+    let workspace = BrWorkspace::new();
+    let init = run_br(
+        &workspace,
+        ["init", "--prefix", "bd"],
+        "init_history_rebuild",
+    );
+    assert!(init.status.success(), "{}", init.stderr);
+    let beads_dir = workspace.root.join(".beads");
+    let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).unwrap();
+    let mut closed = Issue {
+        id: "bd-dirty-close".to_string(),
+        title: "Unflushed local completion".to_string(),
+        created_at: at("2026-11-10T10:00:00Z"),
+        updated_at: at("2026-11-11T12:00:00Z"),
+        ..Issue::default()
+    };
+    storage.create_issue(&closed, "fixture").unwrap();
+    closed.status = Status::Closed;
+    closed.closed_at = Some(at("2026-11-11T10:00:00Z"));
+    closed.close_reason = Some("Verified locally before peer deletion".to_string());
+    closed.closed_by = Some("local-reviewer".to_string());
+    closed.closed_by_session = Some("local-session".to_string());
+    storage.upsert_issue_for_import(&closed).unwrap();
+
+    let clean_live = Issue {
+        id: "bd-clean-live".to_string(),
+        title: "Clean local scalar fields".to_string(),
+        created_at: closed.created_at,
+        updated_at: at("2026-11-12T12:00:00Z"),
+        ..Issue::default()
+    };
+    storage.create_issue(&clean_live, "fixture").unwrap();
+    storage
+        .clear_dirty_flags(std::slice::from_ref(&clean_live.id))
+        .unwrap();
+    let dirty_live = Issue {
+        id: "bd-dirty-live".to_string(),
+        title: "Unflushed local scalar fields".to_string(),
+        ..clean_live.clone()
+    };
+    storage.create_issue(&dirty_live, "fixture").unwrap();
+    let closed = storage.get_issue_for_export(&closed.id).unwrap().unwrap();
+    assert!(storage.get_dirty_issue_ids().unwrap().contains(&closed.id));
+    drop(storage);
+
+    let incoming = Issue {
+        id: closed.id.clone(),
+        title: "Deletion title from JSONL".to_string(),
+        status: Status::Tombstone,
+        created_at: closed.created_at,
+        updated_at: at("2026-11-12T10:00:00Z"),
+        closed_at: conflicting_closure.then(|| at("2026-11-11T11:00:00Z")),
+        deleted_at: Some(at("2026-11-12T10:00:00Z")),
+        deleted_by: Some("peer-deleter".to_string()),
+        delete_reason: Some("Retired on another machine".to_string()),
+        original_type: Some("task".to_string()),
+        ..Issue::default()
+    };
+    let source_clean_live = Issue {
+        title: "Clean live title from JSONL".to_string(),
+        updated_at: at("2026-11-11T09:00:00Z"),
+        ..clean_live
+    };
+    let source_dirty_live = Issue {
+        title: "Dirty live title from JSONL".to_string(),
+        updated_at: at("2026-11-11T09:00:00Z"),
+        ..dirty_live
+    };
+    let content = [&incoming, &source_clean_live, &source_dirty_live]
+        .into_iter()
+        .map(|issue| serde_json::to_string(issue).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(beads_dir.join("issues.jsonl"), format!("{content}\n")).unwrap();
+    (workspace, closed, incoming)
+}
+
+#[test]
+fn e2e_forced_rebuild_preserves_dirty_closure_in_incoming_tombstone() {
+    use beads_rust::model::Status;
+    use beads_rust::storage::SqliteStorage;
+
+    let _log = common::test_log("e2e_forced_rebuild_preserves_dirty_closure_in_incoming_tombstone");
+    for mode in ["--force", "--rebuild"] {
+        let (workspace, local, incoming) = tombstone_history_rebuild_fixture(false);
+        let beads_dir = workspace.root.join(".beads");
+        let source_path = beads_dir.join("issues.jsonl");
+        let source_before = fs::read(&source_path).unwrap();
+        let result = run_br(
+            &workspace,
+            [
+                "sync",
+                "--import-only",
+                mode,
+                "--no-auto-import",
+                "--no-auto-flush",
+            ],
+            "rebuild_history",
+        );
+        assert!(result.status.success(), "{mode}: {}", result.stderr);
+        assert_eq!(fs::read(&source_path).unwrap(), source_before);
+        let storage = SqliteStorage::open(&beads_dir.join("beads.db")).unwrap();
+        let restored = storage.get_issue_for_export(&local.id).unwrap().unwrap();
+        assert_eq!(restored.status, Status::Tombstone);
+        assert_eq!(restored.title, incoming.title);
+        assert_eq!(restored.closed_at, local.closed_at);
+        assert_eq!(restored.close_reason, local.close_reason);
+        assert_eq!(restored.closed_by, local.closed_by);
+        assert_eq!(restored.closed_by_session, local.closed_by_session);
+        assert_eq!(restored.deleted_at, incoming.deleted_at);
+        assert_eq!(restored.deleted_by, incoming.deleted_by);
+        assert_eq!(restored.delete_reason, incoming.delete_reason);
+        assert_eq!(restored.updated_at, incoming.updated_at);
+        // Existing rebuild semantics retain newer dirty live rows (#394),
+        // while force import takes their ordinary fields from JSONL.
+        let mut expected_dirty = std::collections::BTreeSet::from([local.id.clone()]);
+        let dirty_live_title = if mode == "--rebuild" {
+            expected_dirty.insert("bd-dirty-live".to_string());
+            "Unflushed local scalar fields"
+        } else {
+            "Dirty live title from JSONL"
+        };
+        assert_eq!(
+            storage
+                .get_dirty_issue_ids()
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_dirty
+        );
+        for (id, title) in [
+            ("bd-clean-live", "Clean live title from JSONL"),
+            ("bd-dirty-live", dirty_live_title),
+        ] {
+            assert_eq!(storage.get_issue(id).unwrap().unwrap().title, title);
+        }
+        drop(storage);
+
+        let flush = run_br(
+            &workspace,
+            ["sync", "--flush-only", "--no-auto-import"],
+            "export_recovered_history",
+        );
+        assert!(flush.status.success(), "{mode}: {}", flush.stderr);
+        let exported = beads_rust::sync::read_issues_from_jsonl(&source_path).unwrap();
+        let exported = exported.iter().find(|issue| issue.id == local.id).unwrap();
+        assert!(exported.sync_equals(&restored));
+        assert_eq!(exported.updated_at, restored.updated_at);
+    }
+}
+
+#[test]
+fn e2e_forced_rebuild_refuses_conflicting_dirty_closure_before_replacement() {
+    use beads_rust::storage::SqliteStorage;
+
+    let _log =
+        common::test_log("e2e_forced_rebuild_refuses_conflicting_dirty_closure_before_replacement");
+    for mode in ["--force", "--rebuild"] {
+        let (workspace, local, _) = tombstone_history_rebuild_fixture(true);
+        let beads_dir = workspace.root.join(".beads");
+        let source_path = beads_dir.join("issues.jsonl");
+        let source_before = fs::read(&source_path).unwrap();
+        let before_storage = SqliteStorage::open(&beads_dir.join("beads.db")).unwrap();
+        let dirty_before = before_storage
+            .get_dirty_issue_ids()
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        drop(before_storage);
+        let result = run_br(
+            &workspace,
+            [
+                "sync",
+                "--import-only",
+                mode,
+                "--no-auto-import",
+                "--no-auto-flush",
+            ],
+            "refuse_history_conflict",
+        );
+        assert!(
+            !result.status.success(),
+            "{mode} must not discard either closure"
+        );
+        assert!(result.stderr.contains("closed_at"), "{}", result.stderr);
+        assert_eq!(fs::read(&source_path).unwrap(), source_before);
+        let storage = SqliteStorage::open(&beads_dir.join("beads.db")).unwrap();
+        assert_eq!(
+            storage.get_issue_for_export(&local.id).unwrap().unwrap(),
+            local
+        );
+        assert_eq!(
+            storage
+                .get_dirty_issue_ids()
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            dirty_before
+        );
+        assert_eq!(
+            storage.get_issue("bd-clean-live").unwrap().unwrap().title,
+            "Clean local scalar fields"
+        );
+        assert_eq!(
+            storage.get_issue("bd-dirty-live").unwrap().unwrap().title,
+            "Unflushed local scalar fields"
+        );
+    }
+}
+
 /// Invoke the C `sqlite3` CLI to run `PRAGMA integrity_check` against the
 /// given database.  Returns stdout verbatim (expected to be "ok\n" for a
 /// clean DB).  If the binary is missing the test falls back to the string

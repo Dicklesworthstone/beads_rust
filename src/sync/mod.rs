@@ -3943,8 +3943,11 @@ pub struct ImportResult {
     pub updated_count: usize,
     /// Number of issues skipped.
     pub skipped_count: usize,
-    /// Number of tombstones skipped.
+    /// Number of protected tombstones kept without historical enrichment.
     pub tombstone_skipped: usize,
+    /// Protected tombstones enriched without changing their deleted status.
+    /// These rows are also included in `updated_count` and `imported_count`.
+    pub tombstone_enriched: usize,
     /// Conflict markers detected (if any).
     pub conflict_markers: Vec<ConflictMarker>,
     /// Number of orphaned DB entries removed during --rebuild.
@@ -11268,6 +11271,87 @@ fn read_jsonl_lines_by_id(source: &JsonlSourceSnapshot) -> Result<BTreeMap<Strin
     Ok(lines_by_id)
 }
 
+/// Check facts, not content hashes, before replacing or omitting a tombstone.
+/// Hashes deliberately omit deletion metadata and cannot authorize its loss.
+fn verify_tombstone_export_history(
+    storage: &SqliteStorage,
+    source: &JsonlSourceSnapshot,
+    protected_ids: &HashSet<String>,
+) -> Result<()> {
+    if protected_ids.is_empty() {
+        return Ok(());
+    }
+    let mut reader = source.reader();
+    let mut line = String::new();
+    let mut batch = Vec::with_capacity(EXPORT_ISSUE_BATCH_SIZE);
+    while reader.read_line(&mut line)? > 0 {
+        // Existing export guards own malformed-source handling and explicit
+        // force repair. Only identifiable protected rows need this additional
+        // check; a malformed protected row itself still fails closed.
+        if let Ok(partial) = serde_json::from_str::<PartialId>(line.trim())
+            && protected_ids.contains(&partial.id)
+        {
+            let issue: Issue =
+                serde_json::from_str(line.trim()).map_err(|error| BeadsError::SyncConflict {
+                    message: format!(
+                        "Cannot verify tombstone history for '{}' before export: {error}",
+                        partial.id
+                    ),
+                })?;
+            batch.push(issue);
+            if batch.len() >= EXPORT_ISSUE_BATCH_SIZE {
+                verify_tombstone_export_history_batch(storage, &batch)?;
+                batch.clear();
+            }
+        }
+        line.clear();
+    }
+    verify_tombstone_export_history_batch(storage, &batch)
+}
+
+fn verify_tombstone_export_history_batch(
+    storage: &SqliteStorage,
+    previous: &[Issue],
+) -> Result<()> {
+    if previous.is_empty() {
+        return Ok(());
+    }
+    let ids = previous
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let actual = storage
+        .get_issues_for_export(&ids)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
+    for evidence in previous {
+        let stored = actual
+            .get(&evidence.id)
+            .ok_or_else(|| BeadsError::SyncConflict {
+                message: format!(
+                    "Protected tombstone '{}' disappeared before export",
+                    evidence.id
+                ),
+            })?;
+        let joined = merge_tombstone_history(stored, evidence)?;
+        if !stored.sync_equals(&joined)
+            || stored.created_at != joined.created_at
+            || stored.updated_at != joined.updated_at
+            || stored.agent_context != joined.agent_context
+            || !same_tombstone_audit_evidence(stored, &joined)
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing to export tombstone '{}' with less historical evidence than the existing JSONL. Run `br sync --import-only` to preserve the missing facts before exporting; force does not waive this check",
+                    evidence.id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn export_issue_ids(storage: &SqliteStorage) -> Result<Vec<String>> {
     let rows = storage.execute_raw_query(
         r"SELECT id
@@ -11860,6 +11944,16 @@ fn export_to_jsonl_with_policy_expected_authority(
 
     // Get sorted export IDs up front for safety checks and bounded batch hydration.
     let export_ids = export_issue_ids(storage)?;
+
+    if let Some(previous_source) = previous_source {
+        let (mut protected_ids, expired) =
+            storage.get_tombstone_retention_ids_at(config.retention_days, export_as_of)?;
+        // Retention can omit a row from JSONL only after its available history
+        // is preserved in the database. Explicit purges have no database row
+        // and retain their existing omission semantics.
+        protected_ids.extend(expired);
+        verify_tombstone_export_history(storage, previous_source, &protected_ids)?;
+    }
 
     // Fetch dirty metadata for safe clearing later
     let dirty_metadata = storage.get_dirty_issue_metadata()?;
@@ -14534,6 +14628,26 @@ fn try_incremental_auto_flush(
         export_config.retention_days,
         export_as_of,
     )?;
+    let mut protected_ids: HashSet<_> = changes
+        .replacement_lines
+        .iter()
+        .filter_map(|(id, line)| {
+            serde_json::from_str::<Issue>(line)
+                .ok()
+                .filter(|issue| issue.status == crate::model::Status::Tombstone)
+                .map(|_| id.clone())
+        })
+        .collect();
+    for ids in changes.removed_hash_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
+        protected_ids.extend(
+            storage
+                .get_issues_by_ids(ids)?
+                .into_iter()
+                .filter(|issue| issue.status == crate::model::Status::Tombstone)
+                .map(|issue| issue.id),
+        );
+    }
+    verify_tombstone_export_history(storage, &source, &protected_ids)?;
     certify_incremental_source_changes(storage, &source, &mut changes)?;
 
     if retained_lines.is_none()
@@ -14931,6 +15045,214 @@ pub enum CollisionAction {
     },
 }
 
+fn same_tombstone_audit_evidence(left: &Issue, right: &Issue) -> bool {
+    (left.bypassed_policy == Some(true)) == (right.bypassed_policy == Some(true))
+        && left
+            .bypass_reason
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            == right
+                .bypass_reason
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        && left
+            .policy_gates_fired
+            .iter()
+            .flatten()
+            .collect::<BTreeSet<_>>()
+            == right
+                .policy_gates_fired
+                .iter()
+                .flatten()
+                .collect::<BTreeSet<_>>()
+}
+
+fn normalize_tombstone_evidence(issue: &mut Issue) {
+    // The wire model defines absent and false as "not bypassed" and exports
+    // only true. Keep its canonical form so a legacy false never demands an
+    // audit record the storage projection intentionally does not emit.
+    if issue.bypassed_policy == Some(false) {
+        issue.bypassed_policy = None;
+    }
+    // Normalize only missing text. A deletion is not proof of a close, and
+    // imported dependency defaults are not permission to replace a named
+    // creator or a supplied metadata document.
+    for field in [
+        &mut issue.created_by,
+        &mut issue.close_reason,
+        &mut issue.closed_by_session,
+        &mut issue.closed_by,
+        &mut issue.closed_by_agent_name,
+        &mut issue.closed_by_harness,
+        &mut issue.closed_by_model,
+        &mut issue.bypass_reason,
+        &mut issue.deleted_by,
+        &mut issue.delete_reason,
+        &mut issue.original_type,
+    ] {
+        if field
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            *field = None;
+        }
+    }
+    for dependency in &mut issue.dependencies {
+        for field in [
+            &mut dependency.created_by,
+            &mut dependency.metadata,
+            &mut dependency.thread_id,
+        ] {
+            if field
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                *field = None;
+            }
+        }
+    }
+}
+
+fn join_tombstone_dependencies(merged: &mut Issue, evidence: &Issue) -> Result<()> {
+    for dependency in &evidence.dependencies {
+        if let Some(known) = merged.dependencies.iter_mut().find(|known| {
+            known.depends_on_id == dependency.depends_on_id && known.dep_type == dependency.dep_type
+        }) {
+            let mut incompatible = known.created_at != dependency.created_at;
+            for (retained, supplied) in [
+                (&mut known.created_by, &dependency.created_by),
+                (&mut known.metadata, &dependency.metadata),
+                (&mut known.thread_id, &dependency.thread_id),
+            ] {
+                match (retained.as_ref(), supplied.as_ref()) {
+                    (None, Some(_)) => retained.clone_from(supplied),
+                    (Some(left), Some(right)) if left != right => incompatible = true,
+                    _ => {}
+                }
+            }
+            if incompatible {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Tombstone history conflict for '{}' in dependencies: refusing to discard relationship evidence for '{}' ({})",
+                        merged.id, dependency.depends_on_id, dependency.dep_type
+                    ),
+                });
+            }
+        } else {
+            merged.dependencies.push(dependency.clone());
+        }
+    }
+    merged.dependencies.sort_by(|left, right| {
+        (&left.depends_on_id, left.dep_type.as_str())
+            .cmp(&(&right.depends_on_id, right.dep_type.as_str()))
+    });
+    for dependency in &mut merged.dependencies {
+        dependency
+            .created_by
+            .get_or_insert_with(|| "import".to_string());
+        dependency.metadata.get_or_insert_with(|| "{}".to_string());
+        dependency.thread_id.get_or_insert_with(String::new);
+    }
+    Ok(())
+}
+
+/// Join compatible historical facts without resurrecting a deleted issue.
+///
+/// A row's revision timestamp does not order its individual historical facts:
+/// an older peer can know who closed an issue that a newer peer deleted while
+/// it was still open. Missing fields therefore never erase known evidence.
+/// Contradictory facts cannot be represented by the single-valued issue
+/// schema; refuse them instead of inventing an event or silently electing a
+/// timestamp, reason, or actor. Callers must keep both inputs on failure.
+/// Ordinary issue fields follow the caller's existing choice of `preferred`.
+pub(crate) fn merge_tombstone_history(preferred: &Issue, other: &Issue) -> Result<Issue> {
+    use crate::model::Status;
+
+    if preferred.status != Status::Tombstone && other.status != Status::Tombstone {
+        return Err(BeadsError::internal(
+            "tombstone history merge requires a deleted issue",
+        ));
+    }
+    if preferred.id != other.id || preferred.created_at != other.created_at {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Tombstone history conflict for '{}': issue identities differ; preserve both copies and resolve the identity before syncing",
+                preferred.id
+            ),
+        });
+    }
+
+    let mut merged = preferred.clone();
+    let mut evidence = other.clone();
+    normalize_tombstone_evidence(&mut merged);
+    normalize_tombstone_evidence(&mut evidence);
+    let mut conflicts = Vec::new();
+    macro_rules! preserve {
+        ($($field:ident),+ $(,)?) => {
+            $(match (&merged.$field, &evidence.$field) {
+                (None, Some(_)) => merged.$field.clone_from(&evidence.$field),
+                (Some(known), Some(supplied)) if known != supplied => {
+                    conflicts.push(stringify!($field));
+                }
+                _ => {}
+            })+
+        };
+    }
+    preserve!(
+        created_by,
+        closed_at,
+        close_reason,
+        closed_by_session,
+        closed_by,
+        closed_by_agent_name,
+        closed_by_harness,
+        closed_by_model,
+        bypassed_policy,
+        bypass_reason,
+        deleted_at,
+        deleted_by,
+        delete_reason,
+        original_type,
+    );
+    if !conflicts.is_empty() {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Tombstone history conflict for '{}' in {}: refusing to discard historical evidence. Preserve both copies and reconcile these facts before syncing; force flags do not resolve historical contradictions",
+                preferred.id,
+                conflicts.join(", ")
+            ),
+        });
+    }
+    if let Some(gates) = &evidence.policy_gates_fired {
+        merged
+            .policy_gates_fired
+            .get_or_insert_with(Vec::new)
+            .extend(gates.iter().cloned());
+    }
+    if let Some(gates) = &mut merged.policy_gates_fired {
+        gates.sort();
+        gates.dedup();
+    }
+    merged.status = Status::Tombstone;
+    merged.updated_at = preferred.updated_at.max(other.updated_at);
+    merged.labels.extend(other.labels.iter().cloned());
+    merged.labels.sort();
+    merged.labels.dedup();
+    join_tombstone_dependencies(&mut merged, &evidence)?;
+    merged.comments = union_comment_lists(&preferred.comments, &other.comments, &preferred.id);
+    if preferred.status == Status::Tombstone
+        && other.status != Status::Tombstone
+        && merged.sync_equals(preferred)
+        && same_tombstone_audit_evidence(&merged, preferred)
+    {
+        // A rejected resurrection with no new evidence cannot advance the
+        // deleted row's revision or make its later export look lossy.
+        merged.updated_at = preferred.updated_at;
+    }
+    merged.content_hash = Some(crate::util::content_hash(&merged));
+    Ok(merged)
+}
+
 /// Detect collision for an incoming issue using the 4-phase algorithm with preloaded metadata maps.
 fn detect_collision(
     incoming: &Issue,
@@ -15267,8 +15589,10 @@ fn normalize_issue(issue: &mut Issue) -> usize {
         issue.ephemeral = true;
     }
 
-    // Repair closed_at invariant: if status is terminal (closed/tombstone), ensure closed_at is set
-    if issue.status.is_terminal() && issue.closed_at.is_none() {
+    // Only a closed issue requires a close timestamp. A tombstone may have
+    // been deleted while open; inventing a close from updated_at destroys the
+    // distinction between missing evidence and a conflicting historical fact.
+    if issue.status == crate::model::Status::Closed && issue.closed_at.is_none() {
         issue.closed_at = Some(issue.updated_at);
     }
 
@@ -16022,6 +16346,12 @@ fn skipped_automatic_import_preserves_source(
 ) -> bool {
     let mut retained = stored.clone();
     let mut expected = incoming.clone();
+    if stored.status == crate::model::Status::Tombstone {
+        expected.id = target_id.to_string();
+        return merge_tombstone_history(&expected, stored).is_ok_and(|joined| {
+            skipped_import_matches_stored_issue(Some(stored), target_id, &joined)
+        });
+    }
     if stored.id == target_id
         && incoming.id == target_id
         && stored.status == crate::model::Status::Closed
@@ -16147,7 +16477,7 @@ fn warn_skipped_import_keeps_local_fields(stored: &Issue, target_id: &str, incom
 }
 
 fn export_hash_entry_for_import_action(
-    skipped: &mut Vec<(String, Issue, String)>,
+    skipped: &mut Vec<(String, Issue, String, bool)>,
     action: &CollisionAction,
     target_id: &str,
     issue: &Issue,
@@ -16157,15 +16487,58 @@ fn export_hash_entry_for_import_action(
         CollisionAction::Insert | CollisionAction::Update { .. } => {
             Some((target_id.to_string(), computed_hash.to_string()))
         }
-        CollisionAction::Skip { .. } => {
+        CollisionAction::Skip { reason, .. } => {
             skipped.push((
                 target_id.to_string(),
                 issue.clone(),
                 computed_hash.to_string(),
+                reason.starts_with("Tombstone"),
             ));
             None
         }
     }
+}
+
+/// Preserve compatible historical evidence in a skipped protected row.
+fn enrich_skipped_tombstone_in_tx(
+    storage: &SqliteStorage,
+    actual: &mut Issue,
+    incoming: &Issue,
+    was_protected: bool,
+    result: &mut ImportResult,
+) -> Result<bool> {
+    let mut evidence = incoming.clone();
+    evidence.id.clone_from(&actual.id);
+    let enriched = merge_tombstone_history(actual, &evidence)?;
+    if actual.sync_equals(&enriched)
+        && actual.updated_at == enriched.updated_at
+        && same_tombstone_audit_evidence(actual, &enriched)
+    {
+        return Ok(false);
+    }
+    storage.upsert_issue_for_import_in_tx(&enriched)?;
+    sync_issue_relations(storage, &enriched)?;
+    if was_protected {
+        result.tombstone_skipped = result.tombstone_skipped.saturating_sub(1);
+    } else {
+        result.skipped_count = result.skipped_count.saturating_sub(1);
+    }
+    result.tombstone_enriched += 1;
+    result.imported_count += 1;
+    result.updated_count += 1;
+    record_imported_relation_counts(result, &enriched);
+    if let Some(expected) = result
+        .applied_issues
+        .iter_mut()
+        .rev()
+        .find(|issue| issue.id == actual.id)
+    {
+        *expected = enriched.clone();
+    } else {
+        result.applied_issues.push(enriched.clone());
+    }
+    *actual = enriched;
+    Ok(true)
 }
 
 /// Certify skips against the complete synced payload, including relations.
@@ -16174,22 +16547,24 @@ fn export_hash_entry_for_import_action(
 #[allow(clippy::too_many_arguments)]
 fn certify_skipped_imports(
     storage: &SqliteStorage,
-    lookup: Option<&ImportIssueLookup>,
+    lookup: &mut Option<ImportIssueLookup>,
     mode: ImportMode,
+    enrich_tombstones: bool,
     close_audit: &mut ImportCloseBypassAudit,
-    applied_issues: &mut [Issue],
-    skipped: &mut Vec<(String, Issue, String)>,
+    result: &mut ImportResult,
+    skipped: &mut Vec<(String, Issue, String, bool)>,
     hashes: &mut Vec<(String, String)>,
     ids: &mut HashSet<String>,
+    invalidated_certificate: &mut bool,
 ) -> Result<usize> {
     if skipped.is_empty() {
         return Ok(0);
     }
     let target_ids = skipped
         .iter()
-        .map(|(id, _, _)| id.clone())
+        .map(|(id, _, _, _)| id.clone())
         .collect::<Vec<_>>();
-    let mut stored = match lookup {
+    let mut stored = match lookup.as_ref() {
         Some(lookup) => storage.get_issues_for_import_comparison(&target_ids, lookup)?,
         None => storage.get_issues_for_import_comparison_live(&target_ids)?,
     };
@@ -16199,14 +16574,26 @@ fn certify_skipped_imports(
         .map(|issue| (issue.id.clone(), issue))
         .collect::<HashMap<_, _>>();
     let mut uncertified = 0;
-    for (id, mut incoming, hash) in skipped.drain(..) {
+    for (id, mut incoming, hash, was_protected) in skipped.drain(..) {
+        if enrich_tombstones
+            && let Some(actual) = stored.get_mut(&id)
+            && actual.status == crate::model::Status::Tombstone
+            && enrich_skipped_tombstone_in_tx(storage, actual, &incoming, was_protected, result)?
+        {
+            *invalidated_certificate |= ids.remove(&id);
+            hashes.retain(|(certified_id, _)| certified_id != &id);
+            // Relation replacement invalidates the row-location index.
+            // Later batches must read the committed-in-transaction rows.
+            *lookup = None;
+            close_audit.record_imported(&id, actual);
+        }
         if let Some(actual) = stored.get_mut(&id)
             && let Some(enriched) = enrich_skipped_closure_attribution(actual, &id, &incoming)
         {
             incoming.id.clone_from(&id);
             storage.persist_imported_close_bypass_audit_in_tx(&incoming)?;
             close_audit.record_imported(&id, &incoming);
-            record_expected_closure_enrichment(applied_issues, &id, &incoming);
+            record_expected_closure_enrichment(&mut result.applied_issues, &id, &incoming);
             *actual = enriched;
         }
         if !skipped_import_matches_stored_issue(stored.get(&id), &id, &incoming) {
@@ -16327,6 +16714,7 @@ fn stream_import_actions_in_tx(
     let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
     let mut export_hash_ids = HashSet::new();
     let mut source_target_ids = HashSet::new();
+    let mut imported_tombstone_ids = HashSet::new();
     let mut uncertified_local_wins = 0usize;
     let mut invalidated_certificate = false;
     let mut skipped = Vec::new();
@@ -16452,9 +16840,54 @@ fn stream_import_actions_in_tx(
 
             apply_collision_renames(&mut issue, collision_renames);
 
+            // Apply preceding skipped aliases before reading a current row
+            // for historical union. Otherwise this update could overwrite
+            // evidence enriched by an earlier alias in the same transaction.
+            if !matches!(action, CollisionAction::Skip { .. }) {
+                uncertified_local_wins += certify_skipped_imports(
+                    storage,
+                    &mut skip_lookup,
+                    mode,
+                    true,
+                    &mut close_audit,
+                    &mut tx_result,
+                    &mut skipped,
+                    &mut export_hash_batch,
+                    &mut export_hash_ids,
+                    &mut invalidated_certificate,
+                )?;
+            }
+
             // Keep the immutable incoming payload for certification whenever
             // append-only union adds facts absent from this source record.
             // A content hash excludes comments and cannot certify that union.
+            let source_before_tombstone_union = if matches!(action, CollisionAction::Update { .. })
+                && (issue.status == crate::model::Status::Tombstone
+                    || imported_tombstone_ids.contains(&target_id))
+            {
+                let mut existing = storage
+                    .get_issues_for_import_comparison_live(std::slice::from_ref(&target_id))?;
+                close_audit.attach(&mut existing);
+                if let Some(existing) = existing.first_mut() {
+                    if let Some(comments) = existing_comments_by_issue.get(&target_id) {
+                        existing.comments =
+                            union_comment_lists(&existing.comments, comments, &target_id);
+                    }
+                    let source_issue = issue.clone();
+                    issue.id.clone_from(&target_id);
+                    issue = if existing.status == crate::model::Status::Tombstone {
+                        merge_tombstone_history(existing, &issue)?
+                    } else {
+                        merge_tombstone_history(&issue, existing)?
+                    };
+                    computed_hash = crate::util::content_hash(&issue);
+                    Some(source_issue)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let source_before_comment_union = if matches!(action, CollisionAction::Update { .. }) {
                 let mut comments = issue.comments.clone();
                 if let Some(existing) = existing_comments_by_issue.get(&target_id) {
@@ -16467,9 +16900,9 @@ fn stream_import_actions_in_tx(
                     let source_issue = issue.clone();
                     issue.comments = comments;
                     computed_hash = crate::util::content_hash(&issue);
-                    Some(source_issue)
+                    Some(source_before_tombstone_union.unwrap_or(source_issue))
                 } else {
-                    None
+                    source_before_tombstone_union
                 }
             } else {
                 None
@@ -16488,13 +16921,15 @@ fn stream_import_actions_in_tx(
                     if union.len() > db_comments.len() {
                         uncertified_local_wins += certify_skipped_imports(
                             storage,
-                            skip_lookup.as_ref(),
+                            &mut skip_lookup,
                             mode,
+                            true,
                             &mut close_audit,
-                            &mut tx_result.applied_issues,
+                            &mut tx_result,
                             &mut skipped,
                             &mut export_hash_batch,
                             &mut export_hash_ids,
+                            &mut invalidated_certificate,
                         )?;
                         // A preceding alias may have certified the old comment
                         // set, including in an already-written hash batch.
@@ -16512,20 +16947,6 @@ fn stream_import_actions_in_tx(
                 }
             }
 
-            // Flush before mutations so certification observes exactly the
-            // same transaction state as the former per-row lookup.
-            if !matches!(action, CollisionAction::Skip { .. }) {
-                uncertified_local_wins += certify_skipped_imports(
-                    storage,
-                    skip_lookup.as_ref(),
-                    mode,
-                    &mut close_audit,
-                    &mut tx_result.applied_issues,
-                    &mut skipped,
-                    &mut export_hash_batch,
-                    &mut export_hash_ids,
-                )?;
-            }
             process_import_action(
                 storage,
                 &action,
@@ -16533,6 +16954,11 @@ fn stream_import_actions_in_tx(
                 &mut tx_result,
                 relation_tables_proven_empty,
             )?;
+            if issue.status == crate::model::Status::Tombstone
+                && !matches!(action, CollisionAction::Skip { .. })
+            {
+                imported_tombstone_ids.insert(target_id.clone());
+            }
 
             if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
                 &mut skipped,
@@ -16555,7 +16981,8 @@ fn stream_import_actions_in_tx(
                                 source_issue,
                             )
                         });
-                if source_matches && close_audit.matches_export(&export_id, &issue) {
+                let source_issue = source_before_comment_union.as_ref().unwrap_or(&issue);
+                if source_matches && close_audit.matches_export(&export_id, source_issue) {
                     export_hash_ids.insert(export_id.clone());
                     export_hash_batch.push((export_id, export_hash));
                 } else {
@@ -16567,13 +16994,15 @@ fn stream_import_actions_in_tx(
             if skipped.len() >= IMPORT_SKIP_CERTIFICATION_BATCH_SIZE {
                 uncertified_local_wins += certify_skipped_imports(
                     storage,
-                    skip_lookup.as_ref(),
+                    &mut skip_lookup,
                     mode,
+                    true,
                     &mut close_audit,
-                    &mut tx_result.applied_issues,
+                    &mut tx_result,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
+                    &mut invalidated_certificate,
                 )?;
             }
             if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
@@ -16591,13 +17020,15 @@ fn stream_import_actions_in_tx(
 
     uncertified_local_wins += certify_skipped_imports(
         storage,
-        skip_lookup.as_ref(),
+        &mut skip_lookup,
         mode,
+        true,
         &mut close_audit,
-        &mut tx_result.applied_issues,
+        &mut tx_result,
         &mut skipped,
         &mut export_hash_batch,
         &mut export_hash_ids,
+        &mut invalidated_certificate,
     )?;
     write_import_export_hash_batch(
         storage,
@@ -16746,9 +17177,10 @@ pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
 
 /// Closure evidence belongs only to the current closed state. Treat blank
 /// optional metadata as absent, matching the storage projection, and never
-/// retain a previous closer on an imported reopen or tombstone.
+/// retain a previous closer on an imported reopen. Deletion preserves the
+/// historical closure, including attribution whose timestamp is unknown.
 fn canonicalize_closure_attribution(issue: &mut Issue) {
-    let closed = issue.status == crate::model::Status::Closed;
+    let closed = issue.status.is_terminal();
     for field in [
         &mut issue.closed_by,
         &mut issue.closed_by_agent_name,
@@ -17839,12 +18271,13 @@ fn run_reconcile_apply_tx(
     let mut import_result = ImportResult::default();
     let mut export_hash_batch: Vec<(String, String)> = Vec::new();
     let mut export_hash_ids = HashSet::new();
+    let mut invalidated_certificate = false;
     let mut applied_ids: Vec<String> = Vec::new();
     let mut action_index = 0usize;
     let mut skipped = Vec::new();
     let mut close_audit = storage.load_import_close_bypass_audit()?;
     let current_export_hashes = load_import_export_hashes(storage)?;
-    let skip_lookup = if !plan.actions.is_empty()
+    let mut skip_lookup = if !plan.actions.is_empty()
         && plan.actions.iter().all(|action| {
             matches!(
                 action.kind,
@@ -17889,13 +18322,15 @@ fn run_reconcile_apply_tx(
             if !matches!(action, CollisionAction::Skip { .. }) {
                 outcome.uncertified_local_wins += certify_skipped_imports(
                     storage,
-                    skip_lookup.as_ref(),
+                    &mut skip_lookup,
                     ImportMode::Explicit,
+                    false,
                     &mut close_audit,
-                    &mut import_result.applied_issues,
+                    &mut import_result,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
+                    &mut invalidated_certificate,
                 )?;
             }
             process_import_action(storage, action, &issue, &mut import_result, false)?;
@@ -17931,13 +18366,15 @@ fn run_reconcile_apply_tx(
             if skipped.len() >= IMPORT_SKIP_CERTIFICATION_BATCH_SIZE {
                 outcome.uncertified_local_wins += certify_skipped_imports(
                     storage,
-                    skip_lookup.as_ref(),
+                    &mut skip_lookup,
                     ImportMode::Explicit,
+                    false,
                     &mut close_audit,
-                    &mut import_result.applied_issues,
+                    &mut import_result,
                     &mut skipped,
                     &mut export_hash_batch,
                     &mut export_hash_ids,
+                    &mut invalidated_certificate,
                 )?;
             }
             Ok(())
@@ -17952,13 +18389,15 @@ fn run_reconcile_apply_tx(
 
     outcome.uncertified_local_wins += certify_skipped_imports(
         storage,
-        skip_lookup.as_ref(),
+        &mut skip_lookup,
         ImportMode::Explicit,
+        false,
         &mut close_audit,
-        &mut import_result.applied_issues,
+        &mut import_result,
         &mut skipped,
         &mut export_hash_batch,
         &mut export_hash_ids,
+        &mut invalidated_certificate,
     )?;
     if !export_hash_batch.is_empty() {
         storage.set_changed_export_hashes_in_tx(&export_hash_batch)?;
@@ -18069,6 +18508,9 @@ pub enum ConflictType {
     /// The base is a local export and cannot establish whether an older or
     /// equal-timestamp external revision is stale or a new edit with clock skew.
     AmbiguousBase,
+    /// Tombstone histories contain contradictory facts. Choosing a winning
+    /// row must not silently erase closure or deletion evidence.
+    TombstoneHistory,
 }
 
 /// Result of merging a single issue across base, left (local), and right (external).
@@ -18471,6 +18913,34 @@ fn merge_issue_from_local_export(
     }
 }
 
+/// Make additive tombstone history invisible to the scalar merge decision.
+/// Every copy receives the known evidence, including facts retained only by
+/// a tombstone base, while its original revision time still determines
+/// ordinary field authority. A live or closed base can belong to a previous
+/// close/reopen cycle, so its history is not protected tombstone evidence.
+fn normalize_tombstone_history_for_merge(
+    base: Option<&Issue>,
+    local: &Issue,
+    external: &Issue,
+) -> Result<(Option<Issue>, Issue, Issue)> {
+    let mut history = merge_tombstone_history(local, external)?;
+    if let Some(base) = base.filter(|issue| issue.status == crate::model::Status::Tombstone) {
+        history = merge_tombstone_history(&history, base)?;
+    }
+    let normalize = |issue: &Issue| -> Result<Issue> {
+        let mut normalized = merge_tombstone_history(issue, &history)?;
+        normalized.status = issue.status.clone();
+        normalized.updated_at = issue.updated_at;
+        normalized.content_hash = Some(crate::util::content_hash(&normalized));
+        Ok(normalized)
+    };
+    let normalized_base = match base {
+        Some(base) if base.status == crate::model::Status::Tombstone => Some(normalize(base)?),
+        _ => base.cloned(),
+    };
+    Ok((normalized_base, normalize(local)?, normalize(external)?))
+}
+
 /// Perform a 3-way merge across all issues in the context.
 ///
 /// This iterates through all unique issue IDs across base, left, and right,
@@ -18484,6 +18954,7 @@ fn merge_issue_from_local_export(
 /// # Returns
 /// A `MergeReport` containing all actions taken and any conflicts detected.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn three_way_merge(
     context: &MergeContext,
     strategy: ConflictResolution,
@@ -18528,15 +18999,18 @@ pub fn three_way_merge(
         if unresolved_ids.contains(&id) {
             continue;
         }
-        let base = context.base.get(&id);
+        let original_base = context.base.get(&id);
         let left = context.left.get(&id);
         let right = context.right.get(&id);
+        let tombstone_base =
+            original_base.filter(|issue| issue.status == crate::model::Status::Tombstone);
+        let history_sources = [tombstone_base, left, right];
 
         // Comments are append-only, so a comment present on either side is
         // kept: a side that lacks it never saw it rather than deleted it.
         let with_union = left
             .zip(right)
-            .and_then(|(left, right)| union_comments_if_diverged(base, left, right));
+            .and_then(|(left, right)| union_comments_if_diverged(original_base, left, right));
         // A record whose comments were combined is a new revision of both
         // inputs. Make it strictly newer than either so a clone that later
         // imports the merged JSONL (last-write-wins) takes it instead of
@@ -18549,9 +19023,59 @@ pub fn three_way_merge(
         });
         let (base, left, right) = with_union
             .as_ref()
-            .map_or((base, left, right), |(base, left, right)| {
+            .map_or((original_base, left, right), |(base, left, right)| {
                 (base.as_ref(), Some(left), Some(right))
             });
+
+        // Missing tombstone history is additive evidence, not a competing
+        // row edit. Normalize a tombstone base and both sides before choosing
+        // ordinary fields, preserving their original revision times. Read the
+        // original tombstone base so its comments survive the peer union.
+        let with_tombstone_history = match (left, right) {
+            (Some(local), Some(external))
+                if local.status == crate::model::Status::Tombstone
+                    && external.status == crate::model::Status::Tombstone =>
+            {
+                match normalize_tombstone_history_for_merge(
+                    tombstone_base.or(base),
+                    local,
+                    external,
+                ) {
+                    Ok(joined) => Some(joined),
+                    Err(error) => {
+                        report
+                            .conflicts
+                            .push((id.clone(), ConflictType::TombstoneHistory));
+                        report.notes.push((id.clone(), error.to_string()));
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let (base, left, right) = with_tombstone_history
+            .as_ref()
+            .map_or((base, left, right), |(base, local, external)| {
+                (base.as_ref(), Some(local), Some(external))
+            });
+
+        let revised = |mut issue: Issue| -> Result<Issue> {
+            if issue.status == crate::model::Status::Tombstone {
+                // The ordinary scalar winner cannot discard historical facts
+                // from a tombstone base or either side, including a closed row
+                // whose attempted resurrection is refused below. An unchanged
+                // sole copy needs no rewrite, including its content hash.
+                for source in history_sources.into_iter().flatten() {
+                    if &issue != source {
+                        issue = merge_tombstone_history(&issue, source)?;
+                    }
+                }
+            }
+            if let Some(revision_at) = union_revision_at {
+                issue.updated_at = issue.updated_at.max(revision_at);
+            }
+            Ok(issue)
+        };
 
         // Check tombstone protection: if issue is tombstoned and trying to resurrect.
         // A collided id holds a different issue than the tombstone that
@@ -18566,7 +19090,16 @@ pub fn three_way_merge(
                 // Import paths never allow JSONL to resurrect a local tombstone.
                 // Merge winner flags must preserve that invariant too.
                 if let Some(issue) = left {
-                    report.kept.push(issue.clone());
+                    match revised(issue.clone()) {
+                        Ok(issue) => report.kept.push(issue),
+                        Err(error) => {
+                            report
+                                .conflicts
+                                .push((id.clone(), ConflictType::TombstoneHistory));
+                            report.notes.push((id.clone(), error.to_string()));
+                            continue;
+                        }
+                    }
                 }
                 report.tombstone_protected.push(id.clone());
                 continue;
@@ -18585,26 +19118,35 @@ pub fn three_way_merge(
                 merge_issue_from_local_export(base, left, right, strategy)
             }
         };
-        let revised = |mut issue: Issue| {
-            if let Some(revision_at) = union_revision_at {
-                issue.updated_at = issue.updated_at.max(revision_at);
-            }
-            issue
-        };
-
         match result {
             MergeResult::NoAction => {}
-            MergeResult::Keep(issue) => {
-                report.kept.push(revised(issue));
-            }
+            MergeResult::Keep(issue) => match revised(issue) {
+                Ok(issue) => report.kept.push(issue),
+                Err(error) => {
+                    report
+                        .conflicts
+                        .push((id.clone(), ConflictType::TombstoneHistory));
+                    report.notes.push((id.clone(), error.to_string()));
+                }
+            },
             MergeResult::KeepWithNote(issue, note) => {
                 // Merge notes become issue comments during atomic apply.
                 // Tombstone winners must retain the deletion without trying
                 // to append a comment to a deleted issue.
-                if issue.status != crate::model::Status::Tombstone {
-                    report.notes.push((issue.id.clone(), note));
+                match revised(issue) {
+                    Ok(issue) => {
+                        if issue.status != crate::model::Status::Tombstone {
+                            report.notes.push((issue.id.clone(), note));
+                        }
+                        report.kept.push(issue);
+                    }
+                    Err(error) => {
+                        report
+                            .conflicts
+                            .push((id.clone(), ConflictType::TombstoneHistory));
+                        report.notes.push((id.clone(), error.to_string()));
+                    }
                 }
-                report.kept.push(revised(issue));
             }
             MergeResult::Delete => {
                 report.deleted.push(id.clone());
@@ -19447,6 +19989,44 @@ pub(crate) struct PreservedIssue {
     pub(crate) comments: Option<Vec<Comment>>,
 }
 
+/// Join pre-rebuild evidence with the JSONL row being restored. At least
+/// one side is a tombstone: a dirty live row can supply historical evidence
+/// to an incoming deletion, but cannot restore its live state. The
+/// snapshot stores its relations separately so unreadable sets remain
+/// distinguishable from known empty sets; hydrate the readable ones before
+/// comparing historical evidence.
+fn merge_preserved_tombstone(
+    preserved: &PreservedIssue,
+    incoming: &Issue,
+) -> Result<PreservedIssue> {
+    let mut local = preserved.issue.clone();
+    if let Some(labels) = &preserved.labels {
+        local.labels.clone_from(labels);
+    }
+    if let Some(dependencies) = &preserved.dependencies {
+        local.dependencies.clone_from(dependencies);
+    }
+    if let Some(comments) = &preserved.comments {
+        local.comments.clone_from(comments);
+    }
+    // Explicit rebuilds still take ordinary fields from JSONL. A live row
+    // cannot replace the local tombstone, but may add historical evidence.
+    let mut issue = if incoming.status == crate::model::Status::Tombstone {
+        merge_tombstone_history(incoming, &local)?
+    } else {
+        merge_tombstone_history(&local, incoming)?
+    };
+    if local.source_repo_path.is_some() {
+        issue.source_repo_path = local.source_repo_path;
+    }
+    Ok(PreservedIssue {
+        labels: Some(issue.labels.clone()),
+        dependencies: Some(issue.dependencies.clone()),
+        comments: Some(issue.comments.clone()),
+        issue,
+    })
+}
+
 /// Captured unflushed state and every known obstacle to preserving it.
 ///
 /// Warnings describe the capture itself, before any replacement has occurred.
@@ -19690,9 +20270,11 @@ pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Vec<PreservedIssue
 /// `snapshot_tombstones` pass owns deletion-retention state.
 ///
 /// Best-effort with the same degradation contract as `snapshot_tombstones`.
-/// Call `snapshot_unflushed_state` when failures must be returned to the caller.
+/// Explicit imports preserve historical evidence from this snapshot when
+/// JSONL already tombstones the issue; ordinary live fields remain governed
+/// by the source. Call `snapshot_unflushed_state` when failures must be
+/// returned to the caller.
 #[must_use]
-#[cfg(test)]
 pub(crate) fn snapshot_dirty_live_issues(storage: &SqliteStorage) -> Vec<PreservedIssue> {
     let mut warnings = Vec::new();
     dirty_ids_for_preservation(storage, &mut warnings)
@@ -19840,10 +20422,24 @@ fn restore_preserved_issues_with_omissions(
 
     let marked_at = Utc::now().to_rfc3339();
     storage.with_write_transaction(|storage| {
-        for entry in preserved {
+        // Recheck the join in the same transaction as restoration. Preflight
+        // already rejected contradictions before database replacement, but a
+        // later change must not turn restoration into a blind overwrite.
+        let restored = preserved
+            .iter()
+            .map(|entry| {
+                if entry.issue.status == crate::model::Status::Tombstone
+                    && let Some(incoming) = storage.get_issue_for_export(&entry.issue.id)?
+                {
+                    return merge_preserved_tombstone(entry, &incoming);
+                }
+                Ok(entry.clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for entry in &restored {
             storage.upsert_issue_for_local_restore_in_tx(&entry.issue)?;
         }
-        for entry in preserved {
+        for entry in &restored {
             if let Some(labels) = &entry.labels {
                 storage.sync_labels_for_import_in_tx(&entry.issue.id, labels)?;
             }
@@ -19887,9 +20483,9 @@ fn restore_preserved_issues_with_omissions(
 /// Two buckets:
 ///
 /// - `tombstone_ids`: IDs whose JSONL record carries `status = tombstone`.
-///   The deletion has already been flushed, so the rebuild will reimport it
-///   as a tombstone on its own — we drop any local preserved tombstone for
-///   these IDs.
+///   This establishes deletion state, but not whether all local historical
+///   fields have reached JSONL. Tombstone preservation checks the full rows
+///   separately before a rebuild may replace the database.
 ///
 /// - `non_tombstone_updated_at`: IDs whose JSONL record carries a *non*-
 ///   tombstone status, mapped to the record's `updated_at`. When the local
@@ -19904,43 +20500,76 @@ pub(crate) struct JsonlTombstoneFilter {
         std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
 }
 
-/// Filter the preserved tombstone set down to those that should actually
-/// be restored after the rebuild has reimported the JSONL. Three cases:
+/// Prepare the preserved tombstones before a rebuild replaces the database.
+/// Stream the immutable import source and keep only snapshots that carry
+/// evidence the source's own import cannot reproduce. Candidates are local
+/// tombstones and dirty live rows whose IDs are tombstones in this same
+/// immutable source. Three cases:
 ///
-/// 1. JSONL has this ID as a tombstone: drop from preservation set — the
-///    rebuild's own `import_from_jsonl` will reinstate the tombstone.
+/// 1. JSONL has this ID as a tombstone: join compatible historical fields,
+///    including unflushed closure evidence from a local live row.
+///    Drop the snapshot only if JSONL already contains the joined evidence.
 ///
 /// 2. JSONL has this ID as a non-tombstone: preserve the local tombstone
 ///    and restore it after import. This mirrors the normal
-///    `import_from_jsonl` tombstone guard, which rejects resurrection even
-///    when force-upsert is enabled. Timestamp ordering cannot make a
-///    deleted issue live again; the operator must reopen it explicitly.
+///    `import_from_jsonl` tombstone guard. Compatible closure history and
+///    relations are retained while timestamp ordering cannot make the issue
+///    live again.
 ///
 /// 3. JSONL doesn't have this ID at all: preserve the local deletion history.
 ///    Automatic restoration separately retains accepted clean omissions so
 ///    preserving that history does not turn a peer purge into a dirty delete.
-#[must_use]
+/// # Errors
+///
+/// Contradictory historical facts fail before any database replacement. Both
+/// the original database and the immutable JSONL source remain available.
 pub(crate) fn tombstones_missing_from_jsonl_tombstones(
     tombstones: Vec<PreservedIssue>,
-    jsonl_filter: &JsonlTombstoneFilter,
-) -> Vec<PreservedIssue> {
+    source: &JsonlSourceSnapshot,
+) -> Result<Vec<PreservedIssue>> {
+    if tombstones.is_empty() {
+        return Ok(tombstones);
+    }
     let original_count = tombstones.len();
     let mut skipped_already_flushed = 0usize;
     let mut preserved_non_tombstone_conflicts = 0usize;
-    let preserved: Vec<PreservedIssue> = tombstones
+    let mut by_id = tombstones
         .into_iter()
-        .filter(|tombstone| {
-            let id = &tombstone.issue.id;
-            if jsonl_filter.tombstone_ids.contains(id) {
-                skipped_already_flushed += 1;
-                return false;
-            }
-            if jsonl_filter.non_tombstone_updated_at.contains_key(id) {
-                preserved_non_tombstone_conflicts += 1;
-            }
-            true
-        })
-        .collect();
+        .map(|tombstone| (tombstone.issue.id.clone(), tombstone))
+        .collect::<BTreeMap<_, _>>();
+    let mut preserved = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for_each_jsonl_import_issue(source, |line_num, incoming, _| {
+        if !seen_ids.insert(incoming.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue id '{}' in {} at line {}",
+                incoming.id,
+                source.display_path().display(),
+                line_num
+            )));
+        }
+        let Some(local) = by_id.remove(&incoming.id) else {
+            return Ok(());
+        };
+        let merged = merge_preserved_tombstone(&local, &incoming)?;
+        if incoming.status != crate::model::Status::Tombstone {
+            preserved_non_tombstone_conflicts += 1;
+        } else if persisted_import_issue_equals(&merged.issue, &incoming)
+            && merged.issue.bypassed_policy == incoming.bypassed_policy
+            && merged.issue.bypass_reason == incoming.bypass_reason
+            && merged.issue.policy_gates_fired == incoming.policy_gates_fired
+            && merged.issue.source_repo_path == incoming.source_repo_path
+        {
+            skipped_already_flushed += 1;
+            return Ok(());
+        }
+        preserved.push(merged);
+        Ok(())
+    })?;
+    // Continued absence preserves the local deletion and any accepted
+    // clean-omission receipt; it does not create a new dirty deletion.
+    preserved.extend(by_id.into_values());
+    preserved.sort_by(|left, right| left.issue.id.cmp(&right.issue.id));
 
     if skipped_already_flushed > 0 || preserved_non_tombstone_conflicts > 0 {
         tracing::debug!(
@@ -19952,15 +20581,17 @@ pub(crate) fn tombstones_missing_from_jsonl_tombstones(
         );
     }
 
-    preserved
+    Ok(preserved)
 }
 
 /// Filter the preserved dirty-live-issue set down to those whose latest
 /// state the JSONL cannot reproduce, so a rebuild that replays only the
 /// JSONL does not silently drop them (GitHub #394). Three cases:
 ///
-/// 1. JSONL has this ID as a tombstone: drop from preservation set. A
-///    flushed deletion wins over an unflushed local edit — this mirrors
+/// 1. JSONL has this ID as a tombstone: drop from the live preservation set.
+///    The caller must first offer its historical evidence to
+///    `tombstones_missing_from_jsonl_tombstones` for safe deleted-row recovery.
+///    A flushed deletion wins over an unflushed local edit — this mirrors
 ///    the `import_from_jsonl` tombstone guard, which rejects resurrection
 ///    even for newer non-tombstone rows. Reopening is a separate,
 ///    explicit user action.
@@ -29430,6 +30061,228 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_tombstone_history_rebuild_joins_both_sources_and_exports_to_a_third_peer() {
+        for incoming_revision in [100, 300] {
+            let temp = TempDir::new().unwrap();
+            let source_path = temp.path().join("issues.jsonl");
+            let mut local = with_comment(
+                created_issue("bd-rebuild-history", "Local tombstone", 10),
+                1,
+                "Local verification",
+                60,
+            );
+            local.status = Status::Tombstone;
+            local.closed_at = Some(fixed_time_merge(50));
+            local.close_reason = Some("Verified before deletion".to_string());
+            local.closed_by = Some("local-reviewer".to_string());
+            local.deleted_at = Some(fixed_time_merge(80));
+            local.updated_at = fixed_time_merge(200);
+            local.labels = vec!["local-evidence".to_string()];
+            local.bypassed_policy = Some(true);
+            local.bypass_reason = Some("Recorded exception".to_string());
+            local.policy_gates_fired = Some(vec!["review".to_string()]);
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            storage.upsert_issue_for_import(&local).unwrap();
+            storage
+                .sync_labels_for_import(&local.id, &local.labels)
+                .unwrap();
+            storage
+                .sync_comments_for_import(&local.id, &local.comments)
+                .unwrap();
+            let snapshot = snapshot_tombstones(&storage);
+            assert_eq!(snapshot.len(), 1);
+
+            let mut incoming = with_comment(
+                created_issue(&local.id, "Title from the rebuild source", 10),
+                1,
+                "Peer deletion explanation",
+                90,
+            );
+            incoming.status = Status::Tombstone;
+            incoming.deleted_at = local.deleted_at;
+            incoming.deleted_by = Some("peer-deleter".to_string());
+            incoming.delete_reason = Some("Retired after verification".to_string());
+            incoming.original_type = Some("task".to_string());
+            incoming.updated_at = fixed_time_merge(incoming_revision);
+            incoming.labels = vec!["peer-evidence".to_string()];
+            write_jsonl_issues(&source_path, &[&incoming]);
+            let source_before = fs::read(&source_path).unwrap();
+            let source = capture_jsonl_source_snapshot(&source_path).unwrap();
+            let preserved = tombstones_missing_from_jsonl_tombstones(snapshot, &source).unwrap();
+            assert_eq!(
+                preserved.len(),
+                1,
+                "a sparse tombstone is not a complete backup"
+            );
+            assert_eq!(fs::read(&source_path).unwrap(), source_before);
+
+            let mut rebuilt = SqliteStorage::open_memory().unwrap();
+            import_from_jsonl(&mut rebuilt, &source_path, &ImportConfig::default(), None).unwrap();
+            assert!(
+                rebuilt
+                    .get_issue(&local.id)
+                    .unwrap()
+                    .unwrap()
+                    .closed_at
+                    .is_none()
+            );
+            restore_tombstones_after_rebuild(&mut rebuilt, &preserved).unwrap();
+            let joined = rebuilt.get_issue_for_export(&local.id).unwrap().unwrap();
+            assert_eq!(joined.status, Status::Tombstone);
+            assert_eq!(joined.title, incoming.title);
+            assert_eq!(joined.closed_at, local.closed_at);
+            assert_eq!(joined.close_reason, local.close_reason);
+            assert_eq!(joined.closed_by, local.closed_by);
+            assert_eq!(joined.deleted_at, local.deleted_at);
+            assert_eq!(joined.deleted_by, incoming.deleted_by);
+            assert_eq!(joined.delete_reason, incoming.delete_reason);
+            assert_eq!(joined.original_type, incoming.original_type);
+            assert_eq!(joined.bypassed_policy, Some(true));
+            assert_eq!(joined.bypass_reason, local.bypass_reason);
+            assert_eq!(joined.policy_gates_fired, local.policy_gates_fired);
+            assert_eq!(
+                joined.updated_at,
+                fixed_time_merge(incoming_revision.max(200))
+            );
+            assert_eq!(joined.labels, vec!["local-evidence", "peer-evidence"]);
+            assert_eq!(joined.comments.len(), 2);
+
+            let export_path = temp.path().join("joined.jsonl");
+            export_to_jsonl(&rebuilt, &export_path, &ExportConfig::default()).unwrap();
+            let mut third_peer = SqliteStorage::open_memory().unwrap();
+            import_from_jsonl(
+                &mut third_peer,
+                &export_path,
+                &ImportConfig::default(),
+                None,
+            )
+            .unwrap();
+            let propagated = third_peer.get_issue_for_export(&local.id).unwrap().unwrap();
+            assert!(propagated.sync_equals(&joined));
+            assert_eq!(propagated.bypassed_policy, joined.bypassed_policy);
+            assert_eq!(propagated.bypass_reason, joined.bypass_reason);
+            assert_eq!(propagated.policy_gates_fired, joined.policy_gates_fired);
+            assert_eq!(propagated.updated_at, joined.updated_at);
+            let covered = tombstones_missing_from_jsonl_tombstones(
+                snapshot_tombstones(&rebuilt),
+                &capture_jsonl_source_snapshot(&export_path).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                covered.is_empty(),
+                "fully joined history needs no second restore"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tombstone_history_rebuild_refuses_contradictions_before_replacement() {
+        let temp = TempDir::new().unwrap();
+        let source_path = temp.path().join("issues.jsonl");
+        let mut local = created_issue("bd-rebuild-conflict", "Retain both histories", 10);
+        local.status = Status::Tombstone;
+        local.closed_at = Some(fixed_time_merge(50));
+        local.close_reason = Some("Local reason".to_string());
+        local.deleted_at = Some(fixed_time_merge(80));
+        local.updated_at = fixed_time_merge(100);
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.upsert_issue_for_import(&local).unwrap();
+        let before = storage.get_issue_for_export(&local.id).unwrap().unwrap();
+        for field in ["closed_at", "close_reason", "deleted_at"] {
+            let mut incoming = local.clone();
+            incoming.updated_at = fixed_time_merge(200);
+            match field {
+                "closed_at" => incoming.closed_at = Some(fixed_time_merge(60)),
+                "close_reason" => incoming.close_reason = Some("Peer reason".to_string()),
+                _ => incoming.deleted_at = Some(fixed_time_merge(90)),
+            }
+            write_jsonl_issues(&source_path, &[&incoming]);
+            let source_before = fs::read(&source_path).unwrap();
+            let source = capture_jsonl_source_snapshot(&source_path).unwrap();
+            let error =
+                tombstones_missing_from_jsonl_tombstones(snapshot_tombstones(&storage), &source)
+                    .unwrap_err();
+            assert!(matches!(&error, BeadsError::SyncConflict { .. }));
+            assert!(error.to_string().contains(field));
+            assert_eq!(
+                storage.get_issue_for_export(&local.id).unwrap().unwrap(),
+                before
+            );
+            assert_eq!(fs::read(&source_path).unwrap(), source_before);
+        }
+    }
+
+    #[test]
+    fn test_restore_tombstone_history_conflict_rolls_back_the_whole_batch() {
+        let mut local = created_issue("bd-restore-conflict", "Original local history", 10);
+        local.status = Status::Tombstone;
+        local.closed_at = Some(fixed_time_merge(50));
+        local.close_reason = Some("Local close".to_string());
+        local.deleted_at = Some(fixed_time_merge(80));
+        local.updated_at = fixed_time_merge(100);
+        let mut incoming = local.clone();
+        incoming.close_reason = Some("Contradictory peer close".to_string());
+        incoming.updated_at = fixed_time_merge(200);
+        let mut absent = local.clone();
+        absent.id = "bd-absent".to_string();
+        let preserve = |issue: Issue| PreservedIssue {
+            issue,
+            labels: Some(Vec::new()),
+            dependencies: Some(Vec::new()),
+            comments: Some(Vec::new()),
+        };
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.upsert_issue_for_import(&incoming).unwrap();
+        let before = storage.get_issue_for_export(&incoming.id).unwrap().unwrap();
+        let dirty_before = storage.get_dirty_issue_ids().unwrap();
+        let error =
+            restore_preserved_issues(&mut storage, &[preserve(absent.clone()), preserve(local)])
+                .unwrap_err();
+        assert!(matches!(&error, BeadsError::SyncConflict { .. }));
+        assert!(error.to_string().contains("close_reason"));
+        assert_eq!(
+            storage.get_issue_for_export(&incoming.id).unwrap().unwrap(),
+            before
+        );
+        assert!(storage.get_issue(&absent.id).unwrap().is_none());
+        assert_eq!(storage.get_dirty_issue_ids().unwrap(), dirty_before);
+    }
+
+    #[test]
+    fn test_tombstone_history_recovery_keeps_accepted_omissions_clean() {
+        let mut tombstone = created_issue("bd-history-omitted", "Retained expired history", 10);
+        tombstone.status = Status::Tombstone;
+        tombstone.closed_at = Some(fixed_time_merge(50));
+        tombstone.close_reason = Some("Completed before archival".to_string());
+        tombstone.deleted_at = Some(fixed_time_merge(80));
+        tombstone.updated_at = fixed_time_merge(100);
+        let preserved = PreservedIssue {
+            issue: tombstone.clone(),
+            labels: Some(Vec::new()),
+            dependencies: Some(Vec::new()),
+            comments: Some(Vec::new()),
+        };
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        restore_tombstones_after_automatic_rebuild(
+            &mut storage,
+            &[preserved],
+            &BTreeSet::from([tombstone.id.clone()]),
+        )
+        .unwrap();
+        let restored = storage.get_issue(&tombstone.id).unwrap().unwrap();
+        assert_eq!(restored.closed_at, tombstone.closed_at);
+        assert_eq!(restored.close_reason, tombstone.close_reason);
+        assert_eq!(restored.deleted_at, tombstone.deleted_at);
+        assert_eq!(restored.updated_at, tombstone.updated_at);
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+        assert_eq!(
+            imported_omitted_ids(&storage).unwrap(),
+            HashSet::from([tombstone.id])
+        );
+    }
+
+    #[test]
     fn test_unflushed_snapshot_captures_dirty_tombstones_once_and_ignores_orphans() {
         let fixture_root = TempDir::new().unwrap().keep();
         let mut storage = SqliteStorage::open(&fixture_root.join("beads.db")).unwrap();
@@ -30660,7 +31513,7 @@ mod tests {
                         ));
                     }
                     let incumbent = start.elapsed();
-                    let certify = |lookup: Option<&ImportIssueLookup>| {
+                    let certify = |mut lookup: Option<ImportIssueLookup>| {
                         let mut close_audit = storage.load_import_close_bypass_audit().unwrap();
                         let mut hashes = Vec::new();
                         let mut ids = HashSet::new();
@@ -30672,19 +31525,22 @@ mod tests {
                                         issue.id.clone(),
                                         issue.clone(),
                                         crate::util::content_hash(issue),
+                                        false,
                                     )
                                 })
                                 .collect::<Vec<_>>();
                             assert_eq!(
                                 certify_skipped_imports(
                                     storage,
-                                    lookup,
+                                    &mut lookup,
                                     ImportMode::Explicit,
+                                    false,
                                     &mut close_audit,
-                                    &mut [],
+                                    &mut ImportResult::default(),
                                     &mut skipped,
                                     &mut hashes,
                                     &mut ids,
+                                    &mut false,
                                 )
                                 .unwrap(),
                                 0
@@ -30698,7 +31554,7 @@ mod tests {
                     let batched = start.elapsed();
                     let start = Instant::now();
                     let lookup = storage.build_import_issue_lookup()?;
-                    certify(Some(&lookup));
+                    certify(Some(lookup));
                     Ok((incumbent, batched, start.elapsed()))
                 })
                 .unwrap();
@@ -35988,6 +36844,7 @@ transitions:
         tombstone.status = Status::Tombstone;
         tombstone.deleted_at = Some(fixed_time_merge(200));
         tombstone.updated_at = fixed_time_merge(200);
+        tombstone.content_hash = Some(tombstone.compute_content_hash());
         let context = MergeContext::new(
             issue_map(&[&base, &deletion_base]),
             issue_map(&[&base, &deletion_base]),
@@ -36057,6 +36914,7 @@ transitions:
         tombstone.deleted_at = Some(fixed_time_merge(290));
         tombstone.deleted_by = Some("external-deleter".to_string());
         tombstone.delete_reason = Some("Explicit external deletion".to_string());
+        tombstone.content_hash = Some(tombstone.compute_content_hash());
 
         for local_export_base in [false, true] {
             let context = MergeContext::new(
@@ -36324,6 +37182,464 @@ transitions:
         assert_eq!(report.kept.len(), 1);
         assert_eq!(report.kept[0].status, crate::model::Status::Tombstone);
         assert_eq!(report.kept[0].title, "Deleted");
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_history_converges_without_force() {
+        let mut base = created_issue("bd-history", "Deleted issue", 10);
+        base.status = Status::Tombstone;
+        base.deleted_at = Some(fixed_time_merge(80));
+        base.updated_at = fixed_time_merge(100);
+        let mut closed = base.clone();
+        closed.closed_at = Some(fixed_time_merge(50));
+        closed.close_reason = Some("Verified before deletion".to_string());
+        closed.closed_by = Some("reviewer".to_string());
+        closed.updated_at = fixed_time_merge(200);
+        let mut attributed_delete = base.clone();
+        attributed_delete.deleted_by = Some("archivist".to_string());
+        attributed_delete.delete_reason = Some("Merged into replacement".to_string());
+        attributed_delete.original_type = Some("task".to_string());
+        attributed_delete.updated_at = fixed_time_merge(300);
+
+        let mut converged = None;
+        for (local, external) in [(&closed, &attributed_delete), (&attributed_delete, &closed)] {
+            for local_export_base in [false, true] {
+                let context = MergeContext::new(
+                    issue_map(&[&base]),
+                    issue_map(&[local]),
+                    issue_map(&[external]),
+                );
+                let context = if local_export_base {
+                    context.with_local_export_base()
+                } else {
+                    context
+                };
+                for strategy in [
+                    ConflictResolution::Manual,
+                    ConflictResolution::PreferLocal,
+                    ConflictResolution::PreferExternal,
+                    ConflictResolution::PreferNewer,
+                ] {
+                    let report = three_way_merge(&context, strategy, None);
+                    assert!(report.conflicts.is_empty(), "{report:?}");
+                    assert!(report.deleted.is_empty());
+                    assert!(report.notes.is_empty(), "cannot add comments to tombstones");
+                    assert_eq!(report.kept.len(), 1);
+                    let issue = &report.kept[0];
+                    assert_eq!(issue.status, Status::Tombstone);
+                    assert_eq!(issue.closed_at, closed.closed_at);
+                    assert_eq!(issue.close_reason, closed.close_reason);
+                    assert_eq!(issue.closed_by, closed.closed_by);
+                    assert_eq!(issue.deleted_at, base.deleted_at);
+                    assert_eq!(issue.deleted_by, attributed_delete.deleted_by);
+                    assert_eq!(issue.delete_reason, attributed_delete.delete_reason);
+                    assert_eq!(issue.original_type, attributed_delete.original_type);
+                    assert_eq!(issue.updated_at, fixed_time_merge(300));
+                    if let Some(expected) = &converged {
+                        assert_eq!(issue, expected, "peer direction must not choose history");
+                    } else {
+                        converged = Some(issue.clone());
+                    }
+                }
+            }
+        }
+        let converged = converged.unwrap();
+        let repeated = MergeContext::new(
+            issue_map(&[&base]),
+            issue_map(&[&converged]),
+            issue_map(&[&closed]),
+        )
+        .with_local_export_base();
+        let report = three_way_merge(&repeated, ConflictResolution::Manual, None);
+        assert_eq!(report.kept, vec![converged]);
+        assert!(report.conflicts.is_empty());
+        assert!(report.notes.is_empty());
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_history_preserves_scalar_winner_timestamps() {
+        let mut base = created_issue("bd-history-winner", "Original title", 10);
+        base.status = Status::Tombstone;
+        base.deleted_at = Some(fixed_time_merge(80));
+        let mut local = base.clone();
+        local.title = "Local title".to_string();
+        local.closed_at = Some(fixed_time_merge(50));
+        local.close_reason = Some("Local closure evidence".to_string());
+        local.updated_at = fixed_time_merge(200);
+        let mut external = base.clone();
+        external.title = "External title".to_string();
+        external.deleted_by = Some("peer".to_string());
+        external.updated_at = fixed_time_merge(300);
+
+        for (left, right) in [(&local, &external), (&external, &local)] {
+            let context =
+                MergeContext::new(issue_map(&[&base]), issue_map(&[left]), issue_map(&[right]));
+            for (strategy, expected_title) in [
+                (ConflictResolution::PreferLocal, &left.title),
+                (ConflictResolution::PreferExternal, &right.title),
+                (ConflictResolution::PreferNewer, &external.title),
+            ] {
+                let report = three_way_merge(&context, strategy, None);
+                assert!(report.conflicts.is_empty(), "{report:?}");
+                assert_eq!(report.kept.len(), 1);
+                let issue = &report.kept[0];
+                assert_eq!(&issue.title, expected_title);
+                assert_eq!(issue.closed_at, local.closed_at);
+                assert_eq!(issue.close_reason, local.close_reason);
+                assert_eq!(issue.deleted_by, external.deleted_by);
+                assert_eq!(issue.updated_at, fixed_time_merge(300));
+                assert_eq!(issue.status, Status::Tombstone);
+            }
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_history_conflicts_resist_all_force_strategies() {
+        let mut local = created_issue("bd-history-conflict", "Contradictory history", 10);
+        local.status = Status::Tombstone;
+        local.closed_at = Some(fixed_time_merge(40));
+        local.close_reason = Some("Local close reason".to_string());
+        local.deleted_at = Some(fixed_time_merge(80));
+        local.updated_at = fixed_time_merge(200);
+
+        for field in ["closed_at", "close_reason", "deleted_at"] {
+            for timestamp in [100, 200, 300] {
+                let mut external = local.clone();
+                external.updated_at = fixed_time_merge(timestamp);
+                match field {
+                    "closed_at" => external.closed_at = Some(fixed_time_merge(50)),
+                    "close_reason" => external.close_reason = Some("Peer close reason".to_string()),
+                    _ => external.deleted_at = Some(fixed_time_merge(90)),
+                }
+                let context = MergeContext::new(
+                    issue_map(&[&local]),
+                    issue_map(&[&local]),
+                    issue_map(&[&external]),
+                );
+                for strategy in [
+                    ConflictResolution::Manual,
+                    ConflictResolution::PreferLocal,
+                    ConflictResolution::PreferExternal,
+                    ConflictResolution::PreferNewer,
+                ] {
+                    let report = three_way_merge(&context, strategy, None);
+                    assert_eq!(
+                        report.conflicts,
+                        vec![(local.id.clone(), ConflictType::TombstoneHistory)]
+                    );
+                    assert!(report.kept.is_empty());
+                    assert!(report.deleted.is_empty());
+                    assert!(report.notes.iter().any(|(_, note)| note.contains(field)));
+                    assert_eq!(context.left[&local.id], local);
+                    assert_eq!(context.right[&external.id], external);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_protected_tombstone_keeps_incoming_closure_evidence() {
+        let base = created_issue("bd-history-protected", "Original issue", 10);
+        let mut local = base.clone();
+        local.status = Status::Tombstone;
+        local.deleted_at = Some(fixed_time_merge(80));
+        local.deleted_by = Some("local deleter".to_string());
+        local.updated_at = fixed_time_merge(200);
+        let mut external = with_comment(base.clone(), 1, "Peer verification", 60);
+        external.status = Status::Closed;
+        external.title = "Incoming title cannot resurrect".to_string();
+        external.closed_at = Some(fixed_time_merge(50));
+        external.close_reason = Some("Closed on another machine".to_string());
+        external.closed_by = Some("peer reviewer".to_string());
+        external.updated_at = fixed_time_merge(300);
+        let context = MergeContext::new(
+            issue_map(&[&base]),
+            issue_map(&[&local]),
+            issue_map(&[&external]),
+        );
+        let tombstones = HashSet::from([local.id.clone()]);
+        let report = three_way_merge(
+            &context,
+            ConflictResolution::PreferExternal,
+            Some(&tombstones),
+        );
+        assert!(report.conflicts.is_empty());
+        assert_eq!(report.tombstone_protected, vec![local.id.clone()]);
+        assert_eq!(report.kept.len(), 1);
+        let issue = &report.kept[0];
+        assert_eq!(issue.status, Status::Tombstone);
+        assert_eq!(issue.title, local.title);
+        assert_eq!(issue.closed_at, external.closed_at);
+        assert_eq!(issue.close_reason, external.close_reason);
+        assert_eq!(issue.closed_by, external.closed_by);
+        assert_eq!(issue.deleted_at, local.deleted_at);
+        assert_eq!(issue.deleted_by, local.deleted_by);
+        assert_eq!(issue.comments, external.comments);
+        assert!(issue.updated_at >= external.updated_at);
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_history_keeps_single_scalar_edit() {
+        let mut base = created_issue("bd-history-single-edit", "Exported title", 10);
+        base.status = Status::Tombstone;
+        base.deleted_at = Some(fixed_time_merge(80));
+        base.updated_at = fixed_time_merge(100);
+        let mut changed = base.clone();
+        changed.title = "Corrected title".to_string();
+        changed.closed_at = Some(fixed_time_merge(50));
+        changed.close_reason = Some("Verified before deletion".to_string());
+        changed.updated_at = fixed_time_merge(200);
+
+        for (local, external) in [(&base, &changed), (&changed, &base)] {
+            for local_export_base in [false, true] {
+                let context = MergeContext::new(
+                    issue_map(&[&base]),
+                    issue_map(&[local]),
+                    issue_map(&[external]),
+                );
+                let context = if local_export_base {
+                    context.with_local_export_base()
+                } else {
+                    context
+                };
+                let report = three_way_merge(&context, ConflictResolution::Manual, None);
+                assert!(report.conflicts.is_empty(), "{report:?}");
+                assert!(report.notes.is_empty());
+                assert!(report.deleted.is_empty());
+                assert_eq!(report.kept.len(), 1);
+                let joined = &report.kept[0];
+                assert_eq!(joined.status, Status::Tombstone);
+                assert_eq!(joined.title, changed.title);
+                assert_eq!(joined.closed_at, changed.closed_at);
+                assert_eq!(joined.close_reason, changed.close_reason);
+                assert_eq!(joined.deleted_at, base.deleted_at);
+                assert_eq!(joined.updated_at, changed.updated_at);
+            }
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_history_retains_evidence_only_in_base() {
+        let mut base = with_comment(
+            created_issue("bd-base-history", "Earlier title", 10),
+            1,
+            "Evidence retained only in the base",
+            60,
+        );
+        base.status = Status::Tombstone;
+        base.closed_at = Some(fixed_time_merge(50));
+        base.close_reason = Some("Verified before deletion".to_string());
+        base.closed_by = Some("original-reviewer".to_string());
+        base.deleted_at = Some(fixed_time_merge(80));
+        base.deleted_by = Some("original-deleter".to_string());
+        base.delete_reason = Some("Retired after verification".to_string());
+        base.bypassed_policy = Some(true);
+        base.bypass_reason = Some("Reviewed exception".to_string());
+        base.policy_gates_fired = Some(vec!["review".to_string()]);
+        base.labels = vec!["base-evidence".to_string()];
+        base.updated_at = fixed_time_merge(100);
+        let mut local = created_issue(&base.id, "Current agreed title", 10);
+        local.status = Status::Tombstone;
+        local.deleted_at = base.deleted_at;
+        local.updated_at = fixed_time_merge(200);
+
+        for divergent_comments in [false, true] {
+            let mut external = local.clone();
+            external.updated_at = fixed_time_merge(300);
+            if divergent_comments {
+                external = with_comment(external, 1, "Peer evidence", 90);
+            }
+            for local_export_base in [false, true] {
+                let context = MergeContext::new(
+                    issue_map(&[&base]),
+                    issue_map(&[&local]),
+                    issue_map(&[&external]),
+                );
+                let context = if local_export_base {
+                    context.with_local_export_base()
+                } else {
+                    context
+                };
+                for strategy in [
+                    ConflictResolution::Manual,
+                    ConflictResolution::PreferLocal,
+                    ConflictResolution::PreferExternal,
+                    ConflictResolution::PreferNewer,
+                ] {
+                    let report = three_way_merge(&context, strategy, None);
+                    assert!(report.conflicts.is_empty(), "{report:?}");
+                    assert!(report.deleted.is_empty());
+                    assert!(report.notes.is_empty());
+                    assert_eq!(report.kept.len(), 1);
+                    let joined = &report.kept[0];
+                    assert_eq!(joined.status, Status::Tombstone);
+                    assert_eq!(joined.title, local.title);
+                    assert_eq!(joined.closed_at, base.closed_at);
+                    assert_eq!(joined.close_reason, base.close_reason);
+                    assert_eq!(joined.closed_by, base.closed_by);
+                    assert_eq!(joined.deleted_at, base.deleted_at);
+                    assert_eq!(joined.deleted_by, base.deleted_by);
+                    assert_eq!(joined.delete_reason, base.delete_reason);
+                    assert_eq!(joined.bypassed_policy, base.bypassed_policy);
+                    assert_eq!(joined.bypass_reason, base.bypass_reason);
+                    assert_eq!(joined.policy_gates_fired, base.policy_gates_fired);
+                    assert_eq!(joined.labels, base.labels);
+                    assert!(
+                        joined
+                            .comments
+                            .iter()
+                            .any(|comment| comment.body == base.comments[0].body)
+                    );
+                    assert_eq!(
+                        joined.comments.len(),
+                        if divergent_comments { 2 } else { 1 }
+                    );
+                    let expected_time = if divergent_comments {
+                        external.updated_at + chrono::Duration::microseconds(1)
+                    } else {
+                        external.updated_at
+                    };
+                    assert_eq!(joined.updated_at, expected_time);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_history_retains_base_with_missing_peer() {
+        let mut base = created_issue("bd-base-without-peer", "Exported title", 10);
+        base.status = Status::Tombstone;
+        base.closed_at = Some(fixed_time_merge(50));
+        base.close_reason = Some("Historical verification".to_string());
+        base.deleted_at = Some(fixed_time_merge(80));
+        base.updated_at = fixed_time_merge(100);
+        let mut local = base.clone();
+        local.title = "Current local title".to_string();
+        local.closed_at = None;
+        local.close_reason = None;
+        local.updated_at = fixed_time_merge(200);
+        let context = MergeContext::new(issue_map(&[&base]), issue_map(&[&local]), HashMap::new())
+            .with_local_export_base();
+        for strategy in [
+            ConflictResolution::Manual,
+            ConflictResolution::PreferLocal,
+            ConflictResolution::PreferNewer,
+        ] {
+            let report = three_way_merge(&context, strategy, None);
+            assert!(report.conflicts.is_empty(), "{report:?}");
+            assert!(report.deleted.is_empty());
+            assert!(report.notes.is_empty());
+            assert_eq!(report.kept.len(), 1);
+            let joined = &report.kept[0];
+            assert_eq!(joined.status, Status::Tombstone);
+            assert_eq!(joined.title, local.title);
+            assert_eq!(joined.closed_at, base.closed_at);
+            assert_eq!(joined.close_reason, base.close_reason);
+            assert_eq!(joined.updated_at, local.updated_at);
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_history_conflicts_with_base_are_refused() {
+        let mut base = created_issue("bd-base-conflict", "Protected history", 10);
+        base.status = Status::Tombstone;
+        base.closed_at = Some(fixed_time_merge(50));
+        base.close_reason = Some("Original reason".to_string());
+        base.deleted_at = Some(fixed_time_merge(80));
+        base.updated_at = fixed_time_merge(100);
+        for field in ["closed_at", "close_reason", "deleted_at"] {
+            let mut local = base.clone();
+            match field {
+                "closed_at" => local.closed_at = Some(fixed_time_merge(60)),
+                "close_reason" => local.close_reason = Some("Different peer reason".to_string()),
+                _ => local.deleted_at = Some(fixed_time_merge(90)),
+            }
+            local.updated_at = fixed_time_merge(200);
+            let mut external = local.clone();
+            external.updated_at = fixed_time_merge(300);
+            for local_export_base in [false, true] {
+                let context = MergeContext::new(
+                    issue_map(&[&base]),
+                    issue_map(&[&local]),
+                    issue_map(&[&external]),
+                );
+                let context = if local_export_base {
+                    context.with_local_export_base()
+                } else {
+                    context
+                };
+                for strategy in [
+                    ConflictResolution::Manual,
+                    ConflictResolution::PreferLocal,
+                    ConflictResolution::PreferExternal,
+                    ConflictResolution::PreferNewer,
+                ] {
+                    let report = three_way_merge(&context, strategy, None);
+                    assert_eq!(
+                        report.conflicts,
+                        vec![(base.id.clone(), ConflictType::TombstoneHistory)]
+                    );
+                    assert!(report.kept.is_empty());
+                    assert!(report.deleted.is_empty());
+                    assert!(report.notes.iter().any(|(_, note)| note.contains(field)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_history_does_not_restore_superseded_close() {
+        let mut base = created_issue("bd-reclosed", "Reopened and completed again", 10);
+        base.status = Status::Closed;
+        base.closed_at = Some(fixed_time_merge(50));
+        base.close_reason = Some("First completion".to_string());
+        base.closed_by = Some("previous-closer".to_string());
+        base.closed_by_session = Some("previous-session".to_string());
+        base.closed_by_model = Some("previous-model".to_string());
+        base.bypassed_policy = Some(true);
+        base.bypass_reason = Some("Previous exception".to_string());
+        base.policy_gates_fired = Some(vec!["previous-gate".to_string()]);
+        base.updated_at = fixed_time_merge(60);
+
+        for actor in [None, Some("current-closer")] {
+            let mut local = created_issue(&base.id, &base.title, 10);
+            local.status = Status::Tombstone;
+            local.closed_at = Some(fixed_time_merge(100));
+            local.close_reason = Some("Completed after reopening".to_string());
+            local.closed_by = actor.map(str::to_string);
+            local.deleted_at = Some(fixed_time_merge(150));
+            local.updated_at = fixed_time_merge(200);
+            let mut external = local.clone();
+            external.updated_at = fixed_time_merge(300);
+            for local_export_base in [false, true] {
+                let context = MergeContext::new(
+                    issue_map(&[&base]),
+                    issue_map(&[&local]),
+                    issue_map(&[&external]),
+                );
+                let context = if local_export_base {
+                    context.with_local_export_base()
+                } else {
+                    context
+                };
+                let report = three_way_merge(&context, ConflictResolution::Manual, None);
+                assert!(report.conflicts.is_empty(), "{report:?}");
+                assert!(report.deleted.is_empty());
+                assert_eq!(report.kept.len(), 1);
+                let joined = &report.kept[0];
+                assert_eq!(joined.status, Status::Tombstone);
+                assert_eq!(joined.closed_at, local.closed_at);
+                assert_eq!(joined.close_reason, local.close_reason);
+                assert_eq!(joined.closed_by, local.closed_by);
+                assert!(joined.closed_by_session.is_none());
+                assert!(joined.closed_by_model.is_none());
+                assert!(joined.bypassed_policy.is_none());
+                assert!(joined.bypass_reason.is_none());
+                assert!(joined.policy_gates_fired.is_none());
+                assert_eq!(joined.deleted_at, local.deleted_at);
+                assert_eq!(joined.updated_at, external.updated_at);
+            }
+        }
     }
 
     #[test]

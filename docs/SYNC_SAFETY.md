@@ -362,13 +362,46 @@ reconciliation. Existing explicit `--force` behavior is unchanged.
 | **Ambiguous automatic import** | A skipped conflicting row being acknowledged and later silently overwritten, including older or equal-timestamp external edits | Explicit reconciliation with `sync --merge`; review `--force-db` or `--force-jsonl` when a winner is required |
 | **Payload comment identity** | Treating a database-local comment rowid as global identity: two clones both mint comment id `1`, so a merged JSONL routinely carries one id for two issues; import reassigns the local rowid and verifies comments by `(issue, created_at, author, text)` instead of refusing the file | n/a - never refuses; same-issue duplicate payloads are still rejected |
 | **Tombstone protection** | Resurrecting deleted issues | **None** - by design |
+| **Tombstone history preservation** | Dropping known closure, deletion, attribution, or relationship evidence while keeping a deleted record | **None** - conflicting historical facts require reconciliation |
+
+Tombstone protection preserves the deleted state without freezing its history.
+Ordinary import fills missing closure and deletion timestamps, reasons, actor
+and session attribution, original type, and close-policy bypass evidence from
+the same issue on a peer. Older and equal-timestamp records can supply missing
+facts too; a newer sparse record cannot erase them. Labels, relationships, and
+comments are retained additively. Import reports changed protected records as
+`tombstone_enriched` (also included in `updated`), separately from unchanged
+`tombstone_skipped` records. A tombstone deleted while open keeps an unknown
+`closed_at`; neither deletion nor import fabricates a close timestamp.
+
+Different nonempty closure or deletion timestamps, reasons, actors, or other
+single-valued historical facts cannot all fit in one issue row. Import refuses
+the entire transaction on such contradictions, and three-way merge reports a
+`tombstone_history` conflict even with a force policy. Keep both source copies
+and reconcile the historical facts explicitly; choosing a whole-row winner is
+not evidence that the discarded history was false. Bypass reasons or fired
+gates with an unknown bypass disposition are also refused when the existing
+storage projection cannot represent them, rather than inventing a bypass.
+
+The same join protects tombstones retained during database rebuild and recovery.
+Contradictions are checked against the captured source before replacing the
+database. Full and incremental exports refuse to replace a tombstone
+with a row lacking facts already present in the matching JSONL record, including
+under `--force`. Retention can omit an expired tombstone from JSONL after the
+database preserves that source's historical evidence; explicit purge retains
+its existing intentional-omission semantics. These guards preserve evidence
+still available in a database or source file; they cannot reconstruct fields that older versions already
+removed from every copy.
 
 Ordinary import preserves exported close-policy bypass evidence. A new issue
 keeps its bypass flag, reason, and fired gates. For a skipped issue, import can
 adopt that evidence only when the stored issue and relations match the incoming
 payload, including its closure state, and no local close metadata exists.
-Existing local close metadata takes precedence, including a recorded close
-without a bypass.
+Existing local close metadata takes precedence for live issues, including a
+recorded close without a bypass. Protected tombstones instead join compatible
+historical evidence as described above. Deleting a closed issue retains its
+closure attribution and bypass audit; reopening a live issue still clears the
+attribution for its former close.
 
 Import certifies a row as synchronized only when its resulting exported audit
 also matches the source. A conflicting or missing source audit leaves the local

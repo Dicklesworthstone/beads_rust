@@ -4227,7 +4227,7 @@ fn repair_database_from_jsonl_after_preflight(
         tombstones: preserved_tombstones,
         dirty: preserved_dirty_issues,
         warnings: mut dirty_preservation_warnings,
-    } = preserved_state_for_doctor_rebuild(db_path, source);
+    } = preserved_state_for_doctor_rebuild(db_path, source)?;
     for warning in &dirty_preservation_warnings {
         tracing::warn!(db_path = %db_path.display(), warning, "doctor --repair cannot fully preserve unflushed local state");
     }
@@ -4669,41 +4669,43 @@ fn write_jsonl_rebuild_verification_failed_marker(
 /// every known failure through `dirty_preservation_warnings`. Failure to open
 /// an existing database must be reported as unknown preservation, never as an
 /// empty, successful snapshot.
+/// Conflicting readable tombstone history is refused before replacement;
+/// explicit repair is not permission to discard contradictory audit facts.
 fn preserved_state_for_doctor_rebuild(
     db_path: &Path,
     source: &JsonlSourceSnapshot,
-) -> DoctorPreservedState {
+) -> Result<DoctorPreservedState> {
     if !db_path.is_file() {
-        return DoctorPreservedState {
+        return Ok(DoctorPreservedState {
             warnings: config::missing_database_preservation_warnings(db_path),
             ..DoctorPreservedState::default()
-        };
+        });
     }
     let storage = match SqliteStorage::open(db_path) {
         Ok(storage) => storage,
         Err(err) => {
-            return DoctorPreservedState {
+            return Ok(DoctorPreservedState {
                 warnings: vec![format!(
                     "database {} could not be opened for a pre-rebuild snapshot ({err}); preservation of unflushed tombstones, dirty issues, and their relationships could not be established",
                     db_path.display()
                 )],
                 ..DoctorPreservedState::default()
-            };
+            });
         }
     };
     let crate::sync::UnflushedStateSnapshot {
-        tombstones: tombstone_snapshot,
+        tombstones: mut tombstone_snapshot,
         dirty: dirty_snapshot,
         warnings,
         ..
     } = snapshot_unflushed_state(&storage);
     drop(storage);
     if tombstone_snapshot.is_empty() && dirty_snapshot.is_empty() {
-        return DoctorPreservedState {
+        return Ok(DoctorPreservedState {
             tombstones: tombstone_snapshot,
             dirty: dirty_snapshot,
             warnings,
-        };
+        });
     }
     let jsonl_filter = match scan_jsonl_snapshot_for_tombstone_filter(source) {
         Ok(filter) => filter,
@@ -4716,11 +4718,17 @@ fn preserved_state_for_doctor_rebuild(
             JsonlTombstoneFilter::default()
         }
     };
-    DoctorPreservedState {
-        tombstones: tombstones_missing_from_jsonl_tombstones(tombstone_snapshot, &jsonl_filter),
+    tombstone_snapshot.extend(
+        dirty_snapshot
+            .iter()
+            .filter(|entry| jsonl_filter.tombstone_ids.contains(&entry.issue.id))
+            .cloned(),
+    );
+    Ok(DoctorPreservedState {
+        tombstones: tombstones_missing_from_jsonl_tombstones(tombstone_snapshot, source)?,
         dirty: dirty_issues_missing_from_jsonl(dirty_snapshot, &jsonl_filter),
         warnings,
-    }
+    })
 }
 
 /// Unflushed state captured from the pre-repair database, and an account of
@@ -17080,7 +17088,7 @@ mod tests {
         fs::write(&jsonl_path, "").unwrap();
         let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
 
-        let preserved = preserved_state_for_doctor_rebuild(&db_path, &source);
+        let preserved = preserved_state_for_doctor_rebuild(&db_path, &source).unwrap();
         assert!(preserved.tombstones.is_empty());
         assert!(preserved.dirty.is_empty());
         assert_eq!(preserved.warnings.len(), 1);
@@ -17104,7 +17112,7 @@ mod tests {
         fs::write(&jsonl_path, "").unwrap();
         let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
 
-        let preserved = preserved_state_for_doctor_rebuild(&db_path, &source);
+        let preserved = preserved_state_for_doctor_rebuild(&db_path, &source).unwrap();
         assert!(preserved.tombstones.is_empty());
         assert!(preserved.dirty.is_empty());
         assert!(preserved.warnings.is_empty());
@@ -17128,7 +17136,7 @@ mod tests {
             fs::write(&jsonl_path, "").unwrap();
             let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
 
-            let preserved = preserved_state_for_doctor_rebuild(&db_path, &source);
+            let preserved = preserved_state_for_doctor_rebuild(&db_path, &source).unwrap();
             assert!(preserved.tombstones.is_empty());
             assert!(preserved.dirty.is_empty());
             assert_eq!(preserved.warnings.len(), 1);
@@ -17161,7 +17169,7 @@ mod tests {
         fs::write(&jsonl_path, "").unwrap();
         let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
 
-        let preserved = preserved_state_for_doctor_rebuild(&db_path, &source);
+        let preserved = preserved_state_for_doctor_rebuild(&db_path, &source).unwrap();
         assert!(preserved.tombstones.is_empty());
         assert!(preserved.dirty.is_empty());
         assert_eq!(preserved.warnings.len(), 1);

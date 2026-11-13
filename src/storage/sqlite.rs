@@ -152,7 +152,7 @@ impl CloseAuditProjection {
     }
 
     fn attach_attribution(&self, issue: &mut Issue) {
-        if issue.status == Status::Closed {
+        if issue.status.is_terminal() {
             issue.closed_by.clone_from(&self.closed_by);
             issue
                 .closed_by_agent_name
@@ -217,7 +217,8 @@ impl ImportCloseBypassAudit {
         self.exported.attach(issues);
     }
 
-    /// Mirror imported attribution replacement and insert-only bypass auditing.
+    /// Mirror imported attribution replacement and bypass auditing. Terminal
+    /// tombstone enrichment may add evidence to an existing audit row.
     pub(crate) fn record_imported(&mut self, issue_id: &str, issue: &Issue) {
         let has_attribution = issue.closed_by.is_some()
             || issue.closed_by_agent_name.is_some()
@@ -241,7 +242,8 @@ impl ImportCloseBypassAudit {
             .clone_from(&issue.closed_by_agent_name);
         audit.closed_by_harness.clone_from(&issue.closed_by_harness);
         audit.closed_by_model.clone_from(&issue.closed_by_model);
-        if new_record && issue.bypassed_policy == Some(true) {
+        if (new_record || issue.status == Status::Tombstone) && issue.bypassed_policy == Some(true)
+        {
             audit.bypassed = true;
             audit.reason.clone_from(&issue.bypass_reason);
             audit.gates.clone_from(&issue.policy_gates_fired);
@@ -1697,7 +1699,7 @@ pub(crate) struct PreservedTableRows {
     pub(crate) rows: Vec<Vec<SqliteValue>>,
 }
 
-type CloseAttributionAnchors = HashMap<String, (DateTime<Utc>, DateTime<Utc>)>;
+type CloseAttributionAnchors = HashMap<String, (DateTime<Utc>, Option<DateTime<Utc>>)>;
 
 /// Snapshot of every auxiliary/history table plus per-table capture failures
 /// (a corrupt source page must not abort preservation of the other tables).
@@ -3639,9 +3641,9 @@ impl SqliteStorage {
 
     fn close_attribution_anchors(conn: &Connection) -> Result<CloseAttributionAnchors> {
         let mut anchors = HashMap::new();
-        for row in
-            conn.query("SELECT id, created_at, closed_at FROM issues WHERE status = 'closed'")?
-        {
+        for row in conn.query(
+            "SELECT id, created_at, closed_at FROM issues WHERE status IN ('closed', 'tombstone')",
+        )? {
             let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
                 return Err(BeadsError::Config(
                     "closure anchor has a non-text issue ID".to_string(),
@@ -3651,7 +3653,7 @@ impl SqliteStorage {
                 id.to_string(),
                 (
                     parse_datetime_value(row.get(1))?,
-                    parse_datetime_value(row.get(2))?,
+                    parse_opt_datetime_value(row.get(2))?,
                 ),
             );
         }
@@ -9351,10 +9353,8 @@ impl SqliteStorage {
                     SqliteValue::from(id),
                 ],
             )?;
-            conn.execute_with_params(
-                "DELETE FROM close_metadata WHERE issue_id = ?",
-                &[SqliteValue::from(id)],
-            )?;
+            // A tombstone retains the issue's closure history. Only a real
+            // reopen (or an explicit hard purge) invalidates that evidence.
             // GitHub #384 phase 5: the tombstone transition is a status
             // change like any other; record its admission attribution.
             Self::record_capacity_occupancy_in_tx(conn, id, &ctx.actor, &ctx.attribution)?;
@@ -9545,14 +9545,14 @@ impl SqliteStorage {
         Ok(Some(issue))
     }
 
-    /// Read the closure projection separately from the strict base issue.
+    /// Read the complete closure audit separately from the strict base issue.
     /// The snapshot caller records a warning if this read fails and can retain
     /// the readable issue for an explicitly requested partial repair.
     pub(crate) fn attach_close_attribution_for_preservation(
         &self,
         issue: &mut Issue,
     ) -> Result<()> {
-        Self::attach_close_attribution_from_conn(&self.conn, issue)
+        Self::attach_close_audit_from_conn(&self.conn, issue)
     }
 
     /// Every `issues` row with this ID, read by a full table scan.
@@ -9722,14 +9722,14 @@ impl SqliteStorage {
                 issue.id
             )));
         }
-        if issue.status == Status::Closed && table_exists(conn, "close_metadata") {
+        if issue.status.is_terminal() && table_exists(conn, "close_metadata") {
             Self::attach_close_attribution_from_conn(conn, &mut issue)?;
         }
         Ok(Some(issue))
     }
 
     fn attach_close_attribution_from_conn(conn: &Connection, issue: &mut Issue) -> Result<()> {
-        if issue.status == Status::Closed {
+        if issue.status.is_terminal() {
             let attribution = Self::close_attribution_select_clause(conn)?;
             let rows = conn.query_with_params(
                 &format!(
@@ -9746,7 +9746,7 @@ impl SqliteStorage {
     }
 
     fn attach_close_audit_from_conn(conn: &Connection, issue: &mut Issue) -> Result<()> {
-        if issue.status == Status::Closed && table_exists(conn, "close_metadata") {
+        if issue.status.is_terminal() && table_exists(conn, "close_metadata") {
             let attribution = Self::close_attribution_select_clause(conn)?;
             let audit = conn.query_with_params(
                 &format!(
@@ -22787,13 +22787,17 @@ impl SqliteStorage {
     /// Persist the winning imported closure record (GitHub #474, #584).
     /// Attribution is replaced exactly, including absent values: an imported
     /// historical closure must not inherit the actor of an earlier local
-    /// close. The existing insert-only precedence for bypass auditing remains
-    /// unchanged. No import actor or local events are consulted.
+    /// close. Tombstones retain historical attribution and may only enrich
+    /// their bypass audit; other imports retain insert-only bypass precedence.
+    /// No import actor or local events are consulted.
     pub(crate) fn persist_imported_close_bypass_audit_in_tx(&self, issue: &Issue) -> Result<()> {
         if !self.conn.as_async().in_transaction() {
             return Err(BeadsError::internal(
                 "import audit persistence requires an active transaction",
             ));
+        }
+        if issue.status == Status::Tombstone {
+            self.verify_tombstone_close_audit_preserved(issue)?;
         }
         let attribution = [
             &issue.closed_by,
@@ -22804,7 +22808,7 @@ impl SqliteStorage {
         .map(|value| {
             value
                 .as_deref()
-                .filter(|value| issue.status == Status::Closed && !value.trim().is_empty())
+                .filter(|value| issue.status.is_terminal() && !value.trim().is_empty())
                 .map_or(SqliteValue::Null, SqliteValue::from)
         });
         let has_attribution = attribution.iter().any(|value| *value != SqliteValue::Null);
@@ -22837,9 +22841,29 @@ impl SqliteStorage {
                         .bypass_reason
                         .as_deref()
                         .map_or(SqliteValue::Null, SqliteValue::from),
-                    gates_json.map_or(SqliteValue::Null, SqliteValue::from),
+                    gates_json
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
                 ],
             )?;
+            if issue.status == Status::Tombstone {
+                // Tombstone enrichment can fill an existing, incomplete audit
+                // row. The guard above proves that this replacement retains
+                // every previously known attribution and bypass fact.
+                self.conn.execute_with_params(
+                    "UPDATE close_metadata SET bypassed_policy = ?, bypass_reason = ?, \
+                            policy_gates_fired = ? WHERE issue_id = ?",
+                    &[
+                        SqliteValue::from(i64::from(issue.bypassed_policy == Some(true))),
+                        issue
+                            .bypass_reason
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
+                        gates_json.map_or(SqliteValue::Null, SqliteValue::from),
+                        SqliteValue::from(issue.id.as_str()),
+                    ],
+                )?;
+            }
         }
         if supports_attribution {
             let mut params = Vec::from(attribution);
@@ -22849,6 +22873,86 @@ impl SqliteStorage {
                         closed_by_harness = ?, closed_by_model = ? WHERE issue_id = ?",
                 &params,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Import callers merge tombstone history before writing it. Keep the
+    /// storage boundary fail-closed too, including local recovery and merge
+    /// callers: a sparse row must never erase a known closer or bypass audit.
+    fn verify_tombstone_close_audit_preserved(&self, issue: &Issue) -> Result<()> {
+        if issue.bypassed_policy != Some(true)
+            && (issue
+                .bypass_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+                || issue
+                    .policy_gates_fired
+                    .as_ref()
+                    .is_some_and(|gates| !gates.is_empty()))
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Tombstone history for issue '{}' supplies bypass_reason or policy_gates_fired without bypassed_policy=true; this audit evidence cannot be represented losslessly, so no import was applied",
+                    issue.id
+                ),
+            });
+        }
+        let Some(existing) = self.get_close_metadata(&issue.id)? else {
+            return Ok(());
+        };
+        let conflict = |field: &str| BeadsError::SyncConflict {
+            message: format!(
+                "Tombstone history for issue '{}' would discard or change {field}; no import was applied",
+                issue.id
+            ),
+        };
+        for (field, known, incoming) in [
+            ("closed_by", &existing.closed_by, &issue.closed_by),
+            (
+                "closed_by_agent_name",
+                &existing.closed_by_agent_name,
+                &issue.closed_by_agent_name,
+            ),
+            (
+                "closed_by_harness",
+                &existing.closed_by_harness,
+                &issue.closed_by_harness,
+            ),
+            (
+                "closed_by_model",
+                &existing.closed_by_model,
+                &issue.closed_by_model,
+            ),
+        ] {
+            if known
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .is_some_and(|known| incoming.as_deref() != Some(known))
+            {
+                return Err(conflict(field));
+            }
+        }
+        if existing.bypassed_policy {
+            if issue.bypassed_policy != Some(true) {
+                return Err(conflict("bypassed_policy"));
+            }
+            if existing
+                .bypass_reason
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .is_some_and(|known| issue.bypass_reason.as_deref() != Some(known))
+            {
+                return Err(conflict("bypass_reason"));
+            }
+            if existing.policy_gates_fired.iter().any(|gate| {
+                !issue
+                    .policy_gates_fired
+                    .as_ref()
+                    .is_some_and(|incoming| incoming.contains(gate))
+            }) {
+                return Err(conflict("policy_gates_fired"));
+            }
         }
         Ok(())
     }
@@ -23490,10 +23594,8 @@ impl SqliteStorage {
                         SqliteValue::from(tombstone.id.as_str()),
                     ],
                 )?;
-                storage.conn.execute_with_params(
-                    "DELETE FROM close_metadata WHERE issue_id = ?",
-                    &[SqliteValue::from(tombstone.id.as_str())],
-                )?;
+                // Deletion is terminal history, not a reopen. Retain the
+                // closing actor and policy evidence for future exports.
                 if !was_terminal {
                     storage.insert_sync_merge_event_in_tx(
                         &tombstone.id,
@@ -31326,7 +31428,7 @@ required_fields:
     }
 
     #[test]
-    fn test_delete_issue_clears_close_metadata() {
+    fn test_delete_issue_preserves_close_metadata() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
 
@@ -31343,7 +31445,9 @@ required_fields:
 
         let close_update = IssueUpdate {
             status: Some(Status::Closed),
+            closed_at: Some(Some(t1 + chrono::Duration::hours(1))),
             close_reason: Some(Some("done".to_string())),
+            closed_by_session: Some(Some("closing-session".to_string())),
             ..IssueUpdate::default()
         };
         storage
@@ -31352,19 +31456,114 @@ required_fields:
         storage
             .record_close_metadata(
                 "bd-dmeta",
-                &crate::close_policy::AttributionValues::default(),
-                false,
-                None,
-                &[],
+                &crate::close_policy::AttributionValues {
+                    agent_name: Some("closing-agent".to_string()),
+                    harness: Some("closing-harness".to_string()),
+                    model: Some("closing-model".to_string()),
+                },
+                true,
+                Some("reviewed exception"),
+                &["review".to_string()],
             )
             .unwrap();
-        assert!(storage.get_close_metadata("bd-dmeta").unwrap().is_some());
+        let before = storage.get_close_metadata("bd-dmeta").unwrap().unwrap();
 
-        storage
-            .delete_issue("bd-dmeta", "tester", "cleanup", None)
+        let deleted = storage
+            .delete_issue(
+                "bd-dmeta",
+                "deleting-actor",
+                "cleanup",
+                Some(t1 + chrono::Duration::hours(2)),
+            )
             .unwrap();
 
-        assert!(storage.get_close_metadata("bd-dmeta").unwrap().is_none());
+        assert_eq!(
+            storage.get_close_metadata("bd-dmeta").unwrap(),
+            Some(before)
+        );
+        assert_eq!(deleted.status, Status::Tombstone);
+        assert_eq!(deleted.closed_at, Some(t1 + chrono::Duration::hours(1)));
+        assert_eq!(deleted.close_reason.as_deref(), Some("done"));
+        assert_eq!(
+            deleted.closed_by_session.as_deref(),
+            Some("closing-session")
+        );
+        assert_eq!(deleted.closed_by.as_deref(), Some("tester"));
+        assert_eq!(
+            deleted.closed_by_agent_name.as_deref(),
+            Some("closing-agent")
+        );
+        assert_eq!(
+            deleted.closed_by_harness.as_deref(),
+            Some("closing-harness")
+        );
+        assert_eq!(deleted.closed_by_model.as_deref(), Some("closing-model"));
+        assert_eq!(deleted.deleted_by.as_deref(), Some("deleting-actor"));
+        let exported = storage.get_all_issues_for_export().unwrap();
+        assert_eq!(exported[0].closed_by.as_deref(), Some("tester"));
+        assert_eq!(exported[0].bypassed_policy, Some(true));
+        assert_eq!(
+            exported[0].bypass_reason.as_deref(),
+            Some("reviewed exception")
+        );
+        assert_eq!(
+            exported[0].policy_gates_fired,
+            Some(vec!["review".to_string()])
+        );
+        let mut preserved = storage
+            .get_issue_for_preservation("bd-dmeta")
+            .unwrap()
+            .unwrap();
+        storage
+            .attach_close_attribution_for_preservation(&mut preserved)
+            .unwrap();
+        assert_eq!(preserved.closed_by, exported[0].closed_by);
+        assert_eq!(preserved.bypassed_policy, exported[0].bypassed_policy);
+        assert_eq!(preserved.bypass_reason, exported[0].bypass_reason);
+        assert_eq!(preserved.policy_gates_fired, exported[0].policy_gates_fired);
+    }
+
+    #[test]
+    fn tombstone_import_cannot_erase_existing_close_audit() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let created = Utc.with_ymd_and_hms(2026, 11, 12, 0, 0, 0).unwrap();
+        let mut issue = make_issue(
+            "bd-audit",
+            "Keep audit",
+            Status::Tombstone,
+            2,
+            None,
+            created,
+            None,
+        );
+        issue.closed_at = Some(created + chrono::Duration::hours(1));
+        issue.deleted_at = Some(created + chrono::Duration::hours(2));
+        issue.closed_by = Some("original-closer".to_string());
+        issue.bypassed_policy = Some(true);
+        issue.bypass_reason = Some("reviewed exception".to_string());
+        issue.policy_gates_fired = Some(vec!["review".to_string()]);
+        storage.upsert_issue_for_import(&issue).unwrap();
+        let before = storage.get_issue(&issue.id).unwrap().unwrap();
+        let before_audit = storage.get_close_metadata(&issue.id).unwrap();
+
+        let mut sparse = issue.clone();
+        sparse.title = "This replacement must roll back".to_string();
+        sparse.closed_by = None;
+        sparse.bypassed_policy = None;
+        sparse.bypass_reason = None;
+        sparse.policy_gates_fired = None;
+        let error = storage.upsert_issue_for_import(&sparse).unwrap_err();
+        assert!(error.to_string().contains("closed_by"));
+        assert_eq!(storage.get_issue(&issue.id).unwrap(), Some(before));
+        assert_eq!(storage.get_close_metadata(&issue.id).unwrap(), before_audit);
+
+        let mut enriched = issue;
+        enriched.closed_by_model = Some("historical-model".to_string());
+        enriched.policy_gates_fired = Some(vec!["review".to_string(), "tests".to_string()]);
+        storage.upsert_issue_for_import(&enriched).unwrap();
+        let audit = storage.get_close_metadata(&enriched.id).unwrap().unwrap();
+        assert_eq!(audit.closed_by_model.as_deref(), Some("historical-model"));
+        assert_eq!(audit.policy_gates_fired, vec!["review", "tests"]);
     }
 
     #[test]
@@ -32110,8 +32309,8 @@ required_fields:
             .delete_issue(&issue.id, "deleter", "cleanup", None)
             .unwrap();
         assert_eq!(deleted.deleted_by.as_deref(), Some("deleter"));
-        assert!(deleted.closed_by.is_none());
-        assert!(storage.get_close_metadata(&issue.id).unwrap().is_none());
+        assert_eq!(deleted.closed_by.as_deref(), Some("second-closer"));
+        assert!(storage.get_close_metadata(&issue.id).unwrap().is_some());
     }
 
     #[test]
@@ -32225,6 +32424,55 @@ required_fields:
             assert!(
                 !rebuilt.get_events(&shared.id, 10).unwrap().is_empty(),
                 "audit history remains available"
+            );
+        }
+    }
+
+    #[test]
+    fn tombstone_auxiliary_restore_preserves_unknown_closure_and_merged_audit() {
+        let created = Utc.with_ymd_and_hms(2026, 11, 12, 0, 0, 0).unwrap();
+        for closed_at in [None, Some(created + chrono::Duration::hours(1))] {
+            let source = SqliteStorage::open_memory().unwrap();
+            let mut issue = make_issue(
+                "bd-recover-audit",
+                "Recovered tombstone",
+                Status::Tombstone,
+                2,
+                None,
+                created,
+                None,
+            );
+            issue.closed_at = closed_at;
+            issue.closed_by = Some("original-closer".to_string());
+            issue.bypassed_policy = Some(true);
+            issue.bypass_reason = Some("reviewed exception".to_string());
+            issue.policy_gates_fired = Some(vec!["review".to_string()]);
+            source.upsert_issue_for_import(&issue).unwrap();
+            let snapshot = source.snapshot_auxiliary_history_tables();
+            assert!(snapshot.failures.is_empty(), "{:?}", snapshot.failures);
+
+            let rebuilt = SqliteStorage::open_memory().unwrap();
+            let mut sparse = issue.clone();
+            sparse.closed_by = None;
+            sparse.bypassed_policy = None;
+            sparse.bypass_reason = None;
+            sparse.policy_gates_fired = None;
+            rebuilt.upsert_issue_for_import(&sparse).unwrap();
+            rebuilt.restore_auxiliary_history_tables(&snapshot).unwrap();
+            let recovered = rebuilt.get_issue_for_export(&issue.id).unwrap().unwrap();
+            assert_eq!(recovered.closed_at, closed_at);
+            assert_eq!(recovered.closed_by, issue.closed_by);
+            assert_eq!(recovered.bypassed_policy, issue.bypassed_policy);
+
+            let mut enriched = issue;
+            enriched.closed_by_model = Some("peer-model".to_string());
+            enriched.policy_gates_fired = Some(vec!["review".to_string(), "tests".to_string()]);
+            rebuilt.upsert_issue_for_import(&enriched).unwrap();
+            let merged_audit = rebuilt.get_close_metadata(&enriched.id).unwrap();
+            rebuilt.restore_auxiliary_history_tables(&snapshot).unwrap();
+            assert_eq!(
+                rebuilt.get_close_metadata(&enriched.id).unwrap(),
+                merged_audit
             );
         }
     }

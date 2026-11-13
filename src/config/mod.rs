@@ -1664,7 +1664,7 @@ fn rebuild_database_from_jsonl_snapshot(
 /// A missing row behind an orphan dirty marker is harmless, but an unreadable
 /// row, enumeration, or relationship set requires explicit repair. The
 /// returned vectors are filtered so only state the JSONL cannot reproduce
-/// survives: tombstones not already flushed as tombstones, and dirty live
+/// survives: tombstone evidence not already carried by JSONL, and dirty live
 /// issues whose row is absent from the JSONL or strictly newer than its
 /// JSONL copy (everything else comes back via the rebuild's own
 /// `import_from_jsonl`).
@@ -1707,8 +1707,16 @@ fn preserved_unflushed_state(
         !jsonl_filter.tombstone_ids.contains(id)
             && !jsonl_filter.non_tombstone_updated_at.contains_key(id)
     });
-    snapshot.tombstones =
-        tombstones_missing_from_jsonl_tombstones(snapshot.tombstones, &jsonl_filter);
+    // A source deletion still wins over unflushed live edits, but closure
+    // evidence from those edits must enrich the deleted row before recovery.
+    snapshot.tombstones.extend(
+        snapshot
+            .dirty
+            .iter()
+            .filter(|entry| jsonl_filter.tombstone_ids.contains(&entry.issue.id))
+            .cloned(),
+    );
+    snapshot.tombstones = tombstones_missing_from_jsonl_tombstones(snapshot.tombstones, source)?;
     snapshot.dirty = dirty_issues_missing_from_jsonl(snapshot.dirty, &jsonl_filter);
     Ok(snapshot)
 }
@@ -10288,7 +10296,7 @@ routing:
                 let issue = Issue {
                     id: original_omitted.id.clone(),
                     title: "Peer reintroduced a live issue".to_string(),
-                    created_at: Utc::now(),
+                    created_at: original_omitted.created_at,
                     updated_at: Utc::now(),
                     ..Issue::default()
                 };
