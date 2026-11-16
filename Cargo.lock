@@ -297,7 +297,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.1",
- "signal-hook 0.4.5",
+ "signal-hook 0.4.6",
  "slab",
  "smallvec",
  "socket2",
@@ -447,7 +447,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.1",
  "shell-words",
- "signal-hook 0.4.5",
+ "signal-hook 0.4.6",
  "similar 3.2.1",
  "tar",
  "tempfile",
@@ -1706,9 +1706,9 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "flate2"
-version = "1.1.10"
+version = "1.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+checksum = "626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4"
 dependencies = [
  "crc32fast",
  "miniz_oxide 0.9.1",
@@ -2325,7 +2325,7 @@ dependencies = [
  "gix-zlib",
  "nonempty",
  "parking_lot",
- "signal-hook 0.4.5",
+ "signal-hook 0.4.6",
  "smallvec",
  "thiserror",
 ]
@@ -3017,7 +3017,7 @@ dependencies = [
  "gix-fs",
  "libc",
  "parking_lot",
- "signal-hook 0.4.5",
+ "signal-hook 0.4.6",
  "signal-hook-registry",
  "tempfile",
 ]
@@ -5312,9 +5312,9 @@ dependencies = [
 
 [[package]]
 name = "signal-hook"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b29ffa27d3d59a049bb328258de100f8012848d1b08d444e08bbc02ac468435e"
+checksum = "49f7447afd772ca79ad17ae0a3972a6b0df0cb4b80990fd82707593e9e012a74"
 dependencies = [
  "libc",
  "signal-hook-registry",
