@@ -78,7 +78,7 @@ fsqlite-parser = { version = "=0.4.12" }
 fsqlite-planner = { version = "=0.4.12" }
 fsqlite-wal = { version = "=0.4.12" }
 fsqlite-btree = { version = "=0.4.10" }
-fsqlite-ast = { version = "=0.4.12" }
+fsqlite-ast = { version = "=0.5.0" }
 fsqlite-mvcc = { version = "=0.4.10" }
 fsqlite-observability = { version = "=0.4.12" }
 
