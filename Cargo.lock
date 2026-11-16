@@ -415,7 +415,7 @@ dependencies = [
  "fsqlite-ast",
  "fsqlite-btree",
  "fsqlite-core",
- "fsqlite-error",
+ "fsqlite-error 0.5.0",
  "fsqlite-func",
  "fsqlite-mvcc",
  "fsqlite-observability",
@@ -1801,7 +1801,7 @@ dependencies = [
  "asupersync",
  "fsqlite-ast",
  "fsqlite-core",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-ext-fts5",
  "fsqlite-ext-icu",
  "fsqlite-ext-misc",
@@ -1830,7 +1830,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6814e841996523e99c2257f48d58e68a8fa5593c425ad9efaa3ea56937c88bb"
 dependencies = [
  "foldhash",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-func",
  "fsqlite-pager",
  "fsqlite-types",
@@ -1852,7 +1852,7 @@ dependencies = [
  "foldhash",
  "fsqlite-ast",
  "fsqlite-btree",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-ext-fts5",
  "fsqlite-ext-icu",
  "fsqlite-ext-json",
@@ -1883,9 +1883,18 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.4.12"
+version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4031411660377c42ab229ca0be487b29ecfb19edef77087c9275a23ec1c57ef"
+checksum = "7e1e699677e339165ca5413f5b0f38e0d6e6a15be5c81c8a6bbefabadda10dbf"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "fsqlite-error"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d489f1c924ef1deeee97de720c83920fdc1d8e6ddb775dad6106c5851e955577"
 dependencies = [
  "thiserror",
 ]
@@ -1896,7 +1905,7 @@ version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9f0b9cdf3d877c1cc91add6d91832d8f145fbc78ff66624108a6d3acf5a77c1"
 dependencies = [
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-func",
  "fsqlite-types",
  "smallvec",
@@ -1909,7 +1918,7 @@ version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49fadb888aed8ebb6516eab1960d5a0ccc98228cd198fd58568a4a674554b305"
 dependencies = [
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-func",
  "fsqlite-types",
  "tracing",
@@ -1921,7 +1930,7 @@ version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ffd60fa3dec215fcfb5543a7f79f6e9afd63861100cc162567b62bfa6882d515"
 dependencies = [
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-func",
  "fsqlite-types",
  "json5",
@@ -1935,7 +1944,7 @@ version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f5d633e0af2307f38606df16829cecee625cea1d897bbe9c3fbec2d790b97d9"
 dependencies = [
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-func",
  "fsqlite-types",
  "getrandom 0.4.3",
@@ -1949,7 +1958,7 @@ version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12f5ca59cf367dd53718508997ab0ccf1afb4f9eed86126b9f06faa4199f7187"
 dependencies = [
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-func",
  "fsqlite-types",
 ]
@@ -1961,7 +1970,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb55eb0fa650cbb55a7b3aa80e2325a72fdf5ccf9188c3753ebc5cd7b9d7c34f"
 dependencies = [
  "chrono",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-types",
  "tracing",
 ]
@@ -1977,7 +1986,7 @@ dependencies = [
  "crc32c",
  "crossbeam-epoch",
  "fsqlite-btree",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-observability",
  "fsqlite-pager",
  "fsqlite-types",
@@ -2017,7 +2026,7 @@ dependencies = [
  "chacha20poly1305",
  "dashmap",
  "foldhash",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-observability",
  "fsqlite-types",
  "fsqlite-vfs",
@@ -2037,7 +2046,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f29c9918bf04743d69ffd419bcd5aeb7b0d90ea5e9f42225398414605830ec7"
 dependencies = [
  "fsqlite-ast",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-types",
  "hashbrown 0.17.1",
  "memchr",
@@ -2052,7 +2061,7 @@ checksum = "ab9e52b8ecdd98de0b2139f2686f1795101b96c039c471f10faff28586a2c86c"
 dependencies = [
  "blake3",
  "fsqlite-ast",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-parser",
  "fsqlite-types",
  "lru",
@@ -2071,7 +2080,7 @@ dependencies = [
  "asupersync",
  "bitflags 2.13.1",
  "blake3",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "memchr",
  "parking_lot",
  "serde",
@@ -2092,7 +2101,7 @@ dependencies = [
  "crossbeam-deque",
  "fsqlite-ast",
  "fsqlite-btree",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-func",
  "fsqlite-mvcc",
  "fsqlite-observability",
@@ -2114,7 +2123,7 @@ checksum = "1d69b373b442a8d20af7f34b4b5ed55d67f2845a8da359feaa58dcf27688c45a"
 dependencies = [
  "advisory-lock",
  "asupersync",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-observability",
  "fsqlite-types",
  "io-uring",
@@ -2134,7 +2143,7 @@ dependencies = [
  "asupersync",
  "blake3",
  "crc32c",
- "fsqlite-error",
+ "fsqlite-error 0.4.13",
  "fsqlite-observability",
  "fsqlite-types",
  "fsqlite-vfs",
