@@ -42,13 +42,13 @@ jobs:
           persist-credentials: false
 
       - name: Install the repository's pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # Reviewed 2026-10-09 snapshot
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # Reviewed 2026-10-09 snapshot
         with:
           toolchain: nightly-2026-08-31
           components: rustfmt, clippy
 
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # Reviewed 2026-08-17 snapshot
+        uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # Reviewed 2026-08-17 snapshot
 
       - name: Check formatting
         run: cargo fmt --all -- --check
