@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, verify/issue-612-schema]
     paths-ignore:
       - '.beads/**'
       - 'docs/**'
