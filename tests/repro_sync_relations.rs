@@ -674,13 +674,22 @@ fn comment_revision_preupgrade_alias_import_refuses_lost_provenance_atomically()
             if rename_on_import {
                 original.external_ref = Some(alias_id.to_string());
             }
-            let mut storage = SqliteStorage::open_memory().unwrap();
+            let database = TempDir::new().unwrap();
+            let database_path = database.path().join("preupgrade.db");
+            let storage = SqliteStorage::open(&database_path).unwrap();
             store_revision_fixture(&storage, &original);
+            drop(storage);
             // Simulate a row already rekeyed by the old importer: its owning
             // issue has changed and no portable origin metadata was retained.
-            storage
-                .execute_raw("UPDATE comments SET revision = NULL")
+            let connection = beads_rust::franken_sync::Connection::open(
+                database_path.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+            connection
+                .execute("UPDATE comments SET revision = NULL")
                 .unwrap();
+            connection.close().unwrap();
+            let mut storage = SqliteStorage::open(&database_path).unwrap();
             if state == CommentState::Redacted {
                 storage
                     .redact_comment(&original.id, 17, "original-author", None, false)

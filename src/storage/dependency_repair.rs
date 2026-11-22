@@ -725,7 +725,14 @@ impl SqliteStorage {
         // exactly the batch applied below, including its canonical warnings.
         let actor = ctx.actor.clone();
         for (id, update) in &updates {
-            Self::update_issue_in_tx(conn, ctx, id, update, &actor)?;
+            Self::update_issue_in_tx(
+                conn,
+                ctx,
+                id,
+                update,
+                &actor,
+                !workflow.gate_policies.is_empty(),
+            )?;
             Self::record_capacity_occupancy_in_tx(conn, id, &actor, &ctx.attribution)?;
             Self::end_departed_capacity_exemptions_in_tx(
                 conn,

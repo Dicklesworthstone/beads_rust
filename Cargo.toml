@@ -67,20 +67,20 @@ fsqlite = { version = "=0.4.10", default-features = false, features = [
     "icu",
     "misc",
 ] }
-fsqlite-types = { version = "=0.4.12" }
-fsqlite-error = { version = "=0.5.0" }
+fsqlite-types = { version = "=0.4.10" }
+fsqlite-error = { version = "=0.4.10" }
 fsqlite-core = { version = "=0.4.10" }
-fsqlite-func = { version = "=0.4.12" }
+fsqlite-func = { version = "=0.4.10" }
 fsqlite-vdbe = { version = "=0.4.10" }
-fsqlite-vfs = { version = "=0.4.12" }
+fsqlite-vfs = { version = "=0.4.10" }
 fsqlite-pager = { version = "=0.4.10" }
-fsqlite-parser = { version = "=0.4.12" }
-fsqlite-planner = { version = "=0.4.12" }
-fsqlite-wal = { version = "=0.4.12" }
-fsqlite-btree = { version = "=0.5.0" }
-fsqlite-ast = { version = "=0.5.0" }
+fsqlite-parser = { version = "=0.4.10" }
+fsqlite-planner = { version = "=0.4.10" }
+fsqlite-wal = { version = "=0.4.10" }
+fsqlite-btree = { version = "=0.4.10" }
+fsqlite-ast = { version = "=0.4.10" }
 fsqlite-mvcc = { version = "=0.4.10" }
-fsqlite-observability = { version = "=0.4.12" }
+fsqlite-observability = { version = "=0.4.10" }
 
 # Current-thread runtime that drives fsqlite 0.4's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
