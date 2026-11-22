@@ -12870,6 +12870,8 @@ pub fn auto_import_probe_refreshing_witnesses(
 /// not make its issue data stale. This probe never refreshes witnesses or asks
 /// a reader to upgrade receipts. Mutating callers use
 /// [`auto_import_probe_refreshing_witnesses`] to retain that maintenance.
+/// An empty, untracked JSONL from fresh initialization has no content to import;
+/// it still needs its first receipt before a writer may treat it as observed.
 ///
 /// # Errors
 ///
@@ -12885,7 +12887,7 @@ pub fn auto_import_probe(
         validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
     }
     let probe = compute_jsonl_newer_impl(storage, jsonl_path)?;
-    Ok(probe.jsonl_newer)
+    Ok(probe.jsonl_newer && !probe.empty_untracked)
 }
 
 fn compute_staleness_impl(
@@ -12919,6 +12921,7 @@ struct JsonlNewerProbe {
     jsonl_exists: bool,
     jsonl_mtime: Option<std::time::SystemTime>,
     jsonl_newer: bool,
+    empty_untracked: bool,
     refresh_witness: Option<JsonlWitnessRefresh>,
 }
 
@@ -12928,6 +12931,7 @@ fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Resul
             jsonl_exists: false,
             jsonl_mtime: None,
             jsonl_newer: false,
+            empty_untracked: false,
             refresh_witness: None,
         });
     }
@@ -12953,6 +12957,7 @@ fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Resul
         .get_metadata(METADATA_JSONL_UNIMPORTED_SOURCE)?
         .as_deref()
         == Some("true");
+    let empty_untracked = !pending_source && stored_hash.is_none() && observed.size == 0;
     let jsonl_newer = if pending_source {
         true
     } else if fast_witness_current {
@@ -12984,6 +12989,7 @@ fn compute_jsonl_newer_impl(storage: &SqliteStorage, jsonl_path: &Path) -> Resul
         jsonl_exists: true,
         jsonl_mtime: Some(observed.mtime),
         jsonl_newer,
+        empty_untracked,
         refresh_witness,
     })
 }
@@ -21949,6 +21955,7 @@ mod tests {
             crate::franken_sync::Connection::open(database_path.to_string_lossy().into_owned())
                 .unwrap();
         let legacy_schema = crate::storage::schema::SCHEMA_SQL
+            .replace("        revision TEXT,\n", "")
             .replace("        closed_by TEXT,\n", "")
             .replace(
                 "        assignee_at_report TEXT,\n        override_reason TEXT,\n",
@@ -22002,7 +22009,8 @@ mod tests {
         let raw_before = crate::storage::sqlite::database_family_snapshot(&database_path).unwrap();
         let error = SqliteStorage::open(&database_path).unwrap_err();
         assert!(
-            matches!(&error, BeadsError::Config(message) if message.contains("explicit reviewed")),
+            matches!(&error, BeadsError::SyncConflict { message }
+                if message.contains("sync merge is pending")),
             "{error}"
         );
         let target = u32::try_from(crate::storage::schema::CURRENT_SCHEMA_VERSION).unwrap();
@@ -27078,6 +27086,64 @@ mod tests {
     }
 
     #[test]
+    fn test_read_freshness_probe_allows_only_empty_untracked_jsonl_without_import() {
+        for (contents, stored_hash, pending_source, needs_import) in [
+            ("", None, false, false),
+            ("", None, true, true),
+            ("\n", None, false, true),
+            ("{\"id\":\"bd-unobserved\"}\n", None, false, true),
+            ("", Some("previously-observed-nonempty-source"), false, true),
+        ] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let (_temp_dir, beads_dir, jsonl_path) = counted_workspace();
+            fs::write(&jsonl_path, contents).unwrap();
+            if let Some(hash) = stored_hash {
+                storage
+                    .set_metadata(METADATA_JSONL_CONTENT_HASH, hash)
+                    .unwrap();
+            }
+            if pending_source {
+                storage
+                    .set_metadata(METADATA_JSONL_UNIMPORTED_SOURCE, "true")
+                    .unwrap();
+            }
+            let metadata_before = storage
+                .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                .unwrap();
+
+            assert_eq!(
+                auto_import_probe(&storage, &beads_dir, &jsonl_path, false).unwrap(),
+                needs_import,
+                "contents={contents:?}, stored_hash={stored_hash:?}, pending={pending_source}"
+            );
+            assert!(
+                compute_staleness(&storage, &jsonl_path)
+                    .unwrap()
+                    .jsonl_newer,
+                "the full staleness check must still require a writer to observe the source"
+            );
+            assert_eq!(
+                storage
+                    .execute_raw_query("SELECT rowid, key, value FROM metadata ORDER BY rowid")
+                    .unwrap(),
+                metadata_before,
+                "read-only probes must not record receipts or refresh metadata"
+            );
+            assert_eq!(fs::read(&jsonl_path).unwrap(), contents.as_bytes());
+            assert!(
+                auto_import_probe_refreshing_witnesses(
+                    &mut storage,
+                    &beads_dir,
+                    &jsonl_path,
+                    false,
+                )
+                .unwrap(),
+                "writers must retain the initial receipt/import requirement"
+            );
+        }
+    }
+
+    #[test]
     fn test_read_freshness_probe_does_not_upgrade_legacy_receipts() {
         for version in [None, Some("1"), Some("2"), Some("3")] {
             let mut storage = SqliteStorage::open_memory().unwrap();
@@ -29502,6 +29568,9 @@ mod tests {
         local.closed_by_harness = Some("retained-harness".to_string());
         local.closed_by_model = Some("retained-model".to_string());
         local.labels = vec!["retained-label".to_string()];
+        // The production helper receives a hydrated storage row, including
+        // defaults materialized when sparse JSONL records are persisted.
+        canonicalize_persisted_issue_defaults(&mut local);
 
         for omitted in ["actor", "agent", "harness", "model", "all"] {
             let mut incoming = local.clone();
@@ -30543,7 +30612,7 @@ mod tests {
             local.bypassed_policy = Some(true);
             local.bypass_reason = Some("Recorded exception".to_string());
             local.policy_gates_fired = Some(vec!["review".to_string()]);
-            let mut storage = SqliteStorage::open_memory().unwrap();
+            let storage = SqliteStorage::open_memory().unwrap();
             storage.upsert_issue_for_import(&local).unwrap();
             storage
                 .sync_labels_for_import(&local.id, &local.labels)
@@ -32239,8 +32308,12 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_issue_closure_attribution_does_not_survive_reopen_or_delete() {
-        for status in [Status::Open, Status::Tombstone, Status::Closed] {
+    fn test_normalize_issue_closure_attribution_survives_deletion_but_not_reopen() {
+        for (status, retains_closure) in [
+            (Status::Open, false),
+            (Status::Tombstone, true),
+            (Status::Closed, true),
+        ] {
             let mut issue = make_test_issue("bd-closer", "Closure attribution");
             issue.status = status.clone();
             issue.closed_by = Some("operator-a".to_string());
@@ -32253,12 +32326,12 @@ mod tests {
 
             assert_eq!(
                 issue.closed_by.as_deref(),
-                (status == Status::Closed).then_some("operator-a")
+                retains_closure.then_some("operator-a")
             );
             assert_eq!(issue.closed_by_agent_name, None);
             assert_eq!(
                 issue.closed_by_harness.as_deref(),
-                (status == Status::Closed).then_some("claude-code")
+                retains_closure.then_some("claude-code")
             );
             assert_eq!(issue.closed_by_model, None);
             assert_eq!(issue.deleted_by.as_deref(), Some("deleter"));
@@ -32825,6 +32898,7 @@ mod tests {
                     revision: None,
                 });
             }
+            normalize_comment_revisions(&mut original.comments).unwrap();
             write_additive_issues(&path, std::slice::from_ref(&original));
             import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
             storage.set_metadata("needs_flush", "false").unwrap();
@@ -32844,6 +32918,10 @@ mod tests {
                     revision: None,
                 });
             }
+            // Enroll provenance before aliasing: these are the same comments
+            // on a renamed issue, not unrelated legacy comments originating
+            // from a different issue with coincidentally identical bodies.
+            normalize_comment_revisions(&mut update.comments).unwrap();
             // The alias collides by the original content hash. Classification
             // uses the pre-import metadata, so it skips even after an update.
             let mut alias = if skip_first || change_title {

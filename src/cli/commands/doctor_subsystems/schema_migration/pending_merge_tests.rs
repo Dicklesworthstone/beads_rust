@@ -87,8 +87,8 @@ fn current_pending_merge_retains_observational_noop_planning() {
         seed_pending(&context.db_path, key, "''");
         let before = raw_family_witness(&context.db_path).unwrap();
         let plan = build_observational_plan(&context.db_path).unwrap();
-        assert_eq!(plan.from_version, 19);
-        assert_eq!(plan.to_version, 19);
+        assert_eq!(plan.from_version, current_schema_version().unwrap());
+        assert_eq!(plan.to_version, current_schema_version().unwrap());
         assert!(!plan.eligible);
         assert!(plan.forecast.is_none());
         assert!(plan.plan_token.is_none());

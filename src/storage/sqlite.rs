@@ -9751,7 +9751,10 @@ impl SqliteStorage {
     }
 
     fn attach_close_audit_from_conn(conn: &Connection, issue: &mut Issue) -> Result<()> {
-        if issue.status.is_terminal() && table_exists(conn, "close_metadata") {
+        // Preservation must distinguish an absent record from an unreadable
+        // audit table. Let the query fail so its caller can retain the base
+        // issue and report that its closure evidence was not captured.
+        if issue.status.is_terminal() {
             let attribution = Self::close_attribution_select_clause(conn)?;
             let audit = conn.query_with_params(
                 &format!(
@@ -22063,7 +22066,9 @@ impl SqliteStorage {
         let Some(mut issue) = self.get_issue(id)? else {
             return Ok(None);
         };
-        Self::attach_close_audit_from_conn(&self.conn, &mut issue)?;
+        if issue.status.is_terminal() && table_exists(&self.conn, "close_metadata") {
+            Self::attach_close_audit_from_conn(&self.conn, &mut issue)?;
+        }
 
         // Populate relations
         issue.labels = self.get_labels(id)?;
@@ -27639,7 +27644,7 @@ required_fields:
 
     #[test]
     fn gate_report_authorization_refuses_without_audit_or_mirror_mutation() {
-        let storage = independent_validation_storage();
+        let mut storage = independent_validation_storage();
         storage.set_metadata("needs_flush", "false").unwrap();
         for (provider, actor) in [
             ("worker", "worker"),
@@ -46254,7 +46259,8 @@ required_fields:
         let raw_before = database_family_snapshot(&path).unwrap();
         let error = SqliteStorage::open(&path).unwrap_err();
         assert!(
-            matches!(&error, BeadsError::Config(message) if message.contains("explicit reviewed")),
+            matches!(&error, BeadsError::SyncConflict { message }
+                if message.contains("sync merge is pending")),
             "{error}"
         );
         let target = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap();
@@ -46348,7 +46354,8 @@ required_fields:
         let raw_before = database_family_snapshot(&path).unwrap();
         let error = SqliteStorage::open(&path).unwrap_err();
         assert!(
-            matches!(&error, BeadsError::Config(message) if message.contains("explicit reviewed")),
+            matches!(&error, BeadsError::SyncConflict { message }
+                if message.contains("sync merge is pending")),
             "{error}"
         );
         let target = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap();

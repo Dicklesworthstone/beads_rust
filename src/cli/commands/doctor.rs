@@ -17911,7 +17911,13 @@ mod tests {
 
             let readiness = find_check(&checks, "dep.fully_unblocked_open").unwrap();
             assert_eq!(readiness.status, CheckStatus::Error, "{readiness:?}");
-            assert!(readiness.details.is_none(), "{readiness:?}");
+            assert_eq!(
+                readiness.details,
+                Some(serde_json::json!({
+                    "finding_id": "fm-dependencies-fully-unblocked-open-issues"
+                })),
+                "invalid policy permits finding metadata but no readiness classification"
+            );
             assert_eq!(
                 checks
                     .iter()

@@ -3678,7 +3678,13 @@ fn attest_legacy_v15_projection_values(conn: &Connection) -> Result<()> {
         if !conn.query(&format!("SELECT 1 FROM main.{table} AS source LEFT JOIN main.issues AS issue ON issue.id = source.{parent_column} WHERE issue.id IS NULL LIMIT 1"))?.is_empty() {
             return Err(legacy_v15_refusal(format!("{table} contains an orphan issue reference")));
         }
-        for column in columns {
+        // The v21 revision is synthesized as NULL by the reviewed copy below;
+        // it is not a source column in the exact legacy-v15 declaration. Keep
+        // attesting every copied value without querying that absent column.
+        for column in columns
+            .iter()
+            .filter(|column| table != "comments" || column.name != "revision")
+        {
             let kind = if column.data_type == "INTEGER" {
                 "integer"
             } else {
@@ -7107,7 +7113,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reviewed_v14_clears_export_hashes_when_issues_are_empty() {
+    fn test_reviewed_v14_preserves_export_hashes_when_issues_are_empty() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("reviewed-empty-v13.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
@@ -7132,6 +7138,10 @@ mod tests {
             .expect("restore pre-v15 shape");
         conn.execute("PRAGMA user_version = 13")
             .expect("stamp reviewed source");
+        let export_before = conn
+            .query("SELECT rowid, issue_id, content_hash, exported_at FROM export_hashes")
+            .expect("capture durable export receipt");
+        assert_eq!(export_before.len(), 1);
 
         run_migrations_atomic(
             &conn,
@@ -7147,13 +7157,13 @@ mod tests {
             issue_count.get(0).and_then(SqliteValue::as_integer),
             Some(0)
         );
-        let export_count = conn
-            .query_row("SELECT COUNT(*) FROM export_hashes")
-            .expect("count cleared export hashes");
+        let export_after = conn
+            .query("SELECT rowid, issue_id, content_hash, exported_at FROM export_hashes")
+            .expect("read preserved export receipt");
         assert_eq!(
-            export_count.get(0).and_then(SqliteValue::as_integer),
-            Some(0),
-            "v14 must clear export hashes even when there are no issue rows"
+            format!("{export_after:?}"),
+            format!("{export_before:?}"),
+            "reviewed v14 hash refresh must not erase durable export receipts, even without issue rows"
         );
         assert_eq!(
             connection_user_version(&conn).expect("read migrated version"),
@@ -7900,6 +7910,8 @@ mod tests {
             "UPDATE child_counters SET last_child = 0",
             "UPDATE child_counters SET last_child = NULL",
             "UPDATE comments SET issue_id = 'bd-missing'",
+            "UPDATE comments SET text = X'7061796c6f6164'",
+            "ALTER TABLE comments ADD COLUMN revision TEXT",
             "UPDATE events SET created_at = NULL",
             "UPDATE dependencies SET type = 'Review-Custom' WHERE type = 'blocks'",
             "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT issue_id, depends_on_id, 'BLOCKS', created_at, created_by, metadata, thread_id FROM dependencies WHERE type = 'blocks'",
@@ -9222,8 +9234,11 @@ mod tests {
                 issue_id TEXT NOT NULL,
                 author TEXT NOT NULL,
                 text TEXT NOT NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
             );
+            CREATE INDEX idx_comments_issue ON comments(issue_id);
+            CREATE INDEX idx_comments_created_at ON comments(created_at);
             CREATE TABLE events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 issue_id TEXT NOT NULL,
@@ -9380,8 +9395,11 @@ mod tests {
                 issue_id TEXT NOT NULL,
                 author TEXT NOT NULL,
                 text TEXT NOT NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
             );
+            CREATE INDEX idx_comments_issue ON comments(issue_id);
+            CREATE INDEX idx_comments_created_at ON comments(created_at);
             CREATE TABLE events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 issue_id TEXT NOT NULL,

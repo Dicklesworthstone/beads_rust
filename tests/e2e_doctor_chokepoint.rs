@@ -4218,7 +4218,9 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
         );
         let warning = String::from_utf8_lossy(&read_only.stderr);
         assert!(
-            warning.contains("schema") && warning.contains("JSONL"),
+            warning.contains("schema 14")
+                && warning.contains("reads issues.jsonl directly")
+                && warning.contains("Database-only records remain in the original database"),
             "{warning}"
         );
         let listed = parse_trailing_json(&String::from_utf8_lossy(&read_only.stdout));

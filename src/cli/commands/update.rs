@@ -4029,20 +4029,28 @@ because downstream tooling links to them.\n\n- [ ] schema migration applied\n\
             "late runtime error should not be masked by blocked-cache repair: {err}"
         );
 
-        let reopened =
-            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("reopen");
-        let blocker_after = reopened
-            .storage
-            .get_issue("bd-blocker")
-            .expect("load blocker")
-            .expect("blocker should still exist");
-        assert_eq!(blocker_after.status, Status::Open);
-        assert!(
-            reopened
-                .storage
-                .get_blocked_ids()
+        // Ordinary startup must refuse a missing authoritative table. Inspect
+        // the rolled-back rows without asking startup to recreate labels.
+        let reader = crate::franken_sync::compat::open_with_flags(
+            &beads_dir.join("beads.db").to_string_lossy(),
+            crate::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("inspect rollback without schema maintenance");
+        let blocker_after = reader
+            .query_row("SELECT status FROM issues WHERE id = 'bd-blocker'")
+            .expect("load blocker");
+        assert_eq!(
+            blocker_after
+                .get(0)
+                .and_then(fsqlite_types::SqliteValue::as_text),
+            Some("open")
+        );
+        assert_eq!(
+            reader
+                .query("SELECT issue_id FROM blocked_issues_cache WHERE issue_id = 'bd-blocked'")
                 .expect("blocked ids after rollback")
-                .contains("bd-blocked"),
+                .len(),
+            1,
             "the refused label write must roll back the status and leave its dependent blocked"
         );
 

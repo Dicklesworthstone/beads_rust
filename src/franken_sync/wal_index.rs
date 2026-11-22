@@ -90,7 +90,11 @@ impl DatabaseReplacementExclusion {
         expected_identity: FileIdentity,
     ) -> crate::Result<()> {
         let path = replacement_path(requested)?;
-        let file = open_regular(&path, true)?;
+        // Replacement retains and exchanges main inodes rather than rewriting
+        // their contents. Hard-link aliases remain on the displaced inode,
+        // and the native lock below excludes SQLite access through every alias.
+        // WAL recovery's single-link requirement still applies to its files.
+        let file = open_regular_file(&path, true)?;
         if identity(&file)? != expected_identity {
             return Err(crate::BeadsError::SyncConflict {
                 message: "Database replacement candidate no longer matches its retained identity"
@@ -129,7 +133,7 @@ impl DatabaseReplacementExclusion {
         };
         // Identity is checked again after both admissions; neither a path race
         // nor a successful lock on a different inode authorizes a replacement.
-        let named = open_regular(&path, false)?;
+        let named = open_regular_file(&path, false)?;
         if identity(&named)? != expected_identity {
             return Err(crate::BeadsError::SyncConflict {
                 message: "Database replacement path changed while acquiring exclusion".to_string(),
@@ -158,7 +162,8 @@ impl DatabaseReplacementExclusion {
                 message: "Database replacement inode has no retained native exclusion".to_string(),
             })?;
         if identity(&retained.1.file)? != expected_identity
-            || identity(&open_regular(&replacement_path(requested)?, false)?)? != expected_identity
+            || identity(&open_regular_file(&replacement_path(requested)?, false)?)?
+                != expected_identity
         {
             return Err(crate::BeadsError::SyncConflict {
                 message: "Database replacement name no longer identifies its locked generation"
@@ -249,7 +254,7 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn open_regular(path: &Path, writable: bool) -> io::Result<File> {
+fn open_regular_file(path: &Path, writable: bool) -> io::Result<File> {
     if !fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(invalid("WAL-index recovery refuses non-regular files"));
     }
@@ -272,10 +277,15 @@ fn open_regular(path: &Path, writable: bool) -> io::Result<File> {
             "WAL-index recovery descriptor is not a regular file",
         ));
     }
+    Ok(file)
+}
+
+fn open_regular(path: &Path, writable: bool) -> io::Result<File> {
+    let file = open_regular_file(path, writable)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
+        if file.metadata()?.nlink() != 1 {
             return Err(invalid("WAL-index recovery refuses hard-linked files"));
         }
     }
@@ -1541,6 +1551,17 @@ pub mod tests {
         let candidate = db.with_file_name("candidate.db");
         fs::write(&candidate, b"distinct candidate generation").unwrap();
         let candidate_id = identity(&File::open(&candidate).unwrap()).unwrap();
+        let original_alias = db.with_file_name("original-alias.db");
+        let candidate_alias = db.with_file_name("candidate-alias.db");
+        fs::hard_link(&db, &original_alias).unwrap();
+        fs::hard_link(&candidate, &candidate_alias).unwrap();
+        let peer =
+            RecoveryLock::acquire(open_regular_file(&original_alias, true).unwrap()).unwrap();
+        let error = DatabaseReplacementExclusion::acquire(&db, original_id).unwrap_err();
+        assert!(matches!(error, crate::BeadsError::SyncConflict { .. }));
+        assert_eq!(fs::read(&original_alias).unwrap(), original);
+        assert!(!sidecar(&db, "-fsqlite-ns-use").exists());
+        drop(peer);
         let mut guard = DatabaseReplacementExclusion::acquire(&db, original_id).unwrap();
         guard.retain_candidate(&candidate, candidate_id).unwrap();
         let ledger = fs::read(sidecar(&db, "-fsqlite-ns-use")).unwrap();
@@ -1548,16 +1569,25 @@ pub mod tests {
         renameat_with(CWD, &db, CWD, &candidate, RenameFlags::EXCHANGE).unwrap();
         guard.verify_path(&db, candidate_id).unwrap();
         guard.verify_path(&candidate, original_id).unwrap();
+        guard.verify_path(&original_alias, original_id).unwrap();
+        guard.verify_path(&candidate_alias, candidate_id).unwrap();
+        assert_eq!(fs::read(&original_alias).unwrap(), original);
+        assert_eq!(
+            fs::read(&candidate_alias).unwrap(),
+            b"distinct candidate generation"
+        );
         assert!(guard.verify_path(&db, original_id).is_err());
         // Re-entry must keep the already-held inode instead of trying a second
         // native lock on it through its new name and conflicting with itself.
         guard.retain_candidate(&db, candidate_id).unwrap();
         guard.retain_candidate(&candidate, original_id).unwrap();
-        for path in [&db, &candidate] {
+        for path in [&db, &candidate, &original_alias, &candidate_alias] {
             assert!(matches!(
-                RecoveryLock::acquire(open_regular(path, true).unwrap()),
+                RecoveryLock::acquire(open_regular_file(path, true).unwrap()),
                 Err(TryLockError::WouldBlock)
             ));
+        }
+        for path in [&db, &candidate] {
             assert!(
                 PendingNamespaceOpen::begin(path, NamespaceOpenIntent::ReservedExclusive).is_err()
             );
@@ -1567,12 +1597,62 @@ pub mod tests {
         guard.verify_path(&db, original_id).unwrap();
         guard.verify_path(&candidate, candidate_id).unwrap();
         assert_eq!(fs::read(&db).unwrap(), original);
+        assert_eq!(fs::read(&original_alias).unwrap(), original);
         assert_eq!(fs::read(sidecar(&db, "-fsqlite-ns-use")).unwrap(), ledger);
         drop(guard);
         let mut resumed = DatabaseReplacementExclusion::acquire(&db, original_id).unwrap();
         resumed.retain_candidate(&candidate, candidate_id).unwrap();
         resumed.verify_path(&db, original_id).unwrap();
         resumed.verify_path(&candidate, candidate_id).unwrap();
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn replacement_exclusion_conflicts_with_engine_alias_shared_locks() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::wal_index::tests::replacement_exclusion_conflicts_with_engine_alias_shared_locks",
+        ) {
+            return;
+        }
+        use fsqlite_types::flags::VfsOpenFlags;
+        use fsqlite_types::{Cx, LockLevel};
+        use fsqlite_vfs::{UnixVfs, Vfs, VfsFile};
+
+        let (_temp, db, id) = fixture();
+        let alias = db.with_file_name("engine-alias.db");
+        fs::hard_link(&db, &alias).unwrap();
+        let before = payload(&db);
+        let cx = Cx::new();
+        let (mut peer, _) = UnixVfs::new()
+            .open(
+                &cx,
+                Some(&alias),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+        peer.lock(&cx, LockLevel::Shared).unwrap();
+        let error = DatabaseReplacementExclusion::acquire(&db, id).unwrap_err();
+        assert!(matches!(error, crate::BeadsError::SyncConflict { .. }));
+        assert_eq!(payload(&db), before);
+        peer.unlock(&cx, LockLevel::None).unwrap();
+
+        let guard = DatabaseReplacementExclusion::acquire(&db, id).unwrap();
+        assert!(matches!(
+            peer.lock(&cx, LockLevel::Shared),
+            Err(FrankenError::Busy)
+        ));
+        guard.verify_path(&alias, id).unwrap();
+        drop(guard);
+        peer.lock(&cx, LockLevel::Shared).unwrap();
+        peer.unlock(&cx, LockLevel::None).unwrap();
+        peer.close(&cx).unwrap();
+        assert_eq!(payload(&db), before);
+        assert_eq!(fs::read(alias).unwrap(), before[0]);
     }
 
     #[cfg(any(
@@ -2797,6 +2877,25 @@ pub mod tests {
         fs::hard_link(&retained, &shm).unwrap();
         assert!(quarantine_poisoned_index(db.to_str().unwrap(), id).is_err());
         assert_eq!(fs::read(&retained).unwrap(), poison());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlinked_recovery_payloads_remain_refused() {
+        for suffix in ["", "-wal", "-shm"] {
+            let (_temp, db, id) = fixture();
+            let alias = db.with_file_name("retained-recovery-alias");
+            fs::hard_link(sidecar(&db, suffix), &alias).unwrap();
+            let before = payload(&db);
+            let alias_before = fs::read(&alias).unwrap();
+            let error = quarantine_poisoned_index(db.to_str().unwrap(), id).unwrap_err();
+            assert!(
+                error.to_string().contains("hard-linked"),
+                "{suffix}: {error}"
+            );
+            assert_eq!(payload(&db), before);
+            assert_eq!(fs::read(&alias).unwrap(), alias_before);
+        }
     }
 
     #[cfg(any(

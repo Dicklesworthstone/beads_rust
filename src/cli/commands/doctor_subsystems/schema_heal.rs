@@ -2242,11 +2242,13 @@ mod tests {
             "CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT, created_by TEXT)",
             "INSERT INTO dependencies VALUES ('a-1', 'external-target', 'blocks', 'agent')",
             "ALTER TABLE issues ADD COLUMN due_at TEXT",
-            "UPDATE issues SET due_at = ''",
+            "UPDATE issues SET due_at = '', updated_at = '2026-02-01T00:00:00Z'",
         ] {
             conn.execute(sql).unwrap();
         }
-        let older = serde_json::to_vec(&issue("a-1", "2025-12-01T00:00:00Z")).unwrap();
+        // The older export is the same issue identity. Only the local update
+        // is newer; a different created_at must still refuse comment transfer.
+        let older = serde_json::to_vec(&issue("a-1", "2026-01-01T00:00:00Z")).unwrap();
         let audit = audit_connection(&conn, Some(std::io::Cursor::new(older))).unwrap();
         assert!(!audit.is_clean());
         assert_eq!(audit.restorable.len(), 1);

@@ -11954,6 +11954,14 @@ mod tests {
         }
         crate::storage::schema::execute_batch(&conn, &source_schema)
             .expect("create pre-v18 schema");
+        if version >= 20 {
+            // This runtime table is installed separately from SCHEMA_SQL.
+            // A schema-20 source must already contain its canonical layout.
+            conn.execute(
+                "CREATE TABLE jsonl_row_receipts (issue_id TEXT PRIMARY KEY, row_hash TEXT NOT NULL)",
+            )
+            .expect("create schema-20 row receipts");
+        }
         conn.execute(
             "INSERT INTO issues (
                 id, title, status, priority, issue_type, created_at, updated_at
@@ -12025,6 +12033,12 @@ mod tests {
         .unwrap();
         conn.execute("UPDATE sqlite_sequence SET seq=9000 WHERE name='comments'")
             .unwrap();
+        conn.execute(
+            "INSERT INTO jsonl_row_receipts (rowid, issue_id, row_hash) VALUES \
+             (43, 'bd-schema-rehearsal', 'retained-import-receipt')",
+        )
+        .unwrap();
+        assert!(reviewed_schema20_runtime_compatible(&conn));
         close_connection(conn).unwrap();
         let original = logical_witness(&migration.db_path).unwrap();
         let plan = build_plan(&migration.db_path).unwrap();
@@ -12069,6 +12083,18 @@ mod tests {
             )
             .unwrap(),
             9000,
+        );
+        let receipt = conn
+            .query_row("SELECT rowid, issue_id, row_hash FROM jsonl_row_receipts")
+            .unwrap();
+        assert_eq!(receipt.get(0).and_then(SqliteValue::as_integer), Some(43));
+        assert_eq!(
+            receipt.get(1).and_then(SqliteValue::as_text),
+            Some("bd-schema-rehearsal")
+        );
+        assert_eq!(
+            receipt.get(2).and_then(SqliteValue::as_text),
+            Some("retained-import-receipt")
         );
         close_connection(conn).unwrap();
         let run = fs::read_dir(migration_runs_root(&migration.beads_dir))
@@ -12953,8 +12979,7 @@ mod tests {
             &conn,
             r"
             CREATE TABLE gate_result_history (id INTEGER PRIMARY KEY AUTOINCREMENT);
-            INSERT INTO gate_result_history (id) VALUES (0);
-            DELETE FROM gate_result_history;
+            INSERT INTO sqlite_sequence (name, seq) VALUES ('gate_result_history', 0);
         ",
         )
         .unwrap();
@@ -12965,8 +12990,20 @@ mod tests {
             "an expected candidate addition is still forbidden source drift"
         );
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute("UPDATE sqlite_sequence SET seq=11 WHERE name='gate_result_history'")
-            .unwrap();
+        assert_eq!(
+            conn.execute("UPDATE sqlite_sequence SET seq=11 WHERE name='gate_result_history'")
+                .unwrap(),
+            1,
+            "the fixture must change an existing sequence reservation"
+        );
+        assert_eq!(
+            query_count(
+                &conn,
+                "SELECT seq FROM sqlite_sequence WHERE name='gate_result_history'"
+            )
+            .unwrap(),
+            11
+        );
         close_connection(conn).unwrap();
         let error = verify_reviewed_state_preservation(&db_path, proof.as_ref(), true).unwrap_err();
         assert!(
@@ -13643,6 +13680,32 @@ mod tests {
         .expect("seed v17 auxiliary state and history");
     }
 
+    /// Before v20/v21 these audit records contain no reporter or revision
+    /// evidence. The upgrade preserves their complete existing values and
+    /// appends only unknown (NULL) evidence; the whole-row hashes must change.
+    fn projected_v17_audit_tables(conn: &Connection) -> Vec<LogicalTableWitness> {
+        [("comments", 1), ("gate_result_history", 2)]
+            .into_iter()
+            .map(|(table, additions)| {
+                let rows = conn
+                    .query(&format!("SELECT * FROM {table}"))
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| {
+                        let mut values = row.values().to_vec();
+                        values.extend(std::iter::repeat_n(SqliteValue::Null, additions));
+                        values
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !rows.is_empty(),
+                    "{table} must exercise existing audit records"
+                );
+                legacy_rows_projection(table, false, &rows).unwrap().table
+            })
+            .collect()
+    }
+
     #[test]
     fn typed_key_plan_refuses_operator_foreign_keys_without_changing_source() {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 18);
@@ -13699,6 +13762,7 @@ mod tests {
             "#,
         )
         .unwrap();
+        let projected_audit_tables = projected_v17_audit_tables(&conn);
         close_connection(conn).unwrap();
         let plan =
             build_plan(&migration.db_path).expect("plan canonical v18 with a missing owned index");
@@ -13730,6 +13794,15 @@ mod tests {
         assert!(applied.effects.dependency_type_key_added);
         assert!(!applied.effects.prerequisites_column_added);
         let mut expected_tables = applied.logical_before.tables.clone();
+        for projected in projected_audit_tables {
+            let existing = expected_tables
+                .iter_mut()
+                .find(|table| table.name == projected.name)
+                .unwrap();
+            assert_eq!(existing.row_count, projected.row_count);
+            assert_ne!(existing.rows_sha256, projected.rows_sha256);
+            *existing = projected;
+        }
         expected_tables.push(
             legacy_rows_projection("jsonl_row_receipts", true, &[])
                 .unwrap()
@@ -13802,6 +13875,7 @@ mod tests {
         .expect("seed export bookkeeping");
         seed_v17_auxiliary_rows(&conn);
         let source_row = conn.query_row("SELECT * FROM issues").expect("source row");
+        let projected_audit_tables = projected_v17_audit_tables(&conn);
         close_connection(conn).expect("close source");
         let applied = apply_prerequisite_upgrade(&migration);
         let after = applied
@@ -13814,9 +13888,13 @@ mod tests {
             .iter()
             .filter(|t| t.name != "issues")
         {
+            let expected = projected_audit_tables
+                .iter()
+                .find(|projected| projected.name == table.name)
+                .unwrap_or(table);
             assert_eq!(
                 after.tables.iter().find(|t| t.name == table.name),
-                Some(table)
+                Some(expected)
             );
         }
         let conn = open_read_only(&migration.db_path).expect("open migrated database");

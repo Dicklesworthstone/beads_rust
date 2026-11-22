@@ -583,6 +583,13 @@ fn upgrade_fixture_end_to_end(
                 && !names.iter().any(|name| name == "prerequisites")),
         "{label}: fixture precondition: issues rows on a schema without prerequisites"
     );
+    assert!(
+        !rows_before["comments"]
+            .0
+            .iter()
+            .any(|name| name == "revision"),
+        "{label}: fixture comments must predate portable revisions"
+    );
 
     // 2. Follow the remediation: plan must accept the fixture.
     let plan = run_br(
@@ -614,6 +621,7 @@ fn upgrade_fixture_end_to_end(
     assert_eq!(plan_json["to_version"].as_u64(), Some(u64::from(target)));
     assert_eq!(plan_json["forecast"]["prerequisites_column_added"], true);
     assert_eq!(plan_json["forecast"]["dependency_type_key_added"], true);
+    assert_eq!(plan_json["forecast"]["comment_revisions_added"], true);
     let plan_token = plan_json["plan_token"]
         .as_str()
         .expect("plan token")
@@ -642,6 +650,7 @@ fn upgrade_fixture_end_to_end(
     );
     let applied_json: Value =
         serde_json::from_str(&extract_json_payload(&apply.stdout)).expect("applied JSON");
+    assert_eq!(applied_json["effects"]["comment_revisions_added"], true);
     let run_id = applied_json["run_id"].as_str().expect("run id").to_string();
     assert_eq!(
         header_user_version(&db_path),
@@ -709,7 +718,9 @@ fn upgrade_fixture_end_to_end(
             "{label}: {table} rows ({names:?}) changed across the migration"
         );
     }
-    let prerequisites = engine_rows(&db_path, None)["issues"].clone();
+    let migrated = engine_rows(&db_path, None);
+    assert_comment_revision_migration_defaults(&migrated);
+    let prerequisites = &migrated["issues"];
     let column = prerequisites
         .0
         .iter()
@@ -1060,6 +1071,22 @@ fn assert_gate_reporter_migration_defaults(db: &Path) {
     }
 }
 
+fn assert_comment_revision_migration_defaults(tables: &TableRows) {
+    let (columns, records) = &tables["comments"];
+    let revision = columns
+        .iter()
+        .position(|name| name == "revision")
+        .expect("migration must add comments.revision");
+    assert!(
+        !records.is_empty(),
+        "fixture must exercise existing comments"
+    );
+    assert!(
+        records.iter().all(|row| row[revision] == "NULL"),
+        "historical comments must not acquire invented portable revisions"
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn released_schema19_plan_apply_undo_preserves_every_original_value() {
@@ -1078,6 +1105,7 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
             .iter()
             .any(|name| name == "closed_by")
     );
+    assert!(!released["comments"].0.iter().any(|name| name == "revision"));
     seed_schema19_database_authority(&workspace);
     let before = schema19_authority_rows(&db, None);
     let operator_shape = schema19_operator_shape(&db);
@@ -1092,8 +1120,23 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
     let catalog_before = engine_rows(&db, Some(&catalog_columns));
 
     let stats = run_br(&workspace, ["stats", "--json"], "release19_stats_before");
-    assert!(!stats.status.success(), "{}", stats.stdout);
-    assert!(format!("{}{}", stats.stdout, stats.stderr).contains("migrate-schema"));
+    assert!(stats.status.success(), "{} {}", stats.stdout, stats.stderr);
+    let projected: Value = serde_json::from_str(&stats.stdout).expect("clean JSONL stats JSON");
+    assert_eq!(
+        projected["summary"]["total_issues"], 3,
+        "the JSONL view cannot include the database-only issue"
+    );
+    assert!(
+        stats.stderr.contains("schema 19")
+            && stats.stderr.contains("migrate-schema plan --json")
+            && stats.stderr.contains("reads issues.jsonl directly")
+            && stats
+                .stderr
+                .contains("Database-only records remain in the original database")
+            && stats.stderr.contains("may be absent from this view"),
+        "{}",
+        stats.stderr
+    );
     assert_eq!(schema19_tracker_files(&beads), source_files);
     let doctor = run_br(&workspace, ["doctor", "--json"], "release19_doctor");
     assert!(!doctor.status.success(), "{}", doctor.stdout);
@@ -1153,6 +1196,7 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
     );
     assert!(plan["forecast"]["schema19_runtime_upgrade"].is_null());
     assert_eq!(plan["forecast"]["gate_reporter_columns_added"], true);
+    assert_eq!(plan["forecast"]["comment_revisions_added"], true);
     assert_eq!(plan["forecast"]["dependency_type_key_added"], false);
     assert_eq!(
         heal["migration_plan"]["forecast"]["gate_reporter_columns_added"],
@@ -1177,6 +1221,7 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
     ));
     assert!(applied["effects"]["schema19_runtime_upgrade"].is_null());
     assert_eq!(applied["effects"]["gate_reporter_columns_added"], true);
+    assert_eq!(applied["effects"]["comment_revisions_added"], true);
     assert_eq!(header_user_version(&db), current_schema_version());
     assert_eq!(schema19_authority_rows(&db, Some(&before)), before);
     assert_gate_reporter_migration_defaults(&db);
@@ -1197,6 +1242,7 @@ fn released_schema19_plan_apply_undo_preserves_every_original_value() {
         );
     }
     let after = engine_rows(&db, None);
+    assert_comment_revision_migration_defaults(&after);
     assert!(after["jsonl_row_receipts"].1.is_empty());
     let closed_by = after["close_metadata"]
         .0

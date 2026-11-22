@@ -10574,26 +10574,25 @@ routing:
         #[cfg(unix)]
         let database_before = fs::metadata(&db_path).unwrap();
 
-        // This table lacks the canonical foreign key. Runtime attestation
-        // rejects the storage open, so a successful issue snapshot cannot be
-        // established even though the JSONL and local issue pages are intact.
+        // This declaration lacks the canonical foreign key but retains
+        // constraints outside the reviewed cache repair shape. Refuse the
+        // readable, unsupported layout before attempting JSONL recovery.
         let error = open_storage_with_cli(&beads_dir, &CliOverrides::default())
             .expect_err("malformed schema must require explicit repair");
-        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert!(matches!(error, BeadsError::Config(_)), "{error}");
+        assert!(!should_attempt_jsonl_recovery(
+            &error,
+            &db_path,
+            &jsonl_path
+        ));
         let message = error.to_string();
         for diagnostic in [
-            "Automatic database recovery refused",
-            "could not be opened",
-            "unflushed",
-            "br doctor --json",
-            ".br_recovery",
+            "schema application refused",
+            "unreviewed layout for blocked_issues_cache",
+            "preserve its unknown columns and schema objects",
         ] {
             assert!(message.contains(diagnostic), "{message}");
         }
-        assert!(
-            message.contains(&db_path.display().to_string()),
-            "{message}"
-        );
         for path in family_before {
             assert!(
                 path.is_file(),
@@ -10668,13 +10667,17 @@ routing:
         let database_before = fs::metadata(&db_path).unwrap();
         let error = open_storage_with_cli(&beads_dir, &CliOverrides::default())
             .expect_err("special JSONL fields do not establish original DB preservation");
-        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert!(matches!(error, BeadsError::Config(_)), "{error}");
+        assert!(!should_attempt_jsonl_recovery(
+            &error,
+            &db_path,
+            &jsonl_path
+        ));
         let message = error.to_string();
         for diagnostic in [
-            "Automatic database recovery refused",
-            "could not be opened",
-            "br doctor --json",
-            ".br_recovery",
+            "schema application refused",
+            "unreviewed layout for blocked_issues_cache",
+            "preserve its unknown columns and schema objects",
         ] {
             assert!(message.contains(diagnostic), "{message}");
         }
@@ -10697,8 +10700,10 @@ routing:
         assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
         assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
 
-        // Explicit doctor repair uses this same snapshot-based installation
-        // helper. It remains available after automatic recovery refuses.
+        // Exercise the low-level, explicitly authorized snapshot installer
+        // separately from startup admission. Its caller must perform the
+        // doctor's layout review; a successful import is not permission for
+        // automatic startup to replace this unsupported source.
         let jsonl_authority =
             crate::sync::blocking_jsonl_family_write_lock_with_timeout(&jsonl_path, None)
                 .expect("explicit repair JSONL authority");
@@ -12395,7 +12400,7 @@ routing:
     }
 
     #[test]
-    fn read_only_fast_open_heals_runtime_incomplete_current_schema_under_authority() {
+    fn read_only_fast_open_heals_missing_runtime_index_under_authority() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -12405,8 +12410,8 @@ routing:
         let fixture = Connection::open(db_path.to_string_lossy().into_owned())
             .expect("open runtime-incomplete fixture");
         fixture
-            .execute("DROP TABLE labels")
-            .expect("drop required runtime table");
+            .execute("DROP INDEX idx_issues_status")
+            .expect("drop derived runtime index");
         fixture.close().expect("close fixture");
 
         let cli = CliOverrides {
@@ -12424,6 +12429,38 @@ routing:
             None,
             "recording the repaired schema witness must not create duplicate metadata keys"
         );
+    }
+
+    #[test]
+    fn read_only_fast_open_refuses_missing_authoritative_table_without_recreation() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        drop(SqliteStorage::open(&db_path).expect("initialize current schema"));
+        let fixture = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        fixture.execute("DROP TABLE labels").unwrap();
+        fixture.close().unwrap();
+        let before = database_family_snapshot(&db_path).unwrap();
+
+        let error = open_storage_with_cli(
+            &beads_dir,
+            &CliOverrides {
+                read_only_fast_open: true,
+                ..CliOverrides::default()
+            },
+        )
+        .expect_err("a missing authoritative table must not be silently recreated");
+        assert!(
+            matches!(&error, BeadsError::Config(message)
+                if message.contains("core table labels")
+                    && message.contains("cannot recreate or rebuild authoritative tables")),
+            "{error}"
+        );
+        let diffs =
+            database_family_read_only_diffs(&before, &database_family_snapshot(&db_path).unwrap());
+        assert!(diffs.is_empty(), "refusal changed the database: {diffs:?}");
+        assert!(!beads_dir.join(RECOVERY_DIR_NAME).exists());
     }
 
     #[test]
@@ -13761,7 +13798,7 @@ routing:
         let err = open_storage_with_startup_config_impl(
             startup,
             &CliOverrides::default(),
-            false,
+            JsonlRecoveryStrategy::Automatic,
             None,
             false,
         )
