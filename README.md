@@ -978,6 +978,7 @@ GitHub #384 acceptance matrix.
 | `BR_HISTORY_MAX_BYTES`, `BR_HISTORY_MIN_INTERVAL_SECS` | Size budget and minimum spacing of JSONL history snapshots |
 | `BR_DISABLE_PARALLEL_JSONL_EXPORT` | Force the single-threaded JSONL export path |
 | `BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS` | Age after which `br doctor` reports `.write.lock` as stale (default 300) |
+| `BR_DOCTOR_PATH_WRAPPERS` | `PATH`-style list of intentional `br` wrappers or version-manager shims (the file, or the directory holding it); `br doctor` leaves them out of its duplicate-`br` check |
 | `EDITOR` / `VISUAL` | Editor for `br config edit` |
 | `GITHUB_TOKEN` / `GH_TOKEN` | Authenticate the GitHub API calls made by `br upgrade` |
 | `XDG_CACHE_HOME` | Base directory for br's cache (default `~/.cache`) |

@@ -7690,25 +7690,76 @@ fn br_binaries_in_path_str(path_var: &str) -> Vec<PathBuf> {
     found
 }
 
+/// Declares intentional `br` wrappers and version-manager shims that sit on
+/// `$PATH` ahead of the binary they run (GitHub #616). PATH-list syntax; each
+/// entry is either the wrapper file or the directory whose `br` is one.
+const PATH_WRAPPERS_ENV: &str = "BR_DOCTOR_PATH_WRAPPERS";
+
+/// Identity of "the `br` in this directory": the directory is resolved
+/// through symlinks, the final file is not, so declaring a wrapper never
+/// also excuses the binary a symlinked wrapper points at.
+fn br_wrapper_key(path: &Path) -> Option<PathBuf> {
+    let (dir, name) = if path.is_dir() {
+        (path, std::ffi::OsStr::new("br"))
+    } else {
+        (path.parent()?, path.file_name()?)
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    Some(dir.canonicalize().ok()?.join(name))
+}
+
 fn check_multiple_br_in_path(checks: &mut Vec<CheckResult>) {
     let path_var = std::env::var("PATH").unwrap_or_default();
-    let binaries = br_binaries_in_path_str(&path_var);
-    if binaries.len() <= 1 {
-        push_check(checks, "br_path_dupes", CheckStatus::Ok, None, None);
+    let declared = std::env::var_os(PATH_WRAPPERS_ENV).unwrap_or_default();
+    push_br_path_dupes(checks, &br_binaries_in_path_str(&path_var), &declared);
+}
+
+/// Declared wrappers are left out of the count: one wrapper plus the binary
+/// it runs is `Ok`, while any further, undeclared copy still warns.
+fn push_br_path_dupes(
+    checks: &mut Vec<CheckResult>,
+    binaries: &[PathBuf],
+    declared_wrappers: &std::ffi::OsStr,
+) {
+    let declared: std::collections::HashSet<PathBuf> = std::env::split_paths(declared_wrappers)
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .filter_map(|entry| br_wrapper_key(&entry))
+        .collect();
+    let (wrappers, counted): (Vec<&PathBuf>, Vec<&PathBuf>) = binaries
+        .iter()
+        .partition(|binary| br_wrapper_key(binary).is_some_and(|key| declared.contains(&key)));
+    let display = |paths: &[&PathBuf]| -> Vec<String> {
+        paths.iter().map(|p| p.display().to_string()).collect()
+    };
+    if counted.len() <= 1 {
+        let details = (!wrappers.is_empty()).then(|| {
+            serde_json::json!({
+                "declared_wrappers": display(&wrappers),
+                "declared_via": PATH_WRAPPERS_ENV,
+            })
+        });
+        push_check(checks, "br_path_dupes", CheckStatus::Ok, None, details);
         return;
     }
-    let display: Vec<String> = binaries.iter().map(|p| p.display().to_string()).collect();
     push_check(
         checks,
         "br_path_dupes",
         CheckStatus::Warn,
         Some(format!(
             "Found {} `br` executables on $PATH — operator may be confused which one runs",
-            binaries.len()
+            counted.len()
         )),
         Some(serde_json::json!({
-            "br_paths": display,
-            "remediation": "Reorder PATH so the canonical install resolves first, or remove stale copies",
+            "br_paths": display(&counted),
+            "declared_wrappers": display(&wrappers),
+            "remediation": format!(
+                "Reorder PATH so the canonical install resolves first, or remove stale copies; \
+                 list an intentional wrapper or shim in {PATH_WRAPPERS_ENV}"
+            ),
         })),
     );
 }
@@ -21100,6 +21151,71 @@ mod tests {
         let path_var = format!("{}:{}", real_dir.display(), link_dir.display());
         let found = br_binaries_in_path_str(&path_var);
         assert_eq!(found.len(), 1, "canonical dedup expected: {found:?}");
+    }
+
+    /// GitHub #616: a declared wrapper or shim (by file or by directory) is
+    /// left out of the duplicate count; an undeclared extra copy still warns.
+    #[cfg(unix)]
+    #[test]
+    fn test_br_path_dupes_honors_declared_wrappers() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let mut dirs = Vec::new();
+        for name in ["wrapper", "real", "stale"] {
+            let dir = temp.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            let br = dir.join("br");
+            fs::write(&br, format!("#!/bin/sh\n# {name}\n")).unwrap();
+            let mut perms = fs::metadata(&br).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&br, perms).unwrap();
+            dirs.push(dir);
+        }
+        let [wrapper, real, stale] = [&dirs[0], &dirs[1], &dirs[2]];
+        let path_of = |entries: &[&PathBuf]| {
+            std::env::join_paths(entries.iter().copied())
+                .unwrap()
+                .into_string()
+                .unwrap()
+        };
+        let status = |path_var: &str, declared: &std::ffi::OsStr| {
+            let mut checks = Vec::new();
+            push_br_path_dupes(&mut checks, &br_binaries_in_path_str(path_var), declared);
+            let check = find_check(&checks, "br_path_dupes").expect("check present");
+            (check.status, check.details.clone())
+        };
+        let wrapper_and_real = path_of(&[wrapper, real]);
+
+        let (undeclared, _) = status(&wrapper_and_real, std::ffi::OsStr::new(""));
+        assert!(matches!(undeclared, CheckStatus::Warn), "{undeclared:?}");
+
+        for declared in [wrapper.join("br"), wrapper.clone()] {
+            let (declared_status, details) = status(&wrapper_and_real, declared.as_os_str());
+            assert!(
+                matches!(declared_status, CheckStatus::Ok),
+                "declared {}: {declared_status:?} {details:?}",
+                declared.display()
+            );
+            let details = details.expect("declared wrappers are reported");
+            assert_eq!(
+                details["declared_wrappers"],
+                serde_json::json!([wrapper.join("br").display().to_string()])
+            );
+        }
+
+        let (third_copy, details) = status(
+            &path_of(&[wrapper, real, stale]),
+            wrapper.join("br").as_os_str(),
+        );
+        assert!(matches!(third_copy, CheckStatus::Warn), "{third_copy:?}");
+        let details = details.expect("warn details");
+        assert_eq!(
+            details["br_paths"],
+            serde_json::json!([
+                real.join("br").display().to_string(),
+                stale.join("br").display().to_string()
+            ])
+        );
     }
 
     /// Write a file that is a valid SQLite header for the purposes of
