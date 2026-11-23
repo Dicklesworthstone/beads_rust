@@ -33976,7 +33976,9 @@ required_fields:
 
     #[test]
     fn test_add_label_to_issues_bulk_marks_only_changed_ids() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("bulk-label-add.db");
+        let mut storage = SqliteStorage::open(&database).unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
 
         for id in ["bd-bulk-a", "bd-bulk-b", "bd-bulk-c"] {
@@ -33987,6 +33989,9 @@ required_fields:
             .add_label("bd-bulk-b", "bulk-added", "tester")
             .unwrap();
         storage.clear_all_dirty_issues().unwrap();
+        drop(storage);
+        let mut storage = SqliteStorage::open(&database).unwrap();
+        assert_eq!(storage.conn.as_async().memdb_row_hydration_count(), 0);
 
         let ids = vec![
             "bd-bulk-a".to_string(),
@@ -34018,6 +34023,11 @@ required_fields:
         assert_eq!(
             dirty,
             vec!["bd-bulk-a".to_string(), "bd-bulk-c".to_string()]
+        );
+        assert_eq!(
+            storage.conn.as_async().memdb_row_hydration_count(),
+            0,
+            "bulk label writes and readback must not hydrate the store"
         );
     }
 
@@ -34106,7 +34116,9 @@ required_fields:
 
     #[test]
     fn test_remove_label_from_issues_bulk_marks_only_changed_ids() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("bulk-label-remove.db");
+        let mut storage = SqliteStorage::open(&database).unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
 
         for id in ["bd-bulk-remove-a", "bd-bulk-remove-b", "bd-bulk-remove-c"] {
@@ -34120,6 +34132,9 @@ required_fields:
             .add_label("bd-bulk-remove-c", "bulk-removed", "tester")
             .unwrap();
         storage.clear_all_dirty_issues().unwrap();
+        drop(storage);
+        let mut storage = SqliteStorage::open(&database).unwrap();
+        assert_eq!(storage.conn.as_async().memdb_row_hydration_count(), 0);
 
         let ids = vec![
             "bd-bulk-remove-a".to_string(),
@@ -34154,6 +34169,11 @@ required_fields:
                 "bd-bulk-remove-a".to_string(),
                 "bd-bulk-remove-c".to_string()
             ]
+        );
+        assert_eq!(
+            storage.conn.as_async().memdb_row_hydration_count(),
+            0,
+            "bulk label writes and readback must not hydrate the store"
         );
     }
 

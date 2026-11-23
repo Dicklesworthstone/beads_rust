@@ -362,6 +362,8 @@ impl Connection {
         let inner = drive(
             fsqlite::Connection::open_existing_schema_only_with_expected_identity(path, identity),
         )?;
+        #[cfg(not(target_arch = "wasm32"))]
+        fsqlite_observability::metrics_net::autostart_from_env();
         // #507: after an interruption the index may already be absent or
         // healthy, so quarantine is not a reliable signal for close policy.
         // Set the policy at construction, before any initialization SQL.
@@ -378,7 +380,7 @@ impl Connection {
         // use the engine's writable schema-only opener: rows stay pager-backed,
         // with the same transaction, rollback and WAL validation machinery.
         // Missing/empty files and memory databases still need normal bootstrap.
-        let schema_only = if path.is_empty() || path == ":memory:" {
+        let existing_file = if path.is_empty() || path == ":memory:" {
             false
         } else {
             match std::fs::metadata(&path) {
@@ -387,10 +389,33 @@ impl Connection {
                 Err(error) => return Err(error.into()),
             }
         };
-        let opened = if schema_only {
+        // The schema-only entry point skips the ordinary opener's one-time
+        // engine migration. Preserve that maintenance until the engine's own
+        // marker is current, or its explicit opt-out applies. Resolve once so
+        // the marker and admission cannot refer to different symlink targets.
+        let schema_only_path = existing_file
+            .then(|| std::fs::canonicalize(&path).ok())
+            .flatten()
+            .and_then(|canonical| canonical.into_os_string().into_string().ok())
+            .filter(|canonical| {
+                std::env::var(fsqlite_core::migration::SKIP_MIGRATION_ENV).as_deref() == Ok("1")
+                    || fsqlite_core::migration::read_migration_marker(canonical).is_some_and(
+                        |marker| {
+                            marker.last_upgrade_version
+                                >= fsqlite_core::migration::CURRENT_MIGRATION_VERSION
+                        },
+                    )
+            });
+        let opened = if let Some(canonical) = schema_only_path.as_ref() {
             // Do not retry a refused existing-only open with a creating opener:
             // disappearance, corruption and admission errors must stay errors.
-            drive(fsqlite::Connection::open_existing_schema_only(path.clone()))
+            drive(fsqlite::Connection::open_existing_schema_only(
+                canonical.clone(),
+            ))
+        } else if existing_file {
+            // This constructor performs normal migration and metrics startup
+            // while refusing to recreate a file that disappeared meanwhile.
+            drive(fsqlite::Connection::open_existing(path.clone()))
         } else {
             drive(fsqlite::Connection::open(path.clone()))
         };
@@ -399,6 +424,12 @@ impl Connection {
                 wal_index::warn_if_poisoned(&path);
             }
         })?;
+        // Ordinary open starts this explicitly opted-in service; schema-only
+        // admission does not. Keep the same successful-open contract.
+        #[cfg(not(target_arch = "wasm32"))]
+        if schema_only_path.is_some() {
+            fsqlite_observability::metrics_net::autostart_from_env();
+        }
         Self::from_inner(inner, true, true)
     }
 
@@ -1291,8 +1322,174 @@ pub(crate) mod tests {
         let invalid = temp.path().join("invalid.db");
         let original = b"an existing invalid database must never be recreated";
         std::fs::write(&invalid, original).unwrap();
+        // A current marker admits this fixture to the schema-only opener;
+        // corruption must still fail without retrying a creating initializer.
+        let canonical = invalid.canonicalize().unwrap();
+        let marker_path =
+            fsqlite_core::migration::migration_marker_path(canonical.to_str().unwrap());
+        let marker = fsqlite_core::migration::MigrationMarker {
+            last_upgrade_version: fsqlite_core::migration::CURRENT_MIGRATION_VERSION,
+            last_run_at: 0,
+            repairs_applied: Vec::new(),
+        };
+        let marker_bytes = serde_json::to_vec(&marker).unwrap();
+        std::fs::write(&marker_path, &marker_bytes).unwrap();
         assert!(Connection::open(invalid.to_string_lossy().into_owned()).is_err());
         assert_eq!(std::fs::read(&invalid).unwrap(), original);
+        assert_eq!(std::fs::read(marker_path).unwrap(), marker_bytes);
+    }
+
+    #[test]
+    fn writable_open_preserves_required_engine_migrations() {
+        use fsqlite_core::migration::{
+            CURRENT_MIGRATION_VERSION, migration_marker_path, read_migration_marker,
+        };
+
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::writable_open_preserves_required_engine_migrations",
+        ) {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
+        for state in ["missing", "old", "malformed"] {
+            let path = dir
+                .join(format!("migration-{state}.db"))
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let seed = Connection::open(path.clone()).unwrap();
+            seed.execute("CREATE TABLE retained (id TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .unwrap();
+            seed.execute("INSERT INTO retained VALUES ('kept', 'original payload')")
+                .unwrap();
+            seed.close().unwrap();
+
+            let marker_path = migration_marker_path(&path);
+            let mut marker = read_migration_marker(&path).expect("marker at birth");
+            assert_eq!(marker.last_upgrade_version, CURRENT_MIGRATION_VERSION);
+            match state {
+                "missing" => {
+                    std::fs::rename(&marker_path, dir.join("retained-marker.json")).unwrap();
+                }
+                "old" => {
+                    marker.last_upgrade_version = 0;
+                    std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+                }
+                _ => std::fs::write(&marker_path, b"not a migration marker").unwrap(),
+            }
+
+            let conn = Connection::open(path.clone()).expect("run required engine migration");
+            assert_eq!(
+                read_migration_marker(&path)
+                    .expect("migration must repair and persist its marker")
+                    .last_upgrade_version,
+                CURRENT_MIGRATION_VERSION,
+                "marker state: {state}"
+            );
+            assert_eq!(
+                conn.query_row("SELECT value FROM retained WHERE id = 'kept'")
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::from("original payload")]
+            );
+            conn.close().unwrap();
+
+            let reopened = Connection::open(path).expect("steady-state schema-only reopen");
+            {
+                let point = reopened
+                    .prepare("SELECT value FROM retained WHERE id = ?1")
+                    .unwrap();
+                assert_eq!(
+                    point
+                        .query_row_with_params(&[SqliteValue::from("kept")])
+                        .unwrap()
+                        .values(),
+                    &[SqliteValue::from("original payload")]
+                );
+            }
+            assert_eq!(reopened.as_async().memdb_row_hydration_count(), 0);
+            reopened.close().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_open_uses_canonical_migration_marker_for_symlinks() {
+        use fsqlite_core::migration::{
+            CURRENT_MIGRATION_VERSION, migration_marker_path, read_migration_marker,
+        };
+
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::writable_open_uses_canonical_migration_marker_for_symlinks",
+        ) {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
+        let real = dir.join("real.db");
+        let alias = dir.join("alias.db");
+        let real_path = real.to_str().unwrap();
+        let alias_path = alias.to_str().unwrap();
+        let seed = Connection::open(real_path).unwrap();
+        seed.execute("CREATE TABLE retained (id TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        seed.execute("INSERT INTO retained VALUES ('kept', 'original payload')")
+            .unwrap();
+        seed.close().unwrap();
+        assert_eq!(
+            read_migration_marker(real_path)
+                .expect("canonical marker at birth")
+                .last_upgrade_version,
+            CURRENT_MIGRATION_VERSION
+        );
+        let marker_path = migration_marker_path(real_path);
+        let marker_before = std::fs::read(&marker_path).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert!(!migration_marker_path(alias_path).exists());
+
+        let conn = Connection::open(alias_path).unwrap();
+        {
+            let point = conn
+                .prepare("SELECT value FROM retained WHERE id = ?1")
+                .unwrap();
+            assert_eq!(
+                point
+                    .query_row_with_params(&[SqliteValue::from("kept")])
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::from("original payload")]
+            );
+            assert_eq!(conn.as_async().memdb_row_hydration_count(), 0);
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            conn.execute("UPDATE retained SET value = 'alias write' WHERE id = 'kept'")
+                .unwrap();
+            conn.execute("COMMIT").unwrap();
+            assert_eq!(
+                point
+                    .query_row_with_params(&[SqliteValue::from("kept")])
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::from("alias write")]
+            );
+            assert_eq!(conn.as_async().memdb_row_hydration_count(), 0);
+        }
+        conn.close().unwrap();
+        assert_eq!(std::fs::read(marker_path).unwrap(), marker_before);
+        assert!(!migration_marker_path(alias_path).exists());
+
+        let reopened = Connection::open(real_path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT value FROM retained WHERE id = 'kept'")
+                .unwrap()
+                .values(),
+            &[SqliteValue::from("alias write")]
+        );
+        assert_eq!(reopened.as_async().memdb_row_hydration_count(), 0);
+        reopened.close().unwrap();
     }
 
     #[test]
