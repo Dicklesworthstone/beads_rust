@@ -14151,6 +14151,41 @@ impl SqliteStorage {
         Ok(result)
     }
 
+    /// Returns the children of `parent_id` that still hold it open: issues
+    /// linked to it by a `parent-child` dependency whose status is neither
+    /// `closed` nor `tombstone`, templates excluded. These are the children
+    /// `get_epic_counts()` counts for `br close`, for any parent type; the MCP
+    /// close tool uses this to refuse the same closes (GitHub #618).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_open_linked_children(&self, parent_id: &str) -> Result<Vec<String>> {
+        // Same row shape as `get_epic_counts`: filter the status in Rust.
+        let rows = self.conn.query_with_params(
+            "SELECT d.issue_id, i.status
+             FROM dependencies d
+             JOIN issues i ON d.issue_id = i.id
+             WHERE d.depends_on_id = ?
+               AND d.type = 'parent-child'
+               AND (i.is_template = 0 OR i.is_template IS NULL)",
+            &[SqliteValue::from(parent_id)],
+        )?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let status = row.get(1).and_then(SqliteValue::as_text).unwrap_or("");
+            if status == "closed" || status == "tombstone" {
+                continue;
+            }
+            if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                result.push(id.to_string());
+            }
+        }
+        result.sort();
+        result.dedup();
+        Ok(result)
+    }
+
     /// Add a dependency between issues.
     ///
     /// # Errors
@@ -47009,6 +47044,86 @@ required_fields:
             .get_open_unlinked_dot_notation_children("bd-epic")
             .unwrap();
         assert_eq!(unlinked, vec!["bd-epic.3".to_string()]);
+    }
+
+    #[test]
+    fn open_linked_children_are_the_links_close_counts_for_any_parent_type() {
+        // GitHub #618: the MCP close tool refuses on these, matching the
+        // `get_epic_counts()` check of `br close`. The parent is a task, so the
+        // epic-only `child-open` blocker does not cover it.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut closed = make_issue(
+            "bd-task.3",
+            "Closed child",
+            Status::Closed,
+            1,
+            None,
+            now,
+            None,
+        );
+        closed.closed_at = Some(now);
+        for issue in [
+            make_issue("bd-task", "Task parent", Status::Open, 1, None, now, None),
+            make_issue(
+                "bd-task.1",
+                "Linked dot child",
+                Status::InProgress,
+                1,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-task.2",
+                "Unlinked dot id",
+                Status::Open,
+                1,
+                None,
+                now,
+                None,
+            ),
+            closed,
+            make_issue(
+                "bd-elsewhere",
+                "Linked, other id",
+                Status::Custom("review".to_string()),
+                1,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-related",
+                "Not a child",
+                Status::Open,
+                1,
+                None,
+                now,
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "t").unwrap();
+        }
+        for (child, kind) in [
+            ("bd-task.1", "parent-child"),
+            ("bd-task.3", "parent-child"),
+            ("bd-elsewhere", "parent-child"),
+            ("bd-related", "related"),
+        ] {
+            storage.add_dependency(child, "bd-task", kind, "t").unwrap();
+        }
+
+        assert_eq!(
+            storage.get_open_linked_children("bd-task").unwrap(),
+            vec!["bd-elsewhere".to_string(), "bd-task.1".to_string()]
+        );
+        assert!(
+            storage
+                .get_open_linked_children("bd-task.1")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

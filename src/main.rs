@@ -2910,6 +2910,10 @@ const fn permitted_in_read_only_mode(cmd: &Commands) -> bool {
         | Commands::Capabilities(_)
         | Commands::RobotDocs { .. } => true,
         Commands::Completions(args) => args.output.is_none(),
+        // `--bundle` writes an archive and `--selftest` runs a write lifecycle
+        // in a scratch workspace. Like `completions --output`, a command that
+        // writes files is refused even when it leaves the tracker alone.
+        Commands::Doctor(args) if args.selftest || args.bundle.is_some() => false,
         // `--witness` alone hashes issues.jsonl and returns before SQLite is
         // opened. Combined with another mode it is refused here, not admitted
         // on the strength of the other mode's startup.
@@ -4896,6 +4900,8 @@ mod tests {
             &["br", "agents", "--add", "--force"],
             &["br", "completions", "bash", "--output", "completions.bash"],
             &["br", "sync", "--witness", "--flush-only"],
+            &["br", "doctor", "--selftest"],
+            &["br", "doctor", "--bundle", "doctor.tar.gz"],
         ];
         for args in refused {
             let command = Cli::parse_from(args).command;

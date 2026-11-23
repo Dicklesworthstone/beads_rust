@@ -2552,9 +2552,11 @@ fn validate_mcp_close(
         .get_issue(id)
         .map_err(beads_to_mcp)?
         .ok_or_else(|| beads_to_mcp(BeadsError::IssueNotFound { id: id.to_string() }))?;
-    // Children are `parent-child` links, as in `br close` (GitHub #618); a
-    // dot-shaped id with no link does not hold its namesake open.
+    // Children are `parent-child` links, as in `br close` (GitHub #618): an
+    // open linked child holds any parent open (the cached `child-open`
+    // blocker covers only epics), and a dot-shaped id with no link does not.
     let mut blockers = storage.get_close_blockers(id).map_err(beads_to_mcp)?;
+    blockers.extend(storage.get_open_linked_children(id).map_err(beads_to_mcp)?);
     blockers.sort();
     blockers.dedup();
     if !blockers.is_empty() {
@@ -4867,6 +4869,48 @@ mod tests {
             .expect("get issue")
             .expect("issue exists");
         assert_eq!(issue.status, Status::Closed);
+    }
+
+    #[test]
+    fn close_issue_counts_linked_children_of_any_parent_type_not_dot_ids() {
+        // GitHub #618: the MCP close tool follows `br close`. An open child
+        // linked by `parent-child` holds a task parent open, although the
+        // cached `child-open` blocker covers only epics; an issue whose id
+        // merely looks like a child does not.
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-parent", "task parent");
+        insert_test_issue(&state, "br-mcp-parent.1", "linked child");
+        insert_test_issue(&state, "br-mcp-solo", "rescoped parent");
+        insert_test_issue(&state, "br-mcp-solo.1", "detached dot id");
+        SqliteStorage::open(&state.db_path)
+            .expect("open storage")
+            .add_dependency("br-mcp-parent.1", "br-mcp-parent", "parent-child", "tester")
+            .expect("link child");
+        let (_runtime, cx) = crate::mcp::build_serve_cx().expect("MCP test runtime");
+        let ctx = McpContext::new(cx, 1);
+        let tool = CloseIssueTool::new(Arc::clone(&state));
+
+        let err = tool
+            .call(&ctx, json!({"id": "br-mcp-parent", "reason": "done"}))
+            .expect_err("an open linked child holds its parent open");
+        assert!(err.message.contains("br-mcp-parent.1"), "{}", err.message);
+        let closed = content_json(
+            &tool
+                .call(&ctx, json!({"id": "br-mcp-solo", "reason": "done"}))
+                .expect("an unlinked dot id does not hold its namesake open"),
+        );
+        assert_eq!(closed["status"].as_str(), Some("closed"), "{closed}");
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        for (id, status) in [
+            ("br-mcp-parent", Status::Open),
+            ("br-mcp-parent.1", Status::Open),
+            ("br-mcp-solo.1", Status::Open),
+        ] {
+            let issue = storage.get_issue(id).expect("get issue").expect("exists");
+            assert_eq!(issue.status, status, "{id}");
+        }
     }
 
     #[test]

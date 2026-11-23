@@ -281,3 +281,8 @@ missing_errors_doc = { level = "allow", priority = 1 }
 redundant_clone = { level = "allow", priority = 1 }
 struct_excessive_bools = { level = "allow", priority = 1 }
 if_not_else = { level = "allow", priority = 1 }
+# duration_suboptimal_units: clippy enables it from the rust-version on which
+# Duration::from_mins/from_hours are stable. Stating the real toolchain (#614)
+# switched it on for every `from_secs(60 * n)`; a readability suggestion, not a
+# defect.
+duration_suboptimal_units = { level = "allow", priority = 1 }
