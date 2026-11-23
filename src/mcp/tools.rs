@@ -2552,12 +2552,9 @@ fn validate_mcp_close(
         .get_issue(id)
         .map_err(beads_to_mcp)?
         .ok_or_else(|| beads_to_mcp(BeadsError::IssueNotFound { id: id.to_string() }))?;
+    // Children are `parent-child` links, as in `br close` (GitHub #618); a
+    // dot-shaped id with no link does not hold its namesake open.
     let mut blockers = storage.get_close_blockers(id).map_err(beads_to_mcp)?;
-    blockers.extend(
-        storage
-            .get_open_dot_notation_children(id)
-            .map_err(beads_to_mcp)?,
-    );
     blockers.sort();
     blockers.dedup();
     if !blockers.is_empty() {

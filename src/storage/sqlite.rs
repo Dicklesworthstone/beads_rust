@@ -14106,17 +14106,17 @@ impl SqliteStorage {
         Ok(counts)
     }
 
-    /// Returns IDs of direct dot-notation children of `parent_id` that are
-    /// still open or in-progress, ignoring any formally declared parent-child
-    /// dep rows.
+    /// Returns IDs shaped like direct dot-notation children of `parent_id`
+    /// (`bd-epic.1`, `bd-epic.2`) that are still open or in-progress and have
+    /// no `parent-child` dependency row at all.
     ///
-    /// Rationale: `get_epic_counts()` covers the happy path (issues created
-    /// with `br create --parent ...`, which writes a `parent-child` row in
-    /// `dependencies`). But legacy beads DBs, direct database migrations, or
-    /// older storage versions can contain IDs like
-    /// `bd-epic.1`, `bd-epic.2` that are semantically children but have no dep
-    /// row. Without this check, `br close bd-epic` silently closes the parent
-    /// while leaving those children orphaned.
+    /// A child is an issue with a `parent-child` link; `get_epic_counts()`,
+    /// `epic status`, rollups and `dep list` all go by that link. An id that
+    /// merely looks like a child came from a legacy import that lost its
+    /// links, a hand edit, or a child deliberately detached with
+    /// `br dep remove`. Callers report these (GitHub #618) rather than treat
+    /// them as children. Ids linked to another parent are excluded: they were
+    /// re-parented.
     ///
     /// Excludes grandchildren (e.g. `bd-epic.1.1` is not a direct child of
     /// `bd-epic`). LIKE pattern specials in the parent id are escaped via
@@ -14125,7 +14125,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    pub fn get_open_dot_notation_children(&self, parent_id: &str) -> Result<Vec<String>> {
+    pub fn get_open_unlinked_dot_notation_children(&self, parent_id: &str) -> Result<Vec<String>> {
         let escaped = escape_like_pattern(parent_id);
         let direct_prefix = format!("{escaped}.%");
         let grandchild_prefix = format!("{escaped}.%.%");
@@ -14134,7 +14134,9 @@ impl SqliteStorage {
              WHERE i.status IN ('open', 'in_progress') \
                AND (i.is_template = 0 OR i.is_template IS NULL) \
                AND i.id LIKE ? ESCAPE '\\' \
-               AND i.id NOT LIKE ? ESCAPE '\\'",
+               AND i.id NOT LIKE ? ESCAPE '\\' \
+               AND NOT EXISTS (SELECT 1 FROM dependencies d \
+                               WHERE d.issue_id = i.id AND d.type = 'parent-child')",
             &[
                 SqliteValue::from(direct_prefix.as_str()),
                 SqliteValue::from(grandchild_prefix.as_str()),
@@ -46854,8 +46856,9 @@ required_fields:
     }
 
     // ========================================================================
-    // get_open_dot_notation_children — supplementary guard for legacy/imported
-    // dot-notation parent-child relationships that lack formal dep rows.
+    // get_open_unlinked_dot_notation_children — dot-notation ids under a
+    // parent that carry no parent-child link (legacy imports, detached
+    // children); reported on close instead of treated as children (#618).
     // ========================================================================
 
     #[test]
@@ -46881,7 +46884,9 @@ required_fields:
         storage.create_issue(&child2, "t").unwrap();
         storage.create_issue(&child3, "t").unwrap();
 
-        let mut open_children = storage.get_open_dot_notation_children("bd-epic").unwrap();
+        let mut open_children = storage
+            .get_open_unlinked_dot_notation_children("bd-epic")
+            .unwrap();
         open_children.sort();
         assert_eq!(
             open_children,
@@ -46909,7 +46914,9 @@ required_fields:
         storage.create_issue(&child, "t").unwrap();
         storage.create_issue(&grandchild, "t").unwrap();
 
-        let open_children = storage.get_open_dot_notation_children("bd-root").unwrap();
+        let open_children = storage
+            .get_open_unlinked_dot_notation_children("bd-root")
+            .unwrap();
         assert_eq!(
             open_children,
             vec!["bd-root.1".to_string()],
@@ -46926,7 +46933,9 @@ required_fields:
         storage.create_issue(&parent, "t").unwrap();
         storage.create_issue(&unrelated, "t").unwrap();
 
-        let open_children = storage.get_open_dot_notation_children("bd-solo").unwrap();
+        let open_children = storage
+            .get_open_unlinked_dot_notation_children("bd-solo")
+            .unwrap();
         assert!(
             open_children.is_empty(),
             "parent with no dot-notation children should return empty vec, got {open_children:?}"
@@ -46955,12 +46964,51 @@ required_fields:
         storage.create_issue(&child, "t").unwrap();
         storage.create_issue(&decoy, "t").unwrap();
 
-        let open_children = storage.get_open_dot_notation_children("a_b-1").unwrap();
+        let open_children = storage
+            .get_open_unlinked_dot_notation_children("a_b-1")
+            .unwrap();
         assert_eq!(
             open_children,
             vec!["a_b-1.1".to_string()],
             "underscore in parent id must be escaped so `a_b-1.1` matches but `axb-1.1` does not"
         );
+    }
+
+    #[test]
+    fn dot_notation_children_exclude_ids_with_any_parent_child_link() {
+        // GitHub #618: a dot id linked to its own parent is already counted
+        // through the link, and one re-parented elsewhere is not this
+        // parent's child; neither is "unlinked".
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for (id, title) in [
+            ("bd-epic", "Epic"),
+            ("bd-other", "Other epic"),
+            ("bd-epic.1", "Linked to its parent"),
+            ("bd-epic.2", "Re-parented"),
+            ("bd-epic.3", "Detached"),
+        ] {
+            storage
+                .create_issue(
+                    &make_issue(id, title, Status::Open, 1, None, now, None),
+                    "t",
+                )
+                .unwrap();
+        }
+        storage
+            .add_dependency("bd-epic.1", "bd-epic", "parent-child", "t")
+            .unwrap();
+        storage
+            .add_dependency("bd-epic.2", "bd-other", "parent-child", "t")
+            .unwrap();
+        storage
+            .add_dependency("bd-epic.3", "bd-other", "related", "t")
+            .unwrap();
+
+        let unlinked = storage
+            .get_open_unlinked_dot_notation_children("bd-epic")
+            .unwrap();
+        assert_eq!(unlinked, vec!["bd-epic.3".to_string()]);
     }
 
     #[test]

@@ -498,6 +498,28 @@ fn skipped_human_message(skipped: &SkippedIssue) -> String {
     format!("Skipped {}: {}", id.as_ref(), reason.as_ref())
 }
 
+/// Note for a closed parent whose `<parent>.<n>` ids are still open but carry
+/// no `parent-child` link, so they were not treated as its children (#618).
+fn unlinked_dot_children_warning(parent_id: &str, unlinked: &[String]) -> String {
+    const PREVIEW: usize = 5;
+    let mut listed = unlinked
+        .iter()
+        .take(PREVIEW)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unlinked.len() > PREVIEW {
+        use std::fmt::Write as _;
+        let _ = write!(listed, ", +{} more", unlinked.len() - PREVIEW);
+    }
+    format!(
+        "{parent_id} closed; {} open issue(s) with ids under it have no parent-child link and \
+         were not treated as its children: {listed} (link one with \
+         `br dep add <child> {parent_id} --type parent-child` if it belongs to {parent_id})",
+        unlinked.len()
+    )
+}
+
 fn unblocked_human_line(issue: &UnblockedIssue) -> String {
     let id = sanitize_terminal_inline(&issue.id);
     let title = sanitize_terminal_inline(&issue.title);
@@ -1015,6 +1037,7 @@ fn execute_route_with_storage(
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
     let mut cache_dirty = false;
     let mut capacity_warnings = Vec::new();
+    let mut unlinked_dot_children_by_id: HashMap<String, Vec<String>> = HashMap::new();
 
     let mut atomic_updates = Vec::new();
     let mut planned_closes = Vec::new();
@@ -1088,48 +1111,24 @@ fn execute_route_with_storage(
             continue;
         }
 
-        // Supplementary guard: catch dot-notation children (e.g. `epic.1`,
-        // `epic.2`) that exist in the issues table without a formal
-        // parent-child dep row. These slip past `epic_counts` because
-        // get_epic_counts only scans the dependencies table. Missing-dep
-        // children occur with legacy-bd migrations, bulk JSONL imports,
-        // and hand-edited JSONL. Without this check, closing the parent
-        // silently orphans the open children.
-        let requested_dot_children = if args.force {
-            Vec::new()
-        } else {
-            let open_dot_children = storage_ctx.storage.get_open_dot_notation_children(id)?;
-            let (requested_children, unrequested_children): (Vec<String>, Vec<String>) =
-                open_dot_children
-                    .into_iter()
-                    .partition(|child_id| requested_ids.contains(child_id));
-            if !unrequested_children.is_empty() {
-                let label = if issue.issue_type == IssueType::Epic {
-                    "epic"
-                } else {
-                    "parent issue"
-                };
-                let preview: Vec<String> = unrequested_children.iter().take(5).cloned().collect();
-                let suffix = if unrequested_children.len() > preview.len() {
-                    format!(", +{} more", unrequested_children.len() - preview.len())
-                } else {
-                    String::new()
-                };
-                let skipped = SkippedIssue {
-                    id: id.clone(),
-                    reason: format!(
-                        "{label} has {} open dot-notation child issue(s): {}{} (use --force to close anyway)",
-                        unrequested_children.len(),
-                        preview.join(", "),
-                        suffix
-                    ),
-                };
-                ordered_outcomes[outcome_index] = Some(CloseOutcome::Skipped(skipped.clone()));
-                skipped_issues.push(skipped);
-                continue;
+        // A child is an issue with a `parent-child` link, here exactly as in
+        // `epic status`, rollups, `dep list` and the guard above (GitHub
+        // #618). An id shaped like `<parent>.<n>` with no such link — a
+        // legacy import that lost its links, or a child deliberately detached
+        // with `br dep remove` — does not hold the parent open. It is named in
+        // a warning instead, so a migration that dropped the links stays
+        // visible rather than closing silently.
+        if !args.force {
+            let unlinked = storage_ctx
+                .storage
+                .get_open_unlinked_dot_notation_children(id)?
+                .into_iter()
+                .filter(|child_id| !requested_ids.contains(child_id))
+                .collect::<Vec<_>>();
+            if !unlinked.is_empty() {
+                unlinked_dot_children_by_id.insert(id.clone(), unlinked);
             }
-            requested_children
-        };
+        }
 
         if args.force {
             open_issues.insert(id.clone(), issue);
@@ -1149,7 +1148,6 @@ fn execute_route_with_storage(
             "close",
             close_blockers_result,
         )?;
-        blocker_ids.extend(requested_dot_children);
         blocker_ids.sort();
         blocker_ids.dedup();
         let (internal_blockers, external_blockers): (Vec<String>, Vec<String>) = blocker_ids
@@ -1398,6 +1396,14 @@ fn execute_route_with_storage(
             &storage_ctx.paths.jsonl_path,
             &error,
         );
+    }
+
+    for closed in &closed_issues {
+        if let Some(unlinked) = unlinked_dot_children_by_id.get(&closed.id) {
+            let message = unlinked_dot_children_warning(&closed.id, unlinked);
+            tracing::warn!(id = %closed.id, unlinked = ?unlinked, "{message}");
+            ctx.warning(&message);
+        }
     }
 
     Ok((
@@ -2371,8 +2377,11 @@ mod tests {
         assert_eq!(child.status, Status::Closed);
     }
 
+    /// GitHub #618: a child is a `parent-child` link. An open id shaped like
+    /// `<parent>.<n>` whose link was removed (or never existed) no longer
+    /// holds the parent open; the close succeeds and the id stays open.
     #[test]
-    fn execute_with_args_keeps_parent_blocked_by_unrequested_dot_notation_child() {
+    fn execute_with_args_closes_parent_whose_dot_notation_id_has_no_link() {
         let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2383,12 +2392,18 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let mut epic = make_issue("bd-parent", "Epic");
+        epic.issue_type = IssueType::Epic;
+        storage.create_issue(&epic, "tester").expect("create epic");
         storage
-            .create_issue(&make_issue("bd-parent", "Legacy parent"), "tester")
-            .expect("create parent");
-        storage
-            .create_issue(&make_issue("bd-parent.1", "Legacy child"), "tester")
+            .create_issue(&make_issue("bd-parent.1", "Rescoped child"), "tester")
             .expect("create dot child");
+        storage
+            .add_dependency("bd-parent.1", "bd-parent", "parent-child", "tester")
+            .expect("link child");
+        storage
+            .remove_dependency("bd-parent.1", "bd-parent", None, "tester")
+            .expect("detach child");
         drop(storage);
 
         let _guard = DirGuard::new(temp.path());
@@ -2396,9 +2411,8 @@ mod tests {
             ids: vec!["bd-parent".to_string()],
             ..CloseArgs::default()
         };
-        let err = execute_with_args(&args, true, &CliOverrides::default(), &ctx)
-            .expect_err("parent-only close should remain blocked by dot child");
-        assert!(matches!(err, BeadsError::NothingToDo { .. }));
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("an id with no parent-child link must not block its namesake");
 
         let storage = SqliteStorage::open(&db_path).expect("reopen storage");
         let parent = storage
@@ -2410,8 +2424,49 @@ mod tests {
             .expect("get child")
             .expect("child exists");
 
-        assert_eq!(parent.status, Status::Open);
+        assert_eq!(parent.status, Status::Closed);
         assert_eq!(child.status, Status::Open);
+    }
+
+    /// The `parent-child` link is still what keeps a parent open (#618).
+    #[test]
+    fn execute_with_args_keeps_parent_blocked_by_linked_dot_notation_child() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-parent", "Parent"), "tester")
+            .expect("create parent");
+        storage
+            .create_issue(&make_issue("bd-parent.1", "Linked child"), "tester")
+            .expect("create dot child");
+        storage
+            .add_dependency("bd-parent.1", "bd-parent", "parent-child", "tester")
+            .expect("link child");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-parent".to_string()],
+            ..CloseArgs::default()
+        };
+        let err = execute_with_args(&args, true, &CliOverrides::default(), &ctx)
+            .expect_err("parent-only close should remain blocked by its linked child");
+        assert!(matches!(err, BeadsError::NothingToDo { .. }));
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let parent = storage
+            .get_issue("bd-parent")
+            .expect("get parent")
+            .expect("parent exists");
+        assert_eq!(parent.status, Status::Open);
     }
 
     #[test]
