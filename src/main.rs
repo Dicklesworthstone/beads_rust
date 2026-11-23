@@ -64,7 +64,15 @@ fn main() {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run(cli: Cli, json_error_mode: bool) -> Result<i32> {
+fn run(mut cli: Cli, json_error_mode: bool) -> Result<i32> {
+    // `BR_READ_ONLY` (#615) refuses before anything is discovered, opened or
+    // locked, and implies --no-auto-import --no-auto-flush for the commands
+    // it admits: those still read, but nothing at startup may write.
+    if read_only_mode_requested() {
+        refuse_outside_read_only_mode(&cli.command)?;
+        cli.no_auto_import = true;
+        cli.no_auto_flush = true;
+    }
     // Declare this first so all storage and authority owners unwind before
     // buffered tracing can touch stderr on an error/cancellation return. This
     // includes nested engine and protected-close diagnostics, not just the
@@ -2861,6 +2869,68 @@ fn read_only_fast_open_disable_value_is_truthy(value: &OsStr) -> bool {
     )
 }
 
+/// `BR_READ_ONLY` (GitHub #615): when set to anything but an explicit
+/// "off" value, `br` runs only commands it knows to be read-only and
+/// refuses every other one before discovering or opening the workspace.
+const READ_ONLY_ENV: &str = "BR_READ_ONLY";
+
+#[cfg(not(test))]
+fn read_only_mode_requested() -> bool {
+    std::env::var_os(READ_ONLY_ENV)
+        .as_deref()
+        .is_some_and(read_only_env_value_enables)
+}
+
+/// Unit tests must not inherit the guard from the environment running them.
+#[cfg(test)]
+const fn read_only_mode_requested() -> bool {
+    false
+}
+
+/// A guard fails closed: only an empty value or an explicit "off" spelling
+/// leaves it disabled, so a typo such as `BR_READ_ONLY=enabled` still guards.
+fn read_only_env_value_enables(value: &OsStr) -> bool {
+    !matches!(
+        value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+/// The commands `BR_READ_ONLY` admits: those whose startup posture is
+/// already read-only (no repair, import, flush or writer lock), and those
+/// that never open a workspace. Anything else, including commands added
+/// later, is refused.
+const fn permitted_in_read_only_mode(cmd: &Commands) -> bool {
+    match cmd {
+        // Its startup is observational, but the MCP tools it serves write.
+        #[cfg(feature = "mcp")]
+        Commands::Serve(_) => false,
+        Commands::Version(_)
+        | Commands::Schema(_)
+        | Commands::Capabilities(_)
+        | Commands::RobotDocs { .. } => true,
+        Commands::Completions(args) => args.output.is_none(),
+        _ => requires_read_only_storage(cmd),
+    }
+}
+
+fn refuse_outside_read_only_mode(cmd: &Commands) -> Result<()> {
+    if permitted_in_read_only_mode(cmd) {
+        return Ok(());
+    }
+    Err(BeadsError::ValidationWithHint {
+        field: READ_ONLY_ENV.to_string(),
+        reason: format!(
+            "{READ_ONLY_ENV} is set and this command can modify the workspace; it was \
+             refused before the workspace was opened"
+        ),
+        hint: format!(
+            "Use a read-only command (list, show, ready, search, dep list, sync --status, \
+             doctor without --repair, or a --dry-run preview), or run without {READ_ONLY_ENV}"
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4737,6 +4807,107 @@ mod tests {
                 PendingMergeStartupDisposition::ReadOnlyNoAutoSync,
                 "read-only command must disable automatic import/export while pending"
             );
+        }
+    }
+
+    /// GitHub #615: `BR_READ_ONLY` admits reads, previews and workspace-free
+    /// commands, and refuses every mutation family, before startup.
+    #[test]
+    fn read_only_env_admits_reads_and_refuses_every_mutation_family() {
+        let admitted: Vec<&[&str]> = vec![
+            &["br", "list"],
+            &["br", "show", "bd-one"],
+            &["br", "ready"],
+            &["br", "search", "needle"],
+            &["br", "blocked"],
+            &["br", "count"],
+            &["br", "stats"],
+            &["br", "graph", "--all"],
+            &["br", "dep", "list", "bd-one"],
+            &["br", "comments", "bd-one"],
+            &["br", "comments", "list", "bd-one"],
+            &["br", "label", "list"],
+            &["br", "query", "list"],
+            &["br", "epic", "status"],
+            &["br", "orphans"],
+            &["br", "sync", "--status"],
+            &["br", "sync", "--witness"],
+            &["br", "sync", "--reconcile", "--dry-run"],
+            &["br", "config", "list"],
+            &["br", "config", "get", "issue_prefix"],
+            &["br", "info"],
+            &["br", "where"],
+            &["br", "doctor"],
+            &["br", "doctor", "--repair", "--dry-run"],
+            &["br", "create", "fixture", "--dry-run"],
+            &["br", "delete", "bd-one", "--dry-run"],
+            &["br", "epic", "close-eligible", "--dry-run"],
+            &["br", "version"],
+            &["br", "schema"],
+            &["br", "capabilities"],
+            &["br", "completions", "bash"],
+        ];
+        for args in admitted {
+            let command = Cli::parse_from(args).command;
+            assert!(permitted_in_read_only_mode(&command), "{args:?}");
+            assert!(refuse_outside_read_only_mode(&command).is_ok(), "{args:?}");
+        }
+
+        let refused: Vec<&[&str]> = vec![
+            &["br", "init"],
+            &["br", "create", "fixture"],
+            &["br", "update", "bd-one", "--title", "changed"],
+            &["br", "close", "bd-one"],
+            &["br", "reopen", "bd-one"],
+            &["br", "delete", "bd-one"],
+            &["br", "dep", "add", "bd-one", "bd-two"],
+            &["br", "label", "add", "bd-one", "--label", "p0"],
+            &["br", "comments", "add", "bd-one", "hello"],
+            &["br", "query", "save", "mine"],
+            &["br", "orphans", "--fix"],
+            &["br", "epic", "close-eligible"],
+            &["br", "sync", "--flush-only"],
+            &["br", "sync", "--import-only"],
+            &["br", "sync", "--merge"],
+            &["br", "sync", "--reconcile"],
+            &["br", "sync", "--reconcile-additive", "--apply"],
+            &["br", "config", "set", "sync.auto_flush=true"],
+            &["br", "config", "edit"],
+            &["br", "history", "restore", "fixture.jsonl", "--force"],
+            &["br", "audit", "record", "--kind", "tool_call"],
+            &["br", "doctor", "--repair"],
+            &["br", "doctor", "--repair-indexes"],
+            &["br", "doctor", "undo", "latest"],
+            &["br", "agents", "--add", "--force"],
+            &["br", "completions", "bash", "--output", "completions.bash"],
+        ];
+        for args in refused {
+            let command = Cli::parse_from(args).command;
+            assert!(!permitted_in_read_only_mode(&command), "{args:?}");
+            let error = refuse_outside_read_only_mode(&command).expect_err("refused");
+            assert!(
+                matches!(&error, BeadsError::ValidationWithHint { field, .. } if field == READ_ONLY_ENV),
+                "{args:?}: {error:?}"
+            );
+        }
+        // `serve` starts like a read, but the MCP tools it serves write.
+        #[cfg(feature = "mcp")]
+        assert!(!permitted_in_read_only_mode(
+            &Cli::parse_from(["br", "serve"]).command
+        ));
+        #[cfg(feature = "self_update")]
+        assert!(!permitted_in_read_only_mode(
+            &Cli::parse_from(["br", "upgrade"]).command
+        ));
+    }
+
+    #[test]
+    fn read_only_env_value_fails_closed() {
+        for value in ["1", "true", "TRUE", "yes", "on", "enabled", "y"] {
+            assert!(read_only_env_value_enables(OsStr::new(value)), "{value}");
+        }
+        for value in ["", " ", "0", "false", "No", "OFF"] {
+            assert!(!read_only_env_value_enables(OsStr::new(value)), "{value:?}");
         }
     }
 

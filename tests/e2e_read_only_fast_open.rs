@@ -839,3 +839,151 @@ fn cli_read_only_fast_open_matrix_perf_probe() {
         })
     );
 }
+
+const READ_ONLY_ENV: (&str, &str) = ("BR_READ_ONLY", "1");
+
+/// Every regular file under the workspace except the harness's own logs.
+fn workspace_evidence(workspace: &BrWorkspace) -> BTreeMap<String, RegularFileEvidence> {
+    let mut evidence = regular_file_evidence(&workspace.root);
+    evidence.retain(|path, _| !path.starts_with("logs"));
+    evidence
+}
+
+fn run_read_only(workspace: &BrWorkspace, args: &[&str], label: &str) -> BrRun {
+    run_br_with_env(workspace, args.iter().copied(), [READ_ONLY_ENV], label)
+}
+
+/// GitHub #615: under `BR_READ_ONLY` the reads of the fast-open matrix and the
+/// read-only diagnostics still answer, and none changes a byte of the workspace.
+#[test]
+fn gh615_read_only_env_serves_reads_without_writing_the_workspace() {
+    let seed = seed_workspace();
+    let workspace = &seed.workspace;
+    let before = workspace_evidence(workspace);
+    let mut commands = matrix_commands(&seed);
+    commands.extend([
+        exact_command("info_json", strings(["info", "--json"])),
+        exact_command("where", strings(["where"])),
+        exact_command("config_list_json", strings(["config", "list", "--json"])),
+        exact_command(
+            "create_dry_run_json",
+            strings(["create", "Preview", "--dry-run", "--json"]),
+        ),
+        exact_command("version", strings(["version"])),
+        exact_command("doctor_json", strings(["doctor", "--json"])),
+    ]);
+    for command in &commands {
+        let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+        let run = run_read_only(workspace, &args, &format!("gh615_{}", command.label));
+        // `doctor` exits 1 for any finding about this host; it must still run.
+        if command.label != "doctor_json" {
+            assert_success(&run, command.label);
+        }
+        assert!(
+            !run.stdout.contains(READ_ONLY_ENV.0) && !run.stderr.contains(READ_ONLY_ENV.0),
+            "{} was refused under {}:\n{}\n{}",
+            command.label,
+            READ_ONLY_ENV.0,
+            run.stdout,
+            run.stderr
+        );
+        assert_eq!(
+            workspace_evidence(workspace),
+            before,
+            "{} changed the workspace under {}",
+            command.label,
+            READ_ONLY_ENV.0
+        );
+    }
+}
+
+/// GitHub #615: mutations are refused with a structured error before the
+/// workspace is opened; an explicit "off" value restores normal behaviour.
+#[test]
+fn gh615_read_only_env_refuses_mutations_before_touching_the_workspace() {
+    let seed = seed_workspace();
+    let workspace = &seed.workspace;
+    let blocker = seed.blocker_id.as_str();
+    let blocked = seed.blocked_id.as_str();
+    let before = workspace_evidence(workspace);
+    let refused: Vec<Vec<&str>> = vec![
+        vec!["create", "Refused under read-only", "--json"],
+        vec!["update", blocker, "--status", "in_progress", "--json"],
+        vec!["close", blocker, "--json"],
+        vec!["dep", "add", blocker, blocked, "--json"],
+        vec!["comments", "add", blocker, "refused", "--json"],
+        vec!["sync", "--flush-only", "--json"],
+        vec!["config", "set", "issue_prefix=other", "--json"],
+        vec!["doctor", "--repair", "--json"],
+        vec!["init", "--json"],
+    ];
+    for (index, args) in refused.iter().enumerate() {
+        let run = run_read_only(workspace, args, &format!("gh615_refused_{index}"));
+        assert!(!run.status.success(), "{args:?} ran under read-only");
+        let output: Value = serde_json::from_str(&run.stdout).unwrap_or_else(|error| {
+            panic!("{args:?}: structured refusal ({error}):\n{}", run.stdout)
+        });
+        let message = output["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(READ_ONLY_ENV.0), "{args:?}: {output}");
+        assert_eq!(
+            workspace_evidence(workspace),
+            before,
+            "{args:?} changed the workspace before its refusal"
+        );
+    }
+
+    let allowed = run_br_with_env(
+        workspace,
+        ["create", "Allowed once the guard is off", "--json"],
+        [(READ_ONLY_ENV.0, "0")],
+        "gh615_guard_off_create",
+    );
+    assert_success(&allowed, "gh615_guard_off_create");
+}
+
+/// GitHub #615: `BR_READ_ONLY` implies `--no-auto-import`, so a read over a
+/// newer `issues.jsonl` leaves the database exactly as it was.
+#[test]
+fn gh615_read_only_env_reads_do_not_import_a_newer_jsonl() {
+    let workspace = BrWorkspace::new();
+    run_success(&workspace, &["init", "--prefix", "ro"], "gh615_init");
+    let id = create_issue(
+        &workspace,
+        &["create", "Original database title"],
+        "gh615_seed",
+    );
+    let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+    let rewritten = fs::read_to_string(&jsonl_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut issue: Value = serde_json::from_str(line).unwrap();
+            if issue["id"].as_str() == Some(id.as_str()) {
+                issue["title"] = json!("Newer JSONL that a read-only run must not import");
+                issue["updated_at"] = json!("2099-01-01T00:00:00Z");
+                issue["content_hash"] = Value::Null;
+            }
+            issue.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&jsonl_path, format!("{rewritten}\n")).unwrap();
+    let before = workspace_evidence(&workspace);
+
+    for (label, args) in [
+        ("gh615_stale_list", vec!["list", "--json"]),
+        ("gh615_stale_show", vec!["show", id.as_str(), "--json"]),
+        ("gh615_stale_ready", vec!["ready", "--json"]),
+    ] {
+        let run = run_read_only(&workspace, &args, label);
+        assert_success(&run, label);
+        assert_eq!(workspace_evidence(&workspace), before, "{label} wrote");
+    }
+    assert_eq!(
+        query_private_copy(
+            &workspace.root.join(".beads/beads.db"),
+            "SELECT title FROM issues"
+        ),
+        vec![vec![SqliteValue::from("Original database title")]],
+    );
+}
