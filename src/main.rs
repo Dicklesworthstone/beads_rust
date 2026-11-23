@@ -2898,7 +2898,7 @@ fn read_only_env_value_enables(value: &OsStr) -> bool {
 
 /// The commands `BR_READ_ONLY` admits: those whose startup posture is
 /// already read-only (no repair, import, flush or writer lock), and those
-/// that never open a workspace. Anything else, including commands added
+/// that never open the database. Anything else, including commands added
 /// later, is refused.
 const fn permitted_in_read_only_mode(cmd: &Commands) -> bool {
     match cmd {
@@ -2910,6 +2910,21 @@ const fn permitted_in_read_only_mode(cmd: &Commands) -> bool {
         | Commands::Capabilities(_)
         | Commands::RobotDocs { .. } => true,
         Commands::Completions(args) => args.output.is_none(),
+        // `--witness` alone hashes issues.jsonl and returns before SQLite is
+        // opened. Combined with another mode it is refused here, not admitted
+        // on the strength of the other mode's startup.
+        Commands::Sync(args)
+            if args.witness
+                && !(args.status
+                    || args.flush_only
+                    || args.import_only
+                    || args.merge
+                    || args.reconcile
+                    || args.reconcile_additive
+                    || args.migrate_source_repo_path) =>
+        {
+            true
+        }
         _ => requires_read_only_storage(cmd),
     }
 }
@@ -4880,6 +4895,7 @@ mod tests {
             &["br", "doctor", "undo", "latest"],
             &["br", "agents", "--add", "--force"],
             &["br", "completions", "bash", "--output", "completions.bash"],
+            &["br", "sync", "--witness", "--flush-only"],
         ];
         for args in refused {
             let command = Cli::parse_from(args).command;

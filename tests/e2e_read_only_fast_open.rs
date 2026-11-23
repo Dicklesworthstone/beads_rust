@@ -870,6 +870,11 @@ fn gh615_read_only_env_serves_reads_without_writing_the_workspace() {
             strings(["create", "Preview", "--dry-run", "--json"]),
         ),
         exact_command("version", strings(["version"])),
+        exact_command("sync_status_json", strings(["sync", "--status", "--json"])),
+        exact_command(
+            "sync_witness_json",
+            strings(["sync", "--witness", "--json"]),
+        ),
         exact_command("doctor_json", strings(["doctor", "--json"])),
     ]);
     for command in &commands {
