@@ -95,6 +95,31 @@ checkpoints are skipped while peers are present; `br doctor` reports `wal_size`
 and the sole-opener state (`beads_rust-dk45.5` adds an `engine` block with the
 lease holder).
 
+### Bounded row loading for ordinary writes (#619)
+
+Existing, nonempty persistent databases use the pinned engine's writable
+`open_existing_schema_only` API. This loads the schema while keeping table
+rows behind pager-backed cursors. The ordinary engine opener can otherwise
+hydrate every table into its compatibility `MemDatabase` when a prepared
+point query selects an optional in-memory acceleration path. Even a metadata
+lookup before a one-issue update can then read unrelated descriptions,
+comments and audit history while br holds the workspace write lock.
+
+Fresh paths, zero-length initialization files and in-memory databases retain
+the creating opener. An existing-only refusal is never retried through that
+opener. Identity-bound recovery uses the equivalent schema-only API while
+retaining its expected file identity, WAL-index admission and non-checkpointing
+close policy. Schema-only loading does not disable WAL validation, foreign
+key policy, transaction rollback, savepoints or FTS5 validation, and does not
+change the pinned engine version.
+
+`franken_sync::tests::existing_writable_connections_avoid_whole_store_hydration`
+checks the engine's per-connection hydrated-row counter, with the ordinary
+engine opener as a positive control. It also checks rollback, savepoints,
+committed WAL state, long descriptions and unrelated audit rows. This bounds
+compatibility-mirror hydration; full JSONL synchronization and cold WAL
+validation retain their separate costs.
+
 ### Observational read startup (#585, #586, #596)
 
 Ordinary reads never request schema migration, recovery, automatic import, or

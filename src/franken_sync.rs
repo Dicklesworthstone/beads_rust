@@ -359,9 +359,9 @@ impl Connection {
     ) -> Result<Self, FrankenError> {
         let path = path.into();
         wal_index::quarantine_poisoned_index(&path, identity)?;
-        let inner = drive(fsqlite::Connection::open_existing_with_expected_identity(
-            path, identity,
-        ))?;
+        let inner = drive(
+            fsqlite::Connection::open_existing_schema_only_with_expected_identity(path, identity),
+        )?;
         // #507: after an interruption the index may already be absent or
         // healthy, so quarantine is not a reliable signal for close policy.
         // Set the policy at construction, before any initialization SQL.
@@ -371,7 +371,30 @@ impl Connection {
     /// Open (or create) a database at `path`.
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
         let path = path.into();
-        let inner = drive(fsqlite::Connection::open(path.clone())).inspect_err(|error| {
+        // An ordinary engine open may hydrate every table into its MemDatabase
+        // when a prepared point read selects the optional in-memory fast path.
+        // Even a metadata lookup before a one-issue update then reads the whole
+        // tracker while br holds its write lock (#619). Existing databases can
+        // use the engine's writable schema-only opener: rows stay pager-backed,
+        // with the same transaction, rollback and WAL validation machinery.
+        // Missing/empty files and memory databases still need normal bootstrap.
+        let schema_only = if path.is_empty() || path == ":memory:" {
+            false
+        } else {
+            match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.is_file() && metadata.len() > 0,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let opened = if schema_only {
+            // Do not retry a refused existing-only open with a creating opener:
+            // disappearance, corruption and admission errors must stay errors.
+            drive(fsqlite::Connection::open_existing_schema_only(path.clone()))
+        } else {
+            drive(fsqlite::Connection::open(path.clone()))
+        };
+        let inner = opened.inspect_err(|error| {
             if matches!(error, FrankenError::BusyRecovery) {
                 wal_index::warn_if_poisoned(&path);
             }
@@ -1027,6 +1050,249 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         true
+    }
+
+    /// GH #619: point reads and one-row writes must not hydrate unrelated
+    /// issues or audit history into the engine's compatibility `MemDatabase`.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn existing_writable_connections_avoid_whole_store_hydration() {
+        if run_recovery_test_in_subprocess(
+            "franken_sync::tests::existing_writable_connections_avoid_whole_store_hydration",
+        ) {
+            return;
+        }
+
+        for identity_bound in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("bounded-update.db");
+            let path_text = path.to_string_lossy().into_owned();
+            let description = "x".repeat(10_000);
+            let seed = Connection::open(path_text.clone()).unwrap();
+            seed.execute("PRAGMA journal_mode = WAL").unwrap();
+            seed.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+            for sql in [
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                "CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL)",
+                "CREATE TABLE labels (issue_id TEXT NOT NULL, label TEXT NOT NULL)",
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, body TEXT NOT NULL)",
+            ] {
+                seed.execute(sql).unwrap();
+            }
+            seed.execute("BEGIN IMMEDIATE").unwrap();
+            seed.execute("INSERT INTO metadata VALUES ('state', 'ready')")
+                .unwrap();
+            for index in 0..32_i64 {
+                let id = format!("issue-{index}");
+                seed.execute_with_params(
+                    "INSERT INTO issues VALUES (?1, 'original', ?2)",
+                    &[
+                        SqliteValue::from(id.as_str()),
+                        SqliteValue::from(description.as_str()),
+                    ],
+                )
+                .unwrap();
+                seed.execute_with_params(
+                    "INSERT INTO events VALUES (?1, ?2, ?3)",
+                    &[
+                        SqliteValue::from(index + 1),
+                        SqliteValue::from(id.as_str()),
+                        SqliteValue::from(format!("original event {index}")),
+                    ],
+                )
+                .unwrap();
+            }
+            seed.execute("COMMIT").unwrap();
+            seed.close().unwrap();
+
+            // Positive sensitivity control against the pinned engine's old
+            // ordinary opener, on exactly the same persisted fixture. The
+            // counter is per connection, so parallel tests cannot affect it.
+            let old = drive(fsqlite::Connection::open(path_text.clone())).unwrap();
+            drive(old.execute("PRAGMA fsqlite.concurrent_mode = OFF")).unwrap();
+            {
+                let point =
+                    drive(old.prepare("SELECT value FROM metadata WHERE key = ?1")).unwrap();
+                let row =
+                    drive(point.query_row_with_params(&[SqliteValue::from("state")])).unwrap();
+                assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("ready"));
+            }
+            assert!(
+                old.memdb_row_hydration_count() >= 32,
+                "the old opener must expose the whole-store hydration this regression detects"
+            );
+            drive(old.close()).unwrap();
+
+            let retained = std::fs::File::open(&path).unwrap();
+            let conn = if identity_bound {
+                let identity = fsqlite_vfs::FileIdentity::from_file(&retained)
+                    .unwrap()
+                    .unwrap();
+                Connection::open_existing_with_expected_identity(path_text.clone(), identity)
+                    .unwrap()
+            } else {
+                Connection::open(path_text.clone()).unwrap()
+            };
+            drop(retained);
+            conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+            {
+                let point = conn
+                    .prepare("SELECT value FROM metadata WHERE key = ?1")
+                    .unwrap();
+                for _ in 0..2 {
+                    let row = point
+                        .query_row_with_params(&[SqliteValue::from("state")])
+                        .unwrap();
+                    assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("ready"));
+                }
+                assert_eq!(conn.as_async().memdb_row_hydration_count(), 0);
+
+                conn.execute("BEGIN IMMEDIATE").unwrap();
+                conn.execute("UPDATE issues SET title = 'rolled back' WHERE id = 'issue-0'")
+                    .unwrap();
+                conn.execute("INSERT INTO events VALUES (1000, 'issue-0', 'rolled back')")
+                    .unwrap();
+                conn.execute("ROLLBACK").unwrap();
+                let row = conn
+                    .query_row("SELECT title FROM issues WHERE id = 'issue-0'")
+                    .unwrap();
+                assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("original"));
+                assert!(
+                    conn.query("SELECT id FROM events WHERE id = 1000")
+                        .unwrap()
+                        .is_empty()
+                );
+
+                conn.execute("BEGIN IMMEDIATE").unwrap();
+                conn.execute("UPDATE issues SET title = 'committed' WHERE id = 'issue-0'")
+                    .unwrap();
+                conn.execute("INSERT INTO labels VALUES ('issue-0', 'marked')")
+                    .unwrap();
+                conn.execute("INSERT INTO events VALUES (1001, 'issue-0', 'committed')")
+                    .unwrap();
+                conn.execute("SAVEPOINT one_issue").unwrap();
+                conn.execute("UPDATE issues SET description = 'discarded' WHERE id = 'issue-0'")
+                    .unwrap();
+                conn.execute("UPDATE events SET body = 'discarded' WHERE id = 2")
+                    .unwrap();
+                conn.execute("DELETE FROM labels WHERE issue_id = 'issue-0'")
+                    .unwrap();
+                conn.execute("ROLLBACK TO one_issue").unwrap();
+                conn.execute("RELEASE one_issue").unwrap();
+                conn.execute("COMMIT").unwrap();
+                let row = point
+                    .query_row_with_params(&[SqliteValue::from("state")])
+                    .unwrap();
+                assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("ready"));
+                assert_eq!(
+                    conn.as_async().memdb_row_hydration_count(),
+                    0,
+                    "reads, writes and rollback must stay bounded; identity_bound={identity_bound}"
+                );
+            }
+            conn.close().unwrap();
+            if identity_bound {
+                assert!(
+                    std::fs::metadata(format!("{path_text}-wal")).unwrap().len() > 32,
+                    "identity-bound close must leave committed frames for the reopen probe"
+                );
+            }
+
+            // In the identity-bound case close deliberately does not checkpoint.
+            // Reopening must preserve the committed WAL state as well as all
+            // overflow-page descriptions and unrelated audit history.
+            let reopened = Connection::open(path_text).unwrap();
+            let issues = reopened
+                .query("SELECT id, title, description FROM issues ORDER BY id")
+                .unwrap();
+            assert_eq!(issues.len(), 32);
+            for row in issues {
+                let id = row.get(0).and_then(SqliteValue::as_text).unwrap();
+                let expected = if id == "issue-0" {
+                    "committed"
+                } else {
+                    "original"
+                };
+                assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some(expected));
+                assert_eq!(
+                    row.get(2).and_then(SqliteValue::as_text),
+                    Some(description.as_str())
+                );
+            }
+            let events = reopened
+                .query("SELECT id, issue_id, body FROM events ORDER BY id")
+                .unwrap();
+            assert_eq!(events.len(), 33, "the rolled-back event must not persist");
+            for (index, row) in events.iter().take(32).enumerate() {
+                let id = format!("issue-{index}");
+                let body = format!("original event {index}");
+                assert_eq!(
+                    row.get(0).and_then(SqliteValue::as_integer),
+                    Some(i64::try_from(index).unwrap() + 1)
+                );
+                assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some(id.as_str()));
+                assert_eq!(
+                    row.get(2).and_then(SqliteValue::as_text),
+                    Some(body.as_str())
+                );
+            }
+            let committed = events.last().unwrap();
+            assert_eq!(
+                committed.get(0).and_then(SqliteValue::as_integer),
+                Some(1001)
+            );
+            assert_eq!(
+                committed.get(2).and_then(SqliteValue::as_text),
+                Some("committed")
+            );
+            let labels = reopened
+                .query("SELECT issue_id, label FROM labels")
+                .unwrap();
+            assert_eq!(labels.len(), 1);
+            assert_eq!(
+                labels[0].get(0).and_then(SqliteValue::as_text),
+                Some("issue-0")
+            );
+            assert_eq!(
+                labels[0].get(1).and_then(SqliteValue::as_text),
+                Some("marked")
+            );
+            assert_eq!(reopened.as_async().memdb_row_hydration_count(), 0);
+            reopened.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn writable_open_preserves_creation_and_invalid_file_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let fresh = temp.path().join("fresh.db");
+        let empty = temp.path().join("empty.db");
+        std::fs::write(&empty, []).unwrap();
+        for path in [
+            fresh.to_string_lossy().into_owned(),
+            empty.to_string_lossy().into_owned(),
+            ":memory:".to_string(),
+        ] {
+            let conn = Connection::open(path.clone()).unwrap();
+            conn.execute("CREATE TABLE created (value TEXT)").unwrap();
+            conn.execute("INSERT INTO created VALUES ('preserved')")
+                .unwrap();
+            let row = conn.query_row("SELECT value FROM created").unwrap();
+            assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("preserved"));
+            conn.close().unwrap();
+            if path != ":memory:" {
+                let reopened = Connection::open(path).unwrap();
+                let row = reopened.query_row("SELECT value FROM created").unwrap();
+                assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("preserved"));
+                reopened.close().unwrap();
+            }
+        }
+
+        let invalid = temp.path().join("invalid.db");
+        let original = b"an existing invalid database must never be recreated";
+        std::fs::write(&invalid, original).unwrap();
+        assert!(Connection::open(invalid.to_string_lossy().into_owned()).is_err());
+        assert_eq!(std::fs::read(&invalid).unwrap(), original);
     }
 
     #[test]
