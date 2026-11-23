@@ -442,6 +442,66 @@ fn e2e_no_db_flag_list() {
     );
 }
 
+/// GitHub #613: a `--no-db` read writes nothing inside `.beads/`. Its JSONL
+/// snapshot used to be backed by an unnamed `O_TMPFILE` there, which leaves no
+/// file behind but reaches anything watching the directory as MODIFY and
+/// CLOSE_WRITE events, so the test watches the directory with inotify.
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_no_db_reads_do_not_write_inside_beads_dir() {
+    use rustix::fs::inotify;
+    use std::mem::MaybeUninit;
+
+    let _log = common::test_log("e2e_no_db_reads_do_not_write_inside_beads_dir");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create = run_br(&workspace, ["create", "No-DB watched read"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(sync.status.success(), "sync flush failed: {}", sync.stderr);
+
+    let watch = inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC)
+        .expect("create inotify instance");
+    let writes = inotify::WatchFlags::MODIFY
+        | inotify::WatchFlags::CLOSE_WRITE
+        | inotify::WatchFlags::CREATE
+        | inotify::WatchFlags::DELETE
+        | inotify::WatchFlags::MOVED_FROM
+        | inotify::WatchFlags::MOVED_TO;
+    inotify::add_watch(&watch, workspace.root.join(".beads"), writes).expect("watch .beads");
+
+    let reads: [&[&str]; 2] = [
+        &["--no-db", "list", "--json"],
+        &["--no-db", "ready", "--json"],
+    ];
+    for args in reads {
+        let run = run_br(&workspace, args, "no_db_read");
+        assert!(run.status.success(), "{args:?} failed: {}", run.stderr);
+        // `list` prints a page object and `ready` an array; both name it.
+        assert!(
+            run.stdout.contains("No-DB watched read"),
+            "{args:?} should list the issue: {}",
+            run.stdout
+        );
+    }
+
+    let mut buf = [MaybeUninit::uninit(); 4096];
+    let mut reader = inotify::Reader::new(&watch, &mut buf);
+    let mut events = Vec::new();
+    loop {
+        match reader.next() {
+            Ok(event) => events.push(format!("{:?} {:?}", event.events(), event.file_name())),
+            Err(rustix::io::Errno::WOULDBLOCK) => break,
+            Err(error) => panic!("read inotify events: {error}"),
+        }
+    }
+    assert!(
+        events.is_empty(),
+        "--no-db reads wrote inside .beads/: {events:?}"
+    );
+}
+
 #[test]
 fn e2e_no_db_flag_show() {
     let _log = common::test_log("e2e_no_db_flag_show");
