@@ -747,6 +747,8 @@ sync:
 # actor: "alice"           # audit actor when --actor is not given
 # claim_exclusive: true    # refuse `br update --claim` on an issue another actor holds
 # lock_timeout: 5000       # write-lock wait in milliseconds
+# inherited_context:
+#   enabled: true          # show ancestors' agent_context on descendant show/claim
 ```
 
 ### Config Commands

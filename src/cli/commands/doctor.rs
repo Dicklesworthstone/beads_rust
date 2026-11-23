@@ -20147,6 +20147,44 @@ mod tests {
         assert_eq!(details["finding_id"], "fm-configs-policy-unknown-keys");
     }
 
+    /// GH #603: `inherited_context.enabled` is honored by `br show` and
+    /// `br update`, so `config.unknown_keys` must not tell the operator that
+    /// br ignores it, while a misspelled sibling is still reported.
+    #[test]
+    fn test_check_config_unknown_keys_accepts_inherited_context() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path();
+        let config_path = beads_dir.join("config.yaml");
+
+        fs::write(
+            &config_path,
+            "issue_prefix: bd\ninherited_context:\n  enabled: true\n",
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_config_unknown_keys(beads_dir, &mut checks);
+        let check = find_check(&checks, "config.unknown_keys").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+
+        fs::write(
+            &config_path,
+            "inherited_context:\n  enabled: true\n  enabeld: true\n",
+        )
+        .unwrap();
+        let mut checks = Vec::new();
+        check_config_unknown_keys(beads_dir, &mut checks);
+        let check = find_check(&checks, "config.unknown_keys").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let details = check.details.as_ref().expect("details");
+        let unknown: Vec<&str> = details["unknown_keys"]
+            .as_array()
+            .expect("unknown_keys array")
+            .iter()
+            .filter_map(|entry| entry["key"].as_str())
+            .collect();
+        assert_eq!(unknown, ["inherited_context.enabeld"]);
+    }
+
     /// issue #311: when every issue conforms, the detector reports Ok.
     #[test]
     fn test_check_workflow_statuses_ok_when_all_conform() {

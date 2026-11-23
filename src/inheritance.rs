@@ -94,11 +94,25 @@ pub fn is_enabled_from_inputs(env_val: Option<&str>, config_yaml_path: &Path) ->
     let Ok(value): std::result::Result<serde_yml::Value, _> = serde_yml::from_str(&contents) else {
         return false;
     };
-    value
-        .get("inherited_context")
-        .and_then(|node| node.get("enabled"))
+    // Accept every spelling `config::is_known_config_key` (behind the
+    // `config.unknown_keys` doctor check and `br config schema`) accepts as
+    // this registered key: the nested table or the flat dotted key, with
+    // hyphens or underscores in any case (GitHub #603).
+    config_entry(&value, "inherited_context")
+        .and_then(|node| config_entry(node, "enabled"))
+        .or_else(|| config_entry(&value, "inherited_context.enabled"))
         .and_then(serde_yml::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// The value under `name` in a YAML mapping, matching keys the way the config
+/// registry does: case-insensitively, with `-` and `_` interchangeable.
+fn config_entry<'a>(mapping: &'a serde_yml::Value, name: &str) -> Option<&'a serde_yml::Value> {
+    mapping.as_mapping()?.iter().find_map(|(key, value)| {
+        key.as_str()
+            .is_some_and(|key| key.trim().to_ascii_lowercase().replace('-', "_") == name)
+            .then_some(value)
+    })
 }
 
 /// Walk the parent chain of `child_id` and collect at most two
@@ -397,5 +411,31 @@ mod tests {
         // Malformed YAML => disabled (don't fail the show on bad config).
         std::fs::write(&cfg, "this: is: not: yaml: [").expect("write malformed");
         assert!(!is_enabled_from_inputs(None, &cfg));
+    }
+
+    /// GitHub #603: every spelling the config registry (and so the doctor's
+    /// `config.unknown_keys` check) accepts as `inherited_context.enabled`
+    /// must enable emission exactly like the nested table does.
+    #[test]
+    fn is_enabled_accepts_every_spelling_the_registry_accepts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("config.yaml");
+        for spelling in [
+            "inherited_context.enabled: true\n",
+            "inherited-context.enabled: true\n",
+            "inherited-context:\n  enabled: true\n",
+            "Inherited_Context:\n  Enabled: true\n",
+        ] {
+            std::fs::write(&cfg, spelling).expect("write config");
+            assert!(is_enabled_from_inputs(None, &cfg), "{spelling:?}");
+        }
+        for spelling in [
+            "inherited_context.enabled: false\n",
+            "inherited-context:\n  enabled: false\n",
+            "inherited_context:\n  enabeld: true\n",
+        ] {
+            std::fs::write(&cfg, spelling).expect("write config");
+            assert!(!is_enabled_from_inputs(None, &cfg), "{spelling:?}");
+        }
     }
 }

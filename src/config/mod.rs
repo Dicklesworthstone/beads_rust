@@ -7547,6 +7547,15 @@ pub const KNOWN_CONFIG_KEYS: &[ConfigKeySpec] = &[
         default: None,
         description: "Workspace path for `external:<name>:<id>` dependency ids",
     },
+    // Read from the project `.beads/config.yaml` by `crate::inheritance`, not
+    // through a ConfigLayer getter, so the getter-literal test cannot see it.
+    ConfigKeySpec {
+        key: "inherited_context.enabled",
+        aliases: &["inherited-context.enabled"],
+        value_type: "bool",
+        default: Some("false"),
+        description: "Show ancestors' agent_context on descendant `br show`, `br update --status in_progress` and `--claim` (BR_INHERITED_CONTEXT overrides)",
+    },
 ];
 
 /// Table prefixes under which any sub-key is accepted.
@@ -15175,6 +15184,22 @@ mod config_key_registry_tests {
                 );
             }
         }
+    }
+
+    /// GitHub #603: `crate::inheritance` honors `inherited_context.enabled`
+    /// from `.beads/config.yaml`, so the doctor's `config.unknown_keys` check
+    /// and `br config set` must not call it a key br does not read.
+    #[test]
+    fn inherited_context_enabled_is_a_known_key() {
+        assert!(is_known_config_key("inherited_context.enabled"));
+        assert!(is_known_config_key("inherited-context.enabled"));
+        assert!(
+            KNOWN_CONFIG_KEYS
+                .iter()
+                .any(|spec| spec.key == "inherited_context.enabled" && spec.value_type == "bool"),
+            "`br config schema` must list inherited_context.enabled"
+        );
+        assert!(!is_known_config_key("inherited_context.disabled"));
     }
 
     #[test]
