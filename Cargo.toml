@@ -82,7 +82,7 @@ fsqlite-vdbe = { version = "=0.4.10" }
 fsqlite-vfs = { version = "=0.5.0" }
 fsqlite-pager = { version = "=0.5.0" }
 fsqlite-parser = { version = "=0.4.10" }
-fsqlite-planner = { version = "=0.4.10" }
+fsqlite-planner = { version = "=0.5.0" }
 fsqlite-wal = { version = "=0.4.10" }
 fsqlite-btree = { version = "=0.4.10" }
 fsqlite-ast = { version = "=0.4.10" }

@@ -458,7 +458,7 @@ dependencies = [
  "fastmcp-rust",
  "flate2",
  "fsqlite",
- "fsqlite-ast",
+ "fsqlite-ast 0.4.10",
  "fsqlite-btree",
  "fsqlite-core",
  "fsqlite-error 0.4.10",
@@ -466,8 +466,8 @@ dependencies = [
  "fsqlite-mvcc",
  "fsqlite-observability 0.4.10",
  "fsqlite-pager 0.5.0",
- "fsqlite-parser",
- "fsqlite-planner",
+ "fsqlite-parser 0.4.10",
+ "fsqlite-planner 0.5.0",
  "fsqlite-types 0.4.10",
  "fsqlite-vdbe",
  "fsqlite-vfs 0.5.0",
@@ -1919,14 +1919,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320c4c2f02197d82fca24ca3d26998126196008b9312431c4c95f7361b75b545"
 dependencies = [
  "asupersync 0.5.0",
- "fsqlite-ast",
+ "fsqlite-ast 0.4.10",
  "fsqlite-core",
  "fsqlite-error 0.4.10",
  "fsqlite-ext-fts5",
  "fsqlite-ext-icu",
  "fsqlite-ext-misc",
  "fsqlite-ext-rtree",
- "fsqlite-parser",
+ "fsqlite-parser 0.4.10",
  "fsqlite-types 0.4.10",
  "fsqlite-vfs 0.4.11",
  "fsqlite-wal 0.4.10",
@@ -1940,6 +1940,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1000036fdc45756ebb9c78c70fe19538d7254979d66dad574e645275f5d79d04"
 dependencies = [
  "fsqlite-types 0.4.10",
+ "smallvec",
+]
+
+[[package]]
+name = "fsqlite-ast"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c20482bee20570f526c7dfa76db5256a7b395968308a329f418d64851248991d"
+dependencies = [
+ "fsqlite-types 0.5.1",
  "smallvec",
 ]
 
@@ -1970,7 +1980,7 @@ dependencies = [
  "asupersync 0.5.0",
  "blake3",
  "foldhash",
- "fsqlite-ast",
+ "fsqlite-ast 0.4.10",
  "fsqlite-btree",
  "fsqlite-error 0.4.10",
  "fsqlite-ext-fts5",
@@ -1982,8 +1992,8 @@ dependencies = [
  "fsqlite-mvcc",
  "fsqlite-observability 0.4.10",
  "fsqlite-pager 0.4.10",
- "fsqlite-parser",
- "fsqlite-planner",
+ "fsqlite-parser 0.4.10",
+ "fsqlite-planner 0.4.10",
  "fsqlite-types 0.4.10",
  "fsqlite-vdbe",
  "fsqlite-vfs 0.4.11",
@@ -1991,7 +2001,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "itoa",
  "lazy_static",
- "lru",
+ "lru 0.18.5",
  "serde",
  "serde_json",
  "smallvec",
@@ -2203,9 +2213,23 @@ version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b5ae5875706b7f2205b910c094508219197738a13abef085188af7e8801569b"
 dependencies = [
- "fsqlite-ast",
+ "fsqlite-ast 0.4.10",
  "fsqlite-error 0.4.10",
  "fsqlite-types 0.4.10",
+ "hashbrown 0.17.1",
+ "memchr",
+ "tracing",
+]
+
+[[package]]
+name = "fsqlite-parser"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2728de95b1e11685261161161a91702cf8ae1386a775042fe2aa48a349ee771"
+dependencies = [
+ "fsqlite-ast 0.5.1",
+ "fsqlite-error 0.5.1",
+ "fsqlite-types 0.5.1",
  "hashbrown 0.17.1",
  "memchr",
  "tracing",
@@ -2218,11 +2242,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "844cb4810fe90edf46450d88d6126e38a23c5c78bb2934ccd7af401f18226750"
 dependencies = [
  "blake3",
- "fsqlite-ast",
+ "fsqlite-ast 0.4.10",
  "fsqlite-error 0.4.10",
- "fsqlite-parser",
+ "fsqlite-parser 0.4.10",
  "fsqlite-types 0.4.10",
- "lru",
+ "lru 0.18.5",
+ "serde",
+ "serde_json",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "fsqlite-planner"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fd494658eb2d2aacc3ed48889b9f21d798cfb7bf489b202c88f2bbfb4bdbba5"
+dependencies = [
+ "blake3",
+ "fsqlite-ast 0.5.1",
+ "fsqlite-error 0.5.1",
+ "fsqlite-parser 0.5.1",
+ "fsqlite-types 0.5.1",
+ "lru 0.19.2",
  "serde",
  "serde_json",
  "tracing",
@@ -2277,14 +2319,14 @@ checksum = "bd21dec3a1db7377925cf8739ac8fda0ad2d684d217327e272ab68cfce7049ee"
 dependencies = [
  "asupersync 0.5.0",
  "crossbeam-deque",
- "fsqlite-ast",
+ "fsqlite-ast 0.4.10",
  "fsqlite-btree",
  "fsqlite-error 0.4.10",
  "fsqlite-func",
  "fsqlite-mvcc",
  "fsqlite-observability 0.4.10",
  "fsqlite-pager 0.4.10",
- "fsqlite-parser",
+ "fsqlite-parser 0.4.10",
  "fsqlite-types 0.4.10",
  "fsqlite-wal 0.4.10",
  "hashbrown 0.17.1",
@@ -4102,6 +4144,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4e2a1b977b42ee8b53a2a4adbd1183431c493f1d1960b7ccd893e2f0b9407ba"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5133,7 +5184,7 @@ dependencies = [
  "crossterm",
  "fancy-regex",
  "log",
- "lru",
+ "lru 0.18.5",
  "num-rational",
  "once_cell",
  "os_pipe",
