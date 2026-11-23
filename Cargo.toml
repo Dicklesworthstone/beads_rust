@@ -79,7 +79,7 @@ fsqlite-error = { version = "=0.4.10" }
 fsqlite-core = { version = "=0.4.10" }
 fsqlite-func = { version = "=0.4.10" }
 fsqlite-vdbe = { version = "=0.4.10" }
-fsqlite-vfs = { version = "=0.4.10" }
+fsqlite-vfs = { version = "=0.5.0" }
 fsqlite-pager = { version = "=0.5.0" }
 fsqlite-parser = { version = "=0.4.10" }
 fsqlite-planner = { version = "=0.4.10" }
