@@ -2,7 +2,14 @@
 name = "beads_rust"
 version = "0.7.6"
 edition = "2024"
-rust-version = "1.89"
+# The toolchain this is built and tested with: nightly-2026-08-31 (see
+# rust-toolchain.toml), which reports 1.100.0-nightly. A nightly toolchain is
+# required: the pinned storage engine (fsqlite 0.4.10) enables nightly-only
+# features on x86_64 and on Windows (GitHub #614). Cargo cannot express a
+# channel requirement, so a stable 1.100 compiler passes this check and fails
+# later with E0554; install with
+# `cargo +nightly-2026-08-31 install beads_rust --locked` (README).
+rust-version = "1.100"
 autobenches = false
 default-run = "br"
 description = "Agent-first issue tracker (SQLite + JSONL)"
