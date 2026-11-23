@@ -22,13 +22,13 @@ use crate::sync::{
     ExpectedJsonlSourceRef, ExportConfig, FreshDatabaseReplacementWitness, ImportConfig,
     ImportResult, JsonlSourceSnapshot, JsonlSourceStateWitness, JsonlTombstoneFilter,
     UnflushedStateSnapshot, blocking_database_family_write_lock_with_timeout,
-    capture_optional_jsonl_source, dirty_issues_missing_from_jsonl,
-    export_to_jsonl_with_policy_expected_under_authority, finalize_export_under_authority,
-    import_from_jsonl_snapshot, import_from_jsonl_snapshot_into_fresh_replacement,
-    preflight_import_snapshot, restore_dirty_issues_after_rebuild,
-    restore_tombstones_after_automatic_rebuild, scan_jsonl_snapshot_for_tombstone_filter,
-    snapshot_unflushed_state, tombstones_missing_from_jsonl_tombstones,
-    verify_jsonl_source_snapshot_current,
+    capture_optional_jsonl_source, capture_optional_jsonl_source_for_private_read,
+    dirty_issues_missing_from_jsonl, export_to_jsonl_with_policy_expected_under_authority,
+    finalize_export_under_authority, import_from_jsonl_snapshot,
+    import_from_jsonl_snapshot_into_fresh_replacement, preflight_import_snapshot,
+    restore_dirty_issues_after_rebuild, restore_tombstones_after_automatic_rebuild,
+    scan_jsonl_snapshot_for_tombstone_filter, snapshot_unflushed_state,
+    tombstones_missing_from_jsonl_tombstones, verify_jsonl_source_snapshot_current,
 };
 use crate::util::id::{
     IdConfig, abbreviate_prefix, normalize_configured_prefix, normalize_prefix, parse_id,
@@ -5705,7 +5705,15 @@ fn open_storage_with_startup_config_impl(
         } else {
             None
         };
-        let loaded_jsonl_snapshot = capture_optional_jsonl_source(&paths.jsonl_path)?;
+        // A read builds its private database in the temp directory, so it
+        // backs the snapshot there too and writes nothing under `.beads/`
+        // (#613). A write keeps the beside-source backing a workspace
+        // sandbox already allows (#436).
+        let loaded_jsonl_snapshot = if cli.no_db_write_intent {
+            capture_optional_jsonl_source(&paths.jsonl_path)?
+        } else {
+            capture_optional_jsonl_source_for_private_read(&paths.jsonl_path)?
+        };
         let prefix = match loaded_jsonl_snapshot.as_ref() {
             Some(source) => {
                 resolve_bootstrap_issue_prefix_snapshot(&merged_layer, &beads_dir, source)?

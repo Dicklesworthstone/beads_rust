@@ -2799,23 +2799,50 @@ fn jsonl_fd_stability_witness(metadata: &std::fs::Metadata) -> Result<(u64, Syst
 /// cannot host even an unlinked file. `tempfile` uses `O_TMPFILE` where the
 /// filesystem supports it and otherwise creates and immediately unlinks a
 /// random name, so nothing is left behind on either route.
-fn open_private_snapshot_backing(parent: Option<&Path>) -> std::io::Result<File> {
-    let beside_source = parent
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map(tempfile::tempfile_in);
-    match beside_source {
-        Some(Ok(file)) => Ok(file),
-        Some(Err(beside_error)) => tempfile::tempfile().map_err(|global_error| {
-            std::io::Error::new(
-                global_error.kind(),
-                format!(
-                    "neither the source directory ({beside_error}) nor the temp directory \
-                     ({global_error}) could host the snapshot"
-                ),
-            )
-        }),
-        None => tempfile::tempfile(),
+///
+/// [`SnapshotBacking::ProcessTempFirst`] reverses the preference for private
+/// read-only captures, which must not write inside `.beads/` at all (#613).
+fn open_private_snapshot_backing(
+    parent: Option<&Path>,
+    backing: SnapshotBacking,
+) -> std::io::Result<File> {
+    let parent = parent.filter(|dir| !dir.as_os_str().is_empty());
+    let both_failed = |beside_error: std::io::Error, global_error: std::io::Error| {
+        std::io::Error::new(
+            global_error.kind(),
+            format!(
+                "neither the source directory ({beside_error}) nor the temp directory \
+                 ({global_error}) could host the snapshot"
+            ),
+        )
+    };
+    match (backing, parent) {
+        (_, None) => tempfile::tempfile(),
+        (SnapshotBacking::BesideSource, Some(dir)) => {
+            tempfile::tempfile_in(dir).or_else(|beside_error| {
+                tempfile::tempfile().map_err(|global_error| both_failed(beside_error, global_error))
+            })
+        }
+        (SnapshotBacking::ProcessTempFirst, Some(dir)) => {
+            tempfile::tempfile().or_else(|global_error| {
+                tempfile::tempfile_in(dir)
+                    .map_err(|beside_error| both_failed(beside_error, global_error))
+            })
+        }
     }
+}
+
+/// Where the anonymous backing of a JSONL snapshot is created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotBacking {
+    /// Beside the source, inside the workspace a sandbox already lets `br`
+    /// write (#436); the process temp directory is the fallback.
+    BesideSource,
+    /// The process temp directory first, beside the source only as the
+    /// fallback. JSONL-only reads use it: they already build their private
+    /// database in the temp directory, and a read must not create files
+    /// (even unlinked ones) under `.beads/`, where watchers see them (#613).
+    ProcessTempFirst,
 }
 
 /// Why one attempt to capture a JSONL generation produced no snapshot.
@@ -2875,9 +2902,13 @@ fn capture_opened_jsonl_source_snapshot_with_verifier<VerifyIdentity>(
 where
     VerifyIdentity: FnOnce(JsonlFileIdentity) -> Result<()>,
 {
-    capture_opened_jsonl_source_attempt(path, opened, deadline, |identity| {
-        verify_identity(identity).map_err(CaptureAttemptError::Failed)
-    })
+    capture_opened_jsonl_source_attempt(
+        path,
+        opened,
+        deadline,
+        SnapshotBacking::BesideSource,
+        |identity| verify_identity(identity).map_err(CaptureAttemptError::Failed),
+    )
     .map_err(CaptureAttemptError::into_error)
 }
 
@@ -2890,6 +2921,7 @@ fn capture_opened_jsonl_source_attempt<VerifyIdentity>(
     path: &Path,
     opened: OpenedJsonlSource,
     deadline: Option<Instant>,
+    backing_placement: SnapshotBacking,
     verify_identity: VerifyIdentity,
 ) -> std::result::Result<JsonlSourceSnapshot, CaptureAttemptError>
 where
@@ -2903,12 +2935,13 @@ where
     let before_metadata = regular_jsonl_fd_metadata(opened.as_file(), path)?;
     let before_witness = jsonl_fd_stability_witness(&before_metadata)?;
     ensure_jsonl_capture_deadline(deadline)?;
-    let mut backing = open_private_snapshot_backing(path.parent()).map_err(|error| {
-        BeadsError::Config(format!(
-            "Could not create private backing for JSONL source {}: {error}",
-            external_path_descriptor(path)
-        ))
-    })?;
+    let mut backing =
+        open_private_snapshot_backing(path.parent(), backing_placement).map_err(|error| {
+            BeadsError::Config(format!(
+                "Could not create private backing for JSONL source {}: {error}",
+                external_path_descriptor(path)
+            ))
+        })?;
     ensure_jsonl_capture_deadline(deadline)?;
     let mut file = opened.into_file();
     let mut hasher = Sha256::new();
@@ -2997,13 +3030,24 @@ fn capture_optional_jsonl_source_with_retry(
     path: &Path,
     deadline: Option<Instant>,
 ) -> Result<Option<JsonlSourceSnapshot>> {
-    capture_optional_jsonl_source_with_retry_impl(path, deadline, || Ok(()))
+    capture_optional_jsonl_source_with_retry_backed(path, deadline, SnapshotBacking::BesideSource)
+}
+
+#[cfg(unix)]
+fn capture_optional_jsonl_source_with_retry_backed(
+    path: &Path,
+    deadline: Option<Instant>,
+    backing: SnapshotBacking,
+) -> Result<Option<JsonlSourceSnapshot>> {
+    capture_with_retry(path, deadline, || {
+        capture_optional_jsonl_source_attempt_backed(path, deadline, backing, &mut || Ok(()))
+    })
 }
 
 /// `after_read` runs in every attempt once the source has been copied and
 /// found unmodified, just before its path identity is verified again. Tests
 /// use it to replace the source at that exact point.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn capture_optional_jsonl_source_with_retry_impl<AfterRead>(
     path: &Path,
     deadline: Option<Instant>,
@@ -3076,10 +3120,25 @@ fn jsonl_source_vanished_during_capture(display_path: &Path) -> BeadsError {
 /// One open-and-capture of the generation the path names. A path that names
 /// a different file after the open, or after the read, is a concurrent
 /// replacement ([`CaptureAttemptError::Changed`]).
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn capture_optional_jsonl_source_attempt(
     path: &Path,
     deadline: Option<Instant>,
+    after_read: &mut dyn FnMut() -> std::io::Result<()>,
+) -> std::result::Result<Option<JsonlSourceSnapshot>, CaptureAttemptError> {
+    capture_optional_jsonl_source_attempt_backed(
+        path,
+        deadline,
+        SnapshotBacking::BesideSource,
+        after_read,
+    )
+}
+
+#[cfg(unix)]
+fn capture_optional_jsonl_source_attempt_backed(
+    path: &Path,
+    deadline: Option<Instant>,
+    backing: SnapshotBacking,
     after_read: &mut dyn FnMut() -> std::io::Result<()>,
 ) -> std::result::Result<Option<JsonlSourceSnapshot>, CaptureAttemptError> {
     let still_named = |absolute_path: &Path,
@@ -3107,6 +3166,7 @@ fn capture_optional_jsonl_source_attempt(
         path,
         OpenedJsonlSource { file, identity },
         deadline,
+        backing,
         |identity| {
             after_read()?;
             still_named(&absolute_path, identity)
@@ -3161,6 +3221,49 @@ pub(crate) fn capture_optional_jsonl_source_snapshot(
     path: &Path,
 ) -> Result<Option<JsonlSourceSnapshot>> {
     capture_optional_jsonl_source_with_retry(path, None)
+}
+
+/// Captures an optional generation for a private, read-only JSONL database
+/// (`--no-db` reads). The snapshot is backed in the process temp directory,
+/// where that private database already lives, so the read creates nothing
+/// under the source directory; beside the source is only the fallback
+/// (GitHub #613).
+#[cfg(unix)]
+pub(crate) fn capture_optional_jsonl_source_snapshot_for_private_read(
+    path: &Path,
+) -> Result<Option<JsonlSourceSnapshot>> {
+    capture_optional_jsonl_source_with_retry_backed(path, None, SnapshotBacking::ProcessTempFirst)
+}
+
+/// See the Unix variant above.
+#[cfg(windows)]
+pub(crate) fn capture_optional_jsonl_source_snapshot_for_private_read(
+    path: &Path,
+) -> Result<Option<JsonlSourceSnapshot>> {
+    open_optional_jsonl_source_nofollow(path)?
+        .map(|opened| {
+            let pinned = pin_jsonl_target(path)?;
+            capture_opened_jsonl_source_attempt(
+                path,
+                opened,
+                None,
+                SnapshotBacking::ProcessTempFirst,
+                |identity| {
+                    pinned
+                        .verify_relative_identity(identity)
+                        .map_err(CaptureAttemptError::Failed)
+                },
+            )
+            .map_err(CaptureAttemptError::into_error)
+        })
+        .transpose()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn capture_optional_jsonl_source_snapshot_for_private_read(
+    path: &Path,
+) -> Result<Option<JsonlSourceSnapshot>> {
+    capture_optional_jsonl_source_snapshot(path)
 }
 
 #[cfg(windows)]
@@ -5365,8 +5468,9 @@ mod tests {
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir(&beads_dir).expect("create .beads");
 
-        let mut backing = open_private_snapshot_backing(Some(&beads_dir))
-            .expect("backing beside the source must open");
+        let mut backing =
+            open_private_snapshot_backing(Some(&beads_dir), SnapshotBacking::BesideSource)
+                .expect("backing beside the source must open");
         assert_eq!(
             backing.metadata().expect("backing metadata").dev(),
             std::fs::metadata(&beads_dir)
@@ -5397,11 +5501,51 @@ mod tests {
         let temp = canonical_temp_dir();
         let missing_parent = temp.path().join("does-not-exist");
 
-        open_private_snapshot_backing(Some(&missing_parent))
-            .expect("an unusable source directory must fall back to the temp directory");
-        open_private_snapshot_backing(Some(Path::new("")))
-            .expect("an empty (relative) parent must fall back to the temp directory");
-        open_private_snapshot_backing(None)
-            .expect("no parent at all must fall back to the temp directory");
+        for backing in [
+            SnapshotBacking::BesideSource,
+            SnapshotBacking::ProcessTempFirst,
+        ] {
+            open_private_snapshot_backing(Some(&missing_parent), backing)
+                .expect("an unusable source directory must fall back to the temp directory");
+            open_private_snapshot_backing(Some(Path::new("")), backing)
+                .expect("an empty (relative) parent must fall back to the temp directory");
+            open_private_snapshot_backing(None, backing)
+                .expect("no parent at all must fall back to the temp directory");
+        }
+    }
+
+    /// GitHub #613: a private read must not create its snapshot backing
+    /// under `.beads/`; writes keep the beside-source placement (#436).
+    /// `/proc/self/fd` names the directory even of an unlinked `O_TMPFILE`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_read_snapshot_backing_is_created_outside_the_source_directory() {
+        use std::os::fd::AsRawFd;
+
+        let temp = canonical_temp_dir();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir(&beads_dir).expect("create .beads");
+        let backing_dir = |file: &File| {
+            std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).expect("read fd link")
+        };
+
+        let read =
+            open_private_snapshot_backing(Some(&beads_dir), SnapshotBacking::ProcessTempFirst)
+                .expect("read backing");
+        let read_path = backing_dir(&read);
+        assert!(
+            !read_path.starts_with(&beads_dir),
+            "a read-only snapshot was backed inside the source directory: {}",
+            read_path.display()
+        );
+
+        let write = open_private_snapshot_backing(Some(&beads_dir), SnapshotBacking::BesideSource)
+            .expect("write backing");
+        let write_path = backing_dir(&write);
+        assert!(
+            write_path.starts_with(&beads_dir),
+            "a write snapshot must stay beside its source: {}",
+            write_path.display()
+        );
     }
 }

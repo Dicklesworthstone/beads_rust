@@ -79,6 +79,7 @@ pub use path::{
 pub(crate) use path::{
     JsonlSourceSnapshot, PinnedJsonlName, authority_paths_equivalent,
     capture_jsonl_source_snapshot, capture_optional_jsonl_source_snapshot,
+    capture_optional_jsonl_source_snapshot_for_private_read,
     capture_optional_jsonl_source_snapshot_until, pin_jsonl_target,
 };
 
@@ -199,6 +200,14 @@ impl JsonlSourceSnapshot {
 
 pub(crate) fn capture_optional_jsonl_source(path: &Path) -> Result<Option<JsonlSourceSnapshot>> {
     capture_optional_jsonl_source_snapshot(path)
+}
+
+/// [`capture_optional_jsonl_source`] for a private read-only JSONL database:
+/// the snapshot backing is created outside the source directory (#613).
+pub(crate) fn capture_optional_jsonl_source_for_private_read(
+    path: &Path,
+) -> Result<Option<JsonlSourceSnapshot>> {
+    capture_optional_jsonl_source_snapshot_for_private_read(path)
 }
 
 pub(crate) fn capture_optional_jsonl_source_until(
