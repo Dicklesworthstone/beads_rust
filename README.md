@@ -979,7 +979,7 @@ GitHub #384 acceptance matrix.
 | `BR_DISABLE_PARALLEL_JSONL_EXPORT` | Force the single-threaded JSONL export path |
 | `BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS` | Age after which `br doctor` reports `.write.lock` as stale (default 300) |
 | `BR_DOCTOR_PATH_WRAPPERS` | `PATH`-style list of intentional `br` wrappers or version-manager shims (the file, or the directory holding it); `br doctor` leaves them out of its duplicate-`br` check |
-| `BR_READ_ONLY` | Any value other than empty, `0`, `false`, `no` or `off` makes `br` run only read-only commands (reads, `--dry-run` previews, `sync --status`, `doctor` without `--repair`) with `--no-auto-import --no-auto-flush` implied; every other command is refused before the workspace is opened |
+| `BR_READ_ONLY` | Any value other than empty, `0`, `false`, `no` or `off` makes `br` run only read-only commands (reads, `--dry-run` previews, `sync --status` and `--witness`, `doctor` checks without `--repair`, `--bundle` or `--selftest`) with `--no-auto-import --no-auto-flush` implied; every other command is refused before the workspace is opened |
 | `EDITOR` / `VISUAL` | Editor for `br config edit` |
 | `GITHUB_TOKEN` / `GH_TOKEN` | Authenticate the GitHub API calls made by `br upgrade` |
 | `XDG_CACHE_HOME` | Base directory for br's cache (default `~/.cache`) |
