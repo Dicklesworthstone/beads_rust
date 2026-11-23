@@ -2945,7 +2945,8 @@ fn refuse_outside_read_only_mode(cmd: &Commands) -> Result<()> {
         ),
         hint: format!(
             "Use a read-only command (list, show, ready, search, dep list, sync --status, \
-             doctor without --repair, or a --dry-run preview), or run without {READ_ONLY_ENV}"
+             doctor without --repair, --bundle or --selftest, or a --dry-run preview), or \
+             run without {READ_ONLY_ENV}"
         ),
     })
 }
