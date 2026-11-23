@@ -471,7 +471,7 @@ dependencies = [
  "fsqlite-types 0.4.10",
  "fsqlite-vdbe",
  "fsqlite-vfs 0.5.0",
- "fsqlite-wal 0.4.10",
+ "fsqlite-wal 0.5.0",
  "indicatif",
  "insta",
  "libc",
