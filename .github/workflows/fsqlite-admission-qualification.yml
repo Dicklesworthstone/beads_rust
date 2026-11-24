@@ -61,24 +61,34 @@ jobs:
           family = {name: spec for name, spec in dependencies.items()
                     if name == 'fsqlite' or name.startswith('fsqlite-')}
           assert 'fsqlite' in family and 'fsqlite-vfs' in family and 'fsqlite-wal' in family
-          assert all(isinstance(spec, dict) and set(spec).isdisjoint({'git', 'path'})
+          assert all(isinstance(spec, dict) and set(spec).isdisjoint({'git', 'path', 'registry', 'package'})
                      and re.fullmatch(r'=\d+\.\d+\.\d+', spec.get('version', ''))
                      for spec in family.values()), 'unrecognized or unpinned engine source'
-          versions = {spec['version'] for spec in family.values()}
-          assert len(versions) == 1, 'main already mixes engine-family pins'
+          version = family['fsqlite']['version'][1:]
+          pins = {name: spec['version'][1:] for name, spec in family.items()}
+          # fsqlite-vfs-v0.4.11 (3bb28e73168991913974c1a7b4bb0414b48765fa)
+          # backports the macOS/non-Linux Unix descriptor-leak fix onto 0.4.10;
+          # its public API and all other engine members remain at 0.4.10.
+          backports = {'0.4.10': {'fsqlite-vfs': '0.4.11'}}
+          allowed = backports.get(version, {})
+          assert all(pin == version or pin == allowed.get(name)
+                     for name, pin in pins.items()), 'main already mixes engine-family pins'
           candidate = os.environ['CANDIDATE_VERSION']
           assert re.fullmatch(r'\d+\.\d+\.\d+', candidate), 'candidate must be a release version'
-          version = next(iter(versions))[1:]
-          if os.environ['ENGINE_LANE'] == 'candidate':
+          lane = os.environ['ENGINE_LANE']
+          assert lane in {'locked', 'candidate'}, 'unrecognized engine lane'
+          if lane == 'candidate':
               version = candidate
+              pins = {name: version for name in family}
               for name in family:
                   pattern = r'(?m)^(' + re.escape(name) + r'\s*=\s*\{\s*version\s*=\s*")=[^"]+(".*)$'
                   source, count = re.subn(pattern, lambda match: match[1] + '=' + version + match[2], source)
                   assert count == 1, f'cannot safely replace the pin for {name}'
               path.write_text(source)
           actual = tomllib.loads(path.read_text())['dependencies']
-          assert all(actual[name]['version'] == '=' + version for name in family)
-          Path('expected-family.json').write_text(json.dumps({'version': version, 'direct': sorted(family)}, indent=2))
+          assert all(actual[name]['version'] == '=' + pins[name] for name in family)
+          Path('expected-family.json').write_text(json.dumps(
+              {'version': version, 'direct': sorted(family), 'pins': pins}, indent=2))
           PY
       - name: Resolve candidate without changing production pins
         if: matrix.engine == 'candidate'
@@ -93,10 +103,11 @@ jobs:
           metadata = json.loads(Path('engine-metadata.json').read_text())
           family = [p for p in metadata['packages'] if p['name'] == 'fsqlite' or p['name'].startswith('fsqlite-')]
           assert family and set(expected['direct']) <= {p['name'] for p in family}
-          assert all(p['version'] == expected['version'] for p in family), 'mixed engine-family versions'
+          assert all(p['version'] == expected['pins'].get(p['name'], expected['version'])
+                     for p in family), 'mixed engine-family versions'
           sources = {p.get('source') for p in family}
           source = next(iter(sources)) if len(sources) == 1 else None
-          assert isinstance(source, str) and source.startswith('registry+'), 'mixed/unpublished engine sources'
+          assert source == 'registry+https://github.com/rust-lang/crates.io-index', 'mixed/unpublished engine sources'
           assert len({p['name'] for p in family}) == len(family), 'duplicate engine crate identities'
           Path('resolved-family.json').write_text(json.dumps(
               [{'name': p['name'], 'version': p['version'], 'source': p['source'], 'id': p['id']}

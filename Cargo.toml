@@ -61,11 +61,14 @@ clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 # depends on fsqlite-ext-json internally, but the 0.3.9+ extension enables
 # only serde_json's `preserve_order`; the old viral `arbitrary_precision`
 # feature no longer affects br's JSON/TOON serializers.
-# GH#533/GH#538: pin the entire engine to one audited published release
-# (=0.4.10, frankensqlite tag v0.4.10 = 92aeb2b97, which carries the
+# GH#533/GH#538: pin the engine to the audited published 0.4 family
+# (frankensqlite tag v0.4.10 = 92aeb2b97, which carries the
 # trusted-sharing validator and builds on macOS) so the namespace policy used
 # by br's preflight and by its engine cannot diverge, and crates.io and git
 # installs resolve the same engine.
+# VFS 0.4.11 is the compatible macOS descriptor-leak backport (upstream
+# fsqlite-vfs-v0.4.11 = 3bb28e731); keep this patch without introducing 0.5
+# engine types or a second Asupersync runtime. Upgrade the family together.
 fsqlite = { version = "=0.4.10", default-features = false, features = [
     "native",
     "linux-asupersync-uring",
@@ -79,11 +82,11 @@ fsqlite-error = { version = "=0.4.10" }
 fsqlite-core = { version = "=0.4.10" }
 fsqlite-func = { version = "=0.4.10" }
 fsqlite-vdbe = { version = "=0.4.10" }
-fsqlite-vfs = { version = "=0.5.0" }
-fsqlite-pager = { version = "=0.5.0" }
+fsqlite-vfs = { version = "=0.4.11" }
+fsqlite-pager = { version = "=0.4.10" }
 fsqlite-parser = { version = "=0.4.10" }
-fsqlite-planner = { version = "=0.5.0" }
-fsqlite-wal = { version = "=0.5.0" }
+fsqlite-planner = { version = "=0.4.10" }
+fsqlite-wal = { version = "=0.4.10" }
 fsqlite-btree = { version = "=0.4.10" }
 fsqlite-ast = { version = "=0.4.10" }
 fsqlite-mvcc = { version = "=0.4.10" }
@@ -238,8 +241,8 @@ self_update = [
 # NOTE: no `[patch.crates-io]` here.
 #
 # Asupersync 0.5 and the optional FastMCP family resolve from crates.io.
-# The SQLite family is pinned exactly (=0.4.10) to the published release
-# that carries the trusted-group namespace API.
+# The SQLite family is pinned exactly to 0.4.10, with the compatible VFS
+# 0.4.11 descriptor-leak backport, and carries the trusted-group namespace API.
 # This lets
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`

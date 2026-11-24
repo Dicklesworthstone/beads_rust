@@ -19,10 +19,17 @@ updates:
       - "dependencies"
       - "rust"
     groups:
+      # Engine crates share Rust types and must be upgraded as one family,
+      # including breaking releases. CI validates the exact resolved pins.
+      fsqlite-family:
+        patterns:
+          - "fsqlite*"
       # Group minor/patch updates together to reduce PR noise
       rust-minor:
         patterns:
           - "*"
+        exclude-patterns:
+          - "fsqlite*"
         update-types:
           - "minor"
           - "patch"
