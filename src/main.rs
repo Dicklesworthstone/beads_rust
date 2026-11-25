@@ -4834,46 +4834,597 @@ mod tests {
         }
     }
 
+    /// One invocation of every command path `BR_READ_ONLY` admits. A command
+    /// newly admitted in `permitted_in_read_only_mode` gets a sample here, and
+    /// its arguments then have to be reviewed in `READ_ONLY_REVIEWED_ARGUMENTS`.
+    const READ_ONLY_ADMITTED_SAMPLES: &[&[&str]] = &[
+        &["br", "list"],
+        &["br", "show", "bd-one"],
+        &["br", "ready"],
+        &["br", "search", "needle"],
+        &["br", "scheduler"],
+        &["br", "blocked"],
+        &["br", "count"],
+        &["br", "stale"],
+        &["br", "lint"],
+        &["br", "changelog"],
+        &["br", "stats"],
+        &["br", "status"],
+        &["br", "graph", "--all"],
+        &["br", "coordination", "status"],
+        &["br", "dep", "list", "bd-one"],
+        &["br", "dep", "tree", "bd-one"],
+        &["br", "dep", "cycles"],
+        &["br", "comments", "bd-one"],
+        &["br", "comments", "list", "bd-one"],
+        &["br", "label", "list"],
+        &["br", "label", "list-all"],
+        &["br", "query", "list"],
+        &["br", "query", "run", "mine"],
+        &["br", "epic", "status"],
+        &["br", "orphans"],
+        &["br", "sync", "--status"],
+        &["br", "sync", "--witness"],
+        &["br", "sync", "--reconcile", "--dry-run"],
+        &["br", "config", "list"],
+        &["br", "config", "get", "issue_prefix"],
+        &["br", "config", "path"],
+        &["br", "config", "schema"],
+        &["br", "gate", "list", "bd-one"],
+        &["br", "capacity", "exemptions"],
+        &["br", "audit", "log", "bd-one"],
+        &["br", "audit", "summary"],
+        &["br", "info"],
+        &["br", "where"],
+        &["br", "doctor"],
+        &["br", "doctor", "--repair", "--dry-run"],
+        &["br", "doctor", "capabilities"],
+        &["br", "doctor", "robot-docs"],
+        &["br", "doctor", "health"],
+        &["br", "doctor", "ls"],
+        &["br", "doctor", "explain", "--list"],
+        &["br", "doctor", "undo", "latest", "--dry-run"],
+        &["br", "doctor", "unblock", "bd-one"],
+        &["br", "doctor", "migrate-schema", "plan"],
+        &["br", "doctor", "migrate-schema", "heal", "--dry-run"],
+        &[
+            "br",
+            "doctor",
+            "migrate-schema",
+            "undo",
+            "latest",
+            "--dry-run",
+        ],
+        &["br", "create", "fixture", "--dry-run"],
+        &["br", "delete", "bd-one", "--dry-run"],
+        &["br", "epic", "close-eligible", "--dry-run"],
+        &["br", "version"],
+        &["br", "schema"],
+        &["br", "capabilities"],
+        &["br", "robot-docs", "guide"],
+        &["br", "completions", "bash"],
+    ];
+
+    /// Every argument of every command path `BR_READ_ONLY` admits, each one
+    /// reviewed for whether it can write. `""` is the top level, whose
+    /// arguments (the global ones included) reach every command.
+    ///
+    /// The admission check works per command, so an argument added later to
+    /// an admitted command would be admitted without anyone deciding to (as
+    /// `doctor --bundle` and `doctor --selftest` once were). When
+    /// `read_only_admitted_commands_accept_only_reviewed_arguments` fails
+    /// because a command gained an argument, decide whether that argument can
+    /// write anything: the database, JSONL, the workspace, or any other file.
+    /// If it can, make `permitted_in_read_only_mode` refuse it, like
+    /// `completions --output`, and add a refused case to
+    /// `read_only_env_admits_reads_and_refuses_every_mutation_family`. Either
+    /// way, then add it here.
+    const READ_ONLY_REVIEWED_ARGUMENTS: &[(&str, &[&str])] = &[
+        (
+            "",
+            &[
+                "--actor",
+                "--allow-stale",
+                "--db",
+                "--json",
+                "--lock-timeout",
+                "--no-auto-flush",
+                "--no-auto-import",
+                "--no-color",
+                "--no-daemon",
+                "--no-db",
+                "--quiet",
+                "--verbose",
+            ],
+        ),
+        ("audit log", &["--since", "<id>"]),
+        ("audit summary", &["--days"]),
+        (
+            "blocked",
+            &[
+                "--detailed",
+                "--format",
+                "--label",
+                "--limit",
+                "--priority",
+                "--robot",
+                "--stats",
+                "--type",
+                "--wrap",
+            ],
+        ),
+        ("capabilities", &["--command", "--format", "--stats"]),
+        ("capacity exemptions", &["--history", "--robot", "<id>"]),
+        (
+            "changelog",
+            &["--robot", "--since", "--since-commit", "--since-tag"],
+        ),
+        ("comments", &["--include-deleted", "--wrap", "<id>"]),
+        ("comments list", &["--include-deleted", "--wrap", "<id>"]),
+        ("completions", &["--output", "<shell>"]),
+        ("config get", &["<key>"]),
+        ("config list", &["--project", "--user"]),
+        ("config path", &[]),
+        ("config schema", &["--format"]),
+        (
+            "coordination status",
+            &[
+                "--agents",
+                "--comments",
+                "--format",
+                "--owner-kind",
+                "--reservations",
+                "--robot",
+                "--stats",
+            ],
+        ),
+        (
+            "count",
+            &[
+                "--assignee",
+                "--by",
+                "--by-assignee",
+                "--by-label",
+                "--by-priority",
+                "--by-status",
+                "--by-type",
+                "--exclude-label",
+                "--include-closed",
+                "--include-templates",
+                "--priority",
+                "--status",
+                "--title-contains",
+                "--type",
+                "--unassigned",
+            ],
+        ),
+        (
+            "create",
+            &[
+                "--acceptance-criteria",
+                "--agent-context",
+                "--agent-name",
+                "--assignee",
+                "--defer",
+                "--deps",
+                "--description",
+                "--description-file",
+                "--dry-run",
+                "--due",
+                "--ephemeral",
+                "--estimate",
+                "--external-ref",
+                "--file",
+                "--harness",
+                "--labels",
+                "--model",
+                "--owner",
+                "--parent",
+                "--prerequisites",
+                "--priority",
+                "--silent",
+                "--slug",
+                "--status",
+                "--title",
+                "--type",
+                "<title>",
+            ],
+        ),
+        (
+            "delete",
+            &[
+                "--cascade",
+                "--dry-run",
+                "--force",
+                "--from-file",
+                "--hard",
+                "--reason",
+                "<ids>",
+            ],
+        ),
+        ("dep cycles", &["--blocking-only", "--include-closed"]),
+        (
+            "dep list",
+            &["--direction", "--format", "--stats", "--type", "<issue>"],
+        ),
+        (
+            "dep tree",
+            &["--direction", "--format", "--max-depth", "<issue>"],
+        ),
+        (
+            "doctor",
+            &[
+                "--allow-repeated-repair",
+                "--bundle",
+                "--bundle-events",
+                "--dry-run",
+                "--git-runtime-files",
+                "--include-db",
+                "--include-jsonl",
+                "--keep",
+                "--only",
+                "--quick",
+                "--repair",
+                "--repair-indexes",
+                "--robot-triage",
+                "--selftest",
+                "--selftest-dir",
+                "--skip",
+                "--unsafe-auto-fix",
+            ],
+        ),
+        ("doctor capabilities", &["--command", "--format"]),
+        ("doctor explain", &["--json", "--list", "<finding_id>"]),
+        ("doctor health", &["--json"]),
+        ("doctor ls", &["--json"]),
+        (
+            "doctor migrate-schema heal",
+            &["--discard-db-only", "--dry-run", "--json"],
+        ),
+        ("doctor migrate-schema plan", &["--json"]),
+        (
+            "doctor migrate-schema undo",
+            &["--dry-run", "--json", "<run_id>"],
+        ),
+        ("doctor robot-docs", &["--format"]),
+        (
+            "doctor unblock",
+            &[
+                "--agent-name",
+                "--apply",
+                "--authorize",
+                "--dry-run",
+                "--expect",
+                "--harness",
+                "--model",
+                "--to-status",
+                "<ids>",
+            ],
+        ),
+        ("doctor undo", &["--dry-run", "--json", "<run_id>"]),
+        (
+            "epic close-eligible",
+            &["--dry-run", "--transition-comment"],
+        ),
+        ("epic status", &["--eligible-only"]),
+        ("gate list", &["--robot", "<id>"]),
+        (
+            "graph",
+            &["--all", "--compact", "--dependencies", "--dot", "<issue>"],
+        ),
+        (
+            "info",
+            &["--projections", "--schema", "--thanks", "--whats-new"],
+        ),
+        ("label list", &["<issue>"]),
+        ("label list-all", &[]),
+        ("lint", &["--status", "--type", "<ids>"]),
+        (
+            "list",
+            &[
+                "--all",
+                "--assignee",
+                "--deferred",
+                "--desc-contains",
+                "--exclude-label",
+                "--fields",
+                "--format",
+                "--id",
+                "--label",
+                "--label-any",
+                "--limit",
+                "--long",
+                "--notes-contains",
+                "--offset",
+                "--overdue",
+                "--pretty",
+                "--priority",
+                "--priority-max",
+                "--priority-min",
+                "--reverse",
+                "--sort",
+                "--stats",
+                "--status",
+                "--title-contains",
+                "--tree",
+                "--type",
+                "--unassigned",
+                "--wrap",
+            ],
+        ),
+        ("orphans", &["--details", "--fix", "--robot"]),
+        ("query list", &[]),
+        (
+            "query run",
+            &[
+                "--all",
+                "--assignee",
+                "--deferred",
+                "--desc-contains",
+                "--exclude-label",
+                "--fields",
+                "--format",
+                "--id",
+                "--label",
+                "--label-any",
+                "--limit",
+                "--long",
+                "--notes-contains",
+                "--offset",
+                "--overdue",
+                "--pretty",
+                "--priority",
+                "--priority-max",
+                "--priority-min",
+                "--reverse",
+                "--sort",
+                "--stats",
+                "--status",
+                "--title-contains",
+                "--tree",
+                "--type",
+                "--unassigned",
+                "--wrap",
+                "<name>",
+            ],
+        ),
+        (
+            "ready",
+            &[
+                "--assignee",
+                "--brief",
+                "--epic",
+                "--exclude-label",
+                "--format",
+                "--include-deferred",
+                "--label",
+                "--label-any",
+                "--limit",
+                "--parent",
+                "--priority",
+                "--recursive",
+                "--robot",
+                "--sort",
+                "--stats",
+                "--type",
+                "--unassigned",
+                "--wrap",
+            ],
+        ),
+        ("robot-docs guide", &["--format", "--stats"]),
+        (
+            "scheduler",
+            &[
+                "--candidate-limit",
+                "--format",
+                "--limit",
+                "--robot",
+                "--stale-claim-hours",
+                "--stats",
+            ],
+        ),
+        ("schema", &["--format", "--stats", "<target>"]),
+        (
+            "search",
+            &[
+                "--all",
+                "--assignee",
+                "--deferred",
+                "--desc-contains",
+                "--exclude-label",
+                "--fields",
+                "--format",
+                "--id",
+                "--label",
+                "--label-any",
+                "--limit",
+                "--long",
+                "--notes-contains",
+                "--offset",
+                "--overdue",
+                "--pretty",
+                "--priority",
+                "--priority-max",
+                "--priority-min",
+                "--reverse",
+                "--sort",
+                "--stats",
+                "--status",
+                "--title-contains",
+                "--tree",
+                "--type",
+                "--unassigned",
+                "--wrap",
+                "<query>",
+            ],
+        ),
+        (
+            "show",
+            &["--format", "--no-wrap", "--stats", "--wrap", "<ids>"],
+        ),
+        ("stale", &["--days", "--status"]),
+        (
+            "stats",
+            &[
+                "--activity",
+                "--activity-hours",
+                "--by-assignee",
+                "--by-label",
+                "--by-priority",
+                "--by-type",
+                "--format",
+                "--no-activity",
+                "--robot",
+                "--stats",
+            ],
+        ),
+        (
+            "status",
+            &[
+                "--activity",
+                "--activity-hours",
+                "--by-assignee",
+                "--by-label",
+                "--by-priority",
+                "--by-type",
+                "--format",
+                "--no-activity",
+                "--robot",
+                "--stats",
+            ],
+        ),
+        (
+            "sync",
+            &[
+                "--allow-external-jsonl",
+                "--apply",
+                "--base",
+                "--dry-run",
+                "--error-policy",
+                "--expect-plan-sha256",
+                "--export-parallelism",
+                "--flush-only",
+                "--force",
+                "--force-db",
+                "--force-jsonl",
+                "--import-only",
+                "--manifest",
+                "--merge",
+                "--migrate-source-repo-path",
+                "--orphans",
+                "--rebuild",
+                "--reconcile",
+                "--reconcile-additive",
+                "--rename-prefix",
+                "--resolve-source-id",
+                "--robot",
+                "--skip-invalid-records",
+                "--status",
+                "--witness",
+                "--witness-chunk-lines",
+                "--witness-parallelism",
+            ],
+        ),
+        ("version", &["--check", "--short"]),
+        ("where", &[]),
+    ];
+
+    /// The subcommand path a sample invocation selects, such as `"dep tree"`.
+    fn read_only_command_path(args: &[&str]) -> std::result::Result<String, String> {
+        let matches = Cli::command()
+            .try_get_matches_from(args)
+            .map_err(|error| format!("{args:?} must parse: {error}"))?;
+        let mut path = Vec::new();
+        let mut current = &matches;
+        while let Some((name, sub)) = current.subcommand() {
+            path.push(name.to_string());
+            current = sub;
+        }
+        Ok(path.join(" "))
+    }
+
+    /// Every argument a command defines, by the spelling a user types:
+    /// `--long`, `-s` when there is no long form, or `<id>` for a positional.
+    fn read_only_argument_spellings(command: &clap::Command) -> Vec<String> {
+        let mut spellings: Vec<String> = command
+            .get_arguments()
+            .map(|arg| match (arg.get_long(), arg.get_short()) {
+                (Some(long), _) => format!("--{long}"),
+                (None, Some(short)) => format!("-{short}"),
+                (None, None) => format!("<{}>", arg.get_id()),
+            })
+            .collect();
+        spellings.sort();
+        spellings
+    }
+
+    /// Fails when an admitted command gains, loses or renames an argument, or
+    /// when a command is admitted without its arguments being reviewed. See
+    /// `READ_ONLY_REVIEWED_ARGUMENTS` for what to do when it fails.
+    #[test]
+    fn read_only_admitted_commands_accept_only_reviewed_arguments() {
+        let root = Cli::command();
+        let mut problems = Vec::new();
+        let mut paths = std::collections::BTreeSet::from([String::new()]);
+        for args in READ_ONLY_ADMITTED_SAMPLES {
+            match read_only_command_path(args) {
+                Ok(path) => {
+                    paths.insert(path);
+                }
+                Err(problem) => problems.push(problem),
+            }
+        }
+
+        let reviewed: std::collections::BTreeMap<&str, &[&str]> =
+            READ_ONLY_REVIEWED_ARGUMENTS.iter().copied().collect();
+        let mut current_table = String::new();
+        for path in &paths {
+            let mut command = &root;
+            for name in path.split_whitespace() {
+                command = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("parsed path {path:?} has no {name:?}"));
+            }
+            let spellings = read_only_argument_spellings(command);
+            let quoted: Vec<String> = spellings.iter().map(|s| format!("{s:?}")).collect();
+            current_table.push_str(&format!("        ({path:?}, &[{}]),\n", quoted.join(", ")));
+            match reviewed.get(path.as_str()) {
+                Some(pinned)
+                    if pinned
+                        .iter()
+                        .copied()
+                        .eq(spellings.iter().map(String::as_str)) => {}
+                Some(pinned) => problems.push(format!(
+                    "{path:?}: reviewed {pinned:?}, but the command now accepts {spellings:?}"
+                )),
+                None => problems.push(format!(
+                    "{path:?}: admitted, but its arguments were never reviewed"
+                )),
+            }
+        }
+        for path in reviewed.keys() {
+            if !paths.contains(*path) {
+                problems.push(format!(
+                    "{path:?}: reviewed, but no admitted sample reaches it any more"
+                ));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "BR_READ_ONLY argument review is out of date:\n{}\n\nCurrent arguments of every admitted \
+             command path (review each new one before pasting into READ_ONLY_REVIEWED_ARGUMENTS):\n{current_table}",
+            problems.join("\n")
+        );
+    }
+
     /// GitHub #615: `BR_READ_ONLY` admits reads, previews and workspace-free
     /// commands, and refuses every mutation family, before startup.
     #[test]
     fn read_only_env_admits_reads_and_refuses_every_mutation_family() {
-        let admitted: Vec<&[&str]> = vec![
-            &["br", "list"],
-            &["br", "show", "bd-one"],
-            &["br", "ready"],
-            &["br", "search", "needle"],
-            &["br", "blocked"],
-            &["br", "count"],
-            &["br", "stats"],
-            &["br", "graph", "--all"],
-            &["br", "dep", "list", "bd-one"],
-            &["br", "comments", "bd-one"],
-            &["br", "comments", "list", "bd-one"],
-            &["br", "label", "list"],
-            &["br", "query", "list"],
-            &["br", "epic", "status"],
-            &["br", "orphans"],
-            &["br", "sync", "--status"],
-            &["br", "sync", "--witness"],
-            &["br", "sync", "--reconcile", "--dry-run"],
-            &["br", "config", "list"],
-            &["br", "config", "get", "issue_prefix"],
-            &["br", "info"],
-            &["br", "where"],
-            &["br", "doctor"],
-            &["br", "doctor", "--repair", "--dry-run"],
-            &["br", "create", "fixture", "--dry-run"],
-            &["br", "delete", "bd-one", "--dry-run"],
-            &["br", "epic", "close-eligible", "--dry-run"],
-            &["br", "version"],
-            &["br", "schema"],
-            &["br", "capabilities"],
-            &["br", "robot-docs", "guide"],
-            &["br", "completions", "bash"],
-        ];
-        for args in admitted {
-            let command = Cli::parse_from(args).command;
+        for args in READ_ONLY_ADMITTED_SAMPLES {
+            let command = Cli::try_parse_from(*args)
+                .unwrap_or_else(|error| panic!("{args:?} must parse: {error}"))
+                .command;
             assert!(permitted_in_read_only_mode(&command), "{args:?}");
             assert!(refuse_outside_read_only_mode(&command).is_ok(), "{args:?}");
         }
@@ -4908,9 +5459,22 @@ mod tests {
             &["br", "sync", "--witness", "--flush-only"],
             &["br", "doctor", "--selftest"],
             &["br", "doctor", "--bundle", "doctor.tar.gz"],
+            &[
+                "br",
+                "doctor",
+                "unblock",
+                "bd-one",
+                "--apply",
+                "--expect",
+                "plan-token",
+            ],
+            &["br", "doctor", "migrate-schema", "heal"],
+            &["br", "doctor", "migrate-schema", "undo", "latest"],
         ];
         for args in refused {
-            let command = Cli::parse_from(args).command;
+            let command = Cli::try_parse_from(args)
+                .unwrap_or_else(|error| panic!("{args:?} must parse: {error}"))
+                .command;
             assert!(!permitted_in_read_only_mode(&command), "{args:?}");
             let error = refuse_outside_read_only_mode(&command).expect_err("refused");
             assert!(
