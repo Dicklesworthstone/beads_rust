@@ -90,21 +90,21 @@ pub(super) struct AutomaticDependencyUnblockSnapshot {
 }
 
 /// Classification shared by the JSONL doctor detector and transactional repair.
-pub(crate) struct FullyUnblockedIssue {
+pub struct FullyUnblockedIssue {
     pub(crate) id: String,
     pub(crate) excluded_reasons: Vec<&'static str>,
     pub(crate) stale_blocked: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BlockerFate {
+pub enum BlockerFate {
     Live,
     Satisfied,
     Dangling,
     NonGating,
 }
 
-pub(crate) fn blocker_fate(target: &str, issue_by_id: &HashMap<&str, &Issue>) -> BlockerFate {
+pub fn blocker_fate(target: &str, issue_by_id: &HashMap<&str, &Issue>) -> BlockerFate {
     if target.starts_with("external:") {
         return BlockerFate::Live;
     }
@@ -116,7 +116,7 @@ pub(crate) fn blocker_fate(target: &str, issue_by_id: &HashMap<&str, &Issue>) ->
     }
 }
 
-pub(crate) fn forward_blocking_targets(issue: &Issue) -> Vec<&str> {
+pub fn forward_blocking_targets(issue: &Issue) -> Vec<&str> {
     issue
         .dependencies
         .iter()
@@ -241,7 +241,7 @@ fn classify_fully_unblocked(
 /// their completion. Missing local targets retain the doctor's dangling-edge
 /// classification. The transactional repair separately checks live database
 /// blockers: a missing target cannot be authorized away.
-pub(crate) fn fully_unblocked_issues(
+pub fn fully_unblocked_issues(
     issues: &[Issue],
     ready_statuses: &[String],
 ) -> Vec<FullyUnblockedIssue> {

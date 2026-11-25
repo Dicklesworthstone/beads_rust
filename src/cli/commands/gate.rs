@@ -103,6 +103,7 @@ pub fn execute(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_report(
     args: &GateReportArgs,
     cli: &config::CliOverrides,

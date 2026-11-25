@@ -518,7 +518,7 @@ fn migration_receipt_directories(
         }
     }
     let mut runs = fs::read_dir(&root)
-        .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>())
+        .and_then(std::iter::Iterator::collect::<std::io::Result<Vec<_>>>)
         .map_err(|error| migration_startup_refusal(db_path, &root, error))?;
     runs.sort_by_key(std::fs::DirEntry::file_name);
     for entry in runs {
@@ -3600,10 +3600,8 @@ fn emit_plan(plan: &MigrationPlanReceipt, json: bool) -> Result<()> {
             "Apply: {}",
             plan.apply_command.as_deref().unwrap_or_default()
         );
-        println!("{}", plan.note);
-    } else {
-        println!("{}", plan.note);
     }
+    println!("{}", plan.note);
     Ok(())
 }
 
@@ -7271,6 +7269,7 @@ fn legacy_projection_rowid(conn: &Connection, table: &str) -> Result<Option<&'st
         })
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 fn legacy_table_projection(
     conn: &Connection,
     table: &str,
@@ -7557,6 +7556,7 @@ fn legacy_preserved_schema_witness(
     Ok(hex_digest(hasher.finalize().as_slice()))
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 fn legacy_v15_projection(
     conn: &Connection,
     project_source: bool,
@@ -9491,7 +9491,7 @@ mod tests {
                             }
                             "token" => receipt.plan_token = "unreviewed-token".to_owned(),
                             "raw" => {
-                                receipt.raw_restored.components[0].sha256 = Some("3".repeat(64))
+                                receipt.raw_restored.components[0].sha256 = Some("3".repeat(64));
                             }
                             "logical" => receipt.logical_restored.contents_sha256 = "4".repeat(64),
                             _ => unreachable!(),
@@ -13744,6 +13744,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn reviewed_v18_typed_key_preserves_data_and_restores_source_bytes() {
         let (_temp, migration) = reviewed_source_migration_context("beads.db", 18);
         let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();

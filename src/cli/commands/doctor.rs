@@ -966,8 +966,10 @@ fn verify_current_schema_maintenance_completed(db_path: &Path) -> Result<()> {
         )) => Err(BeadsError::Config(
             "the database now requires a separately reviewed release-layout upgrade".to_owned(),
         )),
-        Some(DoctorSchemaRepairInspection::VersionUpgrade { .. })
-        | Some(DoctorSchemaRepairInspection::Current(CurrentSchemaRepairInspection::NotCurrent))
+        Some(
+            DoctorSchemaRepairInspection::VersionUpgrade { .. }
+            | DoctorSchemaRepairInspection::Current(CurrentSchemaRepairInspection::NotCurrent),
+        )
         | None => Err(BeadsError::Config(
             "the database is absent or no longer declares the inspected current schema".to_owned(),
         )),
@@ -14046,6 +14048,7 @@ fn record_migration_transition_refusal(
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn collect_doctor_report_with_mode_and_db_override(
     beads_dir: &Path,
     paths: &config::ConfigPaths,

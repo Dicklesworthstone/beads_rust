@@ -328,6 +328,7 @@ const SNAPSHOT_MARKER: &str = "reading a private snapshot";
 /// admitted snapshot. A WAL-only edit and an unusable derived index force
 /// actual private recovery, so counting a startup log alone cannot pass.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn read_startup_reuses_one_private_wal_recovery_for_pending_merge_inspection() {
     use beads_rust::franken_sync::{Connection, SqliteValue};
 

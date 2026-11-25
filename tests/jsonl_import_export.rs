@@ -897,21 +897,21 @@ fn tombstone_history_conflicts_roll_back_every_imported_record() {
             incoming.updated_at = incoming.created_at + Duration::hours(revision_hour);
             match field {
                 "closed_at" => {
-                    incoming.closed_at = Some(incoming.created_at + Duration::minutes(30))
+                    incoming.closed_at = Some(incoming.created_at + Duration::minutes(30));
                 }
                 "close_reason" => {
-                    incoming.close_reason = Some("contradictory close reason".to_string())
+                    incoming.close_reason = Some("contradictory close reason".to_string());
                 }
                 "closed_by" => incoming.closed_by = Some("contradictory closer".to_string()),
                 "deleted_at" => {
-                    incoming.deleted_at = Some(incoming.created_at + Duration::minutes(90))
+                    incoming.deleted_at = Some(incoming.created_at + Duration::minutes(90));
                 }
                 "deleted_by" => incoming.deleted_by = Some("contradictory deleter".to_string()),
                 "delete_reason" => {
-                    incoming.delete_reason = Some("contradictory deletion reason".to_string())
+                    incoming.delete_reason = Some("contradictory deletion reason".to_string());
                 }
                 "bypass_reason" => {
-                    incoming.bypass_reason = Some("contradictory waiver".to_string())
+                    incoming.bypass_reason = Some("contradictory waiver".to_string());
                 }
                 _ => unreachable!(),
             }

@@ -193,7 +193,7 @@ fn e2e_comment_edit_preserves_identity_and_checks_author_and_revision() {
     assert!(!empty.status.success());
     assert_eq!(
         listed_comments(&workspace, &issue_id, "unchanged_before_edit"),
-        [original.clone()]
+        std::slice::from_ref(&original)
     );
 
     let edited = successful_json(&run_br(
@@ -255,7 +255,7 @@ fn e2e_comment_edit_preserves_identity_and_checks_author_and_revision() {
     assert!(!stale.status.success());
     assert_eq!(
         listed_comments(&workspace, &issue_id, "unchanged_after_stale"),
-        [forced.clone()]
+        std::slice::from_ref(&forced)
     );
 
     let audit = successful_json(&run_br(
@@ -452,7 +452,7 @@ fn e2e_comment_redaction_and_deletion_keep_tombstones_and_metadata_only_audit() 
     assert_eq!(visible, serde_json::json!([]));
     assert_eq!(
         listed_comments(&workspace, &issue_id, "show_tombstone"),
-        [deleted.clone()]
+        std::slice::from_ref(&deleted)
     );
     let ledger = CommentLedger::read(&workspace);
     ledger.assert_private(&[
@@ -533,7 +533,7 @@ fn e2e_comment_redaction_survives_divergent_machine_and_repeated_old_imports() {
     import_and_flush(&machine_a, &peer_ledger, "import_future_peer_edit");
     assert_eq!(
         listed_comments(&machine_a, &issue_id, "redaction_wins_future_clock"),
-        [redacted.clone()]
+        std::slice::from_ref(&redacted)
     );
     CommentLedger::read(&machine_a).assert_private(&[
         "SYNC_ORIGINAL_PRIVATE_SENTINEL",
@@ -547,7 +547,7 @@ fn e2e_comment_redaction_survives_divergent_machine_and_repeated_old_imports() {
         import_and_flush(&machine_a, older, &format!("import_old_{attempt}"));
         assert_eq!(
             listed_comments(&machine_a, &issue_id, &format!("no_restore_{attempt}")),
-            [redacted.clone()]
+            std::slice::from_ref(&redacted)
         );
         CommentLedger::read(&machine_a).assert_private(&[
             "SYNC_ORIGINAL_PRIVATE_SENTINEL",

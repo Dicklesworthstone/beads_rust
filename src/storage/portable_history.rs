@@ -2074,7 +2074,7 @@ mod tests {
         target.upsert_issue_for_import(&issue).unwrap();
         target.set_workflow_policy(workflow.clone());
         let replay = target.restore_portable_history(&snapshot).unwrap();
-        assert_eq!(replay.replayed, [issue.id.clone()]);
+        assert_eq!(replay.replayed, std::slice::from_ref(&issue.id));
         let restored = target
             .get_scoped_gate_result_history(&issue.id, "in_progress", "closed")
             .unwrap();

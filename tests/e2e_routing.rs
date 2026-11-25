@@ -710,18 +710,16 @@ fn routed_reads_preserve_unavailable_local_database(corrupt: bool) {
     // Changed external JSONL proves that the unknown local receipt disables
     // automatic sync in the routed fallback, including a default invocation.
     let jsonl = external_workspace.root.join(".beads/issues.jsonl");
-    let rows = fs::read_to_string(&jsonl)
-        .unwrap()
-        .lines()
-        .map(|line| {
-            let mut issue: Value = serde_json::from_str(line).unwrap();
-            if issue["id"] == external_id {
-                issue["title"] = "Changed JSONL requires explicit synchronization".into();
-                issue["updated_at"] = "2999-01-01T00:00:00Z".into();
-            }
-            format!("{}\n", serde_json::to_string(&issue).unwrap())
-        })
-        .collect::<String>();
+    let mut rows = String::new();
+    for line in fs::read_to_string(&jsonl).unwrap().lines() {
+        let mut issue: Value = serde_json::from_str(line).unwrap();
+        if issue["id"] == external_id {
+            issue["title"] = "Changed JSONL requires explicit synchronization".into();
+            issue["updated_at"] = "2999-01-01T00:00:00Z".into();
+        }
+        rows.push_str(&serde_json::to_string(&issue).unwrap());
+        rows.push('\n');
+    }
     fs::write(&jsonl, rows).unwrap();
 
     // Preserve the initialized family outside discovery instead of deleting
@@ -774,7 +772,7 @@ fn routed_reads_preserve_unavailable_local_database(corrupt: bool) {
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                 .filter(|warning| warning["code"] == "sync_merge_pending_unknown")
                 .count();
-            assert_eq!(unknown_warnings, if corrupt { 1 } else { 0 }, "{result:?}");
+            assert_eq!(unknown_warnings, usize::from(corrupt), "{result:?}");
             if expected_success {
                 let rows: Vec<Value> =
                     serde_json::from_str(&extract_json_payload(&result.stdout)).unwrap();

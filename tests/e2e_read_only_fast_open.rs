@@ -610,6 +610,7 @@ fn query_private_copy(db: &Path, sql: &str) -> Vec<Vec<SqliteValue>> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn gh585_current_schema_read_cannot_import_or_enter_generic_anomaly_recovery() {
     let workspace = BrWorkspace::new();
     run_success(

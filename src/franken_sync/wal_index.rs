@@ -49,7 +49,7 @@ pub struct RecoveryLock {
 /// copied ledgers and torn bootstrap headers, while refusing unfinished or
 /// unrecognized transition evidence. The live ledger stays unchanged.
 #[derive(Debug)]
-pub(crate) struct DatabaseReplacementExclusion {
+pub struct DatabaseReplacementExclusion {
     // Field order keeps native exclusion until every namespace and cooperative
     // opener hold has been released. No mutation happens during teardown.
     namespaces: Vec<(PathBuf, PendingNamespaceOpen)>,
@@ -1539,12 +1539,13 @@ pub mod tests {
     ))]
     #[test]
     fn replacement_exclusion_retains_both_inodes_through_exchange_and_rollback() {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+
         if run_recovery_test_in_subprocess(
             "franken_sync::wal_index::tests::replacement_exclusion_retains_both_inodes_through_exchange_and_rollback",
         ) {
             return;
         }
-        use rustix::fs::{CWD, RenameFlags, renameat_with};
 
         let (_temp, db, original_id) = fixture();
         let original = fs::read(&db).unwrap();
@@ -1614,14 +1615,15 @@ pub mod tests {
     ))]
     #[test]
     fn replacement_exclusion_conflicts_with_engine_alias_shared_locks() {
+        use fsqlite_types::flags::VfsOpenFlags;
+        use fsqlite_types::{Cx, LockLevel};
+        use fsqlite_vfs::{UnixVfs, Vfs, VfsFile};
+
         if run_recovery_test_in_subprocess(
             "franken_sync::wal_index::tests::replacement_exclusion_conflicts_with_engine_alias_shared_locks",
         ) {
             return;
         }
-        use fsqlite_types::flags::VfsOpenFlags;
-        use fsqlite_types::{Cx, LockLevel};
-        use fsqlite_vfs::{UnixVfs, Vfs, VfsFile};
 
         let (_temp, db, id) = fixture();
         let alias = db.with_file_name("engine-alias.db");

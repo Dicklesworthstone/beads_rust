@@ -14712,6 +14712,7 @@ fn verify_clean_retention_source_batch(
 /// `.br_history` backup. The staged temp file is read back once to verify its
 /// digest, and the rename is proven by file identity rather than a second hash
 /// of the published bytes (GitHub #485).
+#[allow(clippy::too_many_lines)]
 fn try_incremental_auto_flush(
     storage: &mut SqliteStorage,
     jsonl_path: &Path,
@@ -38907,7 +38908,7 @@ transitions:
             ..Default::default()
         };
         for existing_line in [false, true] {
-            write_additive_issues(&path, &[original.clone()]);
+            write_additive_issues(&path, std::slice::from_ref(&original));
             let source = capture_jsonl_source_snapshot(&path).unwrap();
             let line = serde_json::to_string(&removed).unwrap();
             if existing_line {
@@ -38964,7 +38965,7 @@ transitions:
         fs::create_dir_all(&beads_dir).unwrap();
         let path = beads_dir.join("issues.jsonl");
         let original = comment_revision_fixture("bd-comment-full-backup");
-        write_additive_issues(&path, &[original.clone()]);
+        write_additive_issues(&path, std::slice::from_ref(&original));
         let mut removed = original;
         removed.comments[0]
             .revise(CommentState::Redacted, "", "agent", fixed_time_merge(30))

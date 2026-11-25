@@ -2968,6 +2968,7 @@ mod dependency_unblock {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn unblock_595_scoped_capacity_enforces_and_records_reviewed_attribution() {
         for scope in ["harness", "session"] {
             let workspace = workspace();
@@ -3053,7 +3054,7 @@ mod dependency_unblock {
                 let mut changed_attribution = attribution;
                 match changed {
                     "scope" => {
-                        changed_attribution[usize::from(scope == "session")].1 = "different-scope"
+                        changed_attribution[usize::from(scope == "session")].1 = "different-scope";
                     }
                     "agent" => changed_args[5] = "different-worker",
                     "model" => changed_args[7] = "different-model",
