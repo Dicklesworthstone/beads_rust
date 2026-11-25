@@ -2908,7 +2908,11 @@ const fn permitted_in_read_only_mode(cmd: &Commands) -> bool {
         Commands::Version(_)
         | Commands::Schema(_)
         | Commands::Capabilities(_)
-        | Commands::RobotDocs { .. } => true,
+        // Each `robot-docs` subcommand is admitted by name, so one added later
+        // is refused until it is reviewed, like any other new command.
+        | Commands::RobotDocs {
+            command: beads_rust::cli::RobotDocsCommands::Guide(_),
+        } => true,
         Commands::Completions(args) => args.output.is_none(),
         // `--bundle` writes an archive and `--selftest` runs a write lifecycle
         // in a scratch workspace. Like `completions --output`, a command that
@@ -4865,6 +4869,7 @@ mod tests {
             &["br", "version"],
             &["br", "schema"],
             &["br", "capabilities"],
+            &["br", "robot-docs", "guide"],
             &["br", "completions", "bash"],
         ];
         for args in admitted {
