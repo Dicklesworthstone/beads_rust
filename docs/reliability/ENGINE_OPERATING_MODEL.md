@@ -134,6 +134,29 @@ to be repaired before bounded reopening, verify a symlink alias uses the real
 database's marker, and check file-backed bulk label writes preserve exact
 dirty-ID tracking without hydrating unrelated rows.
 
+Schema-only admission does not bound every pager-backed query. In the pinned
+engine, a singleton TEXT-key `IN` predicate still scans the table, and a bound
+aggregate label lookup can scan after an index miss. After deduplicating target
+IDs, singleton bulk-label writes use primary-key equality for the existing
+strict status validation and reuse the point mutation bodies within the same
+transaction. Singleton result loading also uses primary-key equality, retaining
+the requested-ID consistency check and the bulk decoder's behavior. Adding a
+label reads that issue's labels through a nonaggregate equality query, then
+checks membership and the label limit in memory. Larger batches and intentional
+preservation scans retain their existing paths.
+
+`storage::sqlite::tests::test_single_issue_label_updates_avoid_pager_table_scans`
+measures pager-cache accesses on a file-backed fixture containing unrelated
+issues with long descriptions and unrelated labels. The previous singleton
+`IN` and missing-label aggregate queries provide positive controls. The test
+covers result loading, duplicate target IDs, label additions and removals,
+idempotent no-ops, events, timestamps and target-only dirty tracking. The
+companion `test_single_issue_bulk_label_updates_preserve_guards` snapshots the
+relevant tables to check missing-issue and tombstone refusals, the label cap,
+and no-ops at the cap. These check a separate mechanism from the hydrated-row
+counter above; full JSONL synchronization and WAL validation retain their
+separate costs.
+
 #### Interpreting the scaling bound
 
 The bound removes one source of work proportional to unrelated stored payload:
@@ -148,7 +171,7 @@ Several independent dimensions remain:
 | Dimension | Remaining work |
 |---|---|
 | WAL bytes | Application schema preflight reads and checksums the valid WAL frame prefix on **every writable open**, even with a warm filesystem or engine index. Its read/CPU work is proportional to that prefix; its scan buffer is one frame. |
-| Issue lookup and SQL plans | Exact IDs avoid the all-ID resolution pass used for partial IDs. The one-label bulk path still uses text-key `IN (...)` queries for issue validation, timestamp updates and readback. The pinned 0.4.10 engine scans the issue table for that query shape. |
+| Issue lookup and SQL plans | Exact IDs avoid the all-ID resolution pass used for partial IDs. Single-target label validation, timestamp updates and readback use indexed equality. Larger distinct-ID batches retain text-key `IN (...)` queries, which scan the issue table on the pinned 0.4.10 engine. |
 | Target payload and graph | Scalar changes can hash the target's full content. Status/dependency changes can inspect the parent-child graph or rebuild a stale blocked cache. These costs are outside the label-only point-write claim. |
 | Synchronization | Default auto-import/flush and portable history can inspect or rewrite store-sized data while writer authority remains held. Measurements using `--no-auto-import --no-auto-flush` must retain that qualification. |
 | Admission and teardown | Required first-open migrations, schema repair, WAL recovery and sole-opener checkpoints are separate from current-marker steady state. Other openers can delay checkpointing and sustain a larger WAL. |
@@ -164,12 +187,13 @@ checkpointed exact-ID label matrix.
 
 In particular, `issues.id` is a text primary key. The pinned VDBE's indexed
 `IN` fast paths accept integer-literal index probes or rowid/integer-primary-key
-probes; the label path's text-ID bind list does not qualify. Its SELECT path
+probes; the bulk path's text-ID bind list does not qualify. Its SELECT path
 falls through to a table scan, and its UPDATE path scans to collect matching
 rowids before changing them. `WHERE id = ?` is a separate indexed-equality
-path. Thus bounded changed-row counts coexist with a remaining linear
-issue-count term. Lazy column decoding can skip unrelated long descriptions,
-so a scan is not equivalent to recreating the removed whole-store mirror.
+path used by the singleton label operations above. Larger batches retain a
+linear issue-count term despite bounded changed-row counts. Lazy column
+decoding can skip unrelated long descriptions, so a scan is not equivalent to
+recreating the removed whole-store mirror.
 
 These access-path observations are source findings for the locked engine
 ([VDBE code generation at the published 0.4.10 revision](https://github.com/Dicklesworthstone/frankensqlite/blob/92aeb2b9762f2f38154fde74c4055959c6ebe294/crates/fsqlite-vdbe/src/codegen.rs)),

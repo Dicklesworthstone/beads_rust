@@ -9797,6 +9797,24 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_issues_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>> {
+        // The pinned engine scans TEXT-key IN predicates, even for one ID.
+        // Keep singleton receipts on the primary-key lookup without changing
+        // the separate preservation decoder's intentional scan path.
+        if let [id] = ids {
+            return match Self::get_issue_row_from_conn(&self.conn, id)? {
+                Some(row) => {
+                    let issue = Self::issue_from_row(&row)?;
+                    if issue.id != *id {
+                        return Err(BeadsError::internal(format!(
+                            "storage consistency: get_issues_by_ids requested {id:?} but row returned id {:?}",
+                            issue.id
+                        )));
+                    }
+                    Ok(vec![issue])
+                }
+                None => Ok(Vec::new()),
+            };
+        }
         self.get_issues_by_ids_with_decoder(ids, Self::issue_from_row)
     }
 
@@ -14980,26 +14998,30 @@ impl SqliteStorage {
             }
         }
 
-        let row = conn.query_row_with_params(
-            "SELECT count(*) FROM labels WHERE issue_id = ? AND label = ?",
-            &[SqliteValue::from(issue_id), SqliteValue::from(label)],
-        )?;
-        let exists = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+        Self::add_label_after_admission_in_tx(conn, ctx, issue_id, label)
+    }
 
-        if exists > 0 {
-            return Ok(false);
-        }
-
-        let row = conn.query_row_with_params(
-            "SELECT count(*) FROM labels WHERE issue_id = ?",
+    // The caller must validate the label and target within this transaction.
+    fn add_label_after_admission_in_tx(
+        conn: &Connection,
+        ctx: &mut MutationContext,
+        issue_id: &str,
+        label: &str,
+    ) -> Result<bool> {
+        // The engine's aggregate equality path falls back to a table scan on
+        // a missing bound label. Its nonaggregate TEXT lookup handles misses
+        // directly, so read this issue's labels once for both checks.
+        let labels = conn.query_with_params(
+            "SELECT label FROM labels WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
         )?;
-        let label_count = row
-            .get(0)
-            .and_then(SqliteValue::as_integer)
-            .and_then(|count| usize::try_from(count).ok())
-            .unwrap_or(usize::MAX);
-        if label_count >= ISSUE_LABEL_MAX_COUNT {
+        if labels
+            .iter()
+            .any(|row| row.get(0).and_then(SqliteValue::as_text) == Some(label))
+        {
+            return Ok(false);
+        }
+        if labels.len() >= ISSUE_LABEL_MAX_COUNT {
             return Err(label_count_error());
         }
 
@@ -15061,13 +15083,16 @@ impl SqliteStorage {
                     .iter()
                     .map(|id| SqliteValue::from(id.as_str()))
                     .collect::<Vec<_>>();
-                let rows = conn.query_with_params(
-                    &format!(
+                // Even a singleton TEXT-key IN predicate scans on this engine.
+                let status_query = if unique_issue_ids.len() == 1 {
+                    "SELECT id, status FROM issues WHERE id = ?".to_string()
+                } else {
+                    format!(
                         "SELECT id, status FROM issues WHERE id IN ({})",
                         placeholders.join(",")
-                    ),
-                    &params,
-                )?;
+                    )
+                };
+                let rows = conn.query_with_params(&status_query, &params)?;
                 let mut statuses = HashMap::with_capacity(rows.len());
                 for row in &rows {
                     let id = row
@@ -15107,6 +15132,13 @@ impl SqliteStorage {
                             });
                         }
                     }
+                }
+
+                if let [issue_id] = unique_issue_ids.as_slice() {
+                    if Self::add_label_after_admission_in_tx(conn, ctx, issue_id, label)? {
+                        changed_ids.insert(issue_id.clone());
+                    }
+                    continue;
                 }
 
                 let mut label_params = Vec::with_capacity(chunk.len() + 1);
@@ -15254,6 +15286,16 @@ impl SqliteStorage {
             }
         }
 
+        Self::remove_label_after_admission_in_tx(conn, ctx, issue_id, label)
+    }
+
+    // The caller must validate the label and target within this transaction.
+    fn remove_label_after_admission_in_tx(
+        conn: &Connection,
+        ctx: &mut MutationContext,
+        issue_id: &str,
+        label: &str,
+    ) -> Result<bool> {
         let rows = conn.execute_with_params(
             "DELETE FROM labels WHERE issue_id = ? AND label = ?",
             &[SqliteValue::from(issue_id), SqliteValue::from(label)],
@@ -15313,13 +15355,15 @@ impl SqliteStorage {
                     .iter()
                     .map(|id| SqliteValue::from(id.as_str()))
                     .collect::<Vec<_>>();
-                let rows = conn.query_with_params(
-                    &format!(
+                let status_query = if unique_issue_ids.len() == 1 {
+                    "SELECT id, status FROM issues WHERE id = ?".to_string()
+                } else {
+                    format!(
                         "SELECT id, status FROM issues WHERE id IN ({})",
                         placeholders.join(",")
-                    ),
-                    &params,
-                )?;
+                    )
+                };
+                let rows = conn.query_with_params(&status_query, &params)?;
                 let mut statuses = HashMap::with_capacity(rows.len());
                 for row in &rows {
                     let id = row
@@ -15356,6 +15400,13 @@ impl SqliteStorage {
                             });
                         }
                     }
+                }
+
+                if let [issue_id] = unique_issue_ids.as_slice() {
+                    if Self::remove_label_after_admission_in_tx(conn, ctx, issue_id, label)? {
+                        changed_ids.insert(issue_id.clone());
+                    }
+                    continue;
                 }
 
                 let mut label_params = Vec::with_capacity(chunk.len() + 1);
@@ -33972,6 +34023,216 @@ required_fields:
             assert!(result.unwrap_err().to_string().contains(expected_error));
             assert_eq!(label_update_rows(&storage), before);
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_single_issue_label_updates_avoid_pager_table_scans() {
+        const ISSUE_COUNT: usize = 256;
+
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("single-label-pager.db");
+        let mut storage = SqliteStorage::open(&database).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        let description = "x".repeat(10_000);
+        let target = format!("bd-pager-{:04}", ISSUE_COUNT - 1);
+        for index in 0..ISSUE_COUNT {
+            let id = format!("bd-pager-{index:04}");
+            let mut issue = make_issue(&id, &id, Status::Open, 2, None, created_at, None);
+            issue.description = Some(description.clone());
+            if id != target {
+                issue.labels.push("unrelated".to_string());
+            }
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage.clear_all_dirty_issues().unwrap();
+        drop(storage);
+        let mut storage = SqliteStorage::open(&database).unwrap();
+        let pager_accesses = |storage: &SqliteStorage| {
+            storage
+                .conn
+                .as_async()
+                .memory_stats()
+                .unwrap()
+                .page_cache
+                .total_accesses()
+        };
+
+        // Positive controls for two pager-backed scans that the zero-MemDB-
+        // hydration assertion alone cannot detect on the pinned engine.
+        let before = pager_accesses(&storage);
+        let rows = storage
+            .conn
+            .query_with_params(
+                "SELECT id, status FROM issues WHERE id IN (?)",
+                &[SqliteValue::from(target.as_str())],
+            )
+            .unwrap();
+        let issue_scan = pager_accesses(&storage) - before;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0).and_then(SqliteValue::as_text),
+            Some(target.as_str())
+        );
+        let before = pager_accesses(&storage);
+        let row = storage
+            .conn
+            .query_row_with_params(
+                "SELECT count(*) FROM labels WHERE issue_id = ? AND label = ?",
+                &[SqliteValue::from(target.as_str()), SqliteValue::from("new")],
+            )
+            .unwrap();
+        let label_scan = pager_accesses(&storage) - before;
+        assert_eq!(row.get(0).and_then(SqliteValue::as_integer), Some(0));
+        assert!(
+            issue_scan >= ISSUE_COUNT as u64,
+            "issue scan control: {issue_scan}"
+        );
+        assert!(
+            label_scan >= ISSUE_COUNT as u64,
+            "label scan control: {label_scan}"
+        );
+
+        let before = pager_accesses(&storage);
+        let issues = storage
+            .get_issues_by_ids(std::slice::from_ref(&target))
+            .unwrap();
+        let read_accesses = pager_accesses(&storage) - before;
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, target);
+        assert_eq!(issues[0].description.as_deref(), Some(description.as_str()));
+        let mut measured = vec![("read", read_accesses)];
+
+        // Duplicate input IDs still represent one target. Include misses and
+        // idempotent writes so an empty index probe cannot hide another scan.
+        let ids = [target.clone(), target.clone()];
+        for (index, (name, add)) in [
+            ("add", true),
+            ("add-noop", true),
+            ("remove", false),
+            ("remove-noop", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let updated_before = storage.get_issue(&target).unwrap().unwrap().updated_at;
+            let events_before = storage.count_issue_events(&target).unwrap();
+            let before = pager_accesses(&storage);
+            let changed = if add {
+                storage.add_label_to_issues_bulk(&ids, "new", "tester")
+            } else {
+                storage.remove_label_from_issues_bulk(&ids, "new", "tester")
+            }
+            .unwrap();
+            measured.push((name, pager_accesses(&storage) - before));
+            let expected = if index % 2 == 0 {
+                HashSet::from([target.clone()])
+            } else {
+                HashSet::new()
+            };
+            assert_eq!(changed, expected, "{name}");
+            let events_after = storage.count_issue_events(&target).unwrap();
+            if index % 2 == 0 {
+                assert_eq!(events_after, events_before + 1, "{name}");
+            } else {
+                assert_eq!(events_after, events_before, "{name}");
+                assert_eq!(
+                    storage.get_issue(&target).unwrap().unwrap().updated_at,
+                    updated_before,
+                    "{name} must preserve the timestamp"
+                );
+            }
+        }
+        assert!(storage.get_labels(&target).unwrap().is_empty());
+        assert_eq!(storage.get_dirty_issue_ids().unwrap(), vec![target]);
+        assert_eq!(
+            storage.get_labels("bd-pager-0000").unwrap(),
+            vec!["unrelated"]
+        );
+        assert_eq!(storage.conn.as_async().memdb_row_hydration_count(), 0);
+        eprintln!(
+            "pager accesses: issue scan={issue_scan}, label scan={label_scan}, operations={measured:?}"
+        );
+        for (name, accesses) in measured {
+            assert!(
+                accesses < issue_scan.min(label_scan) / 2,
+                "{name} must stay below half of either full-scan control: accesses={accesses}, issue_scan={issue_scan}, label_scan={label_scan}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_issue_bulk_label_updates_preserve_guards() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("single-label-guards.db");
+        let mut storage = SqliteStorage::open(&database).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        for id in ["bd-single-cap", "bd-single-tomb"] {
+            let mut issue = make_issue(id, id, Status::Open, 2, None, created_at, None);
+            issue.labels = if id == "bd-single-cap" {
+                (0..ISSUE_LABEL_MAX_COUNT)
+                    .map(|index| format!("label-{index:02}"))
+                    .collect()
+            } else {
+                vec!["retained".to_string()]
+            };
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .delete_issue("bd-single-tomb", "tester", "fixture", None)
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+        drop(storage);
+        let mut storage = SqliteStorage::open(&database).unwrap();
+        let before = label_update_rows(&storage);
+
+        for id in ["bd-single-missing", "bd-single-tomb"] {
+            let ids = [id.to_string(), id.to_string()];
+            for add in [true, false] {
+                let error = if add {
+                    storage.add_label_to_issues_bulk(&ids, "probe", "tester")
+                } else {
+                    storage.remove_label_from_issues_bulk(&ids, "probe", "tester")
+                }
+                .unwrap_err();
+                if id == "bd-single-missing" {
+                    assert!(
+                        matches!(&error, BeadsError::IssueNotFound { id: found } if found == id),
+                        "{error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(&error, BeadsError::Validation { field, reason }
+                            if field == "issue_id"
+                                && reason.contains("tombstone")
+                                && reason.contains(id)),
+                        "{error:?}"
+                    );
+                }
+                assert_eq!(label_update_rows(&storage), before);
+            }
+        }
+
+        let capped_ids = ["bd-single-cap".to_string(), "bd-single-cap".to_string()];
+        let error = storage
+            .add_label_to_issues_bulk(&capped_ids, "extra", "tester")
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 64 labels"));
+        assert_eq!(label_update_rows(&storage), before);
+        assert!(
+            storage
+                .add_label_to_issues_bulk(&capped_ids, "label-00", "tester")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(label_update_rows(&storage), before);
+        assert!(
+            storage
+                .remove_label_from_issues_bulk(&capped_ids, "absent", "tester")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(label_update_rows(&storage), before);
     }
 
     #[test]
