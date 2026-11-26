@@ -15691,11 +15691,18 @@ impl SqliteStorage {
 
         // SQLite has a finite variable limit (default 999). Chunk to avoid query failures.
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-            let sql = format!(
-                "SELECT issue_id, label FROM labels WHERE issue_id IN ({}) ORDER BY issue_id, label",
-                placeholders.join(",")
-            );
+            // TEXT-key IN predicates scan even for one ID on the pinned engine.
+            // Equality permits a bounded ordered prefix of the label index.
+            let sql = if chunk.len() == 1 {
+                "SELECT issue_id, label FROM labels WHERE issue_id = ? ORDER BY issue_id, label"
+                    .to_string()
+            } else {
+                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+                format!(
+                    "SELECT issue_id, label FROM labels WHERE issue_id IN ({}) ORDER BY issue_id, label",
+                    placeholders.join(",")
+                )
+            };
 
             let params: Vec<SqliteValue> = chunk
                 .iter()
@@ -33294,6 +33301,72 @@ required_fields:
         assert!(removed);
         let labels = storage.get_labels("bd-l1").unwrap();
         assert_eq!(labels, vec!["backend".to_string()]);
+    }
+
+    #[test]
+    fn test_get_labels_for_issues_preserves_singleton_and_chunked_results() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("label-map.db");
+        let mut storage = SqliteStorage::open(&database).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        for (id, labels) in [
+            ("bd-label-map-a", vec!["zulu", "alpha", "middle"]),
+            ("bd-label-map-b", vec!["bravo"]),
+            ("bd-label-map-empty", vec![]),
+            ("bd-label-map-unrelated", vec!["outside"]),
+        ] {
+            let mut issue = make_issue(id, id, Status::Open, 2, None, created_at, None);
+            issue.labels = labels.into_iter().map(str::to_string).collect();
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        drop(storage);
+        let storage = SqliteStorage::open(&database).unwrap();
+        let id_a = "bd-label-map-a".to_string();
+        let id_b = "bd-label-map-b".to_string();
+        let labels_a = vec!["alpha".to_string(), "middle".to_string(), "zulu".to_string()];
+
+        assert!(storage.get_labels_for_issues(&[]).unwrap().is_empty());
+        assert_eq!(
+            storage
+                .get_labels_for_issues(std::slice::from_ref(&id_a))
+                .unwrap(),
+            HashMap::from([(id_a.clone(), labels_a.clone())])
+        );
+        for id in ["bd-label-map-empty", "bd-label-map-missing"] {
+            assert!(
+                storage
+                    .get_labels_for_issues(&[id.to_string()])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let expected = HashMap::from([
+            (id_a.clone(), labels_a),
+            (id_b.clone(), vec!["bravo".to_string()]),
+        ]);
+        assert_eq!(
+            storage
+                .get_labels_for_issues(&[
+                    id_b.clone(),
+                    "bd-label-map-empty".to_string(),
+                    id_a.clone(),
+                    "bd-label-map-missing".to_string(),
+                    id_a.clone(),
+                ])
+                .unwrap(),
+            expected
+        );
+
+        let mut chunked_ids = vec![id_b];
+        chunked_ids.extend(
+            (1..SQLITE_VAR_LIMIT).map(|index| format!("bd-label-map-missing-{index:04}")),
+        );
+        chunked_ids.push(id_a);
+        assert_eq!(
+            storage.get_labels_for_issues(&chunked_ids).unwrap(),
+            expected
+        );
     }
 
     #[test]
