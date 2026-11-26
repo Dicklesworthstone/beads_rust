@@ -95,7 +95,12 @@ impl CommentLedger {
             .expect("pull portable audit history");
     }
 
-    fn assert_private(&self, removed: &[&str]) {
+    /// `generations` is how many checkpoints the history companion holds. A
+    /// flush keeps an older generation for the `issues.jsonl` it replaced
+    /// only when that file's issue anchors (`status`, `created_at`,
+    /// `updated_at`) differ from the database's. When they are equal the two
+    /// generations would be the same one, and the companion keeps one copy.
+    fn assert_private(&self, removed: &[&str], generations: usize) {
         for &sentinel in removed {
             assert!(
                 !self.issues.contains(sentinel),
@@ -106,9 +111,13 @@ impl CommentLedger {
                 "removed text in a retained portable history generation"
             );
         }
-        // Multiple mutations retain two distinct generations. Check every row,
-        // including the older checkpoint that a future import may replay.
-        assert_eq!(self.history.lines().count(), 2);
+        // Check every retained row, including an older checkpoint that a
+        // future import may replay.
+        assert_eq!(
+            self.history.lines().count(),
+            generations,
+            "retained portable history generations"
+        );
         for line in self.history.lines() {
             let checkpoint: Value = serde_json::from_str(line).expect("history checkpoint");
             assert!(checkpoint["history"]["tables"].is_array());
@@ -273,7 +282,7 @@ fn e2e_comment_edit_preserves_identity_and_checks_author_and_revision() {
     assert_eq!(evidence["forced"], true);
     assert_eq!(evidence["identity"], forced["revision"]["identity"]);
     assert_eq!(evidence["head"], forced["revision"]["head"]);
-    CommentLedger::read(&workspace).assert_private(&["EDIT_ORIGINAL_PRIVATE_SENTINEL"]);
+    CommentLedger::read(&workspace).assert_private(&["EDIT_ORIGINAL_PRIVATE_SENTINEL"], 2);
 }
 
 #[test]
@@ -455,10 +464,13 @@ fn e2e_comment_redaction_and_deletion_keep_tombstones_and_metadata_only_audit() 
         std::slice::from_ref(&deleted)
     );
     let ledger = CommentLedger::read(&workspace);
-    ledger.assert_private(&[
-        "REDACT_ORIGINAL_PRIVATE_SENTINEL",
-        "REDACT_EDITED_PRIVATE_SENTINEL",
-    ]);
+    ledger.assert_private(
+        &[
+            "REDACT_ORIGINAL_PRIVATE_SENTINEL",
+            "REDACT_EDITED_PRIVATE_SENTINEL",
+        ],
+        2,
+    );
     let exported: Value = serde_json::from_str(ledger.issues.lines().next().unwrap()).unwrap();
     assert_eq!(exported["comments"][0]["revision"], deleted["revision"]);
     let audit = successful_json(&run_br(
@@ -535,10 +547,15 @@ fn e2e_comment_redaction_survives_divergent_machine_and_repeated_old_imports() {
         listed_comments(&machine_a, &issue_id, "redaction_wins_future_clock"),
         std::slice::from_ref(&redacted)
     );
-    CommentLedger::read(&machine_a).assert_private(&[
-        "SYNC_ORIGINAL_PRIVATE_SENTINEL",
-        "SYNC_PEER_PRIVATE_SENTINEL",
-    ]);
+    // The import took the peer row's future updated_at, so the issues.jsonl
+    // the flush replaced already had the database's anchor: one generation.
+    CommentLedger::read(&machine_a).assert_private(
+        &[
+            "SYNC_ORIGINAL_PRIVATE_SENTINEL",
+            "SYNC_PEER_PRIVATE_SENTINEL",
+        ],
+        1,
+    );
 
     for (attempt, older) in [&original_ledger, &legacy_ledger, &original_ledger]
         .into_iter()
@@ -549,10 +566,15 @@ fn e2e_comment_redaction_survives_divergent_machine_and_repeated_old_imports() {
             listed_comments(&machine_a, &issue_id, &format!("no_restore_{attempt}")),
             std::slice::from_ref(&redacted)
         );
-        CommentLedger::read(&machine_a).assert_private(&[
-            "SYNC_ORIGINAL_PRIVATE_SENTINEL",
-            "SYNC_PEER_PRIVATE_SENTINEL",
-        ]);
+        // The older row lost to the future clock, so the replaced file's
+        // anchor differs and its checkpoint is retained beside the new one.
+        CommentLedger::read(&machine_a).assert_private(
+            &[
+                "SYNC_ORIGINAL_PRIVATE_SENTINEL",
+                "SYNC_PEER_PRIVATE_SENTINEL",
+            ],
+            2,
+        );
     }
     import_and_flush(
         &machine_b,
@@ -563,10 +585,15 @@ fn e2e_comment_redaction_survives_divergent_machine_and_repeated_old_imports() {
     assert_eq!(peer_comments.len(), 1);
     assert_eq!(peer_comments[0]["revision"], redacted["revision"]);
     assert_eq!(peer_comments[0]["text"], "");
-    CommentLedger::read(&machine_b).assert_private(&[
-        "SYNC_ORIGINAL_PRIVATE_SENTINEL",
-        "SYNC_PEER_PRIVATE_SENTINEL",
-    ]);
+    // The import left machine B's database equal to machine A's ledger, so
+    // the flush has nothing to export and B keeps A's two generations.
+    CommentLedger::read(&machine_b).assert_private(
+        &[
+            "SYNC_ORIGINAL_PRIVATE_SENTINEL",
+            "SYNC_PEER_PRIVATE_SENTINEL",
+        ],
+        2,
+    );
 
     let deleted = successful_json(&run_br(
         &machine_a,
@@ -591,10 +618,13 @@ fn e2e_comment_redaction_survives_divergent_machine_and_repeated_old_imports() {
         listed_comments(&machine_b, &issue_id, "peer_deleted")[0]["revision"],
         deleted["revision"]
     );
-    CommentLedger::read(&machine_b).assert_private(&[
-        "SYNC_ORIGINAL_PRIVATE_SENTINEL",
-        "SYNC_PEER_PRIVATE_SENTINEL",
-    ]);
+    CommentLedger::read(&machine_b).assert_private(
+        &[
+            "SYNC_ORIGINAL_PRIVATE_SENTINEL",
+            "SYNC_PEER_PRIVATE_SENTINEL",
+        ],
+        2,
+    );
     // A machine with no database must rebuild the same terminal identity from
     // the JSONL tombstone; no local prior revision is needed to enforce it.
     let machine_c = clone_comment_workspace(&machine_b);
