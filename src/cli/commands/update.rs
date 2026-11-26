@@ -348,6 +348,51 @@ struct UpdateRouteOutput {
     capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
+/// Captured update results that can be rendered after persistence and writer
+/// authority have ended. This owns no storage, configuration, or lock guards.
+#[derive(Debug)]
+#[must_use]
+pub struct UpdateCommandOutput {
+    updated_issues: Vec<UpdatedIssueOutput>,
+    render_items: Vec<UpdateRenderItem>,
+    capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
+    inherited_context: Vec<String>,
+}
+
+impl UpdateCommandOutput {
+    /// Render the captured response without opening storage or acquiring locks.
+    pub fn render(self, ctx: &OutputContext) {
+        if ctx.is_toon() {
+            if self.capacity_warnings.is_empty() {
+                ctx.toon(&self.updated_issues);
+            } else {
+                ctx.toon(&UpdateWithCapacityWarnings {
+                    updated: self.updated_issues,
+                    warnings: self.capacity_warnings,
+                });
+            }
+        } else if ctx.is_json() {
+            if self.capacity_warnings.is_empty() {
+                ctx.json_pretty(&self.updated_issues);
+            } else {
+                ctx.json_pretty(&UpdateWithCapacityWarnings {
+                    updated: self.updated_issues,
+                    warnings: self.capacity_warnings,
+                });
+            }
+        } else if !ctx.is_quiet() {
+            print_render_items(&self.render_items);
+            for warning in &self.capacity_warnings {
+                ctx.warning(&warning.to_string());
+            }
+            for rendered in &self.inherited_context {
+                println!();
+                print!("{rendered}");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct UpdateWithCapacityWarnings {
     updated: Vec<UpdatedIssueOutput>,
@@ -409,13 +454,33 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 /// # Errors
 ///
 /// Returns an error if database operations fail or validation errors occur.
-#[allow(clippy::too_many_lines)]
 pub fn execute_with_storage(
     args: &UpdateArgs,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
     pre_opened: &mut Option<config::OpenStorageResult>,
 ) -> Result<()> {
+    execute_with_deferred_output(args, cli, ctx, pre_opened)?.render(ctx);
+    Ok(())
+}
+
+/// Execute an update without rendering its final receipt.
+///
+/// The caller controls automatic export and storage lifetime. The CLI finishes
+/// both before rendering this response, which owns no writer authority and
+/// cannot reopen storage. Earlier policy and routed export diagnostics retain
+/// their existing behavior.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail or validation errors occur.
+#[allow(clippy::too_many_lines)]
+pub fn execute_with_deferred_output(
+    args: &UpdateArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    pre_opened: &mut Option<config::OpenStorageResult>,
+) -> Result<UpdateCommandOutput> {
     // Refuse terminal-state transitions before doing any I/O. `br update`
     // is a data-only field mutator; terminal-state transitions
     // (closed, tombstone) must go through their dedicated commands so the
@@ -601,47 +666,30 @@ pub fn execute_with_storage(
         crate::util::set_last_touched_id(&beads_dir, last_id);
     }
 
-    if ctx.is_toon() {
-        if capacity_warnings.is_empty() {
-            ctx.toon(&updated_issues);
-        } else {
-            ctx.toon(&UpdateWithCapacityWarnings {
-                updated: updated_issues,
-                warnings: capacity_warnings,
-            });
-        }
-    } else if ctx.is_json() {
-        if capacity_warnings.is_empty() {
-            ctx.json_pretty(&updated_issues);
-        } else {
-            ctx.json_pretty(&UpdateWithCapacityWarnings {
-                updated: updated_issues,
-                warnings: capacity_warnings,
-            });
-        }
-    } else if !ctx.is_quiet() {
-        print_render_items(&render_items);
-        for warning in &capacity_warnings {
-            ctx.warning(&warning.to_string());
-        }
-        // beads_rust#297: emit inherited governing context for any
-        // bead that just transitioned into in_progress (via --claim or
-        // --status in_progress). Done after the update summary so the
-        // child's status change is visible first, then the inherited
-        // context the agent should be operating under.
-        emit_inherited_context_for_in_progress_transitions(&beads_dir, cli, &render_items);
-    }
+    // Capture the best-effort governing context while storage access is still
+    // allowed. Rendering remains ordered after the update summary (#297), but
+    // cannot reopen a writable connection after main releases its authority.
+    let inherited_context = if update_uses_human_output(ctx) {
+        collect_inherited_context_for_in_progress_transitions(&beads_dir, cli, &render_items)
+    } else {
+        Vec::new()
+    };
 
-    Ok(())
+    Ok(UpdateCommandOutput {
+        updated_issues,
+        render_items,
+        capacity_warnings,
+        inherited_context,
+    })
 }
 
-fn emit_inherited_context_for_in_progress_transitions(
+fn collect_inherited_context_for_in_progress_transitions(
     beads_dir: &Path,
     cli: &config::CliOverrides,
     render_items: &[UpdateRenderItem],
-) {
+) -> Vec<String> {
     if !crate::inheritance::is_enabled(beads_dir) {
-        return;
+        return Vec::new();
     }
     let claimed_ids: Vec<&str> = render_items
         .iter()
@@ -658,24 +706,23 @@ fn emit_inherited_context_for_in_progress_transitions(
         })
         .collect();
     if claimed_ids.is_empty() {
-        return;
+        return Vec::new();
     }
-    // Open a transient read-only storage to walk ancestry. Failure
-    // here is non-fatal — the update has already succeeded and the
-    // child's status change is already printed.
+    // Open a transient storage context to walk ancestry before returning the
+    // receipt. Failure remains non-fatal: the update has already succeeded.
     let Ok(storage_ctx) = config::open_storage_with_cli(beads_dir, cli) else {
-        return;
+        return Vec::new();
     };
     let storage = &storage_ctx.storage;
+    let mut inherited_context = Vec::new();
     for id in claimed_ids {
         let blocks = match crate::inheritance::collect_inherited_blocks(storage, id) {
             Ok(blocks) if !blocks.is_empty() => blocks,
             _ => continue,
         };
-        let rendered = crate::inheritance::render_text(&blocks);
-        println!();
-        print!("{rendered}");
+        inherited_context.push(crate::inheritance::render_text(&blocks));
     }
+    inherited_context
 }
 
 fn prepare_single_route(
