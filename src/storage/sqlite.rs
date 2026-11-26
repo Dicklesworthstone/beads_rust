@@ -15097,10 +15097,8 @@ impl SqliteStorage {
                                 )
                             })?
                             .to_string();
-                        let status = row
-                            .get(1)
-                            .and_then(SqliteValue::as_text)
-                            .ok_or_else(|| {
+                        let status =
+                            row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
                                 BeadsError::Config(format!(
                                     "issues row missing status during bulk label add for {id}"
                                 ))
@@ -15114,9 +15112,7 @@ impl SqliteStorage {
                         Some(Status::Tombstone) => {
                             return Err(BeadsError::Validation {
                                 field: "issue_id".to_string(),
-                                reason: format!(
-                                    "cannot add label to tombstone issue: {issue_id}"
-                                ),
+                                reason: format!("cannot add label to tombstone issue: {issue_id}"),
                             });
                         }
                         Some(_) => {}
@@ -15303,11 +15299,12 @@ impl SqliteStorage {
                                 )
                             })?
                             .to_string();
-                        let status = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
-                            BeadsError::Config(format!(
-                                "issues row missing status during bulk label remove for {id}"
-                            ))
-                        })?;
+                        let status =
+                            row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+                                BeadsError::Config(format!(
+                                    "issues row missing status during bulk label remove for {id}"
+                                ))
+                            })?;
                         statuses.insert(id, Status::from_str(status)?);
                     }
                 }

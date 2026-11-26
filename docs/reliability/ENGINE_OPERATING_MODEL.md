@@ -135,15 +135,22 @@ database's marker, and check file-backed bulk label writes preserve exact
 dirty-ID tracking without hydrating unrelated rows.
 
 Schema-only admission does not bound every pager-backed query. In the pinned
-engine, a singleton TEXT-key `IN` predicate still scans the table, and a bound
-aggregate label lookup can scan after an index miss. After deduplicating target
-IDs, singleton bulk-label writes use primary-key equality for the existing
-strict status validation and reuse the point mutation bodies within the same
-transaction. Singleton result loading also uses primary-key equality, retaining
-the requested-ID consistency check and the bulk decoder's behavior. Adding a
-label reads that issue's labels through a nonaggregate equality query, then
-checks membership and the label limit in memory. Larger batches and intentional
-preservation scans retain their existing paths.
+engine, TEXT-key `IN` predicates still scan the table, even for a singleton,
+and a bound aggregate label lookup can scan after an index miss. Bulk label
+additions and removals use point queries for each deduplicated target ID:
+primary-key equality for strict status admission and changed-row timestamp
+updates, nonaggregate issue-label equality for addition membership and count
+checks, and issue-first equality for label deletion. Singletons reuse the
+existing point mutation bodies. Larger batches retain their preflight groups,
+label-cap checks, transaction retry/rollback boundary, changed-only events and
+dirty markers, and one shared timestamp for changed issues in each attempt.
+
+Ordinary issue result loading also uses primary-key equality for every
+requested ID, retaining the requested-ID consistency check and the bulk
+decoder's behavior. Ordinary label receipt loading uses an ordered equality
+query on each issue's label prefix. Both getters preserve duplicate treatment
+within and across the existing input groups. The separate preservation scan
+helper deliberately retains its full-scan path.
 
 `storage::sqlite::tests::test_single_issue_label_updates_avoid_pager_table_scans`
 measures pager-cache accesses on a file-backed fixture containing unrelated
@@ -157,13 +164,52 @@ and no-ops at the cap. These check a separate mechanism from the hydrated-row
 counter above; full JSONL synchronization and WAL validation retain their
 separate costs.
 
+The existing bulk add/remove `*_marks_only_changed_ids` tests now also assert
+shared changed-row timestamps, exact audit events and unchanged state for
+no-ops. `test_add_label_to_issues_bulk_handles_sqlite_var_limit_boundary`
+adds a late missing target after the first preflight group and checks full
+rollback for both additions and removals.
+`test_get_labels_for_issues_preserves_singleton_and_chunked_results` checks
+both getters' duplicate multiplicity within and across input groups. These
+added assertions have not yet executed; they establish no new pager-access or
+timing result, and compiler/runtime qualification remains pending.
+
+#### Update output after protected completion
+
+A successful CLI `update` captures an owned receipt before returning to main.
+Automatic export, when enabled, and `SqliteStorage::Drop` finish under the
+existing writer authority. Main then releases every `Arc` owner of that
+authority before rendering the receipt and reporting any main auto-flush
+warning. Receipt rendering cannot reopen storage, so stdout backpressure does
+not extend the completed mutation's protected lifetime. Earlier diagnostics
+and routed export warnings remain outside this boundary. The Linux regressions
+`update_releases_writer_before_output_after_auto_flush` and
+`update_releases_writer_before_output_without_auto_flush` in
+`tests/e2e_concurrency.rs` block stdout, require a second writer to finish, and
+check the first receipt's captured state and the selected JSONL export policy.
+They cover default auto-flush and `--no-auto-flush`, both with auto-import
+disabled. These regressions have not yet executed.
+
+A 2026-11-26 baseline reproduction used unmodified prebuilt `br 0.7.6`
+(SHA-256 `73cbef7f11680b8349ef5b465d002e404272cc6c06b0f95a86035b488b1844b9`;
+source commit unknown). With `--no-auto-import`, both auto-flush modes blocked
+in `anon_pipe_write` while retaining workspace and database-family write
+locks. A second writer timed out after 1,000 ms with exit code 2 and
+`DATABASE_LOCKED`; default-mode JSONL still lacked the first update. Draining
+stdout let the first writer exit 0 with the correct receipt. This establishes
+the mechanism in that older binary only; candidate runtime behavior and
+latency improvements remain unverified.
+
 #### Interpreting the scaling bound
 
-The bound removes one source of work proportional to unrelated stored payload:
-the optional whole-store compatibility mirror. It is not an `O(1)` guarantee
-for `br update`. Qualify the ordinary steady-state case using exact issue IDs,
-current migration markers, fixed target payloads and graph shape, and an
-explicit synchronization policy. Measure peak RSS, CPU and elapsed time
+Schema-only opening removes the optional whole-store compatibility mirror;
+the point queries avoid the identified TEXT-key `IN` and aggregate-miss scans
+in the operations above. Neither is an `O(1)` guarantee for `br update`. The
+performance target is sparse updates on file-backed databases. Dense batches
+and in-memory `MemDatabase` connections have no qualified speedup from these
+query changes. Qualify the ordinary steady-state case using exact issue IDs,
+current migration markers, fixed target counts, payloads and graph shape, and
+an explicit synchronization policy. Measure peak RSS, CPU and elapsed time
 separately; the hydration counter cannot stand in for any of them.
 
 Several independent dimensions remain:
@@ -171,7 +217,7 @@ Several independent dimensions remain:
 | Dimension | Remaining work |
 |---|---|
 | WAL bytes | Application schema preflight reads and checksums the valid WAL frame prefix on **every writable open**, even with a warm filesystem or engine index. Its read/CPU work is proportional to that prefix; its scan buffer is one frame. |
-| Issue lookup and SQL plans | Exact IDs avoid the all-ID resolution pass used for partial IDs. Single-target label validation, timestamp updates and readback use indexed equality. Larger distinct-ID batches retain text-key `IN (...)` queries, which scan the issue table on the pinned 0.4.10 engine. |
+| Issue lookup and SQL plans | Exact IDs avoid the all-ID resolution pass used for partial IDs. Bulk label admission, membership, deletion and timestamps, plus ordinary issue/label receipt loading, use per-target equality queries. Work still grows with the requested IDs and their labels; other SQL paths may scan. |
 | Target payload and graph | Scalar changes can hash the target's full content. Status/dependency changes can inspect the parent-child graph or rebuild a stale blocked cache. These costs are outside the label-only point-write claim. |
 | Synchronization | Default auto-import/flush and portable history can inspect or rewrite store-sized data while writer authority remains held. Measurements using `--no-auto-import --no-auto-flush` must retain that qualification. |
 | Admission and teardown | Required first-open migrations, schema repair, WAL recovery and sole-opener checkpoints are separate from current-marker steady state. Other openers can delay checkpointing and sustain a larger WAL. |
@@ -179,19 +225,20 @@ Several independent dimensions remain:
 
 Compare both implementations live in the same benchmark invocation. For causal
 attribution, keep the source, locked dependencies and build profile identical
-and restore only the ordinary opener in a separate control build. A released
-binary is a useful additional baseline, but differences from that release
-cannot all be assigned to this fix. Report the observed size range and keep
-WAL growth, migration and default-sync experiments distinct from the
-checkpointed exact-ID label matrix.
+and isolate the opener and query changes in separate control builds. Restore
+only the ordinary opener for the hydration comparison and the previous SQL
+shapes for the point-query comparison. A released binary is a useful additional
+baseline, but differences from that release cannot all be assigned to this
+fix. Report the observed size range and keep WAL growth, migration and
+default-sync experiments distinct from the checkpointed exact-ID label matrix.
 
 In particular, `issues.id` is a text primary key. The pinned VDBE's indexed
 `IN` fast paths accept integer-literal index probes or rowid/integer-primary-key
-probes; the bulk path's text-ID bind list does not qualify. Its SELECT path
-falls through to a table scan, and its UPDATE path scans to collect matching
-rowids before changing them. `WHERE id = ?` is a separate indexed-equality
-path used by the singleton label operations above. Larger batches retain a
-linear issue-count term despite bounded changed-row counts. Lazy column
+probes; a text-ID bind list does not qualify. Such a SELECT falls through to a
+table scan, and an UPDATE scans to collect matching rowids before changing
+them. `WHERE id = ?` is a separate indexed-equality path now used by both the
+singleton and batch label operations above. Other callers and intentional
+preservation scans can still retain a linear issue-count term. Lazy column
 decoding can skip unrelated long descriptions, so a scan is not equivalent to
 recreating the removed whole-store mirror.
 

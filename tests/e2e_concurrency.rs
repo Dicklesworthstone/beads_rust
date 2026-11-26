@@ -681,13 +681,19 @@ fn stalled_snapshot_read(
             if disable_fast_open { "1" } else { "0" },
         )],
     )]);
+    wait_for_stdout_backpressure(&mut children, "read");
+    children
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_stdout_backpressure(children: &mut QueuedBrChildren, label: &str) {
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let child = &mut children.0[0];
         if let Some(status) = child.try_wait().unwrap() {
             let output = children.0.remove(0).wait_with_output().unwrap();
             panic!(
-                "read exited before output backpressure: {status}; stdout={} stderr={}",
+                "{label} exited before output backpressure: {status}; stdout={} stderr={}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -697,11 +703,11 @@ fn stalled_snapshot_read(
             .as_deref()
             .is_some_and(|value| value.contains("pipe_write"))
         {
-            return children;
+            return;
         }
         assert!(
             Instant::now() < deadline,
-            "read never reached output backpressure; last wait channel: {channel:?}"
+            "{label} never reached output backpressure; last wait channel: {channel:?}"
         );
         thread::sleep(WRITE_LOCK_WAIT_POLL_INTERVAL);
     }
@@ -910,6 +916,114 @@ fn competing_snapshot_writer(root: &Path, issue_id: &str) -> std::process::Outpu
     )])
     .finish(Duration::from_secs(20))
     .remove(0)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
+fn assert_update_releases_writer_before_output(auto_flush: bool) {
+    const APPENDED: &str = "committed before response backpressure";
+    let workspace = common::cli::BrWorkspace::new();
+    let root = &workspace.root;
+    let init = run_br_in_dir(root, ["init", "--prefix", "test"]);
+    assert!(init.success, "init failed: {init:?}");
+    let mut issue = common::fixtures::issue("Update receipt remains a committed snapshot");
+    issue.id = "test-update".to_string();
+    let initial_notes = "notes preserved before the concurrent writer\n".repeat(32_768);
+    issue.notes = Some(initial_notes.clone());
+    let jsonl_path = root.join(".beads/issues.jsonl");
+    fs::write(
+        &jsonl_path,
+        format!("{}\n", serde_json::to_string(&issue).unwrap()),
+    )
+    .unwrap();
+    let imported = run_br_in_dir(root, ["sync", "--import-only", "--json"]);
+    assert!(imported.success, "seed import failed: {imported:?}");
+    let flushed = run_br_in_dir(root, ["sync", "--flush-only", "--json"]);
+    assert!(flushed.success, "seed flush failed: {flushed:?}");
+    let jsonl_before = fs::read(&jsonl_path).unwrap();
+    let expected_notes = format!("{initial_notes}{APPENDED}");
+
+    let mut args = vec!["--no-auto-import", "--lock-timeout", "1500"];
+    if !auto_flush {
+        args.push("--no-auto-flush");
+    }
+    args.extend([
+        "update",
+        "test-update",
+        "--append-notes",
+        APPENDED,
+        "--json",
+    ]);
+    let mut update = QueuedBrChildren(vec![spawn_br_child_in_dir(root, args)]);
+    wait_for_stdout_backpressure(&mut update, "update");
+    let records = process_workspace_lock_records(update.0[0].id(), root);
+    assert!(
+        records.is_empty(),
+        "completed update retains workspace authority while stdout is blocked: {records:?}"
+    );
+    let authority = beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+        &root.join(".beads"),
+        &root.join(".beads/beads.db"),
+        Some(0),
+    )
+    .expect("all family authority must end before the update response can block");
+    drop(authority);
+
+    if auto_flush {
+        let exported: serde_json::Value =
+            serde_json::from_slice(&fs::read(&jsonl_path).unwrap()).unwrap();
+        assert_eq!(exported["notes"], expected_notes);
+    } else {
+        assert_eq!(fs::read(&jsonl_path).unwrap(), jsonl_before);
+    }
+
+    let writer = competing_snapshot_writer(root, "test-update");
+    assert!(
+        writer.status.success(),
+        "second writer must finish while the first update's response is blocked: stdout={} stderr={}",
+        String::from_utf8_lossy(&writer.stdout),
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    assert!(update.0[0].try_wait().unwrap().is_none());
+    let output = update.finish(Duration::from_secs(20)).remove(0);
+    assert!(
+        output.status.success(),
+        "first update failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt.len(), 1);
+    assert_eq!(receipt[0]["id"], "test-update");
+    assert_eq!(receipt[0]["notes"]["appended"], APPENDED);
+    assert_eq!(receipt[0]["notes"]["applied"], true);
+    assert_eq!(receipt[0]["notes"]["text"], expected_notes);
+
+    let observed = run_br_in_dir(
+        root,
+        [
+            "--no-auto-import",
+            "--no-auto-flush",
+            "show",
+            "test-update",
+            "--json",
+        ],
+    );
+    assert!(observed.success, "read after writers failed: {observed:?}");
+    let issues = extract_issues_array(&observed.stdout);
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["notes"], "after concurrent writer");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn update_releases_writer_before_output_after_auto_flush() {
+    assert_update_releases_writer_before_output(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn update_releases_writer_before_output_without_auto_flush() {
+    assert_update_releases_writer_before_output(false);
 }
 
 #[cfg(target_os = "linux")]
