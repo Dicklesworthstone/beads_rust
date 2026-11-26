@@ -934,6 +934,7 @@ fn run(mut cli: Cli, json_error_mode: bool) -> Result<i32> {
     }
 
     // Phase 4: Command Execution
+    let mut deferred_update_output = None;
     let result = match cli.command {
         Commands::Init {
             prefix,
@@ -950,12 +951,13 @@ fn run(mut cli: Cli, json_error_mode: bool) -> Result<i32> {
         Commands::Create(args) => {
             execute_create_command(&args, &overrides, &output_ctx, &mut storage_result)
         }
-        Commands::Update(args) => commands::update::execute_with_storage(
+        Commands::Update(args) => commands::update::execute_with_deferred_output(
             &args,
             &overrides,
             &output_ctx,
             &mut storage_result,
-        ),
+        )
+        .map(|output| deferred_update_output = Some(output)),
         Commands::Delete(args) => {
             commands::delete::execute(&args, cli.json, &overrides, &output_ctx)
         }
@@ -1305,10 +1307,14 @@ fn run(mut cli: Cli, json_error_mode: bool) -> Result<i32> {
         drop(overrides);
         drop(ctx);
         drop(write_lock);
+        if let Some(output) = deferred_update_output {
+            output.render(&output_ctx);
+        }
         return Ok(exit_code);
     }
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
+    let mut auto_flush_failure = None;
     if is_mutating
         && !ctx.no_auto_flush()
         && let (Some(res), Some(paths)) = (storage_result.as_mut(), ctx.paths.as_ref())
@@ -1320,21 +1326,11 @@ fn run(mut cli: Cli, json_error_mode: bool) -> Result<i32> {
                     "Automatic JSONL export skipped because sync lock at {} is held by another process",
                     paths.beads_dir.join(".sync.lock").display()
                 ));
-                commands::report_auto_flush_failure(
-                    &output_ctx,
-                    &paths.beads_dir,
-                    &paths.jsonl_path,
-                    &err,
-                );
+                auto_flush_failure = Some((paths.beads_dir.clone(), paths.jsonl_path.clone(), err));
                 None
             }
             Err(e) => {
-                commands::report_auto_flush_failure(
-                    &output_ctx,
-                    &paths.beads_dir,
-                    &paths.jsonl_path,
-                    &e,
-                );
+                auto_flush_failure = Some((paths.beads_dir.clone(), paths.jsonl_path.clone(), e));
                 None
             }
         };
@@ -1356,33 +1352,35 @@ fn run(mut cli: Cli, json_error_mode: bool) -> Result<i32> {
                 history,
             )
         {
-            commands::report_auto_flush_failure(
-                &output_ctx,
-                &paths.beads_dir,
-                &paths.jsonl_path,
-                &e,
-            );
+            auto_flush_failure = Some((paths.beads_dir.clone(), paths.jsonl_path.clone(), e));
         }
     }
 
+    // Close writable storage under its authority before releasing every Arc
+    // owner of the family lock (#270). A captured update receipt and any
+    // auto-flush warning contain only owned data: output backpressure must not
+    // extend this completed mutation's workspace critical section.
+    drop(storage_result);
+    drop(overrides);
+    drop(ctx);
+    drop(write_lock);
+    if let Some(output) = deferred_update_output {
+        output.render(&output_ctx);
+    }
+    if let Some((beads_dir, jsonl_path, error)) = auto_flush_failure {
+        commands::report_auto_flush_failure(&output_ctx, &beads_dir, &jsonl_path, &error);
+    }
+
     if let Some(err) = beads_rust::output::take_output_serialization_failure() {
-        drop(storage_result);
-        drop(overrides);
-        drop(ctx);
-        drop(write_lock);
         return Ok(err.exit_code());
     }
 
     // A command emitted its normal output and any auto-flush has now completed,
     // but detected a condition that must surface to scripted callers via a
     // non-zero exit code (e.g. `dep cycles` with cycles present, or `create -f`
-    // that dropped declared dependency edges) — see #368. Drop storage first so
-    // `SqliteStorage::Drop` checkpoints the WAL before the process exits (#270).
+    // that dropped declared dependency edges) — see #368. Storage and writer
+    // authority have already completed their protected teardown above.
     if let Some(exit_code) = beads_rust::output::take_pending_exit_code() {
-        drop(storage_result);
-        drop(overrides);
-        drop(ctx);
-        drop(write_lock);
         return Ok(exit_code);
     }
 
@@ -1390,14 +1388,8 @@ fn run(mut cli: Cli, json_error_mode: bool) -> Result<i32> {
     // path (#439): on Windows, letting `main` return would reach the CRT
     // `exit()` teardown, where an atexit/TLS destructor joining a thread
     // that `ExitProcess` already terminated aborts with 0xC0000409 and
-    // corrupts the exit code of a command that worked. Storage is dropped
-    // first so `SqliteStorage::Drop` checkpoints the WAL (#270). Configuration
-    // retains authority clones too; release them before the final guard so
-    // kernel process teardown does not extend the workspace critical section.
-    drop(storage_result);
-    drop(overrides);
-    drop(ctx);
-    drop(write_lock);
+    // corrupts the exit code of a command that worked. Storage and all writer
+    // authority owners have already been released before response rendering.
     Ok(0)
 }
 
