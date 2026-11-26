@@ -1746,7 +1746,7 @@ fn run_git_probe_with_program_options(
     run_bounded_capture(&mut command, deadline)
 }
 
-fn hardened_git_command(
+pub(super) fn hardened_git_command(
     program: &OsStr,
     dir: &Path,
     neutralize_attributes_file: bool,

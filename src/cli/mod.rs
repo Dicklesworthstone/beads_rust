@@ -915,19 +915,20 @@ pub enum Commands {
 
     /// Sync database with JSONL file (export or import)
     ///
-    /// IMPORTANT: br sync NEVER executes git commands or auto-commits.
-    /// All file operations are confined to .beads/ by default.
+    /// Use --stage to put selected issues and history in the Git index.
     /// Use -v for detailed safety logging, -vv for debug output.
     #[command(long_about = "Sync database with JSONL file (export or import).
 
 SAFETY GUARANTEES:
-  • br sync NEVER executes git commands or auto-commits
-  • br sync NEVER modifies files outside .beads/ (unless --allow-external-jsonl)
+  • Only --stage and --check access Git. Commits are explicit.
+  • --stage updates the Git index. Working exports stay in .beads/ by default.
   • All writes use atomic temp-file-then-rename pattern
   • Safety guards prevent accidental data loss
 
 MODES (one required):
   --flush-only    Export database to JSONL (safe by default)
+  --stage ID...   Stage selected issues and their history from the working export
+  --check [REV]   Validate the staged export or the pair at a Git revision
   --import-only   Import JSONL into database (validates first)
   --merge         Three-way merge .beads/beads.base.jsonl + DB + JSONL
   --status        Show sync status (read-only)
@@ -983,8 +984,7 @@ EXAMPLES:
 
     /// Explicitly inspect Git visibility for JSONL or local runtime files
     ///
-    /// This diagnostic is intentionally separate from `br sync`: sync never
-    /// executes Git. The command applies a shared probe budget, bounded output,
+    /// The command applies a shared probe budget, bounded output,
     /// literal path handling, and no-prompt/no-optional-lock safeguards.
     #[command(name = "vcs-status")]
     VcsStatus(VcsStatusArgs),
@@ -3110,6 +3110,16 @@ pub const DEFAULT_WITNESS_PARALLELISM: usize = 64;
 #[derive(Args, Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SyncArgs {
+    /// Stage exact issue IDs and their history from the working export into Git
+    #[arg(long, value_name = "ID", num_args = 1.., group = "base_action")]
+    pub stage: Vec<String>,
+
+    /// Validate the staged issue/history pair, or the pair at a Git revision
+    // Clap distinguishes an absent option, a bare --check, and --check REV.
+    #[allow(clippy::option_option)]
+    #[arg(long, value_name = "REV", num_args = 0..=1)]
+    pub check: Option<Option<String>>,
+
     /// Export database to JSONL (DB → .beads/issues.jsonl)
     ///
     /// Writes all issues from `SQLite` database to JSONL format.
@@ -3138,7 +3148,7 @@ pub struct SyncArgs {
     /// Uses `.beads/beads.base.jsonl`, the last local export, as its anchor.
     /// Missing JSONL rows do not delete local issues unless --force-jsonl is
     /// given. Divergent older or equal-timestamp rows require explicit resolution.
-    #[arg(long)]
+    #[arg(long, group = "base_action")]
     pub merge: bool,
 
     /// Additively reconcile JSONL into the database (JSONL → DB, lossless)
@@ -3169,7 +3179,7 @@ pub struct SyncArgs {
     /// `reliability_audit` anomaly record (same write-gate vocabulary as
     /// `br doctor --json`). Its compatibility `git_export` block is always
     /// `{available:false, reason:"not_probed"}` and points to the explicit
-    /// `br vcs-status --json` diagnostic; sync never probes VCS.
+    /// `br vcs-status --json` diagnostic.
     #[arg(long)]
     pub status: bool,
 
@@ -3274,7 +3284,7 @@ pub struct SyncArgs {
     #[arg(long, requires = "merge", conflicts_with_all = ["force", "force_db"])]
     pub force_jsonl: bool,
 
-    /// Merge against this common ancestor instead of `.beads/beads.base.jsonl`
+    /// Common ancestor file for --merge, or starting Git revision for --stage
     ///
     /// For callers that know the real common ancestor of the database and
     /// the JSONL, such as the tracker file at `git merge-base HEAD
@@ -3284,7 +3294,7 @@ pub struct SyncArgs {
     /// change made only in the JSONL is taken. The merge result still
     /// replaces `.beads/beads.base.jsonl`. A path outside `.beads/` needs
     /// --allow-external-jsonl; paths inside `.git/` are always refused.
-    #[arg(long = "base", value_name = "PATH", requires = "merge")]
+    #[arg(long = "base", value_name = "PATH_OR_REV", requires = "base_action")]
     pub merge_base: Option<PathBuf>,
 
     /// Allow using a JSONL path outside the .beads directory.

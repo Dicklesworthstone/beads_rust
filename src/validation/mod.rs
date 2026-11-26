@@ -810,12 +810,13 @@ impl SyncSafetyValidator {
     }
 
     fn references_process_capable_sibling(normalized: &str) -> bool {
-        const ADAPTERS: [&str; 8] = [
+        const ADAPTERS: [&str; 9] = [
             "changelog",
             "config",
             "doctor",
             "orphans",
             "stats",
+            "sync_git_index",
             "upgrade",
             "vcs",
             "version",
@@ -1516,6 +1517,7 @@ mod tests {
             "doctor",
             "orphans",
             "stats",
+            "sync_git_index",
             "upgrade",
             "vcs",
             "version",

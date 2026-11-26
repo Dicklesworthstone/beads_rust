@@ -1,10 +1,13 @@
 //! Regression tests for sync git safety.
 //!
-//! These tests verify that `br sync` NEVER:
+//! These tests verify that ordinary database/JSONL sync modes never:
 //! - Executes git commands
 //! - Creates commits
 //! - Stages changes
 //! - Mutates the .git directory
+//!
+//! Explicit selective staging updates only the requested export pair in the
+//! index. The tests for that mode use a real Git repository.
 //!
 //! This is a critical safety invariant documented in:
 //! - beads_rust-0v1.2.4: "Guarantee no git operations are executed by br sync"
@@ -28,6 +31,222 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const ISSUES: &str = ".beads/issues.jsonl";
+const HISTORY: &str = ".beads/issues.history.jsonl";
+
+fn git(workspace: &BrWorkspace, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(&workspace.root)
+        .output()
+        .expect("execute git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("UTF-8 git output")
+}
+
+fn br(workspace: &BrWorkspace, args: &[&str]) -> String {
+    let out = run_br(workspace, args, args[0]);
+    assert!(out.status.success(), "br {args:?}: {}", out.stderr);
+    out.stdout.trim().to_owned()
+}
+
+fn git_pair(workspace: &BrWorkspace, rev: &str) -> [String; 2] {
+    [ISSUES, HISTORY].map(|path| git(workspace, &["show", &format!("{rev}:{path}")]))
+}
+
+fn working_pair(workspace: &BrWorkspace) -> [String; 2] {
+    [ISSUES, HISTORY].map(|path| fs::read_to_string(workspace.root.join(path)).unwrap())
+}
+
+fn baseline_workspace() -> (BrWorkspace, String) {
+    let workspace = BrWorkspace::new();
+    init_git_repo(&workspace);
+    br(&workspace, &["init", "--prefix", "test"]);
+    let baseline = br(&workspace, &["q", "Baseline issue", "--actor", "base"]);
+    br(&workspace, &["sync", "--flush-only"]);
+    git(&workspace, &["add", "--", ISSUES, HISTORY]);
+    git(&workspace, &["commit", "-qm", "Baseline exports"]);
+    (workspace, baseline)
+}
+
+#[test]
+fn selective_staging_publishes_only_named_issues_and_their_history() {
+    let (workspace, baseline) = baseline_workspace();
+    let head = get_head_commit(&workspace.root);
+    let base = git_pair(&workspace, "HEAD");
+    let first = br(&workspace, &["q", "Ready", "--actor", "session-a"]);
+    let later = br(&workspace, &["q", "Also ready", "--actor", "session-a"]);
+    let pending = br(&workspace, &["q", "Unfinished", "--actor", "session-b"]);
+    // Session B also changes an existing issue. Its original row and history
+    // must survive staging even though the current export has a newer anchor.
+    br(
+        &workspace,
+        &[
+            "update",
+            &baseline,
+            "--title",
+            "Still editing",
+            "--actor",
+            "session-b",
+        ],
+    );
+    br(&workspace, &["sync", "--flush-only"]);
+    let working = working_pair(&workspace);
+    assert!(working[1].contains("session-b"));
+    fs::write(workspace.root.join("notes.txt"), "already staged\n").unwrap();
+    git(&workspace, &["add", "notes.txt"]);
+
+    br(&workspace, &["sync", "--stage", &first, "--base", "HEAD"]);
+    br(&workspace, &["sync", "--stage", &later]);
+    br(&workspace, &["sync", "--check"]);
+    br(&workspace, &["sync", "--check", "HEAD"]);
+
+    let staged = git_pair(&workspace, "");
+    let mut expected: Vec<_> = working[0]
+        .lines()
+        .filter(|line| {
+            let issue: serde_json::Value = serde_json::from_str(line).unwrap();
+            matches!(issue["id"].as_str(), Some(id) if id == first || id == later)
+        })
+        .chain(base[0].lines())
+        .collect();
+    expected.sort_by_cached_key(|line| {
+        serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    });
+    assert_eq!(expected.len(), 3);
+    assert_eq!(staged[0].lines().collect::<Vec<_>>(), expected);
+    // Inspect all retained checkpoints, including any recovery generation.
+    assert!(!staged[1].contains(&pending));
+    assert!(!staged[1].contains("session-b"));
+    let latest: serde_json::Value =
+        serde_json::from_str(staged[1].lines().next_back().unwrap()).unwrap();
+    let events = latest["history"]["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|table| table["table"] == "events")
+        .unwrap();
+    for id in [&first, &later] {
+        assert!(latest["history"]["issues"].get(id.as_str()).is_some());
+        assert!(
+            events["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row[1].as_str() == Some(id))
+        );
+    }
+    assert_eq!(working_pair(&workspace), working);
+    assert_eq!(get_head_commit(&workspace.root), head);
+    assert_eq!(git(&workspace, &["show", ":notes.txt"]), "already staged\n");
+
+    // A named revision is an actual alternate base. It can omit an issue
+    // from an earlier staging operation. Both IDs can then be staged at once.
+    br(&workspace, &["sync", "--stage", &later, "--base", "HEAD"]);
+    let rebased = git_pair(&workspace, "");
+    assert!(!rebased[0].contains(&first));
+    assert!(!rebased[1].contains(&first));
+    br(
+        &workspace,
+        &["sync", "--stage", &first, &later, "--base", "HEAD"],
+    );
+    let restaged = git_pair(&workspace, "");
+    assert_eq!(restaged[0], staged[0]);
+    br(&workspace, &["sync", "--check"]);
+
+    let unknown = run_br(
+        &workspace,
+        ["sync", "--stage", &pending, "test-unknown"],
+        "unknown",
+    );
+    assert!(
+        !unknown.status.success(),
+        "a bad ID must reject the whole selection"
+    );
+    assert_eq!(git_pair(&workspace, ""), restaged);
+
+    // A simultaneous Git writer owns this lock. Staging must respect it
+    // even when the two newly computed blobs are otherwise valid.
+    let lock = workspace.root.join(".git/index.lock");
+    fs::write(&lock, b"other writer").unwrap();
+    let busy = run_br(&workspace, ["sync", "--stage", &pending], "locked_index");
+    assert!(!busy.status.success());
+    assert_eq!(fs::read(&lock).unwrap(), b"other writer");
+    assert_eq!(git_pair(&workspace, ""), restaged);
+    assert_eq!(working_pair(&workspace), working);
+}
+
+#[test]
+fn selective_export_rejects_corrupt_pairs_before_updating_the_index() {
+    let (workspace, _) = baseline_workspace();
+    let selected = br(&workspace, &["q", "New row"]);
+    br(&workspace, &["sync", "--flush-only"]);
+    let working = working_pair(&workspace);
+    let mut reversed: Vec<_> = working[0].lines().collect();
+    reversed.reverse();
+    let duplicate = format!(
+        "{}{}\n",
+        working[0],
+        working[0].lines().next_back().unwrap()
+    );
+    let stale = working[0]
+        .lines()
+        .map(|row| {
+            let mut issue: serde_json::Value = serde_json::from_str(row).unwrap();
+            issue["updated_at"] = "2001-01-01T00:00:00Z".into();
+            issue.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let checksum = working[1].replace("\"history_sha256\":\"", "\"history_sha256\":\"0");
+    assert_ne!(checksum, working[1]);
+
+    // A damaged working companion cannot authorize a new staged checkpoint.
+    // Checking the valid index remains possible while that file is damaged.
+    let base = git_pair(&workspace, "");
+    fs::write(workspace.root.join(HISTORY), &checksum).unwrap();
+    br(&workspace, &["sync", "--check"]);
+    let damaged = run_br(
+        &workspace,
+        ["sync", "--stage", &selected],
+        "damaged_working",
+    );
+    assert!(!damaged.status.success());
+    assert_eq!(git_pair(&workspace, ""), base);
+    assert_eq!(
+        fs::read_to_string(workspace.root.join(HISTORY)).unwrap(),
+        checksum
+    );
+
+    for (label, issues, history) in [
+        ("row_order", reversed.join("\n"), &working[1]),
+        ("duplicate", duplicate, &working[1]),
+        ("stale_anchor", stale, &working[1]),
+        ("checksum", working[0].clone(), &checksum),
+    ] {
+        fs::write(workspace.root.join(ISSUES), issues).unwrap();
+        fs::write(workspace.root.join(HISTORY), history).unwrap();
+        git(&workspace, &["add", "--", ISSUES, HISTORY]);
+        fs::write(workspace.root.join(ISSUES), &working[0]).unwrap();
+        fs::write(workspace.root.join(HISTORY), &working[1]).unwrap();
+        let corrupt_index = git_pair(&workspace, "");
+        let check = run_br(&workspace, ["sync", "--check"], label);
+        assert!(!check.status.success(), "--check accepted {label}");
+        br(&workspace, &["sync", "--check", "HEAD"]);
+        let stage = run_br(&workspace, ["sync", "--stage", &selected], label);
+        assert!(!stage.status.success(), "--stage accepted {label}");
+        assert_eq!(git_pair(&workspace, ""), corrupt_index);
+        assert_eq!(working_pair(&workspace), working);
+    }
+}
 
 fn visit_dir(dir: &Path, base: &Path, hash_map: &mut BTreeMap<String, String>) {
     if let Ok(entries) = fs::read_dir(dir) {

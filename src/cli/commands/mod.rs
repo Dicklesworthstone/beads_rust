@@ -51,6 +51,7 @@ pub mod show;
 pub mod stale;
 pub mod stats;
 pub mod sync;
+pub mod sync_git_index;
 pub mod update;
 pub mod vcs;
 pub mod version;

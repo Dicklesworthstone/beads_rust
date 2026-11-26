@@ -2107,15 +2107,16 @@ Semantics:
 
 ### sync
 
-Sync database with JSONL file.
+Synchronize SQLite and JSONL, stage selected issues, or verify an export pair.
 
 ```bash
 br sync [OPTIONS]
 ```
 
 **SAFETY GUARANTEES:**
-- NEVER executes git commands or auto-commits
-- NEVER modifies files outside the selected workspace's `.beads/` (unless `--allow-external-jsonl`)
+- DB/JSONL synchronization runs independently of Git. `--stage` and `--check`
+  use local Git plumbing on explicit request. You make the commit yourself.
+- DB/JSONL writes default to the selected workspace's `.beads/`.
 - Publishes JSONL/base/manifest files with checked temporary-file replacement;
   database mutations use transactions and operation-specific rollback guards
 - Safety guards prevent accidental data loss
@@ -2127,6 +2128,8 @@ br sync [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--flush-only` | Export database to JSONL |
+| `--stage <ID>...` | Stage the named issues and their portable history as one Git index update |
+| `--check [REV]` | Verify the export pair in the Git index (default) or at a Git revision |
 | `--import-only` | Import JSONL into database |
 | `--merge` | Three-way merge `.beads/beads.base.jsonl`, SQLite, and JSONL |
 | `--reconcile` | Additively reconcile JSONL into the database (lossless, previewable) |
@@ -2142,6 +2145,7 @@ br sync [OPTIONS]
 | `--force-db` | With `--merge`, resolve conflicts by keeping the local SQLite version |
 | `--force-jsonl` | With `--merge`, resolve conflicts by keeping the JSONL version |
 | `--base <PATH>` | With `--merge`, use this file as the common ancestor instead of `.beads/beads.base.jsonl` (read-only; outside `.beads/` needs `--allow-external-jsonl`) |
+| `--base <REV>` | With `--stage`, compose the pair from this Git revision plus the selected working records. The default base is the index. |
 | `--allow-external-jsonl` | Allow JSONL path outside `.beads/` |
 | `--manifest` | Write manifest file with export summary |
 | `--error-policy <POLICY>` | Export error handling: strict, best-effort, partial, required-core |
@@ -2154,6 +2158,28 @@ br sync [OPTIONS]
 | `--expect-plan-sha256 <SHA256>` | Required with `--apply`; must equal the exact reviewed dry-run token |
 | `--resolve-source-id <ISSUE_ID>` | Explicitly choose the allowed non-lifecycle JSONL scalar fields for one reviewed shared-ID conflict when JSONL is not older; repeat per ID |
 | `--robot` | Machine-readable output |
+
+**Selective exports in a shared working tree**
+
+Run `br sync --flush-only` to make pending SQLite changes available in the
+working export. `br sync --stage br-abc br-def` copies the named issue rows
+and their history from the working pair into the staged pair. Other issue IDs
+retain their versions from the index. Additional invocations can stage more
+IDs. With `--base HEAD`, all unselected IDs instead come from the named
+revision, replacing any previously staged versions in the export pair.
+
+If both export paths are absent from the base, staging can seed a pair with
+the selected IDs. A partially missing pair, unknown ID, stale anchor, or
+checksum failure stops staging. Both paths are published together. The
+working exports and unrelated staged paths remain available for other work.
+
+Run `br sync --check` to validate the resulting index before committing. Run
+`br sync --check HEAD` to validate a committed pair. Both check issue ordering,
+unique IDs, history checksums, and correspondence between history anchors and
+issue rows. Use `git diff --cached` to review everything already staged, then
+`git commit` to commit the index. Sessions sharing an index should take turns
+staging, reviewing and committing. The atomic index update ends when
+`--stage` returns, so another session can change the index before the commit.
 
 **Merge semantics:**
 - `--merge` compares the local SQLite database and the current JSONL file against `.beads/beads.base.jsonl`, the workspace's last local export. That anchor is not proof that the JSONL ever contained the export, so a row missing from the JSONL is kept, and a differing JSONL row whose timestamp does not advance past the anchor and the local copy is reported as `AmbiguousBase`.
@@ -2298,7 +2324,7 @@ br sync --flush-only -v
 
 Explicitly inspect Git visibility for the configured JSONL export, or inventory
 tracked local database and recovery files. This is a separate, user-requested
-diagnostic capability; no `br sync` mode delegates to it or executes Git.
+diagnostic capability. Ordinary database/JSONL synchronization operates independently of Git.
 
 ```bash
 br vcs-status [--jsonl PATH] [--allow-external-jsonl] [--timeout-ms MILLISECONDS] [--json|--robot]

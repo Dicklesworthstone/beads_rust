@@ -10,8 +10,8 @@
 safety model for the `br sync` command, which synchronizes your SQLite database
 with a JSONL file for git-based collaboration.
 
-**Key safety principle**: with the default `.beads/` paths, `br sync` will never
-modify your source code or execute git commands. External JSONL paths require
+With the default `.beads/` paths, database/JSONL synchronization operates
+inside the workspace metadata directory without executing Git. External JSONL paths require
 explicit opt-in and remain subject to extension, symlink, traversal, and `.git/`
 guards.
 
@@ -30,8 +30,11 @@ guards.
 | **Source-path migration** (`--migrate-source-repo-path`) | Reconciles DB/JSONL rows and plans normalization of every `source_repo_path` to the canonical current workspace while preserving portable `source_repo` names |
 | **Rebuild** (`--import-only --rebuild`) | Treats JSONL as authoritative and rebuilds SQLite from it |
 | **Status** (`--status`) | Shows database/JSONL sync state without probing VCS |
+| **Stage** (`--stage <ID>...`) | Publishes selected issues and their portable history to the Git index in one update |
+| **Check** (`--check [REV]`) | Verifies issue ordering, unique IDs, history checksums and anchors for a staged or committed pair |
 
-All file I/O is confined to the `.beads/` directory by default.
+Ordinary sync modes default to files in `.beads/`. The two Git modes above
+require an explicit request. Staging writes the new blobs and the index.
 
 ---
 
@@ -39,14 +42,18 @@ All file I/O is confined to the `.beads/` directory by default.
 
 These are explicit design non-goals for the sync command. `br sync` will never:
 
-1. **Execute git commands** - No commits, no pushes, no staging
-2. **Modify files outside its sync allowlist** - Default writes stay in `.beads/`; external JSONL paths require explicit opt-in
+1. **Stage changes automatically** - Index publication requires `--stage` and exact issue IDs
+2. **Modify arbitrary worktree paths** - DB/JSONL writes default to `.beads/`; external JSONL paths require explicit opt-in
 3. **Install or invoke git hooks** - Fully manual hook setup if desired
 4. **Run as a daemon** - Simple CLI only, no background processes
 5. **Auto-commit changes** - Every git operation requires explicit user action
 6. **Connect to external services** - Offline-first, no network calls
 
 ### Writing your own pre-commit hook
+
+A hook that runs `git add .beads/` or stages the full working exports will
+override selective staging. When using `br sync --stage`, a validation-only
+hook can run `br sync --check` on the staged pair.
 
 If you add a hook that flushes and stages `.beads/issues.jsonl`, make it
 respect path-limited commits. `git commit --only <path>` and
@@ -565,8 +572,7 @@ metadata without attempting to attach a comment to the deleted issue.
 | **Complete-generation witness** | Applying after DB or JSONL changed | **None** - regenerate the plan |
 | **Commit-both recovery receipt** | An interruption leaving an unwitnessed DB/JSONL generation | **None** - the next migration/merge invocation resumes the pending receipt |
 
-The migration deliberately does not probe Git or infer staged/unstaged state;
-all `br sync` modes retain zero Git authority. Run `br vcs-status --json`
+The migration operates independently of Git. Run `br vcs-status --json`
 separately before applying when VCS state is part of the operator's review.
 
 ### Workspace write admission
@@ -958,7 +964,7 @@ This incident motivated every design decision in `br`'s safety model.
 
 | Layer | Protection | Failure Mode Blocked |
 |-------|------------|---------------------|
-| **No sync git operations** | `br sync` has no runtime git subprocess path | Eliminates the primary attack vector from the original incident |
+| **Explicit Git authority** | Only `--stage` and `--check` use Git during sync | Keeps automatic and ordinary DB/JSONL synchronization independent of Git |
 | **Sync write allowlist** | Default writes stay in `.beads/`; external JSONL writes require opt-in | Prevents accidental modification of source code, configs, or system files |
 | **Path validation** | Rejects `.git`, traversal (`../`), symlink escapes, and disallowed extensions | Blocks path injection attacks and symlink-based escapes |
 | **Checked publication and transactions** | JSONL/base/manifest publication uses checked temporary replacement; database mutations use transactions and operation-specific rollback | Prevents partial publication and partial database mutation |
@@ -990,7 +996,7 @@ The safety model is backed by an extensive test suite that ensures these guarant
 
 - **Path guard unit tests** (`sync::path::tests`): 22 tests verify that traversal attempts, external paths, and disallowed file types are rejected
 - **File tree snapshot tests** (`e2e_sync_git_safety.rs`): Integration tests take complete snapshots of the directory tree before and after sync, verifying that only `.beads/issues.jsonl` and related files are touched
-- **Authority sentinel matrix** (`e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation`): supported sync operations and distinct option branches run with a fake `git` first on `PATH`, detecting ordinary executable-name dispatch; every invocation compares the complete `.git` tree byte-for-byte with no exceptions. The source and runtime-dependency guards cover absolute-path, shell, linked-library, and sibling-adapter authority surfaces separately
+- **Authority sentinel matrix** (`e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation`): database/JSONL sync operations and distinct option branches run with a fake `git` first on `PATH`, detecting ordinary executable-name dispatch; every invocation compares the complete `.git` tree byte-for-byte with no exceptions. Separate selective-export tests exercise index publication and validation against real Git repositories.
 - **Fail-closed source validation** (`SyncSafetyValidator::validate_no_git_authority_in_sync_sources`): recursively scans both `src/sync/**/*.rs` and `src/cli/commands/sync.rs`, rejecting subprocess construction, inclusion escape hatches, Git libraries, process-capable CLI delegation, missing/unreadable/non-UTF-8 paths, symlinks, and unsupported special filesystem entries; a parsed Cargo-manifest check rejects direct normal and target-runtime Git-library edges, while `cargo tree -e normal` is the separate transitive runtime-closure gate
 - **Atomic write tests** (`e2e_sync_failure_injection.rs`): Tests inject failures mid-export to verify the original file is preserved
 - **Conflict marker tests**: Import preflight tests verify that merge conflicts are detected and rejected
@@ -1015,7 +1021,7 @@ If a safety guard triggers unexpectedly, the verbose log will show exactly why.
 
 ### The Core Guarantee
 
-With default `.beads/` paths, sync is deliberately constrained to its storage
+With default `.beads/` paths, database/JSONL sync is constrained to its storage
 allowlist and has no intended process, Git-library, or CLI-adapter authority.
 External JSONL access requires explicit opt-in.
 

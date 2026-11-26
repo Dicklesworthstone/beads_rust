@@ -133,7 +133,9 @@ the project `.gitignore`, `br config edit/set` updates config files,
 `br completions -o` writes shell completion files, `br upgrade` updates the
 installed binary, and git-reporting commands such as `br changelog`, `br
 orphans`, commit-activity `br stats`, and the explicitly requested bounded
-`br vcs-status` diagnostic inspect git state/history.
+`br vcs-status` diagnostic inspect git state/history. For a shared working
+tree, `br sync --stage` explicitly stages selected issue and history records,
+and `br sync --check` validates the staged pair or a named Git revision.
 
 ```bash
 # Normal issue state lives under .beads/
@@ -537,6 +539,22 @@ git add .beads/             # Stage changes
 git commit -m "Fix: login timeout (br-a1b2c3)"
 ```
 
+When several sessions share the same working tree, stage the issues for one
+commit by their exact IDs. The flush makes every session's changes available in
+the working exports. The staging command takes only the named issues and their
+history from those exports. It preserves the other issues already in the index.
+
+```bash
+br sync --flush-only
+br sync --stage br-a1b2c3 br-d4e5f6
+br sync --check
+git diff --cached --stat
+git commit -m "Fix login timeout and add retry coverage"
+```
+
+Commit the reviewed index directly. Running `git add .beads/` or `git commit -a`
+after selective staging would pick up other sessions' working changes again.
+
 ---
 
 ## Commands
@@ -675,6 +693,8 @@ for revision checks, actor semantics, and privacy limitations.
 | Command | Description | Example |
 |---------|-------------|---------|
 | `sync` | Explicit DB ↔ JSONL modes | `br sync --flush-only` |
+| `sync --stage` | Stage selected exported issues and their history | `br sync --stage br-a1b2c3 br-d4e5f6` |
+| `sync --check` | Validate the staged or committed export pair | `br sync --check HEAD` |
 | `sync --witness` | Read-only deterministic JSONL witness | `br sync --witness --robot` |
 | `sync --reconcile-additive` | Lossless exact-ID recovery plan/apply | `br sync --reconcile-additive --robot` |
 | `sync --migrate-source-repo-path` | Reconcile rows and normalize machine-specific source paths | `br sync --migrate-source-repo-path --robot` |
@@ -979,7 +999,7 @@ GitHub #384 acceptance matrix.
 | `BR_DISABLE_PARALLEL_JSONL_EXPORT` | Force the single-threaded JSONL export path |
 | `BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS` | Age after which `br doctor` reports `.write.lock` as stale (default 300) |
 | `BR_DOCTOR_PATH_WRAPPERS` | `PATH`-style list of intentional `br` wrappers or version-manager shims (the file, or the directory holding it); `br doctor` leaves them out of its duplicate-`br` check |
-| `BR_READ_ONLY` | Any value other than empty, `0`, `false`, `no` or `off` makes `br` run only read-only commands (reads, `--dry-run` previews, `sync --status` and `--witness`, `doctor` checks without `--repair`, `--bundle` or `--selftest`) with `--no-auto-import --no-auto-flush` implied; every other command is refused before the workspace is opened |
+| `BR_READ_ONLY` | Any value other than empty, `0`, `false`, `no` or `off` makes `br` run only read-only commands (reads, `--dry-run` previews, `sync --status`, `--witness` and `--check`, `doctor` checks without `--repair`, `--bundle` or `--selftest`) with `--no-auto-import --no-auto-flush` implied; every other command is refused before the workspace is opened |
 | `EDITOR` / `VISUAL` | Editor for `br config edit` |
 | `GITHUB_TOKEN` / `GH_TOKEN` | Authenticate the GitHub API calls made by `br upgrade` |
 | `XDG_CACHE_HOME` | Base directory for br's cache (default `~/.cache`) |
@@ -1044,7 +1064,7 @@ Pull from git       ──►      git pull         ──►    JSONL updated
 
 Bare `br sync` is intentionally refused; choose `--flush-only`, `--import-only`,
 `--merge`, `--reconcile`, `--reconcile-additive`,
-`--migrate-source-repo-path`, `--status`, or `--witness`
+`--migrate-source-repo-path`, `--status`, `--witness`, `--stage`, or `--check`
 so the data direction and authority are explicit. `br sync --status` never
 probes Git; run `br vcs-status --json` only when Git visibility is explicitly
 wanted.
@@ -1055,8 +1075,8 @@ wanted.
 
 | Guard | Implementation |
 |-----------|----------------|
-| Sync never executes git | No runtime `Command::new("git")` calls in `src/sync/` or `src/cli/commands/sync.rs` |
-| Sync uses an allowlist for writes | Default writes stay in `.beads/`; external JSONL paths require `--allow-external-jsonl` or an explicit external DB/JSONL family and `.git/` paths are still rejected |
+| Ordinary DB/JSONL sync operates independently of Git | Git access for `--stage` and `--check` requires an explicit request |
+| Scoped writes | DB/JSONL modes default to `.beads/`; selective staging publishes two export entries in one Git index update |
 | Checked publication and transactions | JSONL/base/manifest publication uses checked temporary replacement; database mutations use transactions and operation-specific rollback |
 | Refuse accidental issue loss on export | An empty or stale DB cannot overwrite JSONL rows it lacks unless they were explicitly purged or the operator uses `--force` |
 
@@ -1206,7 +1226,7 @@ br sync --migrate-source-repo-path --apply \
 
 The portable `source_repo` name is preserved. Apply uses the durable sync
 publication receipt so an interruption after the database commit or JSONL
-publication is resumed safely. Sync still does not probe Git; use
+publication is resumed safely. This migration does not probe Git; use
 `br vcs-status --json` separately when staged/worktree state matters.
 
 ### Sync Issues After Git Merge

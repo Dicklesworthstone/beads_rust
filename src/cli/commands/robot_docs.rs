@@ -14,9 +14,8 @@ const GUIDE: &str = r#"br Agent Guide
 
 Purpose:
   br is a local-first issue tracker. It stores primary state in SQLite and
-  exports .beads/issues.jsonl for git-friendly handoff. Normal issue and sync
-  paths never run git. Only an explicit br vcs-status request runs bounded,
-  read-only Git probes.
+  exports .beads/issues.jsonl for git-friendly handoff. Ordinary issue and
+  database/JSONL sync paths never run git. Use br vcs-status for Git diagnostics.
 
 Machine-output defaults:
   Use --json or --format json for scripts. Diagnostics and structured errors
@@ -47,7 +46,11 @@ Claiming work:
 Completing work:
   br close <id> --reason "Completed: <specific proof>" --json
   br sync --flush-only
-  Stage code and .beads changes together outside br.
+  In a shared working tree, stage your issues by exact ID:
+  br sync --stage <id>...
+  br sync --check
+  Stage your code, review git diff --cached, then commit the index.
+  A subsequent git add .beads/ would also stage other sessions' working changes.
 
 Discovery:
   br schema commands --format json
@@ -117,6 +120,14 @@ const CANONICAL_COMMANDS: &[CanonicalCommand] = &[
         task: "final JSONL export",
         command: "br sync --flush-only",
     },
+    CanonicalCommand {
+        task: "stage selected issues and history",
+        command: "br sync --stage <id>...",
+    },
+    CanonicalCommand {
+        task: "validate staged exports",
+        command: "br sync --check",
+    },
 ];
 
 /// Execute the robot-docs command.
@@ -166,11 +177,17 @@ mod tests {
 
     #[test]
     fn guide_scopes_git_authority_and_discovers_vcs_status() {
-        assert!(GUIDE.contains("Only an explicit br vcs-status request"));
-        assert!(
-            CANONICAL_COMMANDS
-                .iter()
-                .any(|entry| entry.command == "br vcs-status --json")
-        );
+        for command in [
+            "br vcs-status --json",
+            "br sync --stage <id>...",
+            "br sync --check",
+        ] {
+            assert!(GUIDE.contains(command));
+            assert!(
+                CANONICAL_COMMANDS
+                    .iter()
+                    .any(|entry| entry.command == command)
+            );
+        }
     }
 }

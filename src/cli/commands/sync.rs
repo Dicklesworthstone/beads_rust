@@ -820,6 +820,10 @@ fn resolve_sync_startup_paths(
     Ok((beads_dir, startup, path_policy))
 }
 
+pub(super) fn export_pair_path(args: &SyncArgs, cli: &config::CliOverrides) -> Result<PathBuf> {
+    Ok(resolve_sync_startup_paths(args, cli)?.2.jsonl_path)
+}
+
 /// Explicit rebuilds may prepare a fresh database when the original cannot
 /// open; the command retains its original backup until import succeeds.
 /// Rename, salvage, and reviewed reconciliation only defer initial loading of
@@ -845,6 +849,19 @@ fn sync_startup_recovery_strategy(args: &SyncArgs) -> config::JsonlRecoveryStrat
 /// `recover_database_from_jsonl` has already moved the existing DB aside.
 #[allow(clippy::too_many_lines)]
 pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
+    if (!args.stage.is_empty() || args.check.is_some())
+        && (args.force
+            || args.manifest
+            || args.orphans.is_some()
+            || args.error_policy.is_some()
+            || args.export_parallelism.is_some()
+            || args.rename_prefix)
+    {
+        return Err(BeadsError::validation(
+            "mode",
+            "Database import/export options cannot be combined with --stage or --check",
+        ));
+    }
     if args.skip_invalid_records && !args.import_only {
         return Err(BeadsError::Validation {
             field: "skip_invalid_records".to_string(),
@@ -952,6 +969,8 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
     }
 
     let mode_count = u8::from(args.status)
+        + u8::from(!args.stage.is_empty())
+        + u8::from(args.check.is_some())
         + u8::from(args.flush_only)
         + u8::from(args.import_only)
         + u8::from(args.merge)
@@ -963,7 +982,7 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify exactly one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
+                "Must specify exactly one of --stage, --check, --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
                     .to_string(),
         });
     }
@@ -971,7 +990,7 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
+                "Must specify one of --stage, --check, --flush-only, --import-only, --merge, --reconcile, --reconcile-additive, --migrate-source-repo-path, --status, or --witness"
                     .to_string(),
         });
     }
@@ -1037,10 +1056,10 @@ pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         });
     }
 
-    if args.merge_base.is_some() && !args.merge {
+    if args.merge_base.is_some() && !args.merge && args.stage.is_empty() {
         return Err(BeadsError::Validation {
             field: "base".to_string(),
-            reason: "--base can only be used with --merge".to_string(),
+            reason: "--base can only be used with --merge or --stage".to_string(),
         });
     }
 

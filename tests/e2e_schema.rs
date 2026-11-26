@@ -1071,9 +1071,10 @@ fn e2e_robot_docs_guide_text_is_concise() {
     assert!(lines <= 80, "guide should stay concise, got {lines} lines");
     assert!(run.stdout.contains("br capabilities --format json"));
     assert!(run.stdout.contains("br ready --json"));
-    // The guide's non-invasiveness promise ("Normal issue and sync paths
-    // never run git. Only an explicit br vcs-status request ...").
+    // Ordinary synchronization and explicit selective staging have different scopes.
     assert!(run.stdout.contains("never run git"));
+    assert!(run.stdout.contains("br sync --stage <id>..."));
+    assert!(run.stdout.contains("br sync --check"));
 }
 
 #[test]

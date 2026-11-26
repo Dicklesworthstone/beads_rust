@@ -6357,6 +6357,11 @@ impl<'de> Deserialize<'de> for DuplicateKeyRejectingJson {
     }
 }
 
+/// Parse one export record without silently discarding repeated JSON fields.
+pub(crate) fn parse_unique_json(text: &str) -> serde_json::Result<serde_json::Value> {
+    serde_json::from_str::<DuplicateKeyRejectingJson>(text).map(|json| json.0)
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
     const ISSUE_FIELDS: &[&str] = &[
@@ -6423,9 +6428,8 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
     ];
     const COMMENT_FIELDS: &[&str] = &["id", "issue_id", "author", "text", "created_at", "revision"];
 
-    let value = serde_json::from_str::<DuplicateKeyRejectingJson>(trimmed)
-        .map_err(|error| BeadsError::Config(format!("Invalid JSON at line {line_num}: {error}")))?
-        .0;
+    let value = parse_unique_json(trimmed)
+        .map_err(|error| BeadsError::Config(format!("Invalid JSON at line {line_num}: {error}")))?;
     let object = value.as_object().ok_or_else(|| {
         BeadsError::Config(format!(
             "Additive reconciliation source record at line {line_num} must be a JSON object"
@@ -6500,14 +6504,12 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
         }
     }
     if let Some(agent_context) = issue.agent_context.as_deref() {
-        let parsed = serde_json::from_str::<DuplicateKeyRejectingJson>(agent_context)
-            .map_err(|error| {
-                BeadsError::Config(format!(
-                    "Agent context for issue '{}' at line {line_num} is not duplicate-free JSON: {error}",
-                    issue.id
-                ))
-            })?
-            .0;
+        let parsed = parse_unique_json(agent_context).map_err(|error| {
+            BeadsError::Config(format!(
+                "Agent context for issue '{}' at line {line_num} is not duplicate-free JSON: {error}",
+                issue.id
+            ))
+        })?;
         let canonical = serde_json::to_string(&parsed).map_err(|error| {
             BeadsError::Config(format!(
                 "Agent context for issue '{}' at line {line_num} could not be canonicalized: {error}",

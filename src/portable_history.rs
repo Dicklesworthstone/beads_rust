@@ -14,6 +14,9 @@
 //! receipts that block affected protected gates until rework. Only a damaged
 //! companion file is an error.
 
+mod selective;
+pub use selective::{check_export_pair, compose_selected_export};
+
 use crate::error::{BeadsError, Result};
 use crate::storage::{
     PortableHistoryIssue, PortableHistoryReplay, PortableHistorySnapshot, SqliteStorage,
@@ -127,7 +130,10 @@ fn read_lines(path: &Path) -> Result<Vec<Checkpoint>> {
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(damaged("history companion must be a regular file"));
     }
-    let text = fs::read_to_string(path)?;
+    parse_checkpoints(&fs::read_to_string(path)?)
+}
+
+fn parse_checkpoints(text: &str) -> Result<Vec<Checkpoint>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (index, line) in text.lines().enumerate() {
@@ -201,15 +207,7 @@ fn anchors_of(text: &str) -> BTreeMap<String, PortableHistoryIssue> {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let field = |name: &str| value.get(name).and_then(Value::as_str);
-        let (Some(id), Some(created_at), Some(updated_at)) =
-            (field("id"), field("created_at"), field("updated_at"))
-        else {
-            continue;
-        };
-        // Import reads a missing status as the default one.
-        let status = field("status").unwrap_or(default_status.as_str());
-        let Some(anchor) = PortableHistoryIssue::canonical(status, created_at, updated_at) else {
+        let Some((id, anchor)) = row_anchor(&value, default_status.as_str()) else {
             continue;
         };
         if anchors.insert(id.to_owned(), anchor).is_some() {
@@ -220,6 +218,18 @@ fn anchors_of(text: &str) -> BTreeMap<String, PortableHistoryIssue> {
         anchors.remove(&id);
     }
     anchors
+}
+
+/// Read the exact stored status (including custom values) and use the v1
+/// timestamp canonicalization for the two fields that bind evidence to it.
+fn row_anchor<'a>(row: &'a Value, default_status: &str) -> Option<(&'a str, PortableHistoryIssue)> {
+    let field = |name: &str| row.get(name).and_then(Value::as_str);
+    let anchor = PortableHistoryIssue::canonical(
+        field("status").unwrap_or(default_status),
+        field("created_at")?,
+        field("updated_at")?,
+    )?;
+    Some((field("id")?, anchor))
 }
 
 pub fn stored_warnings(storage: &SqliteStorage) -> Result<Vec<String>> {

@@ -84,6 +84,16 @@ fn run(mut cli: Cli, json_error_mode: bool) -> Result<i32> {
     let command_supports_auto_import = should_auto_import(&cli.command);
     let mut overrides = build_cli_overrides(&cli);
 
+    // These explicit Git operations work on export blobs. They must also
+    // work in a fresh checkout where SQLite has never been initialized.
+    if let Commands::Sync(args) = &cli.command
+        && (args.check.is_some() || !args.stage.is_empty())
+    {
+        commands::sync_git_index::execute(args, &overrides, &output_ctx)?;
+        return Ok(beads_rust::output::take_output_serialization_failure()
+            .map_or(0, |error| error.exit_code()));
+    }
+
     // Validate the captured workspace before startup repair or automatic import
     // can mutate a database under a different workspace's policy/authority.
     if let Commands::Coordination {
@@ -2914,7 +2924,8 @@ const fn permitted_in_read_only_mode(cmd: &Commands) -> bool {
         // opened. Combined with another mode it is refused here, not admitted
         // on the strength of the other mode's startup.
         Commands::Sync(args)
-            if args.witness
+            if (args.witness || args.check.is_some())
+                && args.stage.is_empty()
                 && !(args.status
                     || args.flush_only
                     || args.import_only

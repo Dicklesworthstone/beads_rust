@@ -261,7 +261,7 @@ const SAFETY: &[SafetyCapability] = &[
     },
     SafetyCapability {
         name: "sync_path_allowlist",
-        guarantee: "sync writes stay inside .beads unless an external JSONL path is explicitly allowed.",
+        guarantee: "Database/JSONL sync writes default to .beads. Explicit sync --stage updates the export pair in the Git index.",
     },
     SafetyCapability {
         name: "write_lock_for_storage_mutations",
@@ -579,7 +579,9 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
             "`--hard` prunes tombstones from JSONL immediately and should be rare.",
         ],
         "sync" => &[
-            "br sync never runs git operations.",
+            "Database/JSONL synchronization runs independently of Git.",
+            "Use --stage <ID>... to publish selected working issue and history rows to the Git index.",
+            "Use --check to verify the staged pair or --check <REV> to verify a Git revision.",
             "External JSONL paths require both `BEADS_JSONL` and `--allow-external-jsonl`.",
             "Use `--status --json` or `--witness` for read-only diagnostics.",
         ],
@@ -1114,7 +1116,12 @@ fn command_contract(name: &str) -> CommandContract {
             operation: "mixed",
             workspace: "required",
             machine_output: &["json", "text"],
-            examples: &["br sync --status --json", "br sync --flush-only"],
+            examples: &[
+                "br sync --status --json",
+                "br sync --flush-only",
+                "br sync --stage <ID>...",
+                "br sync --check HEAD",
+            ],
         },
         "vcs-status" => CommandContract {
             operation: "read",
