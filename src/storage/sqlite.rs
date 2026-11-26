@@ -9797,12 +9797,17 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_issues_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>> {
-        // The pinned engine scans TEXT-key IN predicates, even for one ID.
-        // Keep singleton receipts on the primary-key lookup without changing
-        // the separate preservation decoder's intentional scan path.
-        if let [id] = ids {
-            return match Self::get_issue_row_from_conn(&self.conn, id)? {
-                Some(row) => {
+        // TEXT-key IN predicates scan the pinned engine. Keep ordinary result
+        // loading on point lookups without changing the preservation decoder's
+        // intentional scan path. Retain IN's duplicate semantics per input group.
+        let mut issues = Vec::new();
+        for chunk in ids.chunks(SQLITE_VAR_LIMIT) {
+            let mut seen = HashSet::with_capacity(chunk.len());
+            for id in chunk {
+                if !seen.insert(id.as_str()) {
+                    continue;
+                }
+                if let Some(row) = Self::get_issue_row_from_conn(&self.conn, id)? {
                     let issue = Self::issue_from_row(&row)?;
                     if issue.id != *id {
                         return Err(BeadsError::internal(format!(
@@ -9810,12 +9815,11 @@ impl SqliteStorage {
                             issue.id
                         )));
                     }
-                    Ok(vec![issue])
+                    issues.push(issue);
                 }
-                None => Ok(Vec::new()),
-            };
+            }
         }
-        self.get_issues_by_ids_with_decoder(ids, Self::issue_from_row)
+        Ok(issues)
     }
 
     fn get_issues_by_ids_with_decoder(
@@ -15074,45 +15078,35 @@ impl SqliteStorage {
         self.mutate("add_label_to_issues_bulk", actor, |conn, ctx| {
             let mut changed_ids = HashSet::new();
             let now_str = Utc::now().to_rfc3339();
+            let status_query = conn.prepare("SELECT id, status FROM issues WHERE id = ?")?;
 
-            // The existing-label probe binds one label plus every issue id, so
-            // reserve one parameter slot for the label value.
+            // Keep strict admission and the existing preflight groups. TEXT-key
+            // IN predicates scan this engine, so query each target by equality.
             for chunk in unique_issue_ids.chunks(SQLITE_VAR_LIMIT - 1) {
-                let placeholders = vec!["?"; chunk.len()];
-                let params = chunk
-                    .iter()
-                    .map(|id| SqliteValue::from(id.as_str()))
-                    .collect::<Vec<_>>();
-                // Even a singleton TEXT-key IN predicate scans on this engine.
-                let status_query = if unique_issue_ids.len() == 1 {
-                    "SELECT id, status FROM issues WHERE id = ?".to_string()
-                } else {
-                    format!(
-                        "SELECT id, status FROM issues WHERE id IN ({})",
-                        placeholders.join(",")
-                    )
-                };
-                let rows = conn.query_with_params(&status_query, &params)?;
-                let mut statuses = HashMap::with_capacity(rows.len());
-                for row in &rows {
-                    let id = row
-                        .get(0)
-                        .and_then(SqliteValue::as_text)
-                        .ok_or_else(|| {
-                            BeadsError::Config(
-                                "issues row missing id during bulk label add".to_string(),
-                            )
-                        })?
-                        .to_string();
-                    let status = row
-                        .get(1)
-                        .and_then(SqliteValue::as_text)
-                        .ok_or_else(|| {
-                            BeadsError::Config(format!(
-                                "issues row missing status during bulk label add for {id}"
-                            ))
-                        })?;
-                    statuses.insert(id, Status::from_str(status)?);
+                let mut statuses = HashMap::with_capacity(chunk.len());
+                for issue_id in chunk {
+                    let rows =
+                        status_query.query_with_params(&[SqliteValue::from(issue_id.as_str())])?;
+                    for row in &rows {
+                        let id = row
+                            .get(0)
+                            .and_then(SqliteValue::as_text)
+                            .ok_or_else(|| {
+                                BeadsError::Config(
+                                    "issues row missing id during bulk label add".to_string(),
+                                )
+                            })?
+                            .to_string();
+                        let status = row
+                            .get(1)
+                            .and_then(SqliteValue::as_text)
+                            .ok_or_else(|| {
+                                BeadsError::Config(format!(
+                                    "issues row missing status during bulk label add for {id}"
+                                ))
+                            })?;
+                        statuses.insert(id, Status::from_str(status)?);
+                    }
                 }
 
                 for issue_id in chunk {
@@ -15141,83 +15135,37 @@ impl SqliteStorage {
                     continue;
                 }
 
-                let mut label_params = Vec::with_capacity(chunk.len() + 1);
-                label_params.push(SqliteValue::from(label));
-                label_params.extend(chunk.iter().map(|id| SqliteValue::from(id.as_str())));
-                let existing_rows = conn.query_with_params(
-                    &format!(
-                        "SELECT issue_id FROM labels WHERE label = ? AND issue_id IN ({})",
-                        placeholders.join(",")
-                    ),
-                    &label_params,
-                )?;
-                let existing_ids = existing_rows
-                    .iter()
-                    .filter_map(|row| {
-                        row.get(0)
-                            .and_then(SqliteValue::as_text)
-                            .map(ToString::to_string)
-                    })
-                    .collect::<HashSet<_>>();
-                let missing_ids = chunk
-                    .iter()
-                    .filter(|issue_id| !existing_ids.contains(issue_id.as_str()))
-                    .collect::<Vec<_>>();
+                // A missing-label aggregate can fall back to a full scan.
+                // Read each target's bounded label prefix once for both
+                // membership and the cap, before mutating this group.
+                let label_query = conn.prepare("SELECT label FROM labels WHERE issue_id = ?")?;
+                let mut missing_ids = Vec::new();
+                for issue_id in chunk {
+                    let labels =
+                        label_query.query_with_params(&[SqliteValue::from(issue_id.as_str())])?;
+                    if labels
+                        .iter()
+                        .any(|row| row.get(0).and_then(SqliteValue::as_text) == Some(label))
+                    {
+                        continue;
+                    }
+                    if labels.len() >= ISSUE_LABEL_MAX_COUNT {
+                        return Err(label_count_error());
+                    }
+                    missing_ids.push(issue_id);
+                }
 
                 if missing_ids.is_empty() {
                     continue;
                 }
 
-                let missing_placeholders = vec!["?"; missing_ids.len()];
-                let missing_params = missing_ids
-                    .iter()
-                    .map(|id| SqliteValue::from(id.as_str()))
-                    .collect::<Vec<_>>();
-                let count_rows = conn.query_with_params(
-                    &format!(
-                        "SELECT issue_id, COUNT(*) FROM labels WHERE issue_id IN ({}) GROUP BY issue_id",
-                        missing_placeholders.join(",")
-                    ),
-                    &missing_params,
-                )?;
-                let mut label_counts = HashMap::with_capacity(count_rows.len());
-                for row in &count_rows {
-                    let issue_id = row
-                        .get(0)
-                        .and_then(SqliteValue::as_text)
-                        .ok_or_else(|| {
-                            BeadsError::Config(
-                                "labels row missing issue_id during bulk label add".to_string(),
-                            )
-                        })?
-                        .to_string();
-                    let count = row
-                        .get(1)
-                        .and_then(SqliteValue::as_integer)
-                        .and_then(|count| usize::try_from(count).ok())
-                        .unwrap_or(0);
-                    label_counts.insert(issue_id, count);
-                }
-
-                for issue_id in &missing_ids {
-                    if label_counts
-                        .get(issue_id.as_str())
-                        .copied()
-                        .unwrap_or(0)
-                        >= ISSUE_LABEL_MAX_COUNT
-                    {
-                        return Err(label_count_error());
-                    }
-                }
-
-                for issue_id in &missing_ids {
-                    conn.execute_with_params(
-                        "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
-                        &[
-                            SqliteValue::from(issue_id.as_str()),
-                            SqliteValue::from(label),
-                        ],
-                    )?;
+                let insert_label =
+                    conn.prepare("INSERT INTO labels (issue_id, label) VALUES (?, ?)")?;
+                for &issue_id in &missing_ids {
+                    insert_label.execute_with_params(&[
+                        SqliteValue::from(issue_id.as_str()),
+                        SqliteValue::from(label),
+                    ])?;
 
                     ctx.record_event(
                         EventType::LabelAdded,
@@ -15225,25 +15173,16 @@ impl SqliteStorage {
                         Some(format!("Added label {label}")),
                     );
                     ctx.mark_dirty(issue_id);
-                    changed_ids.insert((*issue_id).clone());
+                    changed_ids.insert(issue_id.clone());
                 }
 
-                for update_chunk in missing_ids.chunks(SQLITE_VAR_LIMIT - 1) {
-                    let update_placeholders = vec!["?"; update_chunk.len()];
-                    let mut update_params = Vec::with_capacity(update_chunk.len() + 1);
-                    update_params.push(SqliteValue::from(now_str.as_str()));
-                    update_params.extend(
-                        update_chunk
-                            .iter()
-                            .map(|issue_id| SqliteValue::from(issue_id.as_str())),
-                    );
-                    conn.execute_with_params(
-                        &format!(
-                            "UPDATE issues SET updated_at = ? WHERE id IN ({})",
-                            update_placeholders.join(",")
-                        ),
-                        &update_params,
-                    )?;
+                let update_timestamp =
+                    conn.prepare("UPDATE issues SET updated_at = ? WHERE id = ?")?;
+                for issue_id in missing_ids {
+                    update_timestamp.execute_with_params(&[
+                        SqliteValue::from(now_str.as_str()),
+                        SqliteValue::from(issue_id.as_str()),
+                    ])?;
                 }
             }
 
@@ -15346,41 +15285,31 @@ impl SqliteStorage {
         self.mutate("remove_label_from_issues_bulk", actor, |conn, ctx| {
             let mut changed_ids = HashSet::new();
             let now_str = Utc::now().to_rfc3339();
+            let status_query = conn.prepare("SELECT id, status FROM issues WHERE id = ?")?;
 
-            // Label lookups/deletes bind one label plus every issue id, so
-            // reserve one parameter slot for the label value.
+            // Retain preflight groups while bounding every lookup to a target.
             for chunk in unique_issue_ids.chunks(SQLITE_VAR_LIMIT - 1) {
-                let placeholders = vec!["?"; chunk.len()];
-                let params = chunk
-                    .iter()
-                    .map(|id| SqliteValue::from(id.as_str()))
-                    .collect::<Vec<_>>();
-                let status_query = if unique_issue_ids.len() == 1 {
-                    "SELECT id, status FROM issues WHERE id = ?".to_string()
-                } else {
-                    format!(
-                        "SELECT id, status FROM issues WHERE id IN ({})",
-                        placeholders.join(",")
-                    )
-                };
-                let rows = conn.query_with_params(&status_query, &params)?;
-                let mut statuses = HashMap::with_capacity(rows.len());
-                for row in &rows {
-                    let id = row
-                        .get(0)
-                        .and_then(SqliteValue::as_text)
-                        .ok_or_else(|| {
-                            BeadsError::Config(
-                                "issues row missing id during bulk label remove".to_string(),
-                            )
-                        })?
-                        .to_string();
-                    let status = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
-                        BeadsError::Config(format!(
-                            "issues row missing status during bulk label remove for {id}"
-                        ))
-                    })?;
-                    statuses.insert(id, Status::from_str(status)?);
+                let mut statuses = HashMap::with_capacity(chunk.len());
+                for issue_id in chunk {
+                    let rows =
+                        status_query.query_with_params(&[SqliteValue::from(issue_id.as_str())])?;
+                    for row in &rows {
+                        let id = row
+                            .get(0)
+                            .and_then(SqliteValue::as_text)
+                            .ok_or_else(|| {
+                                BeadsError::Config(
+                                    "issues row missing id during bulk label remove".to_string(),
+                                )
+                            })?
+                            .to_string();
+                        let status = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+                            BeadsError::Config(format!(
+                                "issues row missing status during bulk label remove for {id}"
+                            ))
+                        })?;
+                        statuses.insert(id, Status::from_str(status)?);
+                    }
                 }
 
                 for issue_id in chunk {
@@ -15409,75 +15338,40 @@ impl SqliteStorage {
                     continue;
                 }
 
-                let mut label_params = Vec::with_capacity(chunk.len() + 1);
-                label_params.push(SqliteValue::from(label));
-                label_params.extend(chunk.iter().map(|id| SqliteValue::from(id.as_str())));
-                let existing_rows = conn.query_with_params(
-                    &format!(
-                        "SELECT issue_id FROM labels WHERE label = ? AND issue_id IN ({})",
-                        placeholders.join(",")
-                    ),
-                    &label_params,
-                )?;
-                let removable_ids = existing_rows
-                    .iter()
-                    .filter_map(|row| {
-                        row.get(0)
-                            .and_then(SqliteValue::as_text)
-                            .map(ToString::to_string)
-                    })
-                    .collect::<HashSet<_>>();
+                // Put the issue predicate first: this engine chooses the first
+                // indexed equality, and a label-first probe can visit every
+                // other issue carrying a common label.
+                let delete_label =
+                    conn.prepare("DELETE FROM labels WHERE issue_id = ? AND label = ?")?;
+                let mut removable_ids = Vec::new();
+                for issue_id in chunk {
+                    if delete_label.execute_with_params(&[
+                        SqliteValue::from(issue_id.as_str()),
+                        SqliteValue::from(label),
+                    ])? > 0
+                    {
+                        removable_ids.push(issue_id);
+                    }
+                }
 
                 if removable_ids.is_empty() {
                     continue;
                 }
 
-                let removable_ids = chunk
-                    .iter()
-                    .filter(|issue_id| removable_ids.contains(issue_id.as_str()))
-                    .collect::<Vec<_>>();
-                let remove_placeholders = vec!["?"; removable_ids.len()];
-                let mut remove_params = Vec::with_capacity(removable_ids.len() + 1);
-                remove_params.push(SqliteValue::from(label));
-                remove_params.extend(
-                    removable_ids
-                        .iter()
-                        .map(|issue_id| SqliteValue::from(issue_id.as_str())),
-                );
-                conn.execute_with_params(
-                    &format!(
-                        "DELETE FROM labels WHERE label = ? AND issue_id IN ({})",
-                        remove_placeholders.join(",")
-                    ),
-                    &remove_params,
-                )?;
-
-                for issue_id in &removable_ids {
+                let update_timestamp =
+                    conn.prepare("UPDATE issues SET updated_at = ? WHERE id = ?")?;
+                for issue_id in removable_ids {
                     ctx.record_event(
                         EventType::LabelRemoved,
                         issue_id,
                         Some(format!("Removed label {label}")),
                     );
                     ctx.mark_dirty(issue_id);
-                    changed_ids.insert((*issue_id).clone());
-                }
-
-                for update_chunk in removable_ids.chunks(SQLITE_VAR_LIMIT - 1) {
-                    let update_placeholders = vec!["?"; update_chunk.len()];
-                    let mut update_params = Vec::with_capacity(update_chunk.len() + 1);
-                    update_params.push(SqliteValue::from(now_str.as_str()));
-                    update_params.extend(
-                        update_chunk
-                            .iter()
-                            .map(|issue_id| SqliteValue::from(issue_id.as_str())),
-                    );
-                    conn.execute_with_params(
-                        &format!(
-                            "UPDATE issues SET updated_at = ? WHERE id IN ({})",
-                            update_placeholders.join(",")
-                        ),
-                        &update_params,
-                    )?;
+                    changed_ids.insert(issue_id.clone());
+                    update_timestamp.execute_with_params(&[
+                        SqliteValue::from(now_str.as_str()),
+                        SqliteValue::from(issue_id.as_str()),
+                    ])?;
                 }
             }
 
@@ -15679,49 +15573,36 @@ impl SqliteStorage {
         &self,
         issue_ids: &[String],
     ) -> Result<HashMap<String, Vec<String>>> {
-        // Stay below SQLite's common 999-variable ceiling while keeping the
-        // default scheduler candidate window to one evidence-loading round trip.
-        const SQLITE_VAR_LIMIT: usize = 900;
-
         if issue_ids.is_empty() {
             return Ok(HashMap::new());
         }
 
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
-
-        // SQLite has a finite variable limit (default 999). Chunk to avoid query failures.
+        // Reuse an ordered index-prefix lookup rather than scanning for a
+        // TEXT-key IN list. Keep the existing per-group duplicate behavior.
+        let query = self.conn.prepare(
+            "SELECT issue_id, label FROM labels WHERE issue_id = ? ORDER BY issue_id, label",
+        )?;
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
-            // TEXT-key IN predicates scan even for one ID on the pinned engine.
-            // Equality permits a bounded ordered prefix of the label index.
-            let sql = if chunk.len() == 1 {
-                "SELECT issue_id, label FROM labels WHERE issue_id = ? ORDER BY issue_id, label"
-                    .to_string()
-            } else {
-                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-                format!(
-                    "SELECT issue_id, label FROM labels WHERE issue_id IN ({}) ORDER BY issue_id, label",
-                    placeholders.join(",")
-                )
-            };
-
-            let params: Vec<SqliteValue> = chunk
-                .iter()
-                .map(|s| SqliteValue::from(s.as_str()))
-                .collect();
-
-            let rows = self.conn.query_with_params(&sql, &params)?;
-            for row in &rows {
-                let issue_id = row
-                    .get(0)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
-                let label = row
-                    .get(1)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
-                map.entry(issue_id).or_default().push(label);
+            let mut seen = HashSet::with_capacity(chunk.len());
+            for issue_id in chunk {
+                if !seen.insert(issue_id.as_str()) {
+                    continue;
+                }
+                let rows = query.query_with_params(&[SqliteValue::from(issue_id.as_str())])?;
+                for row in &rows {
+                    let issue_id = row
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or("")
+                        .to_string();
+                    let label = row
+                        .get(1)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or("")
+                        .to_string();
+                    map.entry(issue_id).or_default().push(label);
+                }
             }
         }
 
@@ -33346,7 +33227,7 @@ required_fields:
         }
 
         let expected = HashMap::from([
-            (id_a.clone(), labels_a),
+            (id_a.clone(), labels_a.clone()),
             (id_b.clone(), vec!["bravo".to_string()]),
         ]);
         assert_eq!(
@@ -33362,14 +33243,38 @@ required_fields:
             expected
         );
 
-        let mut chunked_ids = vec![id_b];
+        let mut chunked_ids = vec![id_b.clone()];
         chunked_ids
             .extend((1..SQLITE_VAR_LIMIT).map(|index| format!("bd-label-map-missing-{index:04}")));
-        chunked_ids.push(id_a);
+        chunked_ids.push(id_a.clone());
         assert_eq!(
             storage.get_labels_for_issues(&chunked_ids).unwrap(),
             expected
         );
+
+        // Match IN-query semantics: deduplicate within each input chunk, but
+        // retain a second occurrence when the same ID appears in another chunk.
+        let mut duplicate_ids = vec![id_b.clone(), id_a.clone(), id_a.clone()];
+        duplicate_ids.resize(SQLITE_VAR_LIMIT, "bd-label-map-missing".to_string());
+        duplicate_ids.extend([id_a.clone(), id_b.clone(), id_a.clone()]);
+        let mut repeated_labels_a = labels_a.clone();
+        repeated_labels_a.extend(labels_a);
+        assert_eq!(
+            storage.get_labels_for_issues(&duplicate_ids).unwrap(),
+            HashMap::from([
+                (id_a.clone(), repeated_labels_a),
+                (id_b.clone(), vec!["bravo".to_string(), "bravo".to_string()]),
+            ])
+        );
+
+        let mut returned_ids = storage
+            .get_issues_by_ids(&duplicate_ids)
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect::<Vec<_>>();
+        returned_ids.sort();
+        assert_eq!(returned_ids, vec![id_a.clone(), id_a, id_b.clone(), id_b]);
     }
 
     #[test]
@@ -34318,13 +34223,20 @@ required_fields:
         let mut storage = SqliteStorage::open(&database).unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
 
-        for id in ["bd-bulk-a", "bd-bulk-b", "bd-bulk-c"] {
+        let issue_ids = ["bd-bulk-a", "bd-bulk-b", "bd-bulk-c"];
+        for id in issue_ids {
             let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
             storage.create_issue(&issue, "tester").unwrap();
         }
         storage
             .add_label("bd-bulk-b", "bulk-added", "tester")
             .unwrap();
+        let before = issue_ids.map(|id| {
+            (
+                storage.get_issue(id).unwrap().unwrap().updated_at,
+                storage.get_events(id, 0).unwrap(),
+            )
+        });
         storage.clear_all_dirty_issues().unwrap();
         drop(storage);
         let mut storage = SqliteStorage::open(&database).unwrap();
@@ -34337,7 +34249,7 @@ required_fields:
             "bd-bulk-a".to_string(),
         ];
         let changed = storage
-            .add_label_to_issues_bulk(&ids, "bulk-added", "tester")
+            .add_label_to_issues_bulk(&ids, "bulk-added", "bulk-tester")
             .unwrap();
         let expected = ["bd-bulk-a", "bd-bulk-c"]
             .into_iter()
@@ -34345,7 +34257,7 @@ required_fields:
             .collect::<HashSet<_>>();
         assert_eq!(changed, expected);
 
-        for id in ["bd-bulk-a", "bd-bulk-b", "bd-bulk-c"] {
+        for id in issue_ids {
             assert!(
                 storage
                     .get_labels(id)
@@ -34366,6 +34278,40 @@ required_fields:
             0,
             "bulk label writes and readback must not hydrate the store"
         );
+
+        let changed_at = storage.get_issue(issue_ids[0]).unwrap().unwrap().updated_at;
+        for (id, (updated_before, events_before)) in issue_ids.into_iter().zip(before) {
+            let issue = storage.get_issue(id).unwrap().unwrap();
+            let events = storage.get_events(id, 0).unwrap();
+            if expected.contains(id) {
+                assert_eq!(issue.updated_at, changed_at);
+                assert_ne!(issue.updated_at, updated_before);
+                assert_eq!(events.len(), events_before.len() + 1);
+                assert!(events_before.iter().all(|event| events.contains(event)));
+                let event = events
+                    .iter()
+                    .find(|event| !events_before.contains(event))
+                    .unwrap();
+                assert_eq!(event.event_type, EventType::LabelAdded);
+                assert_eq!(event.actor, "bulk-tester");
+                assert_eq!(event.comment.as_deref(), Some("Added label bulk-added"));
+                assert!(event.old_value.is_none());
+                assert!(event.new_value.is_none());
+            } else {
+                assert_eq!(issue.updated_at, updated_before);
+                assert_eq!(events, events_before);
+            }
+        }
+
+        storage.clear_all_dirty_issues().unwrap();
+        let before_noop = label_update_rows(&storage);
+        assert!(
+            storage
+                .add_label_to_issues_bulk(&ids, "bulk-added", "bulk-tester")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(label_update_rows(&storage), before_noop);
     }
 
     #[test]
@@ -34391,6 +34337,25 @@ required_fields:
         let mut dirty = storage.get_dirty_issue_ids().unwrap();
         dirty.sort();
         assert_eq!(dirty, ids);
+
+        storage.clear_all_dirty_issues().unwrap();
+        let missing_id = "bd-bulk-boundary-missing";
+        let mut with_missing = ids.clone();
+        with_missing.push(missing_id.to_string());
+        let before = label_update_rows(&storage);
+        for add in [true, false] {
+            let error = if add {
+                storage.add_label_to_issues_bulk(&with_missing, "must-roll-back", "tester")
+            } else {
+                storage.remove_label_from_issues_bulk(&with_missing, "bulk-boundary", "tester")
+            }
+            .unwrap_err();
+            assert!(
+                matches!(&error, BeadsError::IssueNotFound { id } if id == missing_id),
+                "{error:?}"
+            );
+            assert_eq!(label_update_rows(&storage), before);
+        }
     }
 
     #[test]
@@ -34458,7 +34423,8 @@ required_fields:
         let mut storage = SqliteStorage::open(&database).unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
 
-        for id in ["bd-bulk-remove-a", "bd-bulk-remove-b", "bd-bulk-remove-c"] {
+        let issue_ids = ["bd-bulk-remove-a", "bd-bulk-remove-b", "bd-bulk-remove-c"];
+        for id in issue_ids {
             let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
             storage.create_issue(&issue, "tester").unwrap();
         }
@@ -34468,6 +34434,12 @@ required_fields:
         storage
             .add_label("bd-bulk-remove-c", "bulk-removed", "tester")
             .unwrap();
+        let before = issue_ids.map(|id| {
+            (
+                storage.get_issue(id).unwrap().unwrap().updated_at,
+                storage.get_events(id, 0).unwrap(),
+            )
+        });
         storage.clear_all_dirty_issues().unwrap();
         drop(storage);
         let mut storage = SqliteStorage::open(&database).unwrap();
@@ -34480,7 +34452,7 @@ required_fields:
             "bd-bulk-remove-a".to_string(),
         ];
         let changed = storage
-            .remove_label_from_issues_bulk(&ids, "bulk-removed", "tester")
+            .remove_label_from_issues_bulk(&ids, "bulk-removed", "bulk-tester")
             .unwrap();
         let expected = ["bd-bulk-remove-a", "bd-bulk-remove-c"]
             .into_iter()
@@ -34488,7 +34460,7 @@ required_fields:
             .collect::<HashSet<_>>();
         assert_eq!(changed, expected);
 
-        for id in ["bd-bulk-remove-a", "bd-bulk-remove-b", "bd-bulk-remove-c"] {
+        for id in issue_ids {
             assert!(
                 !storage
                     .get_labels(id)
@@ -34512,6 +34484,40 @@ required_fields:
             0,
             "bulk label writes and readback must not hydrate the store"
         );
+
+        let changed_at = storage.get_issue(issue_ids[0]).unwrap().unwrap().updated_at;
+        for (id, (updated_before, events_before)) in issue_ids.into_iter().zip(before) {
+            let issue = storage.get_issue(id).unwrap().unwrap();
+            let events = storage.get_events(id, 0).unwrap();
+            if expected.contains(id) {
+                assert_eq!(issue.updated_at, changed_at);
+                assert_ne!(issue.updated_at, updated_before);
+                assert_eq!(events.len(), events_before.len() + 1);
+                assert!(events_before.iter().all(|event| events.contains(event)));
+                let event = events
+                    .iter()
+                    .find(|event| !events_before.contains(event))
+                    .unwrap();
+                assert_eq!(event.event_type, EventType::LabelRemoved);
+                assert_eq!(event.actor, "bulk-tester");
+                assert_eq!(event.comment.as_deref(), Some("Removed label bulk-removed"));
+                assert!(event.old_value.is_none());
+                assert!(event.new_value.is_none());
+            } else {
+                assert_eq!(issue.updated_at, updated_before);
+                assert_eq!(events, events_before);
+            }
+        }
+
+        storage.clear_all_dirty_issues().unwrap();
+        let before_noop = label_update_rows(&storage);
+        assert!(
+            storage
+                .remove_label_from_issues_bulk(&ids, "bulk-removed", "bulk-tester")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(label_update_rows(&storage), before_noop);
     }
 
     #[test]
