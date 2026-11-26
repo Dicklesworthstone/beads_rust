@@ -124,13 +124,75 @@ change the pinned engine version.
 checks the engine's per-connection hydrated-row counter, with the ordinary
 engine opener as a positive control. It also checks rollback, savepoints,
 committed WAL state, long descriptions and unrelated audit rows. This bounds
-compatibility-mirror hydration; full JSONL synchronization and cold WAL
-validation retain their separate costs.
+compatibility-mirror hydration, not all row materialization, page reads, process
+memory or command latency. The test's full-table preservation queries also
+leave this counter at zero. Full JSONL synchronization and WAL validation
+retain their separate costs.
 
 Additional regressions require missing, stale and malformed migration markers
 to be repaired before bounded reopening, verify a symlink alias uses the real
 database's marker, and check file-backed bulk label writes preserve exact
 dirty-ID tracking without hydrating unrelated rows.
+
+#### Interpreting the scaling bound
+
+The bound removes one source of work proportional to unrelated stored payload:
+the optional whole-store compatibility mirror. It is not an `O(1)` guarantee
+for `br update`. Qualify the ordinary steady-state case using exact issue IDs,
+current migration markers, fixed target payloads and graph shape, and an
+explicit synchronization policy. Measure peak RSS, CPU and elapsed time
+separately; the hydration counter cannot stand in for any of them.
+
+Several independent dimensions remain:
+
+| Dimension | Remaining work |
+|---|---|
+| WAL bytes | Application schema preflight reads and checksums the valid WAL frame prefix on **every writable open**, even with a warm filesystem or engine index. Its read/CPU work is proportional to that prefix; its scan buffer is one frame. |
+| Issue lookup and SQL plans | Exact IDs avoid the all-ID resolution pass used for partial IDs. The one-label bulk path still uses text-key `IN (...)` queries for issue validation, timestamp updates and readback. The pinned 0.4.10 engine scans the issue table for that query shape. |
+| Target payload and graph | Scalar changes can hash the target's full content. Status/dependency changes can inspect the parent-child graph or rebuild a stale blocked cache. These costs are outside the label-only point-write claim. |
+| Synchronization | Default auto-import/flush and portable history can inspect or rewrite store-sized data while writer authority remains held. Measurements using `--no-auto-import --no-auto-flush` must retain that qualification. |
+| Admission and teardown | Required first-open migrations, schema repair, WAL recovery and sole-opener checkpoints are separate from current-marker steady state. Other openers can delay checkpointing and sustain a larger WAL. |
+| Concurrent writers | Writers still serialize. Single-process improvements do not establish queue latency, aggregate memory or concurrent throughput. |
+
+Compare both implementations live in the same benchmark invocation. For causal
+attribution, keep the source, locked dependencies and build profile identical
+and restore only the ordinary opener in a separate control build. A released
+binary is a useful additional baseline, but differences from that release
+cannot all be assigned to this fix. Report the observed size range and keep
+WAL growth, migration and default-sync experiments distinct from the
+checkpointed exact-ID label matrix.
+
+In particular, `issues.id` is a text primary key. The pinned VDBE's indexed
+`IN` fast paths accept integer-literal index probes or rowid/integer-primary-key
+probes; the label path's text-ID bind list does not qualify. Its SELECT path
+falls through to a table scan, and its UPDATE path scans to collect matching
+rowids before changing them. `WHERE id = ?` is a separate indexed-equality
+path. Thus bounded changed-row counts coexist with a remaining linear
+issue-count term. Lazy column decoding can skip unrelated long descriptions,
+so a scan is not equivalent to recreating the removed whole-store mirror.
+
+These access-path observations are source findings for the locked engine
+([VDBE code generation at the published 0.4.10 revision](https://github.com/Dicklesworthstone/frankensqlite/blob/92aeb2b9762f2f38154fde74c4055959c6ebe294/crates/fsqlite-vdbe/src/codegen.rs)),
+not measured speedups. When collecting query-plan evidence, inspect UPDATE
+bytecode as well as `EXPLAIN QUERY PLAN`: the generic explainer's `SEARCH`
+label for an `OpenWrite` cursor does not exclude a preceding collection scan.
+
+`scripts/bench_bounded_write.py` runs the paired CLI matrix. It retains binary
+and source identifiers, fixture hashes, individual samples and exact
+payload/label/dirty-ID/audit checks. A small native supervisor
+(`scripts/bench_bounded_write_usage.c`, compiled with a C compiler during
+setup) measures each CLI child's own peak RSS. Directly calling `wait4` on a
+child of the Python campaign can inherit the campaign's growing resident
+memory before exec and fabricate a memory slope. The supervisor's separate
+exec and fork keep fixture/verification memory out of that measurement.
+
+The default matrix uses 1,000, 4,000 and 16,000 issues with 10,000-byte
+descriptions, first/middle/last exact IDs and real add/remove operations.
+`--writers 4,16` adds same-target writer waves at the largest size.
+`--retain-wal --wal-growth-updates N` selects a separate retained-WAL run;
+samples also grow that WAL, so interpret the recorded before/after ranges
+rather than treating the group as a fixed WAL size. These synthetic fixtures
+do not by themselves qualify large comment histories or dependency graphs.
 
 ### Observational read startup (#585, #586, #596)
 

@@ -1,0 +1,90 @@
+{
+  "arguments": {
+    "baseline": "/workspace/scratch/9de04f53ce15/released/br",
+    "baseline_lockfile": null,
+    "baseline_source": "v0.7.6-harness-smoke",
+    "candidate": "/workspace/scratch/9de04f53ce15/released/br",
+    "candidate_lockfile": null,
+    "candidate_source": "v0.7.6-harness-smoke",
+    "cc": "cc",
+    "comparison_kind": "calibration",
+    "description_bytes": 10000,
+    "lock_timeout_ms": 120000,
+    "notes": "Harness retained-WAL smoke only; identical released executables; no candidate performance claim",
+    "output": "/workspace/scratch/9de04f53ce15/bounded_write_retained_smoke_01",
+    "repeats": 1,
+    "reserve_mib": 512,
+    "retain_wal": true,
+    "sizes": [
+      8
+    ],
+    "targets": "first,middle,last",
+    "timeout_seconds": 600,
+    "wal_growth_updates": 2,
+    "warmups": 0,
+    "writer_repeats": 1,
+    "writers": [
+      4
+    ]
+  },
+  "benchmark_sha256": "5e3175f6804f0c3c4868e5eae244e414e577daea3bdefddbaf4c16371000618c",
+  "binaries": {
+    "baseline": {
+      "lockfile": null,
+      "path": "/workspace/scratch/9de04f53ce15/released/br",
+      "sha256": "73cbef7f11680b8349ef5b465d002e404272cc6c06b0f95a86035b488b1844b9",
+      "source": "v0.7.6-harness-smoke",
+      "version": "br 0.7.6"
+    },
+    "candidate": {
+      "lockfile": null,
+      "path": "/workspace/scratch/9de04f53ce15/released/br",
+      "sha256": "73cbef7f11680b8349ef5b465d002e404272cc6c06b0f95a86035b488b1844b9",
+      "source": "v0.7.6-harness-smoke",
+      "version": "br 0.7.6"
+    }
+  },
+  "comparison_kind": "calibration",
+  "cpu_count": 9,
+  "environment_policy": "remove BR_/BEADS_/BD_/FSQLITE_/TOON_ and preload overrides; pin BEADS_DIR and actor",
+  "load_average": [
+    7.50244140625,
+    9.42822265625,
+    6.962890625
+  ],
+  "lock_scope": "end-to-end child duration includes queue wait; lock hold is not instrumented",
+  "notes": "Harness retained-WAL smoke only; identical released executables; no candidate performance claim",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+  "python": "3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]",
+  "rss_units": "wait4 bytes on Darwin; wait4 KiB converted to bytes on Linux",
+  "schema": "br.bounded-write-benchmark.v1",
+  "source_binding": "operator-supplied identifiers; binary hashes verified",
+  "time_utc": "2026-11-26T01:39:30.454469+00:00",
+  "timing": "fresh C supervisor per child; monotonic child wall; per-PID wait4 CPU/RSS; warm filesystem; untimed verification",
+  "usage_supervisor": {
+    "command": [
+      "/usr/bin/cc",
+      "-std=c11",
+      "-O2",
+      "-Wall",
+      "-Wextra",
+      "-Werror",
+      "/workspace/scratch/9de04f53ce15/bounded_write_retained_smoke_01/bench_bounded_write_usage.c",
+      "-o",
+      "/workspace/scratch/9de04f53ce15/bounded_write_retained_smoke_01/bounded-write-usage"
+    ],
+    "compiler": "/usr/bin/cc",
+    "compiler_version": "cc (Debian 14.2.0-19) 14.2.0\nCopyright (C) 2024 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+    "executable": {
+      "bytes": 16736,
+      "path": "/workspace/scratch/9de04f53ce15/bounded_write_retained_smoke_01/bounded-write-usage",
+      "sha256": "d6f0ec1a74dfc1d727014aa230e3220bfdff309f0ea24035d42305908ea4a924"
+    },
+    "source": {
+      "bytes": 5145,
+      "path": "/workspace/scratch/9de04f53ce15/bounded_write_retained_smoke_01/bench_bounded_write_usage.c",
+      "sha256": "487ddef0284b2a6089b5dd6fc74c28007d41b2069023a53dd0b865e59b54901c"
+    }
+  },
+  "wal_mode": "retained"
+}

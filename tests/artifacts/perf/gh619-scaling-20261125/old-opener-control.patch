@@ -1,0 +1,22 @@
+diff --git a/src/franken_sync.rs b/src/franken_sync.rs
+index cf2d52a..583014c 100644
+--- a/src/franken_sync.rs
++++ b/src/franken_sync.rs
+@@ -360,7 +360,7 @@ impl Connection {
+         let path = path.into();
+         wal_index::quarantine_poisoned_index(&path, identity)?;
+         let inner = drive(
+-            fsqlite::Connection::open_existing_schema_only_with_expected_identity(path, identity),
++            fsqlite::Connection::open_existing_with_expected_identity(path, identity),
+         )?;
+         #[cfg(not(target_arch = "wasm32"))]
+         fsqlite_observability::metrics_net::autostart_from_env();
+@@ -409,7 +409,7 @@ impl Connection {
+         let opened = if let Some(canonical) = schema_only_path.as_ref() {
+             // Do not retry a refused existing-only open with a creating opener:
+             // disappearance, corruption and admission errors must stay errors.
+-            drive(fsqlite::Connection::open_existing_schema_only(
++            drive(fsqlite::Connection::open_existing(
+                 canonical.clone(),
+             ))
+         } else if existing_file {

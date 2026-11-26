@@ -1,0 +1,132 @@
+[
+  {
+    "name": "true",
+    "returncode": 0,
+    "usage": {
+      "schema": "br.bounded-write-usage.v1",
+      "start_ns": 768838842107,
+      "stop_ns": 768839828875,
+      "wall_seconds": 0.000986768,
+      "user_seconds": 0.000714,
+      "system_seconds": 0.0,
+      "cpu_seconds": 0.000714,
+      "peak_rss_bytes": 393216,
+      "minor_faults": 192,
+      "major_faults": 0,
+      "input_blocks": 0,
+      "output_blocks": 0,
+      "exit_code": 0,
+      "terminating_signal": 0
+    },
+    "stderr": ""
+  },
+  {
+    "name": "exit7",
+    "returncode": 7,
+    "usage": {
+      "schema": "br.bounded-write-usage.v1",
+      "start_ns": 768840903215,
+      "stop_ns": 768841805787,
+      "wall_seconds": 0.000902572,
+      "user_seconds": 0.000829,
+      "system_seconds": 0.0,
+      "cpu_seconds": 0.000829,
+      "peak_rss_bytes": 655360,
+      "minor_faults": 244,
+      "major_faults": 0,
+      "input_blocks": 24,
+      "output_blocks": 0,
+      "exit_code": 7,
+      "terminating_signal": 0
+    },
+    "stderr": ""
+  },
+  {
+    "name": "sigterm",
+    "returncode": 143,
+    "usage": {
+      "schema": "br.bounded-write-usage.v1",
+      "start_ns": 768843243034,
+      "stop_ns": 768844801334,
+      "wall_seconds": 0.0015583,
+      "user_seconds": 0.0,
+      "system_seconds": 0.001468,
+      "cpu_seconds": 0.001468,
+      "peak_rss_bytes": 524288,
+      "minor_faults": 242,
+      "major_faults": 0,
+      "input_blocks": 0,
+      "output_blocks": 0,
+      "exit_code": 143,
+      "terminating_signal": 15
+    },
+    "stderr": ""
+  },
+  {
+    "name": "missing",
+    "returncode": 127,
+    "usage": {
+      "schema": "br.bounded-write-usage.v1",
+      "start_ns": 768846001183,
+      "stop_ns": 768846371792,
+      "wall_seconds": 0.000370609,
+      "user_seconds": 0.000307,
+      "system_seconds": 0.0,
+      "cpu_seconds": 0.000307,
+      "peak_rss_bytes": 262144,
+      "minor_faults": 85,
+      "major_faults": 0,
+      "input_blocks": 0,
+      "output_blocks": 0,
+      "exit_code": 127,
+      "terminating_signal": 0
+    },
+    "stderr": "usage-helper: exec command: No such file or directory\n"
+  },
+  {
+    "name": "alloc",
+    "returncode": 0,
+    "usage": {
+      "schema": "br.bounded-write-usage.v1",
+      "start_ns": 768847134532,
+      "stop_ns": 768874801317,
+      "wall_seconds": 0.027666785,
+      "user_seconds": 0.011936,
+      "system_seconds": 0.015479,
+      "cpu_seconds": 0.027415,
+      "peak_rss_bytes": 23199744,
+      "minor_faults": 6046,
+      "major_faults": 0,
+      "input_blocks": 0,
+      "output_blocks": 0,
+      "exit_code": 0,
+      "terminating_signal": 0
+    },
+    "stderr": ""
+  },
+  {
+    "name": "exclusive-receipt",
+    "returncode": 125,
+    "stderr": "usage-helper: create exclusive receipt: File exists\n"
+  },
+  {
+    "name": "large-parent",
+    "outer_wait4_peak_rss_bytes": 76808192,
+    "usage": {
+      "schema": "br.bounded-write-usage.v1",
+      "start_ns": 768942119239,
+      "stop_ns": 768942947638,
+      "wall_seconds": 0.000828399,
+      "user_seconds": 0.000739,
+      "system_seconds": 0.0,
+      "cpu_seconds": 0.000739,
+      "peak_rss_bytes": 393216,
+      "minor_faults": 192,
+      "major_faults": 0,
+      "input_blocks": 8,
+      "output_blocks": 0,
+      "exit_code": 0,
+      "terminating_signal": 0
+    }
+  }
+]
