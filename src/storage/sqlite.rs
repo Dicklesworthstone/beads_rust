@@ -33323,7 +33323,11 @@ required_fields:
         let storage = SqliteStorage::open(&database).unwrap();
         let id_a = "bd-label-map-a".to_string();
         let id_b = "bd-label-map-b".to_string();
-        let labels_a = vec!["alpha".to_string(), "middle".to_string(), "zulu".to_string()];
+        let labels_a = vec![
+            "alpha".to_string(),
+            "middle".to_string(),
+            "zulu".to_string(),
+        ];
 
         assert!(storage.get_labels_for_issues(&[]).unwrap().is_empty());
         assert_eq!(
@@ -33359,9 +33363,8 @@ required_fields:
         );
 
         let mut chunked_ids = vec![id_b];
-        chunked_ids.extend(
-            (1..SQLITE_VAR_LIMIT).map(|index| format!("bd-label-map-missing-{index:04}")),
-        );
+        chunked_ids
+            .extend((1..SQLITE_VAR_LIMIT).map(|index| format!("bd-label-map-missing-{index:04}")));
         chunked_ids.push(id_a);
         assert_eq!(
             storage.get_labels_for_issues(&chunked_ids).unwrap(),
