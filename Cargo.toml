@@ -69,7 +69,7 @@ clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 # VFS 0.4.11 is the compatible macOS descriptor-leak backport (upstream
 # fsqlite-vfs-v0.4.11 = 3bb28e731); keep this patch without introducing 0.5
 # engine types or a second Asupersync runtime. Upgrade the family together.
-fsqlite = { version = "=0.4.10", default-features = false, features = [
+fsqlite = { version = "=0.5.1", default-features = false, features = [
     "native",
     "linux-asupersync-uring",
     "fts5",
@@ -77,20 +77,20 @@ fsqlite = { version = "=0.4.10", default-features = false, features = [
     "icu",
     "misc",
 ] }
-fsqlite-types = { version = "=0.4.10" }
-fsqlite-error = { version = "=0.4.10" }
-fsqlite-core = { version = "=0.4.10" }
-fsqlite-func = { version = "=0.4.10" }
-fsqlite-vdbe = { version = "=0.4.10" }
-fsqlite-vfs = { version = "=0.4.11" }
-fsqlite-pager = { version = "=0.4.10" }
-fsqlite-parser = { version = "=0.4.10" }
-fsqlite-planner = { version = "=0.4.10" }
-fsqlite-wal = { version = "=0.4.10" }
-fsqlite-btree = { version = "=0.4.10" }
-fsqlite-ast = { version = "=0.4.10" }
-fsqlite-mvcc = { version = "=0.4.10" }
-fsqlite-observability = { version = "=0.4.10" }
+fsqlite-types = { version = "=0.5.1" }
+fsqlite-error = { version = "=0.5.1" }
+fsqlite-core = { version = "=0.5.1" }
+fsqlite-func = { version = "=0.5.1" }
+fsqlite-vdbe = { version = "=0.5.1" }
+fsqlite-vfs = { version = "=0.5.1" }
+fsqlite-pager = { version = "=0.5.1" }
+fsqlite-parser = { version = "=0.5.1" }
+fsqlite-planner = { version = "=0.5.1" }
+fsqlite-wal = { version = "=0.5.1" }
+fsqlite-btree = { version = "=0.5.1" }
+fsqlite-ast = { version = "=0.5.1" }
+fsqlite-mvcc = { version = "=0.5.1" }
+fsqlite-observability = { version = "=0.5.1" }
 
 # Current-thread runtime that drives fsqlite 0.4's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
